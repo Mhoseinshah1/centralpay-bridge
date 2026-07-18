@@ -135,6 +135,12 @@ def _load_review_payment(db: Session, order_id: str) -> Payment | None:
     return payment
 
 
+# Advisory-lock key serializing `fee set --ensure-initial` across processes
+# (installer reruns racing each other). Arbitrary but fixed; used only with
+# pg_advisory_xact_lock, so it is released automatically at commit/rollback.
+FEE_ENSURE_INITIAL_LOCK_KEY = 0x6665_6501  # "fee\x01"
+
+
 def _cmd_fee(args: argparse.Namespace) -> int:
     """Fee policy operations (host CLI delegates here; no shell SQL).
 
@@ -223,10 +229,32 @@ def _cmd_fee(args: argparse.Namespace) -> int:
                 else:
                     effective_at = datetime.now(UTC)
                     scheduled_flag = False
-                if args.ensure_initial and select_effective_policy(db) is not None:
-                    print("A fee policy already exists; keeping it unchanged.")
-                    db.rollback()
-                    return 0
+                if args.ensure_initial:
+                    # "Initial" means the fee_policies table has ZERO rows —
+                    # not "no currently effective policy". A future scheduled
+                    # policy or cancelled history is an operator decision the
+                    # installer must never override with a surprise immediate
+                    # policy. Serialize concurrent installer reruns with a
+                    # transaction-level advisory lock (PostgreSQL): the loser
+                    # waits for the winner's commit, re-counts, and no-ops —
+                    # at most one initial policy can ever be created.
+                    if db.get_bind().dialect.name == "postgresql":
+                        db.execute(
+                            text("SELECT pg_advisory_xact_lock(:key)"),
+                            {"key": FEE_ENSURE_INITIAL_LOCK_KEY},
+                        )
+                    existing = db.execute(
+                        select(func.count(FeePolicy.id))
+                    ).scalar_one()
+                    if existing:
+                        print(
+                            f"Fee policy history already exists ({existing} "
+                            "row(s), including any scheduled or cancelled "
+                            "policies); --ensure-initial makes no change. "
+                            "Use 'centralpay fee set' to change the fee."
+                        )
+                        db.rollback()
+                        return 0
                 policy = create_policy(
                     db,
                     rate_bps=rate_bps,
