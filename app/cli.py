@@ -36,7 +36,13 @@ def _payment_summary(payment: Payment) -> dict[str, Any]:
         "bot_order_id": payment.bot_order_id,
         "gateway_order_id": payment.gateway_order_id,
         "status": payment.status,
+        # Unambiguous amounts: the bot's ORIGINAL invoice vs what the payer
+        # paid THROUGH THE GATEWAY (original + fee).
+        "original_bot_invoice": payment.amount,
         "amount": payment.amount,
+        "fee_rate_bps": payment.fee_rate_bps,
+        "fee_amount": payment.fee_amount,
+        "paid_through_gateway": payment.payable_amount,
         "gateway_verified": payment.gateway_verified_at is not None,
         "gateway_verified_at": _iso(payment.gateway_verified_at),
         "reference_id": payment.reference_id,
