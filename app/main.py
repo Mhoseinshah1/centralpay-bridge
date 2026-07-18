@@ -74,6 +74,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.session_factory = create_session_factory(settings.database_url)
+    from app.ratelimit import RateLimiters
+
+    app.state.rate_limiters = RateLimiters(settings)
     app.state.centralpay = CentralPayClient(
         base_url=settings.centralpay_base_url,
         getlink_api_key=settings.centralpay_getlink_api_key,

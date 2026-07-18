@@ -104,6 +104,17 @@ class Settings(BaseSettings):
     admin_bot_health_recovery_threshold: int = Field(default=2, ge=1)
     # Optional build commit for /version (set at deploy time).
     git_commit_sha: str = ""
+    # First-production-payment guardrail: when true, the first verified
+    # payment records a critical audit event and admin alert. Never alters
+    # financial behavior; disabled by default.
+    first_payment_guard_enabled: bool = False
+
+    # Application-level rate limiting (in-memory, per process; see
+    # app/ratelimit.py for distributed semantics).
+    rate_limit_enabled: bool = True
+    rate_limit_create_per_minute: int = Field(default=120, gt=0)
+    rate_limit_invalid_key_per_10min: int = Field(default=20, gt=0)
+    rate_limit_invalid_signature_per_10min: int = Field(default=100, gt=0)
     # Internal (non-public) API base URL the admin bot probes for health.
     admin_bot_api_url: str = "http://api:8000"
     # Admin bot container liveness heartbeat file.
