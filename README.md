@@ -52,9 +52,13 @@ the adversarial review, and a green release workflow. Original topics:
 
 **Phase 3 — Deployment and operations** (this code):
 
-- Production Dockerfile (multi-stage, non-root, amd64/arm64) and Docker
-  Compose stack: `caddy` (TLS) → `api` → `db`, plus `worker` and a one-shot
-  `migrate` service that gates API/worker startup on successful migrations
+- Production Dockerfile (multi-stage, non-root fixed UID, amd64/arm64) and
+  Docker Compose stack: `caddy` (TLS) → `api` → `db`, plus `worker` and a
+  one-shot `migrate` service that gates API/worker startup on successful
+  migrations. Since the deployment audit: split edge/internal networks
+  (Caddy has no route to PostgreSQL), read-only hardened app containers
+  (`cap_drop: ALL`, `no-new-privileges`, tmpfs), per-service secret
+  masking, and `sig`+`ct` redaction in access logs
 - One-line interactive installer for Ubuntu 22.04 / 24.04 / 26.04
 - `centralpay` management command (status, logs, diagnose, backup, restore,
   update, ssl, uninstall, …)

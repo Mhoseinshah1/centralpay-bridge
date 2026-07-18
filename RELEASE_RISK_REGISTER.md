@@ -176,6 +176,16 @@ unaccounted for — the top priority of AGENTS.md.
   validation, and the new app-level limits.
 - Tests: `tests/test_phase5_hardening.py` rate-limit suite.
 
+### 17b. Deployment-audit note (audit/deployment-installer-security)
+- The compose stack now isolates Caddy on an edge network (no route to
+  PostgreSQL), hardens api/worker/migrate like the admin bot (read-only
+  root fs, cap_drop ALL, no-new-privileges, tmpfs), masks unneeded
+  secrets per service (worker included), redacts the `ct` token in Caddy
+  access logs, and enforces all of it with policy tests. Runtime behavior
+  of the hardened profile is validated by pattern (the admin bot has run
+  it since Phase 4) — full runtime confirmation lands with real-host
+  validation (B1).
+
 ### 18. Base images not digest-pinned — **ACCEPTED RISK for RC; backlog**
 - Images remain tag-pinned (`python:3.12-slim`, `postgres:16`,
   `caddy:2`). This sandbox cannot reach Docker Hub to resolve digests;

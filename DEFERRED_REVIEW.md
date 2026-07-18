@@ -88,6 +88,23 @@ services stopped with printed recovery steps. Full-state restore fidelity
 and sequence safety are proven on real PostgreSQL. Off-site replication
 (topic 21) remains manual — a local backup is NOT disaster recovery.
 
+Status update (deployment audit, audit/deployment-installer-security):
+Docker/Compose/Caddy/installer/CLI were audited. Fixed: the Caddy access
+log now redacts the one-time callback token (ct) alongside sig; the
+Compose networks are split (Caddy on an edge network with no route to
+PostgreSQL); api/worker/migrate now run the same hardening profile as the
+admin bot (read-only root fs, tmpfs, cap_drop ALL, no-new-privileges —
+every service denies privilege escalation); the worker masks CentralPay
+keys, the inbound API key, and the callback HMAC secret; .dockerignore
+excludes credentials, dumps, key material, and local databases; the logs
+commands use a component allowlist. Verified and now policy-tested: no
+Docker socket/privileged/host namespaces, only 80/443 published, no
+archive extraction in the update path, non-root fixed-UID image, no
+secrets in image layers. Installer posture confirmed (keyring-based apt,
+/dev/tty input, silent secret reads, UFW never enabled silently,
+umask 077 config writes). Real-host installer execution remains blocker
+B1; base-image digest pinning remains topic 18.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection
