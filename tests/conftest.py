@@ -32,6 +32,9 @@ TEST_GETLINK_API_KEY = "test-getlink-api-key-55e0b2b7"
 TEST_VERIFY_API_KEY = "test-verify-api-key-9c23aa41"
 TEST_DB_PASSWORD = "test-db-password-77aa88bb"
 TEST_BOT_TOKEN = "test-bot-notify-token-3f9d1c7a"
+TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6"
+TEST_ADMIN_ID = 111111111
+TEST_ADMIN_ID_2 = 222222222
 TEST_USER_ID = 4242
 
 DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
@@ -202,6 +205,71 @@ def notifier(settings, bot_stub) -> Iterator[BotNotifier]:
     )
     yield instance
     instance.close()
+
+
+@pytest.fixture
+def admin_settings(settings):
+    return settings.model_copy(
+        update={
+            "admin_bot_enabled": True,
+            "admin_bot_token": TEST_ADMIN_BOT_TOKEN,
+            "admin_telegram_ids": f"{TEST_ADMIN_ID},{TEST_ADMIN_ID_2}",
+        }
+    )
+
+
+@pytest.fixture
+def alert_policy(app, admin_settings):
+    """Enable alert-row creation for the duration of a test.
+
+    Depends on `app` so create_app's own configure_alert_creation (which
+    disables the policy for the default test settings) runs first.
+    """
+    from app.adminbot.alerts import configure_alert_creation, reset_alert_creation
+
+    configure_alert_creation(admin_settings)
+    yield admin_settings
+    reset_alert_creation()
+
+
+class FakeAlertSender:
+    """Programmable async Telegram sender for tests."""
+
+    def __init__(self) -> None:
+        from app.adminbot.telegram import SendOutcome
+
+        self.sent: list[tuple[int, str]] = []
+        self.results: dict[int, list[SendOutcome]] = {}
+        self.default = SendOutcome(ok=True)
+
+    async def send(self, chat_id: int, text: str):
+        self.sent.append((chat_id, text))
+        queued = self.results.get(chat_id)
+        if queued:
+            return queued.pop(0)
+        return self.default
+
+
+def run_alert_pass(session_factory, sender, admin_settings, admin_ids=None, **kwargs):
+    import asyncio
+
+    from app.adminbot.alerts import alert_delivery_pass
+
+    ids = admin_ids if admin_ids is not None else (TEST_ADMIN_ID, TEST_ADMIN_ID_2)
+    kwargs.setdefault("jitter", lambda: 1.0)
+    return asyncio.run(
+        alert_delivery_pass(session_factory, sender, admin_settings, ids, **kwargs)
+    )
+
+
+def get_alerts(session_factory, alert_type=None):
+    from app.models import AdminAlert
+
+    with session_factory() as session:
+        query = select(AdminAlert).order_by(AdminAlert.id)
+        if alert_type is not None:
+            query = query.where(AdminAlert.alert_type == alert_type)
+        return list(session.execute(query).scalars())
 
 
 # --- helpers used across test modules ---
