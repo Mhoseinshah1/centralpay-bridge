@@ -69,21 +69,21 @@ def create_custom_payment(
         "payment_create_requested",
         extra={"bot_order_id": body.order_id, "amount": body.amount},
     )
-    if not (
-        settings.min_payment_amount_toman <= body.amount <= settings.max_payment_amount_toman
-    ):
+    # The MINIMUM applies to the ORIGINAL bot amount. The MAXIMUM applies to
+    # the final payable amount (original + service fee) and is enforced in
+    # the creation service before any snapshot or gateway call — see
+    # payable_amount_out_of_range.
+    if body.amount < settings.min_payment_amount_toman:
         logger.warning(
             "amount_out_of_range",
             extra={
                 "bot_order_id": body.order_id,
                 "amount": body.amount,
                 "min_amount": settings.min_payment_amount_toman,
-                "max_amount": settings.max_payment_amount_toman,
             },
         )
         raise AmountOutOfRangeError(
-            f"Amount must be between {settings.min_payment_amount_toman} and "
-            f"{settings.max_payment_amount_toman} TOMAN"
+            f"Amount must be at least {settings.min_payment_amount_toman} TOMAN"
         )
     url = create_payment(
         db, client, settings, bot_order_id=body.order_id, amount=body.amount

@@ -103,14 +103,20 @@ def _validate_and_apply_verification(
             data={"gateway_order_id": payment.gateway_order_id, "field_errors": field_errors},
         )
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
-    if result.amount != payment.amount:
+    # CentralPay charged the PAYABLE amount (original + fee snapshot), so
+    # verification compares against payable_amount — a gateway reporting
+    # the original amount instead is a financial anomaly.
+    if result.amount != payment.payable_amount:
         _move_to_manual_review(
             db,
             payment,
-            mismatch_event="verify_amount_mismatch",
+            mismatch_event="verify_payable_amount_mismatch",
             data={
                 "gateway_order_id": payment.gateway_order_id,
-                "expected_amount": payment.amount,
+                "original_amount": payment.amount,
+                "fee_rate_bps": payment.fee_rate_bps,
+                "fee_amount": payment.fee_amount,
+                "expected_payable_amount": payment.payable_amount,
                 "reported_amount": result.amount,
                 "field_errors": field_errors,
             },
@@ -166,7 +172,10 @@ def _validate_and_apply_verification(
         data={
             "gateway_order_id": payment.gateway_order_id,
             "reference_id": result.reference_id,
-            "amount": payment.amount,
+            "original_amount": payment.amount,
+            "fee_rate_bps": payment.fee_rate_bps,
+            "fee_amount": payment.fee_amount,
+            "payable_amount": payment.payable_amount,
         },
     )
     queue_notification(db, payment, now=now)

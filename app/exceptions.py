@@ -27,6 +27,15 @@ class AmountOutOfRangeError(BridgeError):
     default_message = "Amount is outside the configured payment bounds"
 
 
+class PayableAmountOutOfRangeError(BridgeError):
+    code = "payable_amount_out_of_range"
+    http_status = 400
+    default_message = (
+        "Final payable amount (original amount plus service fee) exceeds the "
+        "configured maximum"
+    )
+
+
 class DuplicateOrderAmountMismatchError(BridgeError):
     code = "duplicate_order_amount_mismatch"
     http_status = 409
