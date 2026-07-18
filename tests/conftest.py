@@ -18,17 +18,20 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.bot import BotNotifier
 from app.centralpay import CentralPayClient
 from app.config import Settings
 from app.main import create_app
 from app.models import Base, Payment, PaymentEvent
 from app.security import callback_signature
+from app.services.notification import run_worker_pass, utcnow
 
 TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"
 TEST_CALLBACK_HMAC_SECRET = "test-callback-hmac-secret-8d11a52b"
 TEST_GETLINK_API_KEY = "test-getlink-api-key-55e0b2b7"
 TEST_VERIFY_API_KEY = "test-verify-api-key-9c23aa41"
 TEST_DB_PASSWORD = "test-db-password-77aa88bb"
+TEST_BOT_TOKEN = "test-bot-notify-token-3f9d1c7a"
 TEST_USER_ID = 4242
 
 DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
@@ -103,6 +106,14 @@ def settings() -> Settings:
         centralpay_verify_api_key=TEST_VERIFY_API_KEY,
         centralpay_user_id=TEST_USER_ID,
         centralpay_timeout_seconds=5.0,
+        bot_payment_notify_url="https://bot.test.local/api/payment",
+        bot_notify_token=TEST_BOT_TOKEN,
+        bot_notify_retry_mode="safe",
+        bot_notify_max_attempts=6,
+        bot_notify_connect_timeout_seconds=2.0,
+        bot_notify_read_timeout_seconds=2.0,
+        bot_notify_worker_interval_seconds=0.1,
+        bot_notify_claim_timeout_seconds=120.0,
     )
 
 
@@ -157,6 +168,42 @@ def client(app) -> Iterator[TestClient]:
         yield test_client
 
 
+class BotStub:
+    """Programmable fake bot API behind httpx.MockTransport."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.requests: list[dict[str, object]] = []
+        self.headers: list[dict[str, str]] = []
+        self.result: httpx.Response | Exception = httpx.Response(200, json={"ok": True})
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        with self.lock:
+            self.requests.append(json.loads(request.content.decode("utf-8")))
+            self.headers.append(dict(request.headers))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.fixture
+def bot_stub() -> BotStub:
+    return BotStub()
+
+
+@pytest.fixture
+def notifier(settings, bot_stub) -> Iterator[BotNotifier]:
+    instance = BotNotifier(
+        url=settings.bot_payment_notify_url,
+        token=settings.bot_notify_token,
+        connect_timeout_seconds=settings.bot_notify_connect_timeout_seconds,
+        read_timeout_seconds=settings.bot_notify_read_timeout_seconds,
+        transport=httpx.MockTransport(bot_stub.handler),
+    )
+    yield instance
+    instance.close()
+
+
 # --- helpers used across test modules ---
 
 
@@ -206,3 +253,53 @@ def get_events(
 
 def event_types(events: list[PaymentEvent]) -> list[str]:
     return [event.event_type for event in events]
+
+
+def as_utc(value):
+    """SQLite returns naive datetimes; our writes are always UTC."""
+    from datetime import UTC
+
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def run_pass(
+    session_factory,
+    notifier_instance,
+    settings,
+    *,
+    worker_id: str = "test-worker-1",
+    now=None,
+    jitter=lambda: 1.0,
+    batch_size: int = 20,
+):
+    """One deterministic worker pass on a fresh session."""
+    session = session_factory()
+    try:
+        now_fn = (lambda: now) if now is not None else utcnow
+        return run_worker_pass(
+            session,
+            notifier_instance,
+            settings,
+            worker_id=worker_id,
+            now_fn=now_fn,
+            jitter=jitter,
+            batch_size=batch_size,
+        )
+    finally:
+        session.close()
+
+
+def make_verified_pending(
+    client, settings, session_factory, stub, *, order_id: str = "ntf-1", amount: int = 10000
+) -> Payment:
+    """Full flow: create the payment and verify it via a signed callback,
+    leaving it in bot_notify_pending."""
+    response = create_order(client, settings, order_id=order_id, amount=amount)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, order_id)
+    stub.verify_result = verify_ok_response(amount=amount)
+    callback_response = client.get(callback_path(settings, payment.gateway_order_id))
+    assert callback_response.status_code == 200
+    return get_payment(session_factory, order_id)
