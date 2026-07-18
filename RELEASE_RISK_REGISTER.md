@@ -32,16 +32,20 @@ unaccounted for — the top priority of AGENTS.md.
   duplicate-callback fault-injection tests, PostgreSQL concurrency tests.
 - Release decision: closed.
 
-### 2. Gateway-controlled error text — **ACCEPTED RISK**
+### 2. Gateway-controlled error text — **FIXED (audit/gateway-response-hardening)**
 - Severity: low · Financial impact: none · Exploitability: low (requires
   a hostile/compromised gateway) · Likelihood: low
-- Mitigation: gateway text is truncated to 200 characters, passes
-  through the secret-redaction pipeline, and is stored in audit data.
-  Client-visible error responses use fixed error codes; free text is not
-  interpolated into HTML (payer pages are templated with escaping).
-- Tests: redaction suite; page-rendering tests.
-- Release decision: accepted for RC; sanitization review remains on the
-  post-release backlog.
+- Fix: raw gateway text no longer leaves `app/centralpay.py`. Responses
+  are classified into a fixed internal reason-code vocabulary
+  (`gateway_rejected`, `gateway_response_invalid`, `gateway_missing_data`,
+  `gateway_invalid_redirect_url`, `gateway_invalid_*` field codes); logs,
+  exceptions, `last_error`, audit event data, and API responses carry
+  codes only. Redirect URLs are parsed with `urlsplit` and accepted only
+  as HTTPS with a valid hostname, no credentials, no control characters,
+  and bounded length.
+- Tests: sentinel-text redaction suites (client-level and end-to-end),
+  redirect-URL rejection matrix.
+- Release decision: closed.
 
 ### 3. Untrusted `X-Request-ID` — **ACCEPTED RISK**
 - Severity: low · Financial impact: none · Exploitability: low ·
@@ -59,8 +63,8 @@ unaccounted for — the top priority of AGENTS.md.
   of positive markers — never inferred from truthy values or the
   presence of `data`. Every financial field is parsed with typed
   coercion; malformed fields produce explicit reason codes
-  (`verify_empty_reference_id`, `verify_invalid_amount`,
-  `verify_invalid_user_id`) and route to manual review.
+  (`gateway_invalid_reference_id`, `gateway_invalid_amount`,
+  `gateway_invalid_user_id`) and route to manual review.
 - Residual: the real CentralPay response contract has never been
   observed from this codebase. → **Release blocker B2 (staging
   validation, `STAGING_VALIDATION.md`)**.
