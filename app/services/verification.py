@@ -9,7 +9,6 @@ payment can never be verified twice.
 import enum
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -28,7 +27,7 @@ from app.exceptions import (
 )
 from app.models import Payment, PaymentStatus
 from app.security import callback_token_matches
-from app.services.notification import queue_notification
+from app.services.notification import queue_notification, utcnow
 
 logger = logging.getLogger("app.services.verification")
 
@@ -152,8 +151,10 @@ def _validate_and_apply_verification(
 
     # Verified state and pending notification state commit atomically; the
     # bot notification itself is sent later, by the worker, outside any
-    # database transaction.
-    now = datetime.now(UTC)
+    # database transaction. The timestamp comes from the notification
+    # pipeline's single utcnow() seam so the verified-at and next-retry
+    # clocks can never diverge (and tests can pin them deterministically).
+    now = utcnow()
     payment.gateway_verified_at = now
     payment.reference_id = result.reference_id
     payment.card_last4 = _card_last4(result.card_number)
