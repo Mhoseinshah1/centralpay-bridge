@@ -328,6 +328,47 @@ full attempt history is preserved in `payment_events`. An administrator
 must inspect it (`python -m app.cli manual-review`) and resolve it
 manually. Administrator tooling for resolution arrives in later phases.
 
+### Worker lifecycle and recovery guarantees (audit)
+
+The delivery pipeline is a strict four-step sequence designed around
+crash windows (documented model; every step below is regression-tested):
+
+1. The **callback transaction** commits the verified fact together with
+   `bot_notify_pending` and the queue timestamp — atomically.
+2. A worker **claims** one due payment (`FOR UPDATE SKIP LOCKED`,
+   attempt counter incremented, `bot_notification_started` audit event)
+   and **commits the claim**.
+3. The HTTP request to the bot runs with **no database transaction
+   open** — locks are never held across external I/O in the worker.
+4. The classified result is recorded in a **new transaction**, and only
+   if the row still carries **this worker's claim at this attempt
+   number** — a straggler whose attempt outlived its claim can never
+   record a result against a successor's claim (the discard itself is
+   audited as `bot_notification_result_discarded`).
+
+Recovery guarantees:
+
+- **Nothing lives in process memory.** Queue state, retry schedule, and
+  attempt history are all in PostgreSQL; any worker restart (SIGTERM,
+  SIGINT, container kill, crash) resumes from the database.
+- **Stale claims** (a worker died mid-attempt) are recovered on every
+  pass, in bounded batches: the interrupted attempt's outcome is
+  unknown, so safe mode routes it to manual review as an ambiguous
+  delivery; idempotent mode requeues it with backoff.
+- **Retries are bounded in every path**: failed attempts AND interrupted
+  attempts count against `BOT_NOTIFY_MAX_ATTEMPTS`; when the limit is
+  reached — including via repeated stale-claim recovery — the payment
+  moves to manual review with `retry_limit_reached`. Nothing retries
+  forever, and nothing is silently dropped.
+- **Manual review is terminal for the worker**: passes never select
+  `manual_review` payments, callbacks never reset them, and duplicate
+  create requests never reset them.
+- Multiple workers are safe: `SKIP LOCKED` guarantees a payment is
+  claimed by at most one worker; ordering is deterministic
+  (`next_retry_at` ascending — oldest due first, so retries and new
+  payments share one fair queue and neither starves); batches are
+  bounded (20 per pass).
+
 ### Running the worker locally
 
 ```bash

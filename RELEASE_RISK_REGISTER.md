@@ -148,6 +148,10 @@ unaccounted for — the top priority of AGENTS.md.
 ### 13. Stale-claim conservatism in safe mode — **ACCEPTED RISK (deliberate)**
 - Availability is sacrificed for financial correctness by design.
   Pre-send-marker optimization is post-release backlog. Severity: low.
+- Worker-audit update: stale-claim recovery is now bounded per pass, and
+  interrupted attempts count against the retry limit in idempotent mode
+  (previously unbounded requeue — fixed). Claim ownership is verified
+  before any result is recorded (straggler writes discarded + audited).
 
 ### 14. `Retry-After` integer-seconds only — **ACCEPTED RISK**
 - HTTP-date values fall back to the backoff schedule. Severity: low;
