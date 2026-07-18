@@ -75,6 +75,10 @@ class ClaimedPayment:
     bot_order_id: str
     gateway_order_id: int
     attempt: int
+    # Claim ownership (audit fix): results are recorded only when the row
+    # still carries THIS worker's claim at THIS attempt number, so a slow
+    # straggler can never record its outcome against a successor's claim.
+    worker_id: str
 
 
 def queue_notification(db: Session, payment: Payment, *, now: datetime) -> None:
@@ -154,6 +158,7 @@ def claim_next_due(db: Session, *, worker_id: str, now: datetime) -> ClaimedPaym
         bot_order_id=payment.bot_order_id,
         gateway_order_id=payment.gateway_order_id,
         attempt=attempt,
+        worker_id=worker_id,
     )
     db.commit()
     logger.info("bot_notification_started", extra=_log_extra(claimed, attempt=attempt))
@@ -203,11 +208,27 @@ def record_attempt_result(
     ).scalar_one()
     if (
         payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value
-        or payment.notification_claimed_by is None
+        or payment.notification_claimed_by != claimed.worker_id
+        or payment.bot_notify_attempts != claimed.attempt
     ):
-        # The claim was released (stale-claim recovery) or the payment was
-        # resolved elsewhere while this attempt ran: never overwrite.
+        # The claim was released (stale-claim recovery), re-claimed by
+        # another worker/attempt, or the payment was resolved elsewhere
+        # while this attempt ran: never overwrite. The discard is part of
+        # the permanent audit trail, not just a log line.
         db.rollback()
+        record_event(
+            db,
+            payment_id=claimed.payment_id,
+            event_type="bot_notification_result_discarded",
+            level="warning",
+            data={
+                "attempt": claimed.attempt,
+                "worker_id": claimed.worker_id,
+                "reason_code": outcome.reason_code,
+                "http_status": outcome.http_status,
+            },
+        )
+        db.commit()
         logger.warning(
             "bot_notification_result_discarded",
             extra=_log_extra(claimed, attempt=claimed.attempt, outcome=outcome),
@@ -376,12 +397,15 @@ def release_stale_claims(
     *,
     now: datetime,
     jitter: JitterFn = default_jitter,
+    limit: int = 100,
 ) -> int:
     """Recover payments whose claiming worker died mid-attempt.
 
     The interrupted attempt's outcome is unknown — the request may or may not
     have reached the bot — so this is treated exactly like an ambiguous
-    delivery: manual review in safe mode, requeue in idempotent mode.
+    delivery: manual review in safe mode, requeue in idempotent mode. The
+    batch is bounded (``limit``); anything beyond it is recovered on the
+    following passes, keeping lock scope and memory bounded.
     """
     cutoff = now - timedelta(seconds=settings.bot_notify_claim_timeout_seconds)
     payments = (
@@ -392,6 +416,8 @@ def release_stale_claims(
                 Payment.notification_claimed_at.is_not(None),
                 Payment.notification_claimed_at <= cutoff,
             )
+            .order_by(Payment.notification_claimed_at.asc())
+            .limit(limit)
             .with_for_update(skip_locked=True)
         )
         .scalars()
@@ -408,7 +434,29 @@ def release_stale_claims(
             "stale_worker_id": payment.notification_claimed_by,
             "retry_mode": settings.bot_notify_retry_mode,
         }
-        if settings.bot_notify_retry_mode == "idempotent":
+        if (
+            settings.bot_notify_retry_mode == "idempotent"
+            and attempt >= settings.bot_notify_max_attempts
+        ):
+            # Bounded-retry fix: interrupted attempts count against the same
+            # limit as failed ones. Without this check a delivery whose
+            # worker dies on every attempt would requeue forever in
+            # idempotent mode.
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="notification_recovered_after_restart",
+                level="warning",
+                data={**data, "action": "retry_limit_reached"},
+            )
+            _move_to_manual_review(
+                db,
+                payment,
+                reason_code=ReasonCode.RETRY_LIMIT_REACHED.value,
+                attempt=attempt,
+                now=now,
+            )
+        elif settings.bot_notify_retry_mode == "idempotent":
             delay = retry_delay_seconds(attempt, None, jitter)
             next_retry_at = now + timedelta(seconds=delay)
             payment.bot_notify_reason = ReasonCode.BOT_TIMEOUT_AMBIGUOUS.value
