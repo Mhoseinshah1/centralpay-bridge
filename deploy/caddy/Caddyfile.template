@@ -1,0 +1,64 @@
+# CentralPay Bridge — Caddy reverse proxy template.
+# install.sh replaces {{PAYMENT_DOMAIN}} and {{TLS_EMAIL}} and writes the
+# result to /etc/centralpay-bridge/Caddyfile. Automatic HTTPS is handled by
+# Caddy (Let's Encrypt) using the configured email.
+
+{
+	email {{TLS_EMAIL}}
+	# The admin API is not needed and must not be exposed.
+	admin off
+}
+
+{{PAYMENT_DOMAIN}} {
+	encode gzip
+
+	# JSON access logs to stdout (Docker handles rotation: 20m x 5 files).
+	# The sig query parameter carries the callback HMAC signature and is
+	# redacted before the log line is written.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri query {
+					replace sig REDACTED
+				}
+			}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	# Payment API requests are small JSON bodies; cap request size hard.
+	request_body {
+		max_size 64KB
+	}
+
+	# Only the public application routes are reachable. Everything else —
+	# docs, internals, directory paths — returns 404. There is no static
+	# file serving and therefore no directory listing.
+	@public {
+		path /api/custom-payment /api/centralpay/callback /health/live /health/ready
+	}
+
+	handle @public {
+		reverse_proxy api:8000 {
+			# Client information for the application, set by the proxy.
+			header_up X-Forwarded-Proto {scheme}
+			# The application trusts X-Request-ID; the proxy overwrites any
+			# client-supplied value so request IDs are always proxy-issued.
+			header_up X-Request-ID {http.request.uuid}
+		}
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+}

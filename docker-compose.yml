@@ -1,0 +1,146 @@
+# CentralPay Bridge production deployment.
+#
+# Secrets live outside the repository in /etc/centralpay-bridge/centralpay.env
+# (created by install.sh with mode 0600). Nothing in this file contains
+# credentials. Only Caddy publishes host ports; the API and PostgreSQL are
+# reachable exclusively on the internal network.
+
+name: centralpay-bridge
+
+x-app-image: &app-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: centralpay-bridge:latest
+
+x-app-env: &app-env
+  env_file:
+    - path: ${CENTRALPAY_ENV_FILE:-/etc/centralpay-bridge/centralpay.env}
+      required: false
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: centralpay
+      POSTGRES_USER: centralpay
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - internal
+    # No published ports: PostgreSQL is never publicly reachable.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U centralpay -d centralpay"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    shm_size: 128mb
+    logging: *default-logging
+
+  migrate:
+    <<: [*app-image, *app-env]
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+    healthcheck:
+      disable: true
+    logging: *default-logging
+
+  api:
+    <<: [*app-image, *app-env]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      # API never starts on an unmigrated or failed-migration database.
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    # No published ports: only Caddy reaches the API.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+
+  worker:
+    <<: [*app-image, *app-env]
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    healthcheck:
+      # Liveness: the worker touches this file after every completed pass.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, sys, time
+          path = os.environ.get("WORKER_HEARTBEAT_FILE", "/tmp/centralpay-worker-heartbeat")
+          fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < 120
+          sys.exit(0 if fresh else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ${CENTRALPAY_CADDYFILE:-/etc/centralpay-bridge/Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging: *default-logging
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  db_data:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  db_password:
+    file: ${CENTRALPAY_DB_PASSWORD_FILE:-/etc/centralpay-bridge/db_password}
