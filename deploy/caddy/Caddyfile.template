@@ -13,8 +13,9 @@
 	encode gzip
 
 	# JSON access logs to stdout (Docker handles rotation: 20m x 5 files).
-	# The sig query parameter carries the callback HMAC signature and is
-	# redacted before the log line is written.
+	# The sig query parameter carries the callback HMAC signature and ct
+	# carries the one-time callback token; both are redacted before the log
+	# line is written.
 	log {
 		output stdout
 		format filter {
@@ -22,6 +23,7 @@
 			fields {
 				request>uri query {
 					replace sig REDACTED
+					replace ct REDACTED
 				}
 			}
 		}
