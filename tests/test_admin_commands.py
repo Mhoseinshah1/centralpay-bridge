@@ -175,7 +175,7 @@ def test_health_reports_components(handlers):
 def test_start_includes_no_balance_credit_warning(handlers):
     text = "\n".join(handlers.handle(admin_ctx(), "start", []))
     assert "واریز قطعی اعتبار" in text
-    assert "0.5.0-rc1" in text
+    assert "0.6.0-rc1" in text
 
 
 def test_errors_summary_lists_reason_events(
@@ -198,4 +198,4 @@ def test_errors_summary_lists_reason_events(
 
 def test_version_command(handlers):
     text = "\n".join(handlers.handle(admin_ctx(), "version", []))
-    assert "0.5.0-rc1" in text
+    assert "0.6.0-rc1" in text

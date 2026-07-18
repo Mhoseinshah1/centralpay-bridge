@@ -252,7 +252,7 @@ def test_health_details_machine_readable(client, settings, session_factory, stub
     response = client.get("/health/details")
     assert response.status_code == 200
     details = response.json()
-    assert details["version"] == "0.5.0-rc1"
+    assert details["version"] == "0.6.0-rc1"
     assert details["database"] == "ok"
     assert details["pending_notifications"] == 1
     assert details["manual_review"] == 0
