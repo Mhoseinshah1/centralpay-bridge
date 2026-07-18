@@ -1,4 +1,4 @@
-# Real-host installer validation — 0.5.0-rc1
+# Real-host installer validation — 0.6.0-rc1
 
 **Status: NOT PERFORMED — RELEASE BLOCKER (B1).**
 
@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main
 
 has therefore **never been executed**. Per the release instructions,
 this is recorded honestly as a release blocker rather than claimed as
-complete: **0.5.0-rc1 must not be tagged until this validation has been
+complete: **0.6.0-rc1 must not be tagged until this validation has been
 performed on a real host and the results are recorded below.**
 
 ## What HAS been validated (and how)

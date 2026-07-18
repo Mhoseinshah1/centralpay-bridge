@@ -18,6 +18,52 @@ How to move an existing installation between versions. General rules:
 - Migrations run automatically: the `migrate` service applies
   `alembic upgrade head` before api/worker start (compose gating).
 
+## 0.5.0-rc1 → 0.6.0-rc1
+
+### Schema (migration `0006`)
+
+Applied automatically by the `migrate` service. Creates the append-only
+`fee_policies` table and adds four snapshot columns to `payments`:
+`fee_policy_id` (FK RESTRICT, nullable), `fee_rate_bps`, `fee_amount`,
+`payable_amount`. Every existing payment is backfilled as fee-less:
+
+```
+fee_policy_id  = NULL
+fee_rate_bps   = 0
+fee_amount     = 0
+payable_amount = amount
+```
+
+so its financial meaning is unchanged. CHECK constraints then bind
+`payable_amount = amount + fee_amount`, the rate range (0..10000 bps),
+non-negative fees, and fee-policy row consistency at the storage layer.
+The backfill is a single UPDATE plus CHECK validation — a brief
+table-scan lock, negligible at this system's row counts, and valid for
+every state 0.5.0-rc1 can have produced (proven by the
+populated-database migration test).
+
+### Behavior
+
+- With no fee policy configured (the default after upgrade), behavior is
+  identical to 0.5.0-rc1: getLink is asked for the original amount and
+  verify is compared against it (payable == amount when the fee is 0).
+- Enabling a fee is an explicit operator action:
+  `centralpay fee set RATE --note "..."` (root). Fee changes affect NEW
+  orders only. The installer's fee question (default 0) only applies on
+  fresh installs; `--ensure-initial` never overwrites an existing
+  policy on a rerun.
+- `MAX_PAYMENT_AMOUNT_TOMAN` now bounds the FINAL payable amount; with
+  a non-zero fee, orders whose `amount + fee` exceeds it are rejected
+  with `payable_amount_out_of_range`.
+
+### Rollback limitation (important)
+
+The schema is never downgraded. **After 0006 is applied, the 0.5.0-rc1
+application can no longer create payments** — it does not populate the
+NOT NULL `payable_amount` column. `centralpay rollback` across this
+boundary is therefore NOT a routine path: roll forward, or restore the
+pre-update backup (losing post-upgrade payments) as disaster recovery.
+
 ## 0.4.0-dev → 0.5.0-rc1
 
 ### Schema (migration `0004`)

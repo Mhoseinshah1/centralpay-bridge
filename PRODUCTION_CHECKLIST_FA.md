@@ -1,4 +1,4 @@
-# چک‌لیست استقرار تولید (Production) — نسخهٔ 0.5.0-rc1
+# چک‌لیست استقرار تولید (Production) — نسخهٔ 0.6.0-rc1
 
 > **هشدار:** این نسخه یک «نامزد انتشار» (Release Candidate) است و تا
 > بسته‌شدن همهٔ موارد مسدودکننده در `RELEASE_RISK_REGISTER.md` **نباید
@@ -40,7 +40,7 @@
       (idempotent) است.
 - [ ] `MIN_PAYMENT_AMOUNT_TOMAN` و `MAX_PAYMENT_AMOUNT_TOMAN` مطابق
       سیاست فروشگاه تنظیم شده‌اند.
-- [ ] `CENTRALPAY_UPDATE_REF` روی برچسب انتشار (مثل `v0.5.0-rc1`)
+- [ ] `CENTRALPAY_UPDATE_REF` روی برچسب انتشار (مثل `v0.6.0-rc1`)
       تنظیم است، نه روی شاخهٔ `main`.
 - [ ] `FIRST_PAYMENT_GUARD_ENABLED=true` تنظیم شده است (پس از اولین
       پرداخت موفق می‌توانید آن را خاموش کنید).

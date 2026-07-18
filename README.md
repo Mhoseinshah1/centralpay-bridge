@@ -16,7 +16,7 @@ roadmap is GitHub issue #1.
 The full test suite (unit + PostgreSQL integration + fault injection +
 backup/restore round-trip), lint, type checking, and migration validation
 pass; the multi-agent adversarial review remains outstanding. Every
-deferred topic has been triaged for 0.5.0-rc1 in
+deferred topic has been triaged for 0.6.0-rc1 in
 [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md) — **open release
 blockers**: real-host installer validation
 ([REAL_HOST_VALIDATION.md](REAL_HOST_VALIDATION.md)), staging validation
@@ -88,7 +88,7 @@ the adversarial review, and a green release workflow. Original topics:
 - Persian message formatting (Jalali timestamps) with HTML escaping of
   every dynamic value
 
-**Phase 5 — Release-candidate hardening (0.5.0-rc1)** (this code):
+**Phase 5 — Release-candidate hardening (0.5.0-rc1)**:
 
 - One-time callback tokens bound into the HMAC signature (hash-only
   storage, durable consumption, no hard expiration — legitimate late
@@ -112,6 +112,24 @@ the adversarial review, and a green release workflow. Original topics:
   [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md),
   [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md),
   [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md)
+
+**Phase 6 — Dynamic percentage fee (0.6.0-rc1)** (this code):
+
+- Percentage service fee paid by the payer through CentralPay, invisible
+  to the selling bot: original invoice preserved, immutable per-payment
+  fee snapshot, integer round-half-up arithmetic, getLink charges the
+  payable amount, verify enforces it, and the bot notification payload
+  is byte-for-byte unchanged — see
+  [Dynamic service fee](#dynamic-service-fee-percentage)
+- Append-only audited `fee_policies` with deterministic selection and
+  restart-free scheduled changes; `centralpay fee` host CLI (root-only
+  mutations) and read-only admin-bot `/fee`; installer fee question with
+  `--ensure-initial`
+- Migration `0006` (zero-fee backfill + CHECK constraints binding
+  `payable = amount + fee`); fee-aware db-check, backups, and reporting
+- Real-host fix: deployment scripts committed executable (100755) and
+  installed with explicit modes (backup.sh 0750 root:root)
+- Release docs: [RELEASE_NOTES_0.6.0_RC1.md](RELEASE_NOTES_0.6.0_RC1.md)
 
 Persian documentation: [README_FA.md](README_FA.md),
 [INSTALL_FA.md](INSTALL_FA.md), [OPERATIONS_FA.md](OPERATIONS_FA.md),

@@ -1,4 +1,4 @@
-# Admin Telegram bot validation — 0.5.0-rc1
+# Admin Telegram bot validation — 0.6.0-rc1
 
 **Status: NOT PERFORMED against real Telegram — RELEASE BLOCKER B3 for
 enabling the admin bot in production.** The payment path does not depend
