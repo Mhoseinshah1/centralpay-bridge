@@ -38,6 +38,48 @@ class PaymentStatus(enum.StrEnum):
     MANUAL_REVIEW = "manual_review"
 
 
+class FeePolicy(Base):
+    """Append-only, versioned service-fee configuration.
+
+    Financial configuration is never edited or deleted: changing the fee
+    creates a NEW row, cancelling a scheduled policy fills the
+    cancellation fields on its row. Payments snapshot the policy at
+    creation and never depend on later reads. Selection is deterministic:
+    highest ``effective_at`` not after now, then highest ``id``, skipping
+    cancelled rows.
+    """
+
+    __tablename__ = "fee_policies"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    # Fee percentage in basis points: 0 = 0%, 225 = 2.25%, 10000 = 100%.
+    rate_bps: Mapped[int] = mapped_column(Integer, nullable=False)
+    effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_by: Mapped[str | None] = mapped_column(String(128))
+    cancellation_note: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_fee_policies_effective_at", "effective_at"),
+        CheckConstraint(
+            "rate_bps >= 0 AND rate_bps <= 10000", name="ck_fee_policies_rate_bps_range"
+        ),
+        CheckConstraint("note <> ''", name="ck_fee_policies_note_not_empty"),
+        # Cancellation fields are set together or not at all.
+        CheckConstraint(
+            "(cancelled_at IS NULL AND cancelled_by IS NULL AND cancellation_note IS NULL)"
+            " OR (cancelled_at IS NOT NULL AND cancelled_by IS NOT NULL"
+            " AND cancellation_note IS NOT NULL)",
+            name="ck_fee_policies_cancellation_consistent",
+        ),
+    )
+
+
 class Payment(Base):
     __tablename__ = "payments"
 
@@ -49,8 +91,24 @@ class Payment(Base):
         BigInteger, unique=True, nullable=False, index=True
     )
     gateway_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    # Amount in TOMAN.
+    # ORIGINAL bot invoice amount in TOMAN — exactly what the bot requested.
+    # Never includes the service fee and is never modified after creation.
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # --- Immutable fee snapshot (dynamic fee feature) -----------------------
+    # Captured exactly once at payment creation from the then-effective fee
+    # policy; a later policy change NEVER alters an existing payment.
+    # fee_amount = (amount * fee_rate_bps + 5000) // 10000  (round half up)
+    # payable_amount = amount + fee_amount  (what CentralPay charges).
+    fee_policy_id: Mapped[int | None] = mapped_column(
+        ForeignKey("fee_policies.id", ondelete="RESTRICT"), nullable=True
+    )
+    fee_rate_bps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    fee_amount: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    payable_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default=PaymentStatus.CREATED.value, index=True
     )
@@ -105,6 +163,19 @@ class Payment(Base):
         # F14-adjacent: attempt counters can never go negative.
         CheckConstraint(
             "bot_notify_attempts >= 0", name="ck_payments_attempts_non_negative"
+        ),
+        # Fee snapshot invariants (migration 0006): rates are basis points
+        # within 0..10000, fees are never negative, and the payable amount
+        # is exactly original + fee.
+        CheckConstraint(
+            "fee_rate_bps >= 0 AND fee_rate_bps <= 10000",
+            name="ck_payments_fee_rate_bps_range",
+        ),
+        CheckConstraint("fee_amount >= 0", name="ck_payments_fee_amount_non_negative"),
+        CheckConstraint("payable_amount > 0", name="ck_payments_payable_positive"),
+        CheckConstraint(
+            "payable_amount = amount + fee_amount",
+            name="ck_payments_payable_equals_amount_plus_fee",
         ),
         # F1/F9: a payment can only be queued for (or accepted by) the bot
         # AFTER the gateway-verified fact is durably recorded.
