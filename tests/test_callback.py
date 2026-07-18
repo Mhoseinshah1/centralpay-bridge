@@ -66,10 +66,14 @@ def test_verify_success(client, settings, session_factory, stub):
 
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json() == {"status": "verified", "order_id": "cb-ok"}
+    # A verified payment gets a user-facing success page; bot delivery is
+    # queued for the worker, so final processing is pending.
+    assert 'data-status="bot_pending"' in response.text
+    assert "cb-ok" in response.text
 
     payment = get_payment(session_factory, "cb-ok")
-    assert payment.status == PaymentStatus.GATEWAY_VERIFIED.value
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert payment.gateway_verified_at is not None
     assert payment.reference_id == "REF-777"
     # Only the last four digits are stored, never the full card number.
     assert payment.card_last4 == "7890"
@@ -85,6 +89,7 @@ def test_verify_success(client, settings, session_factory, stub):
         "payment_link_created",
         "callback_received",
         "gateway_payment_verified",
+        "bot_notification_queued",
     ]
 
 
@@ -96,7 +101,7 @@ def test_verify_amount_mismatch_moves_to_manual_review(client, settings, session
 
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json() == {"status": "under_review", "order_id": "cb-amount"}
+    assert 'data-status="under_review"' in response.text
 
     payment = get_payment(session_factory, "cb-amount")
     assert payment.status == PaymentStatus.MANUAL_REVIEW.value
@@ -116,7 +121,7 @@ def test_verify_user_id_mismatch_moves_to_manual_review(client, settings, sessio
 
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json()["status"] == "under_review"
+    assert 'data-status="under_review"' in response.text
 
     payment = get_payment(session_factory, "cb-user")
     assert payment.status == PaymentStatus.MANUAL_REVIEW.value
@@ -135,7 +140,7 @@ def test_verify_missing_reference_id_moves_to_manual_review(
 
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json()["status"] == "under_review"
+    assert 'data-status="under_review"' in response.text
 
     payment = get_payment(session_factory, "cb-noref")
     assert payment.status == PaymentStatus.MANUAL_REVIEW.value
@@ -151,15 +156,16 @@ def test_duplicate_callback_does_not_verify_again(client, settings, session_fact
     stub.verify_result = verify_ok_response(amount=10000)
 
     first = client.get(callback_path(settings, payment.gateway_order_id))
-    assert first.json()["status"] == "verified"
+    assert 'data-status="bot_pending"' in first.text
     second = client.get(callback_path(settings, payment.gateway_order_id))
     assert second.status_code == 200
-    assert second.json() == {"status": "already_verified", "order_id": "cb-dup"}
+    assert 'data-status="bot_pending"' in second.text
 
     # Verify was called exactly once; the verified record was not overwritten.
     assert len(stub.verify_requests) == 1
     payment = get_payment(session_factory, "cb-dup")
-    assert payment.status == PaymentStatus.GATEWAY_VERIFIED.value
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert payment.gateway_verified_at is not None
     assert "duplicate_callback_ignored" in event_types(get_events(session_factory, payment.id))
 
 
@@ -176,7 +182,7 @@ def test_callback_after_manual_review_does_not_verify_again(
     stub.verify_result = verify_ok_response(amount=10000)
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json()["status"] == "under_review"
+    assert 'data-status="under_review"' in response.text
     # manual_review payments belong to an administrator; no auto re-verify.
     assert len(stub.verify_requests) == 1
     assert get_payment(session_factory, "cb-review").status == PaymentStatus.MANUAL_REVIEW.value
@@ -216,5 +222,8 @@ def test_verify_network_failure_is_recoverable(client, settings, session_factory
     stub.verify_result = verify_ok_response(amount=10000)
     response = client.get(callback_path(settings, payment.gateway_order_id))
     assert response.status_code == 200
-    assert response.json()["status"] == "verified"
-    assert get_payment(session_factory, "cb-neterr").status == PaymentStatus.GATEWAY_VERIFIED.value
+    assert 'data-status="bot_pending"' in response.text
+    assert (
+        get_payment(session_factory, "cb-neterr").status
+        == PaymentStatus.BOT_NOTIFY_PENDING.value
+    )

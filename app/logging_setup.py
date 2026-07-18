@@ -55,6 +55,7 @@ def collect_secret_values(settings: Settings) -> list[str]:
         settings.callback_hmac_secret,
         settings.centralpay_getlink_api_key,
         settings.centralpay_verify_api_key,
+        settings.bot_notify_token,
     ]
     try:
         password = make_url(settings.database_url).password
