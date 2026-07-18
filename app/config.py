@@ -74,6 +74,41 @@ class Settings(BaseSettings):
     # Worker liveness heartbeat file, touched after every pass.
     worker_heartbeat_file: str = "/tmp/centralpay-worker-heartbeat"
 
+    # --- Administrator Telegram bot (Phase 4). Optional; disabled unless
+    # explicitly configured. The API/worker only use these to decide whether
+    # to CREATE alert outbox rows — they never talk to Telegram themselves.
+    admin_bot_enabled: bool = False
+    admin_bot_token: str = ""
+    # Comma-separated numeric Telegram user IDs. Authorization is by numeric
+    # ID only — usernames are never trusted. Parsed and validated by
+    # parse_admin_telegram_ids(); deliberately NOT validated at Settings
+    # construction so a bad value can never block API or worker startup.
+    admin_telegram_ids: str = ""
+    admin_bot_alerts_enabled: bool = True
+    admin_bot_payment_success_alerts: bool = False
+    admin_bot_error_alerts: bool = True
+    admin_bot_manual_review_alerts: bool = True
+    admin_bot_backup_alerts: bool = True
+    admin_bot_health_alerts: bool = True
+    admin_bot_daily_report_enabled: bool = True
+    admin_bot_daily_report_time: str = "09:00"
+    admin_bot_timezone: str = "Asia/Tehran"
+    admin_bot_max_message_length: int = Field(default=3500, ge=500, le=4096)
+    admin_bot_alert_dedup_minutes: int = Field(default=30, ge=1)
+    # Alert delivery / monitoring tuning.
+    admin_bot_alert_poll_interval_seconds: float = Field(default=5.0, gt=0)
+    admin_bot_alert_max_attempts: int = Field(default=8, gt=0, le=50)
+    admin_bot_alert_claim_timeout_seconds: float = Field(default=300.0, gt=0)
+    admin_bot_health_check_interval_seconds: float = Field(default=60.0, gt=0)
+    admin_bot_health_failure_threshold: int = Field(default=3, ge=1)
+    admin_bot_health_recovery_threshold: int = Field(default=2, ge=1)
+    # Optional build commit for /version (set at deploy time).
+    git_commit_sha: str = ""
+    # Internal (non-public) API base URL the admin bot probes for health.
+    admin_bot_api_url: str = "http://api:8000"
+    # Admin bot container liveness heartbeat file.
+    admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
+
     @model_validator(mode="after")
     def _validate_bot_settings(self) -> Self:
         if self.min_payment_amount_toman >= self.max_payment_amount_toman:
@@ -108,3 +143,48 @@ def validate_bot_notification_settings(settings: Settings) -> None:
         raise ConfigurationError("BOT_PAYMENT_NOTIFY_URL is not configured")
     if not settings.bot_notify_token:
         raise ConfigurationError("BOT_NOTIFY_TOKEN is not configured")
+
+
+def parse_admin_telegram_ids(raw: str) -> tuple[int, ...]:
+    """Parse comma-separated numeric Telegram user IDs.
+
+    Raises ConfigurationError (never echoing full values beyond the IDs
+    themselves, which are not secrets) on malformed input. Usernames are
+    never accepted.
+    """
+    ids: list[int] = []
+    for part in raw.split(","):
+        candidate = part.strip()
+        if not candidate:
+            continue
+        if not candidate.isdigit() or int(candidate) <= 0:
+            raise ConfigurationError(
+                "ADMIN_TELEGRAM_IDS must contain only positive numeric "
+                "Telegram user IDs separated by commas"
+            )
+        ids.append(int(candidate))
+    return tuple(dict.fromkeys(ids))
+
+
+def validate_admin_bot_settings(settings: Settings) -> tuple[int, ...]:
+    """Startup validation for the admin bot service only.
+
+    The API and worker never call this, so invalid admin-bot configuration
+    can never block payment processing. Returns the parsed admin IDs.
+    """
+    if not settings.admin_bot_enabled:
+        raise ConfigurationError("ADMIN_BOT_ENABLED is false")
+    if not settings.admin_bot_token:
+        raise ConfigurationError("ADMIN_BOT_TOKEN is not configured")
+    admin_ids = parse_admin_telegram_ids(settings.admin_telegram_ids)
+    if not admin_ids:
+        raise ConfigurationError("ADMIN_TELEGRAM_IDS is empty")
+    if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", settings.admin_bot_daily_report_time):
+        raise ConfigurationError("ADMIN_BOT_DAILY_REPORT_TIME must be HH:MM")
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(settings.admin_bot_timezone)
+    except Exception as exc:
+        raise ConfigurationError("ADMIN_BOT_TIMEZONE is not a valid IANA timezone") from exc
+    return admin_ids
