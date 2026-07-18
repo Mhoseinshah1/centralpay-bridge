@@ -95,13 +95,18 @@ def test_getlink_rejected_response(client, settings, session_factory, stub):
     response = create_order(client, settings, order_id="order-rejected")
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "centralpay_rejected"
+    # Gateway-controlled text never reaches the API caller.
+    assert "invalid merchant" not in response.text
 
     payment = get_payment(session_factory, "order-rejected")
     assert payment.status == PaymentStatus.GETLINK_FAILED.value
     assert payment.last_error
+    assert "invalid merchant" not in payment.last_error
     events = get_events(session_factory, payment.id)
     assert event_types(events) == ["payment_created", "centralpay_getlink_failed"]
     assert events[-1].level == "error"
+    # ...nor the stored audit trail: internal reason codes only.
+    assert "invalid merchant" not in str(events[-1].data)
 
 
 def test_getlink_network_failure(client, settings, session_factory, stub):

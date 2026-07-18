@@ -58,11 +58,19 @@ Review whether a timestamp/nonce should be added to the signed message and
 what expiry policy CentralPay's redirect flow tolerates.
 
 ### 2. Gateway-controlled error text handling
-`_safe_reason()` in `app/centralpay.py` copies gateway-supplied message text
-(truncated to 200 chars) into exception messages, audit event data, and API
-error responses. This is attacker-influenceable-by-gateway content flowing
-into logs and client-visible responses. Review sanitization/encoding and
-whether gateway text should be stored but never echoed to API callers.
+**RESOLVED (audit/gateway-response-hardening).** `_safe_reason()` copied
+gateway-supplied message text (truncated to 200 chars) into exception
+messages, audit event data, and API error responses. It has been removed:
+gateway responses are now classified into a fixed internal reason-code
+vocabulary (`gateway_rejected`, `gateway_response_invalid`,
+`gateway_missing_data`, `gateway_invalid_redirect_url`,
+`gateway_invalid_reference_id`, `gateway_invalid_amount`,
+`gateway_invalid_user_id`) inside `app/centralpay.py`, and raw gateway text
+never leaves that module. Redirect URLs are additionally validated with a
+real URL parser (HTTPS-only, no credentials, no control characters,
+bounded length) — see the gateway-controlled data policy in SECURITY.md.
+Regression tests assert sentinel gateway text never reaches exceptions,
+logs, stored errors, audit data, or API responses.
 
 ### 3. Untrusted X-Request-ID handling
 `app/middleware.py` accepts `X-Request-ID` from any client (sanitized to
