@@ -24,6 +24,18 @@ CentralPay confirmation, or lost silently is always critical.
 - **Authentication:** constant-time comparison for the inbound API key and
   for HMAC-SHA256 callback signatures; signatures are validated before any
   database or gateway work.
+- **Strict creation schema (audit):** `POST /api/custom-payment` accepts
+  only a string `api_key`, a JSON-integer `amount` (booleans, floats, and
+  numeric strings are rejected, never coerced; absolute schema backstop
+  10¹² TOMAN below BIGINT), and an opaque `order_id` (≤128 chars, no
+  control characters or NUL — NUL previously reached PostgreSQL and caused
+  a 500). Malformed requests are rejected with a generic
+  `validation_error` that never echoes field contents, and create no
+  payment rows, no audit rows, and no gateway traffic. `order_id` is never
+  trimmed, case-folded, or Unicode-normalized. Authentication runs before
+  any order lookup, so unauthenticated callers cannot enumerate orders,
+  and the `payment_create_requested` log event is emitted only after
+  authentication.
 - **Callback replay protection (0.5.0-rc1):** every payment link embeds a
   one-time token covered by the HMAC signature; only the token's SHA-256
   hash is stored, superseded tokens are rejected under the row lock before

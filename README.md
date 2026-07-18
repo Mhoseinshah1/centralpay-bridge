@@ -207,9 +207,58 @@ request itself (method, path, status, request id — never the query string).
 | Endpoint | Purpose |
 | --- | --- |
 | `POST /api/custom-payment` | Create a payment; body `{"api_key", "amount", "order_id"}`; returns `{"url": "..."}` |
-| `GET /api/centralpay/callback?orderId=...&sig=...` | Signed CentralPay return URL; triggers verification and returns a payer-facing status page |
+| `GET /api/centralpay/callback?orderId=...&ct=...&sig=...` | Signed CentralPay return URL; triggers verification and returns a payer-facing status page |
 | `GET /health/live` | Liveness probe |
 | `GET /health/ready` | Readiness probe with a real database connectivity check |
+
+### Payment-creation request contract (strict)
+
+The request schema rejects anything outside this contract with a generic
+`422 validation_error` (field contents are never echoed back):
+
+- `api_key` — string. Compared in constant time; never logged, never
+  included in errors.
+- `amount` — JSON **integer**, TOMAN. Booleans, floats, and numeric
+  strings are rejected, never coerced. Policy bounds are
+  `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` (checked after
+  authentication, error `amount_out_of_range`); the schema additionally
+  enforces an absolute backstop of 10¹² TOMAN.
+- `order_id` — opaque non-empty string, at most 128 characters, no
+  control characters, no NUL. Passed through byte-exact: never trimmed,
+  case-folded, or Unicode-normalized.
+
+### Idempotency contract
+
+Creation is idempotent by `order_id`, serialized with a database row
+lock (the lock is held across the CentralPay getLink call — model A —
+so two concurrent requests can never both call getLink for one order):
+
+- Same `order_id` + same `amount` with a live link → the **same URL** is
+  returned (`payment_duplicate_returned` log event); no new gateway
+  call, no new callback token.
+- Same `order_id` + **different amount** → `409
+  duplicate_order_amount_mismatch` (audited); the stored payment is
+  never modified.
+- Already gateway-verified order → `409 order_already_verified`; a new
+  link is **never** issued for a verified payment (this also covers
+  verified payments later moved to manual review).
+- Never-verified order under manual review → `409 order_under_review`;
+  state is never silently reset.
+- After a getLink failure (including ambiguous timeouts) → the retry
+  issues a fresh gateway order id and a fresh one-time callback token;
+  the possibly-half-registered previous id is abandoned, and tokens from
+  superseded attempts are rejected at callback time. **Link refresh is
+  driven by the bot re-requesting the same `order_id`** — an unpaid
+  link's token stays valid until a retry durably commits its
+  replacement (token and redirect URL always commit atomically).
+- Gateway order ids are random 12-digit integers under a database
+  unique index — guess-resistant, no sequence to drift or reset after a
+  backup restore.
+
+A crash between a successful getLink and our commit loses the invoice
+reference atomically (neither token nor URL is stored); the orphaned
+CentralPay invoice is unreachable (its URL was never returned to
+anyone), and the bot's retry recovers with a fresh link.
 
 ## Bot notification (Phase 2)
 
