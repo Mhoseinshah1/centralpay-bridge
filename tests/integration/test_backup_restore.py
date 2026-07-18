@@ -203,7 +203,7 @@ def test_pg_dump_restore_round_trip(populated_db, pg_engine, tmp_path):
     counts_after, payments_after = _snapshot(pg_engine)
     assert counts_after == counts_before
     assert payments_after == payments_before
-    # The financial facts survived byte-for-byte.
+    # The financial facts survived field-for-field.
     restored = {row[0]: row for row in payments_after}
     assert restored["bk-1"][1] == PaymentStatus.BOT_NOTIFY_PENDING.value
     assert restored["bk-1"][2] == 25000
@@ -394,7 +394,7 @@ def test_full_state_round_trip_and_sequence_safety(
 ):
     """Audit task 041/049: every payment state, its audit history, alert
     outbox rows, and sequence positions survive a dump/wipe/restore
-    byte-for-byte — and new inserts after restore cannot collide."""
+    field-for-field — and new inserts after restore cannot collide."""
     session_factory = _build_full_state(settings, pg_engine, bot_stub, notifier)
 
     # Sanity: the fixture really covers the states we claim it does.
@@ -517,7 +517,7 @@ def test_fee_policies_survive_restore_and_stay_decoupled(
 ):
     """Active, scheduled, AND cancelled fee policies survive a
     dump/wipe/restore with full history; payment fee snapshots restore
-    byte-for-byte; and a policy change made AFTER the restore still leaves
+    field-for-field; and a policy change made AFTER the restore still leaves
     restored payments untouched and gets a non-colliding policy id."""
     from datetime import UTC, datetime, timedelta
 

@@ -856,3 +856,37 @@ def test_db_check_detects_policyless_fee_corruption(
         ).scalar_one()
     assert payment.fee_rate_bps == 500
     assert payment.fee_amount == 0
+
+
+def test_concurrent_ensure_initial_creates_exactly_one_policy(
+    settings, pg_session_factory, monkeypatch
+):
+    """Zero-based audit: two installer reruns racing `fee set
+    --ensure-initial` are serialized by a transaction-level PostgreSQL
+    advisory lock — exactly one initial policy row can ever exist."""
+    import app.ops as ops_module
+    from app.models import FeePolicy
+    from app.ops import main as ops_main
+
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: pg_session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    barrier = threading.Barrier(2)
+
+    def initialize(rate: str) -> int:
+        barrier.wait(timeout=10)
+        return ops_main(
+            ["fee", "set", rate, "--note", "Initial installation fee",
+             "--actor", "installer", "--ensure-initial"]
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(initialize, rate) for rate in ("10", "5")]
+        results = [future.result(timeout=60) for future in futures]
+
+    assert results == [0, 0]  # the loser is a clean no-op, not an error
+    with pg_session_factory() as db:
+        policies = db.execute(select(FeePolicy)).scalars().all()
+    assert len(policies) == 1
+    assert policies[0].rate_bps in (1000, 500)  # whichever won the lock

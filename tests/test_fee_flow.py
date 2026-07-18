@@ -3,7 +3,8 @@
 The contract under test: `payment.amount` stays the ORIGINAL bot invoice,
 CentralPay is asked to charge `payable_amount = amount + fee`, verify
 validates against `payable_amount`, and the bot notification payload is
-byte-for-byte unchanged (order_id + actions only — never any amount).
+unchanged: the exact JSON object and field set (order_id + actions
+only — never any amount).
 """
 
 import json
@@ -265,7 +266,7 @@ def test_payable_exactly_at_maximum_accepted(client, settings, session_factory, 
     assert get_payment(session_factory, "fee-edge").payable_amount == 99_999_999
 
 
-# --- bot notification payload is byte-for-byte unchanged ---------------------
+# --- bot notification payload: exact JSON object and field set ---------------
 
 
 def test_bot_notification_payload_contains_no_fee_fields(
@@ -408,7 +409,7 @@ def test_ops_fee_ensure_initial_never_resets_existing_policy(
     # Installer re-run with a different answer: the existing policy wins.
     assert ops_main(["fee", "set", "0", "--note", "Initial installation fee",
                      "--actor", "installer", "--ensure-initial"]) == 0
-    assert "keeping it unchanged" in capsys.readouterr().out
+    assert "--ensure-initial makes no change" in capsys.readouterr().out
     assert _active_rate(session_factory) == 1000
     with session_factory() as db:
         assert db.execute(select(func.count(FeePolicy.id))).scalar_one() == 1
@@ -544,3 +545,58 @@ def test_delivered_fee_payment_retains_exact_snapshot(
         final.fee_amount,
         final.payable_amount,
     ) == (500_000, policy_id, 1000, 50_000, 550_000)
+
+
+# --- zero-based audit: --ensure-initial means ZERO policy rows ---------------
+
+
+def _policy_count(session_factory) -> int:
+    with session_factory() as db:
+        return db.execute(select(func.count(FeePolicy.id))).scalar_one()
+
+
+def test_ops_ensure_initial_creates_only_from_zero_rows(ops_env, session_factory, capsys):
+    assert _policy_count(session_factory) == 0
+    assert ops_main(["fee", "set", "10", "--note", "Initial installation fee",
+                     "--actor", "installer", "--ensure-initial"]) == 0
+    assert _policy_count(session_factory) == 1
+    assert _active_rate(session_factory) == 1000
+
+
+def test_ops_ensure_initial_noop_with_only_future_policy(ops_env, session_factory, capsys):
+    """A future scheduled policy is an operator decision: the installer must
+    NOT inject a surprise immediate policy in front of it."""
+    set_fee_policy(
+        session_factory, 250, effective_at=datetime.now(UTC) + timedelta(days=7)
+    )
+    assert ops_main(["fee", "set", "10", "--note", "Initial installation fee",
+                     "--actor", "installer", "--ensure-initial"]) == 0
+    out = capsys.readouterr().out
+    assert "--ensure-initial makes no change" in out
+    assert _policy_count(session_factory) == 1  # still only the scheduled one
+    assert _active_rate(session_factory) is None  # nothing active yet — preserved
+
+
+def test_ops_ensure_initial_noop_with_only_cancelled_history(
+    ops_env, session_factory, capsys
+):
+    """Cancelled history is still history: its existence proves an operator
+    has managed fees deliberately, so the installer changes nothing."""
+    with session_factory() as db:
+        db.add(
+            FeePolicy(
+                rate_bps=250,
+                effective_at=datetime.now(UTC) + timedelta(days=7),
+                created_by="operator",
+                note="scheduled then cancelled",
+                cancelled_at=datetime.now(UTC),
+                cancelled_by="operator",
+                cancellation_note="changed my mind",
+            )
+        )
+        db.commit()
+    assert ops_main(["fee", "set", "10", "--note", "Initial installation fee",
+                     "--actor", "installer", "--ensure-initial"]) == 0
+    assert "--ensure-initial makes no change" in capsys.readouterr().out
+    assert _policy_count(session_factory) == 1
+    assert _active_rate(session_factory) is None
