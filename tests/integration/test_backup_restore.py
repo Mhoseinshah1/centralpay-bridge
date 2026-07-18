@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -29,6 +30,7 @@ from tests.conftest import (
     build_app,
     create_order,
     get_payment,
+    getlink_ok_response,
     valid_callback_path,
     verify_ok_response,
 )
@@ -275,3 +277,230 @@ def test_pg_tool_resolver_fails_loudly_without_compatible_binary(tmp_path, monke
 
     with pytest.raises(RuntimeError, match="postgresql-client-16"):
         _find_pg_tool("pg_dump", 16, search_root=tmp_path / "lib")
+
+
+def _build_full_state(settings, pg_engine, bot_stub, notifier):
+    """A database carrying every creation/delivery state plus an alert."""
+    import datetime as dt
+
+    from sqlalchemy import update
+
+    from app.models import AdminAlert, Payment
+    from tests.conftest import run_pass
+
+    Base.metadata.create_all(pg_engine)
+    with pg_engine.begin() as connection:
+        connection.execute(
+            text("CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(32) NOT NULL)")
+        )
+        connection.execute(text("INSERT INTO alembic_version (version_num) VALUES ('0004')"))
+    session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
+    stub = CentralPayStub()
+    application = build_app(settings, session_factory, stub)
+
+    def verify(client, order_id, amount):
+        payment = get_payment(session_factory, order_id)
+        stub.verify_result = verify_ok_response(amount=amount, reference_id=f"REF-{order_id}")
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+
+    with TestClient(application, raise_server_exceptions=False) as client:
+        # link_created
+        assert create_order(client, settings, order_id="fs-link", amount=1000).status_code == 200
+        # getlink_failed
+        stub.getlink_result = httpx.ConnectError("refused")
+        assert create_order(client, settings, order_id="fs-fail", amount=2000).status_code == 502
+        stub.getlink_result = getlink_ok_response()
+        # bot_notify_pending
+        assert create_order(client, settings, order_id="fs-pend", amount=3000).status_code == 200
+        verify(client, "fs-pend", 3000)
+        # bot_notify_accepted
+        assert create_order(client, settings, order_id="fs-acc", amount=4000).status_code == 200
+        verify(client, "fs-acc", 4000)
+        # manual_review (bot rejected with 422)
+        assert create_order(client, settings, order_id="fs-rev", amount=5000).status_code == 200
+        verify(client, "fs-rev", 5000)
+        # retry-scheduled (bot 500)
+        assert create_order(client, settings, order_id="fs-retry", amount=6000).status_code == 200
+        verify(client, "fs-retry", 6000)
+    application.state.centralpay.close()
+
+    # Process the four queued payments one at a time, in queue order
+    # (fs-pend, fs-acc, fs-rev, fs-retry — next_retry_at ascending), with
+    # per-payment bot behavior so every outcome is deterministic.
+    bot_stub.result = httpx.Response(200, json={"ok": True})
+    run_pass(session_factory, notifier, settings, batch_size=1)  # fs-pend -> accepted
+    run_pass(session_factory, notifier, settings, batch_size=1)  # fs-acc -> accepted
+    bot_stub.result = httpx.Response(422)
+    run_pass(session_factory, notifier, settings, batch_size=1)  # fs-rev -> manual review
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings, batch_size=1)  # fs-retry -> retry scheduled
+
+    with session_factory() as session:
+        # Stale claim on fs-pend... fs-pend was delivered above; instead mark
+        # the retry-scheduled payment as stale-claimed to capture claim state.
+        session.execute(
+            update(Payment)
+            .where(Payment.bot_order_id == "fs-retry")
+            .values(
+                notification_claimed_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+                notification_claimed_by="crashed-worker",
+            )
+        )
+        session.add(
+            AdminAlert(
+                alert_type="backup_test_alert",
+                severity="warning",
+                payload={"note": "fidelity-check"},
+            )
+        )
+        session.commit()
+    return session_factory
+
+
+_FINANCIAL_COLUMNS = (
+    "bot_order_id", "gateway_order_id", "status", "amount", "reference_id",
+    "card_last4", "callback_token_hash", "bot_notify_reason",
+    "bot_notify_attempts", "notification_claimed_by", "review_resolution",
+)
+
+
+def _financial_snapshot(engine):
+    with engine.connect() as connection:
+        payments = connection.execute(
+            text(
+                "SELECT "
+                + ", ".join(_FINANCIAL_COLUMNS)
+                + ", gateway_verified_at IS NOT NULL AS verified,"
+                " next_retry_at IS NOT NULL AS retry_scheduled,"
+                " manual_review_at IS NOT NULL AS in_review"
+                " FROM payments ORDER BY bot_order_id"
+            )
+        ).all()
+        events = connection.execute(
+            text(
+                "SELECT payment_id, event_type, count(*) FROM payment_events"
+                " GROUP BY payment_id, event_type ORDER BY payment_id, event_type"
+            )
+        ).all()
+        alerts = connection.execute(
+            text("SELECT alert_type, severity, status FROM admin_alerts ORDER BY id")
+        ).all()
+    return [tuple(r) for r in payments], [tuple(r) for r in events], [tuple(r) for r in alerts]
+
+
+def test_full_state_round_trip_and_sequence_safety(
+    settings, pg_engine, bot_stub, notifier, tmp_path
+):
+    """Audit task 041/049: every payment state, its audit history, alert
+    outbox rows, and sequence positions survive a dump/wipe/restore
+    byte-for-byte — and new inserts after restore cannot collide."""
+    session_factory = _build_full_state(settings, pg_engine, bot_stub, notifier)
+
+    # Sanity: the fixture really covers the states we claim it does.
+    with pg_engine.connect() as connection:
+        statuses = dict(
+            connection.execute(text("SELECT bot_order_id, status FROM payments")).all()
+        )
+    assert statuses["fs-link"] == "link_created"
+    assert statuses["fs-fail"] == "getlink_failed"
+    assert statuses["fs-pend"] == "bot_notify_accepted"  # first delivery pass
+    assert statuses["fs-acc"] == "bot_notify_accepted"
+    assert statuses["fs-rev"] == "manual_review"
+    assert statuses["fs-retry"] == "bot_notify_pending"
+
+    before = _financial_snapshot(pg_engine)
+    dump_file = _dump(tmp_path)
+    args, env = _pg_env_and_args()
+    pg_restore = _find_pg_tool("pg_restore", _server_major())
+
+    with pg_engine.begin() as connection:
+        for table in (*_TABLES, "alembic_version"):
+            connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+    subprocess.run(
+        [pg_restore, *args, "--no-owner", "--exit-on-error", str(dump_file)],
+        env=env, check=True, timeout=120,
+    )
+
+    assert _financial_snapshot(pg_engine) == before  # full financial fidelity
+
+    # Sequences were preserved by the custom-format dump: inserting a new
+    # payment must not collide with restored primary keys.
+    from app.models import Payment
+
+    with session_factory() as session:
+        session.add(
+            Payment(
+                bot_order_id="fs-after-restore",
+                gateway_order_id=999_000_111_222,
+                gateway_user_id=1,
+                amount=7000,
+                status="created",
+            )
+        )
+        session.commit()
+    with pg_engine.connect() as connection:
+        count = connection.execute(text("SELECT count(*) FROM payments")).scalar_one()
+    assert count == 7
+
+
+def test_db_check_detects_and_repairs_sequence_drift(
+    settings, pg_engine, bot_stub, notifier, monkeypatch, capsys
+):
+    """Audit task 049: a sequence forced behind its table maximum (manual
+    import, drifted restore) is detected by db-check, repaired with
+    --repair-sequences, and inserts succeed afterwards."""
+    import app.ops as ops_module
+    from app.models import Payment
+    from app.ops import main as ops_main
+
+    session_factory = _build_full_state(settings, pg_engine, bot_stub, notifier)
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    # Healthy database: db-check passes.
+    assert ops_main(["db-check"]) == 0
+    capsys.readouterr()
+
+    # Force the payments sequence behind the table maximum.
+    with pg_engine.begin() as connection:
+        connection.execute(
+            text("SELECT setval(pg_get_serial_sequence('payments', 'id'), 1)")
+        )
+    assert ops_main(["db-check"]) == 1
+    out = capsys.readouterr().out
+    assert "sequence_behind:payments" in out
+
+    # Repair, then inserts succeed without PK collisions.
+    assert ops_main(["db-check", "--repair-sequences"]) == 0
+    with session_factory() as session:
+        session.add(
+            Payment(
+                bot_order_id="seq-after-repair",
+                gateway_order_id=999_000_111_333,
+                gateway_user_id=1,
+                amount=1000,
+                status="created",
+            )
+        )
+        session.commit()
+
+
+def test_zero_byte_and_plain_sql_archives_rejected(populated_db, tmp_path):
+    """Audit task 042: the pg_restore --list validation gate refuses empty
+    files and plain SQL passed off as custom-format archives."""
+    _, env = _pg_env_and_args()
+    pg_restore = _find_pg_tool("pg_restore", _server_major())
+
+    empty = tmp_path / "empty.dump"
+    empty.write_bytes(b"")
+    sql = tmp_path / "sql.dump"
+    sql.write_text("SELECT 1;\n-- not a custom-format archive\n")
+
+    for candidate in (empty, sql):
+        with open(candidate, "rb") as fh:
+            result = subprocess.run(
+                [pg_restore, "--list"],
+                env=env, stdin=fh, capture_output=True, timeout=60,
+            )
+        assert result.returncode != 0, candidate

@@ -387,3 +387,72 @@ def test_shellcheck_clean(script):
         ["shellcheck", str(script)], capture_output=True, text=True, timeout=120
     )
     assert result.returncode == 0, result.stdout
+
+
+# --- backup/restore integrity audit ------------------------------------------
+
+
+def test_backup_script_integrity_hardening():
+    text = BACKUP_SCRIPT.read_text()
+    # Exclusive lock shared with restore; reentrant for the pre-restore backup.
+    assert "flock -n 9" in text
+    assert "CENTRALPAY_BACKUP_LOCK_HELD" in text
+    # Restrictive default permissions for every file the script creates.
+    assert "umask 077" in text
+    # Validation before rename: non-empty, custom-format magic, pg_restore.
+    assert "PGDMP" in text
+    assert "pg_restore --list" in text
+    # Atomicity and no-overwrite.
+    assert ".partial" in text
+    assert "target file already exists" in text
+    # Checksum manifest written atomically after validation.
+    assert "sha256sum" in text
+    assert ".manifest" in text
+    assert "validation=passed" in text
+    # Retention failure is loud but never converts a successful backup
+    # into a failure; sidecars are removed together with expired dumps.
+    assert "backup_retention_failed" in text
+    assert '"${old}.manifest"' in text
+    # Credentials are never read or logged (dump runs inside the container
+    # against its local socket; the script never touches the DB password).
+    assert "PGPASSWORD" not in text
+    assert "$DATABASE_URL" not in text
+    assert "${DATABASE_URL" not in text
+
+
+def test_restore_preflight_and_failure_safety():
+    text = MANAGEMENT.read_text()
+    restore_body = text.split("cmd_restore()")[1].split("cmd_db_check()")[0]
+    # Preflight: regular file, no symlink, magic bytes, checksum manifest.
+    assert "! -L" in restore_body
+    assert "PGDMP" in restore_body
+    assert "sha256sum" in restore_body
+    # Legacy files need an explicit extra confirmation; --yes cannot skip it.
+    assert "RESTORE-LEGACY" in restore_body
+    assert "--yes cannot accept a legacy backup" in restore_body
+    # Exclusive lock shared with the backup script.
+    assert "flock -n 9" in restore_body
+    assert "CENTRALPAY_BACKUP_LOCK_HELD=1" in restore_body
+    # All writers stopped, including the admin bot when enabled.
+    assert "compose stop api worker" in restore_body
+    assert "compose stop admin-bot" in restore_body
+    # Partial-restore detection and explicit recovery guidance.
+    assert "--exit-on-error" in restore_body
+    assert "restore_failure_instructions" in restore_body
+    # Post-restore integrity gate before services are started.
+    assert "db-check --repair-sequences" in restore_body
+    assert restore_body.index("db-check") < restore_body.index("compose up -d --wait")
+    # Failure guidance never restarts services against a partial database.
+    instructions = text.split("restore_failure_instructions()")[1].split("cmd_restore()")[0]
+    assert "STOPPED" in instructions
+    assert "centralpay restore" in instructions
+
+
+def test_db_check_command_exposed():
+    text = MANAGEMENT.read_text()
+    assert "cmd_db_check" in text
+    assert "db-check" in text
+    result = subprocess.run(
+        ["bash", str(MANAGEMENT), "help"], capture_output=True, text=True, timeout=30
+    )
+    assert "db-check" in result.stdout
