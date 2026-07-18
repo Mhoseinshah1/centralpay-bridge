@@ -42,4 +42,11 @@ def record_event(
         event_type,
         extra={"payment_id": payment_id, "audit_data": data},
     )
+    # Best-effort admin alert creation in the same transaction. A no-op
+    # unless the admin bot is enabled; never raises (see adminbot.alerts).
+    from app.adminbot import alerts as admin_alerts
+
+    admin_alerts.on_audit_event(
+        db, event_type=event_type, level=level, payment_id=payment_id, data=data
+    )
     return event
