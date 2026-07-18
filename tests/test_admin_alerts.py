@@ -11,13 +11,13 @@ from tests.conftest import (
     TEST_ADMIN_ID,
     TEST_ADMIN_ID_2,
     FakeAlertSender,
-    callback_path,
     create_order,
     get_alerts,
     get_payment,
     make_verified_pending,
     run_alert_pass,
     run_pass,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -44,7 +44,7 @@ def test_amount_mismatch_creates_high_severity_alert(
     assert create_order(client, settings, order_id="al-amount", amount=10000).status_code == 200
     payment = get_payment(session_factory, "al-amount")
     stub.verify_result = verify_ok_response(amount=999)
-    client.get(callback_path(settings, payment.gateway_order_id))
+    client.get(valid_callback_path(stub, payment.gateway_order_id))
 
     alerts = get_alerts(session_factory, "verify_amount_mismatch")
     assert len(alerts) == 1

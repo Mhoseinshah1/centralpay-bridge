@@ -205,7 +205,7 @@ def test_worker_records_database_heartbeat(session_factory):
         )
     assert len(rows) == 1
     assert rows[0].last_error_code == "RuntimeError"
-    assert rows[0].version == "0.4.0-dev"
+    assert rows[0].version == "0.5.0-rc1"
 
 
 def test_signature_storm_creates_single_aggregated_alert(
@@ -219,7 +219,8 @@ def test_signature_storm_creates_single_aggregated_alert(
     signature_failure_tracker.reset()
     for _ in range(6):
         response = client.get(
-            f"/api/centralpay/callback?orderId={payment.gateway_order_id}&sig={'0' * 64}"
+            f"/api/centralpay/callback?orderId={payment.gateway_order_id}"
+            f"&ct={'a' * 32}&sig={'0' * 64}"
         )
         assert response.status_code == 403
     alerts = get_alerts(session_factory, "callback_signature_failures")

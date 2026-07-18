@@ -17,6 +17,17 @@ RUN python -m venv /opt/venv \
 
 FROM python:3.12-slim AS runtime
 
+# Build metadata (populated by CI; empty defaults keep local builds working).
+ARG BUILD_REVISION=""
+ARG BUILD_CREATED=""
+LABEL org.opencontainers.image.title="centralpay-bridge" \
+      org.opencontainers.image.description="Payment bridge between a Telegram bot gateway API and CentralPay" \
+      org.opencontainers.image.source="https://github.com/Mhoseinshah1/centralpay-bridge" \
+      org.opencontainers.image.version="0.5.0-rc1" \
+      org.opencontainers.image.revision="${BUILD_REVISION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
+      org.opencontainers.image.licenses="UNLICENSED"
+
 # PYTHONDONTWRITEBYTECODE: no .pyc files at runtime (read-only-friendly).
 # PYTHONUNBUFFERED: JSON logs reach Docker immediately.
 ENV PYTHONDONTWRITEBYTECODE=1 \

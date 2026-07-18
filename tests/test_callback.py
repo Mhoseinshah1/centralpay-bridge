@@ -9,6 +9,7 @@ from tests.conftest import (
     event_types,
     get_events,
     get_payment,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -37,10 +38,59 @@ def test_signature_for_different_order_id_rejected(client, settings, session_fac
     payment = _create_paid_order(client, settings, session_factory, stub, order_id="cb-swap")
     from app.security import callback_signature
 
-    other_sig = callback_signature(settings.callback_hmac_secret, payment.gateway_order_id + 1)
-    response = client.get(callback_path(settings, payment.gateway_order_id, sig=other_sig))
+    ct = "0123456789abcdef0123456789abcdef"
+    other_sig = callback_signature(
+        settings.callback_hmac_secret, payment.gateway_order_id + 1, ct
+    )
+    response = client.get(
+        callback_path(settings, payment.gateway_order_id, sig=other_sig, ct=ct)
+    )
     assert response.status_code == 403
     assert stub.verify_requests == []
+
+
+def test_stale_callback_token_rejected_before_verify(client, settings, session_factory, stub):
+    """A token from a superseded link attempt must never reach verify."""
+    import httpx
+
+    stub.getlink_result = httpx.ConnectError("connection refused")
+    assert create_order(client, settings, order_id="cb-stale").status_code == 502
+    from tests.conftest import getlink_ok_response
+
+    stub.getlink_result = getlink_ok_response()
+    assert create_order(client, settings, order_id="cb-stale").status_code == 200
+    payment = get_payment(session_factory, "cb-stale")
+
+    # The first attempt's returnUrl (index 0) carries the stale token; its
+    # signature is valid but the stored hash has been superseded.
+    first_url = str(stub.getlink_requests[0]["returnUrl"])
+    stale_path = first_url[first_url.index("/api/centralpay/callback"):]
+    # The stale URL also carries the OLD gateway order id, which no longer
+    # resolves — replaying it is a 404. Rebuild a stale-token URL against the
+    # CURRENT order id to isolate the token check.
+    from urllib.parse import parse_qs, urlsplit
+
+    stale_ct = parse_qs(urlsplit(stale_path).query)["ct"][0]
+    from app.security import callback_signature
+
+    sig = callback_signature(settings.callback_hmac_secret, payment.gateway_order_id, stale_ct)
+    response = client.get(
+        f"/api/centralpay/callback?orderId={payment.gateway_order_id}"
+        f"&ct={stale_ct}&sig={sig}"
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "invalid_callback_token"
+    # The gateway verify endpoint was never contacted.
+    assert stub.verify_requests == []
+    assert "callback_token_invalid" in event_types(
+        get_events(session_factory, payment.id)
+    )
+
+    # The legitimate current link still works (not rejected too aggressively).
+    stub.verify_result = verify_ok_response(amount=10000, reference_id="REF-cb-stale")
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
+    assert response.status_code == 200
+    assert 'data-status="bot_pending"' in response.text
 
 
 def test_callback_payment_not_found(client, settings, session_factory, stub):
@@ -64,7 +114,7 @@ def test_verify_success(client, settings, session_factory, stub):
         amount=10000, reference_id="REF-777", card_number="6037-9912-3456-7890"
     )
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     # A verified payment gets a user-facing success page; bot delivery is
     # queued for the worker, so final processing is pending.
@@ -99,7 +149,7 @@ def test_verify_amount_mismatch_moves_to_manual_review(client, settings, session
     )
     stub.verify_result = verify_ok_response(amount=9000)
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     assert 'data-status="under_review"' in response.text
 
@@ -119,7 +169,7 @@ def test_verify_user_id_mismatch_moves_to_manual_review(client, settings, sessio
     )
     stub.verify_result = verify_ok_response(amount=10000, user_id=1)
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     assert 'data-status="under_review"' in response.text
 
@@ -138,7 +188,7 @@ def test_verify_missing_reference_id_moves_to_manual_review(
     )
     stub.verify_result = verify_ok_response(amount=10000, reference_id=None)
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     assert 'data-status="under_review"' in response.text
 
@@ -155,9 +205,9 @@ def test_duplicate_callback_does_not_verify_again(client, settings, session_fact
     )
     stub.verify_result = verify_ok_response(amount=10000)
 
-    first = client.get(callback_path(settings, payment.gateway_order_id))
+    first = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert 'data-status="bot_pending"' in first.text
-    second = client.get(callback_path(settings, payment.gateway_order_id))
+    second = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert second.status_code == 200
     assert 'data-status="bot_pending"' in second.text
 
@@ -176,11 +226,11 @@ def test_callback_after_manual_review_does_not_verify_again(
         client, settings, session_factory, stub, order_id="cb-review", amount=10000
     )
     stub.verify_result = verify_ok_response(amount=1)
-    assert client.get(callback_path(settings, payment.gateway_order_id)).status_code == 200
+    assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
     assert get_payment(session_factory, "cb-review").status == PaymentStatus.MANUAL_REVIEW.value
 
     stub.verify_result = verify_ok_response(amount=10000)
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     assert 'data-status="under_review"' in response.text
     # manual_review payments belong to an administrator; no auto re-verify.
@@ -194,7 +244,7 @@ def test_verify_gateway_declined(client, settings, session_factory, stub):
     )
     stub.verify_result = httpx.Response(200, json={"status": "error", "message": "not paid"})
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "verification_failed"
 
@@ -211,7 +261,7 @@ def test_verify_network_failure_is_recoverable(client, settings, session_factory
     )
     stub.verify_result = httpx.ConnectError("connection refused")
 
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 502
     assert response.json()["error"]["code"] == "centralpay_connection_error"
     payment = get_payment(session_factory, "cb-neterr")
@@ -220,7 +270,7 @@ def test_verify_network_failure_is_recoverable(client, settings, session_factory
 
     # A later callback retry verifies successfully.
     stub.verify_result = verify_ok_response(amount=10000)
-    response = client.get(callback_path(settings, payment.gateway_order_id))
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     assert 'data-status="bot_pending"' in response.text
     assert (

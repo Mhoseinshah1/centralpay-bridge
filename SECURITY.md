@@ -24,6 +24,22 @@ CentralPay confirmation, or lost silently is always critical.
 - **Authentication:** constant-time comparison for the inbound API key and
   for HMAC-SHA256 callback signatures; signatures are validated before any
   database or gateway work.
+- **Callback replay protection (0.5.0-rc1):** every payment link embeds a
+  one-time token covered by the HMAC signature; only the token's SHA-256
+  hash is stored, superseded tokens are rejected under the row lock before
+  the gateway is contacted, and verified payments short-circuit to their
+  final result without re-verification.
+- **Strict gateway parsing (0.5.0-rc1):** CentralPay responses are accepted
+  only on an explicit success marker; financial fields are parsed with
+  typed coercion and malformed values route to manual review with explicit
+  reason codes — success is never inferred from truthy values.
+- **Rate limiting (0.5.0-rc1):** application-level sliding windows for
+  invalid API keys, invalid callback signatures, and payment-create bursts;
+  `X-Forwarded-For` is never trusted for limiter identity. Limiters are
+  per-process and in-memory (documented limitation).
+- **Update integrity (0.5.0-rc1):** `centralpay update` pins a release tag
+  by default and verifies the published `SHA256SUMS` before deploying;
+  rollback is application-only — the database schema is never downgraded.
 - **Secret handling:** secrets live in `/etc/centralpay-bridge/` (0700
   directory, 0600 files), outside the Git checkout; `.env` files are
   git-ignored; a log-redaction backstop strips every configured secret from
@@ -49,12 +65,16 @@ CentralPay confirmation, or lost silently is always critical.
 
 ## Known gaps
 
-Unresolved review topics are tracked openly in
+Every deferred review topic has been triaged in
+[RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md) (fixed / accepted
+risk / release blocker / backlog), with the original list preserved in
 [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md). The multi-agent adversarial
 review has not been completed; production deployment is blocked until it
-is. Notable open items include callback replay protection, verify response
-schema confirmation against real CentralPay documentation, and rate
-limiting at the proxy.
+is. Other open blockers: real-host installer validation, staging
+validation of the real CentralPay response schema, and live Telegram
+validation for the optional admin bot. Notable accepted risks: proxy-level
+rate limiting absent (app-level limits added in 0.5.0-rc1), base images
+tag-pinned rather than digest-pinned.
 
 ## Supported versions
 

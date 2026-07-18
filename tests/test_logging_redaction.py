@@ -9,12 +9,11 @@ from app.logging_setup import (
     SecretRedactor,
     collect_secret_values,
 )
-from app.security import callback_signature
 from tests.conftest import (
     TEST_DB_PASSWORD,
-    callback_path,
     create_order,
     get_payment,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -64,7 +63,7 @@ def test_logs_do_not_expose_configured_secrets(client, settings, session_factory
         create_order(client, settings, order_id="log-1", amount=10000)
         payment = get_payment(session_factory, "log-1")
         stub.verify_result = verify_ok_response(amount=10000, card_number="6037991234567890")
-        client.get(callback_path(settings, payment.gateway_order_id))
+        client.get(valid_callback_path(stub, payment.gateway_order_id))
 
         # Prove the redaction backstop works even if code logs a secret directly.
         logging.getLogger("app.test").info(
@@ -88,10 +87,14 @@ def test_logs_do_not_expose_configured_secrets(client, settings, session_factory
 
     assert REDACTED in output  # the backstop line was redacted, not dropped
 
-    # Callback signatures, full card numbers, and full redirect URLs never
-    # appear in logs either.
-    signature = callback_signature(settings.callback_hmac_secret, payment.gateway_order_id)
-    assert signature not in output
+    # Callback signatures, tokens, full card numbers, and full redirect URLs
+    # never appear in logs either. Extract the real signed values from the
+    # captured returnUrl.
+    from urllib.parse import parse_qs, urlsplit
+
+    query = parse_qs(urlsplit(valid_callback_path(stub, payment.gateway_order_id)).query)
+    assert query["sig"][0] not in output
+    assert query["ct"][0] not in output
     assert "6037991234567890" not in output
     assert "gateway.test/pay/tok123" not in output
 
@@ -104,7 +107,7 @@ def test_request_logs_contain_path_but_not_query_string(client, settings, sessio
         create_order(client, settings, order_id="log-2", amount=10000)
         payment = get_payment(session_factory, "log-2")
         stub.verify_result = verify_ok_response(amount=10000)
-        client.get(callback_path(settings, payment.gateway_order_id))
+        client.get(valid_callback_path(stub, payment.gateway_order_id))
     finally:
         root.removeHandler(handler)
 

@@ -79,6 +79,13 @@ curl https://YOUR_DOMAIN/health/ready
 
 </div>
 
+پیش از فعال‌سازی پرداخت واقعی، چک‌لیست کامل استقرار تولید را دنبال
+کنید: [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md).
+توصیه می‌شود پیش از اولین پرداخت واقعی، در فایل
+`/etc/centralpay-bridge/centralpay.env` مقدار
+`FIRST_PAYMENT_GUARD_ENABLED=true` تنظیم شود تا اولین پرداخت تأییدشده
+یک هشدار بحرانی یک‌بارمصرف برای مدیران ثبت کند.
+
 ## رفع اشکال SSL
 
 - `centralpay ssl` — بررسی DNS و تلاش دوباره برای صدور گواهی

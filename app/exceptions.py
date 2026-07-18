@@ -51,6 +51,12 @@ class InvalidCallbackSignatureError(BridgeError):
     default_message = "Invalid callback signature"
 
 
+class InvalidCallbackTokenError(BridgeError):
+    code = "invalid_callback_token"
+    http_status = 403
+    default_message = "Invalid or stale callback token"
+
+
 class PaymentNotFoundError(BridgeError):
     code = "payment_not_found"
     http_status = 404
@@ -84,6 +90,12 @@ class CentralPayRejectedError(CentralPayError):
 class CentralPayInvalidResponseError(CentralPayError):
     code = "centralpay_invalid_response"
     default_message = "Payment gateway returned an invalid response"
+
+
+class RateLimitedError(BridgeError):
+    code = "rate_limited"
+    http_status = 429
+    default_message = "Too many requests"
 
 
 class GatewayOrderIdAllocationError(BridgeError):

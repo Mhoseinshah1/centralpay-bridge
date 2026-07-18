@@ -1,11 +1,11 @@
 """Audit trail: every financial state transition is recorded with a request id."""
 
 from tests.conftest import (
-    callback_path,
     create_order,
     event_types,
     get_events,
     get_payment,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -16,7 +16,7 @@ def test_full_flow_records_ordered_audit_events(client, settings, session_factor
     payment = get_payment(session_factory, "audit-1")
 
     stub.verify_result = verify_ok_response(amount=12000)
-    callback_response = client.get(callback_path(settings, payment.gateway_order_id))
+    callback_response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert callback_response.status_code == 200
 
     events = get_events(session_factory, payment.id)
@@ -63,7 +63,7 @@ def test_audit_events_never_contain_secrets(client, settings, session_factory, s
     create_order(client, settings, order_id="audit-3", amount=8000)
     payment = get_payment(session_factory, "audit-3")
     stub.verify_result = verify_ok_response(amount=8000, card_number="6037991234567890")
-    client.get(callback_path(settings, payment.gateway_order_id))
+    client.get(valid_callback_path(stub, payment.gateway_order_id))
 
     secrets = [
         settings.inbound_api_key,

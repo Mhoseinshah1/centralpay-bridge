@@ -34,6 +34,30 @@ class VerifyResult:
     user_id: int | None
     card_number: str | None
     failure_reason: str | None
+    # Explicit parse-level reason codes for gateway-successful responses
+    # whose fields were missing or mistyped (e.g. verify_invalid_amount).
+    field_errors: tuple[str, ...] = ()
+
+
+# Explicit positive success markers. Success is NEVER inferred from truthy
+# values or from the mere presence of a data object.
+_SUCCESS_STATUS_VALUES = {"1", "success", "ok", "completed", "done", "true"}
+
+
+def _explicit_success(body: dict[str, Any]) -> bool:
+    success = body.get("success")
+    if success is True:
+        return True
+    if isinstance(success, str) and success.strip().lower() == "true":
+        return True
+    status = body.get("status")
+    if status is True:
+        return True
+    return (
+        not isinstance(status, bool)
+        and isinstance(status, int | str)
+        and str(status).strip().lower() in _SUCCESS_STATUS_VALUES
+    )
 
 
 def _to_int(value: object) -> int | None:
@@ -140,17 +164,29 @@ class CentralPayClient:
         }
         body = self._post_json("getLink.php", payload)
         failure = _explicit_failure(body)
-        data = body.get("data")
-        redirect_url = data.get("redirectUrl") if isinstance(data, dict) else None
-        if failure is not None or not isinstance(redirect_url, str) or not redirect_url.strip():
-            reason = failure or _safe_reason(body)
-            logger.warning(
-                "centralpay_getlink_rejected",
-                extra={"gateway_order_id": order_id, "reason": reason},
-            )
-            raise CentralPayRejectedError(f"getLink rejected: {reason}")
-        logger.info("centralpay_getlink_ok", extra={"gateway_order_id": order_id})
-        return redirect_url.strip()
+        if failure is not None:
+            reason = f"getlink_rejected: {failure}"
+        elif not _explicit_success(body):
+            # No explicit positive marker: success is never guessed.
+            reason = "getlink_response_unrecognized"
+        else:
+            data = body.get("data")
+            if not isinstance(data, dict):
+                reason = "getlink_missing_data"
+            else:
+                redirect_url = data.get("redirectUrl")
+                if (
+                    isinstance(redirect_url, str)
+                    and redirect_url.strip().startswith(("https://", "http://"))
+                ):
+                    logger.info("centralpay_getlink_ok", extra={"gateway_order_id": order_id})
+                    return redirect_url.strip()
+                reason = "getlink_invalid_redirect_url"
+        logger.warning(
+            "centralpay_getlink_rejected",
+            extra={"gateway_order_id": order_id, "reason": reason},
+        )
+        raise CentralPayRejectedError(f"getLink rejected: {reason}")
 
     def verify(self, *, order_id: int) -> VerifyResult:
         """Verify a payment. Raises for transport/protocol errors; returns a
@@ -160,11 +196,14 @@ class CentralPayClient:
         body = self._post_json("verify.php", payload)
         failure = _explicit_failure(body)
         data = body.get("data")
-        if failure is not None or not isinstance(data, dict):
-            reason = failure or "missing data object in verify response"
+        if failure is None and not _explicit_success(body):
+            failure = "verify_response_unrecognized"
+        if failure is None and not isinstance(data, dict):
+            failure = "verify_missing_data"
+        if failure is not None:
             logger.warning(
                 "centralpay_verify_not_successful",
-                extra={"gateway_order_id": order_id, "reason": reason},
+                extra={"gateway_order_id": order_id, "reason": failure},
             )
             return VerifyResult(
                 gateway_success=False,
@@ -172,14 +211,33 @@ class CentralPayClient:
                 amount=None,
                 user_id=None,
                 card_number=None,
-                failure_reason=reason,
+                failure_reason=failure,
             )
-        logger.info("centralpay_verify_ok", extra={"gateway_order_id": order_id})
+        assert isinstance(data, dict)  # narrowed above; failure covers the rest
+        # Gateway reported success: parse fields strictly. Missing or
+        # mistyped fields yield None plus an explicit reason code — the
+        # verification service then routes the payment to manual review
+        # (money may have moved; never guess).
+        field_errors: list[str] = []
+        reference_id = _to_nonempty_str(data.get("referenceId"))
+        if reference_id is None:
+            field_errors.append("verify_empty_reference_id")
+        amount = _to_int(data.get("amount"))
+        if amount is None:
+            field_errors.append("verify_invalid_amount")
+        user_id = _to_int(data.get("userId"))
+        if user_id is None:
+            field_errors.append("verify_invalid_user_id")
+        logger.info(
+            "centralpay_verify_ok",
+            extra={"gateway_order_id": order_id, "field_errors": field_errors or None},
+        )
         return VerifyResult(
             gateway_success=True,
-            reference_id=_to_nonempty_str(data.get("referenceId")),
-            amount=_to_int(data.get("amount")),
-            user_id=_to_int(data.get("userId")),
+            reference_id=reference_id,
+            amount=amount,
+            user_id=user_id,
             card_number=_to_nonempty_str(data.get("cardNumber")),
             failure_reason=None,
+            field_errors=tuple(field_errors),
         )

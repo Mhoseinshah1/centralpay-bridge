@@ -181,7 +181,10 @@ def _map_event(
                 payment_id=payment_id,
                 payload=data,
             )
-    elif event_type in _MISMATCH_REASONS:
+    elif event_type in _MISMATCH_REASONS or event_type in (
+        "reference_id_collision",
+        "first_production_payment_verified",
+    ):
         # Financial-integrity alerts: always created, never deduplicated.
         create_alert(
             db, alert_type=event_type, severity="critical", payment_id=payment_id, payload=data

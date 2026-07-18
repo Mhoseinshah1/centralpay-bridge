@@ -31,6 +31,21 @@ and compose validation pass. Live Telegram delivery was not exercised
 (mocked in tests, per instruction). The multi-agent adversarial review
 remains outstanding.
 
+Status update (Phase 5, 0.5.0-rc1): every topic below has been formally
+triaged in `RELEASE_RISK_REGISTER.md` (fixed / accepted risk / release
+blocker / post-release backlog). Fixed in 0.5.0-rc1: callback replay
+protection (topic 1 — one-time stored tokens), verify success detection
+hardening (topic 4 — explicit allowlist + typed field parsing; real-schema
+confirmation remains a release blocker), malformed integer conversion
+(topic 6), manual-review resolution tooling (topics 12/25 — host CLI),
+application-level rate limiting (topic 17), and update-channel integrity
+(topic 19 — pinned release tag + checksum verification). Fault-injection
+tests now prove the crash-window behavior of topic 5. Release blockers B1
+(real-host installer run, topic 20), B2 (staging/real gateway, topics
+4/5), B3 (live Telegram, topic 22), B4 (adversarial review), and B5
+(release workflow green) remain open — see the risk register for the
+authoritative status of every item.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection
