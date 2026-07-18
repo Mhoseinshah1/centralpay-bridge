@@ -41,6 +41,14 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      # The backup/restore integration tests need client tools whose major
+      # version matches the postgres:16 service (pg_dump aborts on servers
+      # newer than itself; ubuntu-22.04 runners default to client 14).
+      - name: Install PostgreSQL 16 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql-client-16
+          /usr/lib/postgresql/16/bin/pg_dump --version
       - name: Install
         run: pip install -e ".[dev]"
       - name: Ruff
