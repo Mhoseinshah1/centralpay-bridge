@@ -4,7 +4,7 @@ import enum
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
@@ -49,11 +49,33 @@ class Payment(Base):
     # Only the final four card digits may ever be stored.
     card_last4: Mapped[str | None] = mapped_column(String(4))
     last_error: Mapped[str | None] = mapped_column(Text)
+    # Set exactly once, when CentralPay verification is committed. This is the
+    # durable "gateway verified" fact, independent of bot delivery status.
+    gateway_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Bot delivery tracking (Phase 2). Reason codes are machine-readable
+    # (app.reasons.ReasonCode) and stored separately from human-readable text.
+    bot_notify_reason: Mapped[str | None] = mapped_column(String(64))
+    bot_notify_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    bot_last_http_status: Mapped[int | None] = mapped_column(Integer)
+    bot_last_error_code: Mapped[str | None] = mapped_column(String(64))
+    bot_notify_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bot_notify_accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    manual_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notification_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notification_claimed_by: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        # Worker due-scan: status + next_retry_at.
+        Index("ix_payments_notify_due", "status", "next_retry_at"),
     )
 
 

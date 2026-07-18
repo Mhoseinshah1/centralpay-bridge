@@ -122,7 +122,12 @@ def create_payment(
         db.commit()
         raise DuplicateOrderAmountMismatchError()
 
-    if payment.status == PaymentStatus.GATEWAY_VERIFIED.value:
+    verified_statuses = (
+        PaymentStatus.GATEWAY_VERIFIED.value,
+        PaymentStatus.BOT_NOTIFY_PENDING.value,
+        PaymentStatus.BOT_NOTIFY_ACCEPTED.value,
+    )
+    if payment.gateway_verified_at is not None or payment.status in verified_statuses:
         db.rollback()
         raise OrderAlreadyVerifiedError()
     if payment.status == PaymentStatus.MANUAL_REVIEW.value:

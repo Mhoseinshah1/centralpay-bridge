@@ -39,6 +39,7 @@ def test_collect_secret_values_includes_database_password(settings):
     assert settings.callback_hmac_secret in values
     assert settings.centralpay_getlink_api_key in values
     assert settings.centralpay_verify_api_key in values
+    assert settings.bot_notify_token in values
     assert TEST_DB_PASSWORD in values
 
 
@@ -80,6 +81,7 @@ def test_logs_do_not_expose_configured_secrets(client, settings, session_factory
         settings.callback_hmac_secret,
         settings.centralpay_getlink_api_key,
         settings.centralpay_verify_api_key,
+        settings.bot_notify_token,
         TEST_DB_PASSWORD,
     ):
         assert secret not in output

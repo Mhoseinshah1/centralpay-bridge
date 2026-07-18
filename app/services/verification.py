@@ -6,8 +6,10 @@ payment row for the whole verification so concurrent callbacks serialize and a
 payment can never be verified twice.
 """
 
+import enum
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -21,15 +23,33 @@ from app.exceptions import (
     VerificationFailedError,
 )
 from app.models import Payment, PaymentStatus
+from app.services.notification import queue_notification
 
 logger = logging.getLogger("app.services.verification")
 
 _ERROR_MAX_LENGTH = 500
 
+# Statuses that mean CentralPay verification has already succeeded.
+VERIFIED_STATUSES = frozenset(
+    {
+        PaymentStatus.GATEWAY_VERIFIED.value,
+        PaymentStatus.BOT_NOTIFY_PENDING.value,
+        PaymentStatus.BOT_NOTIFY_ACCEPTED.value,
+    }
+)
+
+
+class CallbackStatus(enum.StrEnum):
+    """User-facing outcome of a callback for a verified payment."""
+
+    BOT_ACCEPTED = "bot_accepted"  # verified and the bot API accepted it
+    BOT_PENDING = "bot_pending"  # verified; final bot processing pending
+    UNDER_REVIEW = "under_review"  # administrator review required
+
 
 @dataclass(frozen=True)
 class CallbackResult:
-    status: str  # "verified" | "already_verified" | "under_review"
+    status: CallbackStatus
     bot_order_id: str
 
 
@@ -77,7 +97,7 @@ def _validate_and_apply_verification(
             mismatch_event="verify_missing_reference_id",
             data={"gateway_order_id": payment.gateway_order_id},
         )
-        return CallbackResult("under_review", payment.bot_order_id)
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
     if result.amount != payment.amount:
         _move_to_manual_review(
             db,
@@ -89,7 +109,7 @@ def _validate_and_apply_verification(
                 "reported_amount": result.amount,
             },
         )
-        return CallbackResult("under_review", payment.bot_order_id)
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
     if result.user_id != payment.gateway_user_id:
         _move_to_manual_review(
             db,
@@ -101,9 +121,13 @@ def _validate_and_apply_verification(
                 "reported_user_id": result.user_id,
             },
         )
-        return CallbackResult("under_review", payment.bot_order_id)
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
 
-    payment.status = PaymentStatus.GATEWAY_VERIFIED.value
+    # Verified state and pending notification state commit atomically; the
+    # bot notification itself is sent later, by the worker, outside any
+    # database transaction.
+    now = datetime.now(UTC)
+    payment.gateway_verified_at = now
     payment.reference_id = result.reference_id
     payment.card_last4 = _card_last4(result.card_number)
     payment.last_error = None
@@ -117,8 +141,17 @@ def _validate_and_apply_verification(
             "amount": payment.amount,
         },
     )
+    queue_notification(db, payment, now=now)
     db.commit()
-    return CallbackResult("verified", payment.bot_order_id)
+    logger.info(
+        "bot_notification_queued",
+        extra={
+            "payment_id": payment.id,
+            "bot_order_id": payment.bot_order_id,
+            "gateway_order_id": payment.gateway_order_id,
+        },
+    )
+    return CallbackResult(CallbackStatus.BOT_PENDING, payment.bot_order_id)
 
 
 def process_callback(
@@ -149,21 +182,26 @@ def process_callback(
         data={"gateway_order_id": gateway_order_id, "payment_status": payment.status},
     )
 
-    if payment.status == PaymentStatus.GATEWAY_VERIFIED.value:
-        # Verification already succeeded: never call verify again.
+    if payment.status in VERIFIED_STATUSES or payment.gateway_verified_at is not None:
+        # Verification already succeeded: never call verify again. The page
+        # shown reflects the current bot delivery state.
         record_event(
             db,
             payment_id=payment.id,
             event_type="duplicate_callback_ignored",
-            data={"gateway_order_id": gateway_order_id},
+            data={"gateway_order_id": gateway_order_id, "payment_status": payment.status},
         )
         db.commit()
-        return CallbackResult("already_verified", payment.bot_order_id)
+        if payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value:
+            return CallbackResult(CallbackStatus.BOT_ACCEPTED, payment.bot_order_id)
+        if payment.status == PaymentStatus.MANUAL_REVIEW.value:
+            return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
+        return CallbackResult(CallbackStatus.BOT_PENDING, payment.bot_order_id)
 
     if payment.status == PaymentStatus.MANUAL_REVIEW.value:
         # An administrator owns this payment now; do not auto-verify.
         db.commit()
-        return CallbackResult("under_review", payment.bot_order_id)
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
 
     try:
         result = client.verify(order_id=gateway_order_id)
