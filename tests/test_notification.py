@@ -25,6 +25,26 @@ from tests.conftest import (
 )
 
 FIXED_NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
+# Payments queued during test setup are stamped with this pinned clock so
+# they are always due at FIXED_NOW.
+QUEUE_TIME = FIXED_NOW - timedelta(minutes=5)
+
+
+@pytest.fixture(autouse=True)
+def deterministic_queue_clock(monkeypatch):
+    """Pin the verification-side clock (callback audit fix).
+
+    make_verified_pending queues payments through the real callback flow,
+    which used to stamp next_retry_at with the REAL wall clock while the
+    worker ran at the injected FIXED_NOW constant. The suite therefore
+    passed only while the wall clock was behind 2026-07-18T12:00Z and
+    broke permanently afterwards. Both sides of the clock are now
+    injected: queue timestamps are pinned to QUEUE_TIME, so payments are
+    deterministically due at FIXED_NOW on any date.
+    """
+    import app.services.verification as verification_module
+
+    monkeypatch.setattr(verification_module, "utcnow", lambda: QUEUE_TIME)
 
 
 def _set_payment(session_factory, payment_id, **values):
