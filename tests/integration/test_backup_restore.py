@@ -49,7 +49,7 @@ pytestmark = [
     ),
 ]
 
-_TABLES = ("admin_alerts", "worker_heartbeats", "payment_events", "payments")
+_TABLES = ("admin_alerts", "worker_heartbeats", "payment_events", "payments", "fee_policies")
 
 
 def _pg_env_and_args():
@@ -358,7 +358,8 @@ def _build_full_state(settings, pg_engine, bot_stub, notifier):
 
 
 _FINANCIAL_COLUMNS = (
-    "bot_order_id", "gateway_order_id", "status", "amount", "reference_id",
+    "bot_order_id", "gateway_order_id", "status", "amount",
+    "fee_policy_id", "fee_rate_bps", "fee_amount", "payable_amount", "reference_id",
     "card_last4", "callback_token_hash", "bot_notify_reason",
     "bot_notify_attempts", "notification_claimed_by", "review_resolution",
 )
@@ -434,6 +435,7 @@ def test_full_state_round_trip_and_sequence_safety(
                 gateway_order_id=999_000_111_222,
                 gateway_user_id=1,
                 amount=7000,
+                payable_amount=7000,
                 status="created",
             )
         )
@@ -480,6 +482,7 @@ def test_db_check_detects_and_repairs_sequence_drift(
                 gateway_order_id=999_000_111_333,
                 gateway_user_id=1,
                 amount=1000,
+                payable_amount=1000,
                 status="created",
             )
         )
@@ -504,3 +507,127 @@ def test_zero_byte_and_plain_sql_archives_rejected(populated_db, tmp_path):
                 env=env, stdin=fh, capture_output=True, timeout=60,
             )
         assert result.returncode != 0, candidate
+
+
+# --- dynamic fee policies survive backup and restore -------------------------
+
+
+def test_fee_policies_survive_restore_and_stay_decoupled(
+    settings, pg_engine, tmp_path
+):
+    """Active, scheduled, AND cancelled fee policies survive a
+    dump/wipe/restore with full history; payment fee snapshots restore
+    byte-for-byte; and a policy change made AFTER the restore still leaves
+    restored payments untouched and gets a non-colliding policy id."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import FeePolicy
+
+    Base.metadata.create_all(pg_engine)
+    session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
+
+    with session_factory() as db:
+        db.add(
+            FeePolicy(
+                rate_bps=1000,
+                effective_at=datetime(2020, 1, 1, tzinfo=UTC),
+                created_by="test",
+                note="active policy",
+            )
+        )
+        db.add(
+            FeePolicy(
+                rate_bps=250,
+                effective_at=datetime.now(UTC) + timedelta(days=30),
+                created_by="test",
+                note="scheduled policy",
+            )
+        )
+        db.add(
+            FeePolicy(
+                rate_bps=9000,
+                effective_at=datetime(2019, 1, 1, tzinfo=UTC),
+                created_by="test",
+                note="cancelled policy",
+                cancelled_at=datetime(2019, 6, 1, tzinfo=UTC),
+                cancelled_by="test",
+                cancellation_note="was a mistake",
+            )
+        )
+        db.commit()
+
+    stub = CentralPayStub()
+    application = build_app(settings, session_factory, stub)
+    with TestClient(application, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="bk-fee", amount=500_000).status_code == 200
+    application.state.centralpay.close()
+
+    payment_before = get_payment(session_factory, "bk-fee")
+    assert payment_before.fee_rate_bps == 1000
+    assert payment_before.payable_amount == 550_000
+
+    with pg_engine.connect() as connection:
+        policies_before = [
+            tuple(r)
+            for r in connection.execute(
+                text(
+                    "SELECT id, rate_bps, effective_at, created_by, note,"
+                    " cancelled_at, cancelled_by, cancellation_note"
+                    " FROM fee_policies ORDER BY id"
+                )
+            ).all()
+        ]
+    assert len(policies_before) == 3
+
+    dump_file = _dump(tmp_path)
+    args, env = _pg_env_and_args()
+    pg_restore = _find_pg_tool("pg_restore", _server_major())
+
+    with pg_engine.begin() as connection:
+        for table in _TABLES:
+            connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
+    subprocess.run(
+        [pg_restore, *args, "--no-owner", "--exit-on-error", str(dump_file)],
+        env=env, check=True, timeout=120,
+    )
+
+    with pg_engine.connect() as connection:
+        policies_after = [
+            tuple(r)
+            for r in connection.execute(
+                text(
+                    "SELECT id, rate_bps, effective_at, created_by, note,"
+                    " cancelled_at, cancelled_by, cancellation_note"
+                    " FROM fee_policies ORDER BY id"
+                )
+            ).all()
+        ]
+    assert policies_after == policies_before  # full history, ids included
+
+    payment_after = get_payment(session_factory, "bk-fee")
+    assert payment_after.fee_policy_id == payment_before.fee_policy_id
+    assert payment_after.fee_rate_bps == 1000
+    assert payment_after.fee_amount == 50_000
+    assert payment_after.payable_amount == 550_000
+
+    # A fee change AFTER the restore: the sequence was preserved, so the
+    # new policy id cannot collide, and restored payments keep their
+    # snapshot untouched.
+    from datetime import UTC as _UTC
+    from datetime import datetime as _datetime
+
+    with session_factory() as db:
+        new_policy = FeePolicy(
+            rate_bps=500,
+            effective_at=_datetime.now(_UTC),
+            created_by="test",
+            note="post-restore change",
+        )
+        db.add(new_policy)
+        db.commit()
+        new_policy_id = new_policy.id
+    assert new_policy_id not in {row[0] for row in policies_before}
+
+    unchanged = get_payment(session_factory, "bk-fee")
+    assert unchanged.fee_rate_bps == 1000
+    assert unchanged.payable_amount == 550_000

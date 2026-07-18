@@ -53,6 +53,7 @@ def _drop_all(engine) -> None:
             "worker_heartbeats",
             "payment_events",
             "payments",
+            "fee_policies",
             "alembic_version",
         ):
             connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
@@ -147,6 +148,7 @@ def test_full_payment_flow_on_postgres(settings, pg_app, pg_session_factory):
     assert payment.gateway_verified_at is not None
     assert event_types(get_events(pg_session_factory, payment.id)) == [
         "payment_created",
+        "payment_fee_snapshotted",
         "payment_link_created",
         "callback_received",
         "gateway_payment_verified",
@@ -611,3 +613,246 @@ def test_race_review_acknowledge_against_callback(
     assert len(stub.verify_requests) == 1  # manual review never re-verifies
     events = event_types(get_events(pg_session_factory, payment.id))
     assert "manual_review_acknowledged" in events
+
+
+# --- dynamic fee: migration backfill, concurrency, db-check ------------------
+
+
+def _alembic_upgrade(target: str) -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", target],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "DATABASE_URL": TEST_DATABASE_URL},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"alembic upgrade {target} failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_alembic_stepwise_upgrade(pg_engine):
+    """Every revision applies individually in order (the release gate)."""
+    for revision in ("0001", "0002", "0003", "0004", "0005", "0006"):
+        _alembic_upgrade(revision)
+    inspector = inspect(pg_engine)
+    assert "fee_policies" in inspector.get_table_names()
+
+
+def test_migration_0006_backfills_existing_payments(pg_engine):
+    """Upgrading a database that already contains payments must backfill
+    them as fee-less: payable_amount = amount, zero rate, zero fee, no
+    policy reference — their financial meaning is unchanged."""
+    _alembic_upgrade("0005")
+    with pg_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO payments (bot_order_id, gateway_order_id,"
+                " gateway_user_id, amount, status) VALUES"
+                " ('legacy-1', 100000000001, 4242, 250000, 'link_created')"
+            )
+        )
+    _alembic_upgrade("head")
+
+    with pg_engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT amount, fee_policy_id, fee_rate_bps, fee_amount,"
+                " payable_amount FROM payments WHERE bot_order_id = 'legacy-1'"
+            )
+        ).one()
+    assert row.amount == 250000
+    assert row.fee_policy_id is None
+    assert row.fee_rate_bps == 0
+    assert row.fee_amount == 0
+    assert row.payable_amount == 250000
+
+    inspector = inspect(pg_engine)
+    assert "fee_policies" in inspector.get_table_names()
+    payment_checks = {c["name"] for c in inspector.get_check_constraints("payments")}
+    assert {
+        "ck_payments_fee_rate_bps_range",
+        "ck_payments_fee_amount_non_negative",
+        "ck_payments_payable_positive",
+        "ck_payments_payable_equals_amount_plus_fee",
+    } <= payment_checks
+    policy_checks = {c["name"] for c in inspector.get_check_constraints("fee_policies")}
+    assert {
+        "ck_fee_policies_rate_bps_range",
+        "ck_fee_policies_note_not_empty",
+        "ck_fee_policies_cancellation_consistent",
+    } <= policy_checks
+
+
+def _add_pg_policy(pg_session_factory, rate_bps: int, *, effective_at) -> int:
+    from app.models import FeePolicy
+
+    with pg_session_factory() as db:
+        policy = FeePolicy(
+            rate_bps=rate_bps,
+            effective_at=effective_at,
+            created_by="test",
+            note="pg fee test",
+        )
+        db.add(policy)
+        db.commit()
+        return policy.id
+
+
+def test_concurrent_create_and_fee_change_snapshot_never_mixed(
+    settings, pg_app, pg_session_factory
+):
+    """A fee change racing a payment creation: the snapshot derives from a
+    single policy read — entirely the old rate or entirely the new one,
+    never a mixture — and getLink is asked for exactly the stored payable."""
+    from datetime import UTC, datetime
+
+    from app.models import FeePolicy
+
+    _add_pg_policy(
+        pg_session_factory, 1000, effective_at=datetime(2020, 1, 1, tzinfo=UTC)
+    )
+
+    barrier = threading.Barrier(2)
+    stub = pg_app.state.centralpay_stub
+
+    def submit(client):
+        barrier.wait(timeout=10)
+        return create_order(client, settings, order_id="pg-fee-race", amount=500_000)
+
+    def change_fee():
+        barrier.wait(timeout=10)
+        with pg_session_factory() as db:
+            db.add(
+                FeePolicy(
+                    rate_bps=250,
+                    effective_at=datetime(2020, 1, 2, tzinfo=UTC),
+                    created_by="test",
+                    note="pg fee race change",
+                )
+            )
+            db.commit()
+
+    with (
+        TestClient(pg_app, raise_server_exceptions=False) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        create_future = pool.submit(submit, client)
+        change_future = pool.submit(change_fee)
+        response = create_future.result(timeout=60)
+        change_future.result(timeout=60)
+
+    assert response.status_code == 200
+    payment = get_payment(pg_session_factory, "pg-fee-race")
+    # Whichever policy won the race, the snapshot is internally consistent.
+    assert (payment.fee_rate_bps, payment.fee_amount, payment.payable_amount) in {
+        (1000, 50_000, 550_000),
+        (250, 12_500, 512_500),
+    }
+    assert payment.amount == 500_000
+    assert stub.getlink_requests[-1]["amount"] == payment.payable_amount
+
+
+def test_concurrent_identical_creates_single_fee_snapshot(
+    settings, pg_app, pg_session_factory
+):
+    """Identical concurrent creates with an active fee: one row, one fee
+    snapshot event, one getLink carrying the payable amount."""
+    from datetime import UTC, datetime
+
+    _add_pg_policy(
+        pg_session_factory, 1000, effective_at=datetime(2020, 1, 1, tzinfo=UTC)
+    )
+    barrier = threading.Barrier(2)
+    stub = pg_app.state.centralpay_stub
+
+    def submit(client):
+        barrier.wait(timeout=10)
+        return create_order(client, settings, order_id="pg-fee-dup", amount=500_000)
+
+    with (
+        TestClient(pg_app, raise_server_exceptions=False) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        futures = [pool.submit(submit, client) for _ in range(2)]
+        responses = [future.result(timeout=60) for future in futures]
+
+    assert [r.status_code for r in responses] == [200, 200]
+    assert len({r.json()["url"] for r in responses}) == 1
+    assert len(stub.getlink_requests) == 1
+    assert stub.getlink_requests[0]["amount"] == 550_000
+
+    with pg_session_factory() as session:
+        rows = session.execute(
+            select(Payment).where(Payment.bot_order_id == "pg-fee-dup")
+        ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].payable_amount == 550_000
+    events = event_types(get_events(pg_session_factory, rows[0].id))
+    assert events.count("payment_fee_snapshotted") == 1
+
+
+def test_check_constraints_reject_inconsistent_fee_rows(pg_engine, pg_session_factory):
+    """The 0006 CHECK constraints are enforced by PostgreSQL itself: a row
+    whose payable does not equal amount + fee cannot exist."""
+    from sqlalchemy.exc import IntegrityError
+
+    with (
+        pg_engine.begin() as connection,
+        pytest.raises(IntegrityError, match="ck_payments_payable"),
+    ):
+        connection.execute(
+            text(
+                "INSERT INTO payments (bot_order_id, gateway_order_id,"
+                " gateway_user_id, amount, fee_rate_bps, fee_amount,"
+                " payable_amount, status) VALUES"
+                " ('pg-bad-fee', 100000000002, 4242, 10000, 1000, 1000,"
+                " 10500, 'created')"
+            )
+        )
+
+
+def test_db_check_detects_policyless_fee_corruption(
+    settings, pg_engine, monkeypatch, capsys
+):
+    """db-check must detect fee corruption that the DB CHECK constraints
+    cannot express (a policy-less payment carrying a fee rate), report it,
+    exit non-zero, and never alter the financial fields."""
+    _alembic_upgrade("head")
+    session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
+    stub = CentralPayStub()
+    application = build_app(settings, session_factory, stub)
+    with TestClient(application, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="pg-check", amount=10000).status_code == 200
+    application.state.centralpay.close()
+
+    import app.ops as ops_module
+    from app.ops import main as ops_main
+
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    assert ops_main(["db-check"]) == 0  # healthy before corruption
+    capsys.readouterr()
+
+    # Corrupt: a fee rate appears on a payment that references no policy.
+    # Every DB CHECK still holds (payable == amount + fee_amount), so only
+    # db-check can surface this.
+    with pg_engine.begin() as connection:
+        connection.execute(
+            text("UPDATE payments SET fee_rate_bps = 500 WHERE bot_order_id = 'pg-check'")
+        )
+
+    assert ops_main(["db-check"]) == 1
+    out = capsys.readouterr().out
+    assert "policyless_payment_with_fee" in out
+
+    # Read-only: the corruption was reported, not silently "repaired".
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "pg-check")
+        ).scalar_one()
+    assert payment.fee_rate_bps == 500
+    assert payment.fee_amount == 0

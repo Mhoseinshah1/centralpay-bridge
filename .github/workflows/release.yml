@@ -78,7 +78,7 @@ jobs:
         env:
           DATABASE_URL: postgresql+psycopg://centralpay:ci_test_password@localhost:5432/centralpay_test
         run: |
-          for rev in 0001 0002 0003 0004 0005; do
+          for rev in 0001 0002 0003 0004 0005 0006; do
             alembic upgrade "$rev"
           done
           # A repeated upgrade to head must be a no-op.
