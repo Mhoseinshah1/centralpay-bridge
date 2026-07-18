@@ -37,10 +37,20 @@ jobs:
           cache: pip
       # The backup/restore integration tests need client tools whose major
       # version matches the postgres:16 service (pg_dump aborts on servers
-      # newer than itself; ubuntu-22.04 runners default to client 14).
+      # newer than itself; ubuntu-22.04 runners default to client 14, and
+      # their stock apt sources have no postgresql-client-16 — add the PGDG
+      # repository in that case).
       - name: Install PostgreSQL 16 client tools
         run: |
           sudo apt-get update
+          if ! apt-cache show postgresql-client-16 >/dev/null 2>&1; then
+            sudo install -d /usr/share/postgresql-common/pgdg
+            sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+              https://www.postgresql.org/media/keys/ACCC4CF8.asc
+            echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+              | sudo tee /etc/apt/sources.list.d/pgdg.list
+            sudo apt-get update
+          fi
           sudo apt-get install -y --no-install-recommends postgresql-client-16
           /usr/lib/postgresql/16/bin/pg_dump --version
       - name: Install
