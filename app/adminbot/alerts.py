@@ -35,7 +35,7 @@ logger = logging.getLogger("app.adminbot.alerts")
 ALERT_RETRY_DELAYS_SECONDS: tuple[int, ...] = (30, 60, 120, 300, 900, 1800)
 
 _MISMATCH_REASONS = frozenset(
-    {"verify_amount_mismatch", "verify_user_id_mismatch", "verify_missing_reference_id"}
+    {"verify_payable_amount_mismatch", "verify_user_id_mismatch", "verify_missing_reference_id"}
 )
 
 
