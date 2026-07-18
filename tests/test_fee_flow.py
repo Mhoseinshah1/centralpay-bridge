@@ -497,3 +497,50 @@ def test_daily_report_separates_fee_totals(client, settings, session_factory, st
     assert payload["total_original_invoices_toman"] == 1_000_000
     assert payload["total_fees_toman"] == 100_000
     assert payload["total_collected_via_gateway_toman"] == 1_100_000
+
+
+# --- 0.6.0-rc1 release audit: frozen mismatches and end-state integrity ------
+
+
+def test_payable_mismatch_never_notifies_bot(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """A payable-amount mismatch (fee not actually charged) is frozen in
+    manual review and the worker can NEVER deliver it to the bot — the
+    claim query requires bot_notify_pending AND a verified fact."""
+    set_fee_policy(session_factory, 1000)
+    create_order(client, settings, order_id="fee-frozen", amount=500_000)
+    payment = get_payment(session_factory, "fee-frozen")
+    stub.verify_result = verify_ok_response(amount=500_000)  # original, not payable
+    assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+    assert (
+        get_payment(session_factory, "fee-frozen").status
+        == PaymentStatus.MANUAL_REVIEW.value
+    )
+
+    result = run_pass(session_factory, notifier, settings)
+    assert result["processed"] == 0
+    assert bot_stub.requests == []  # the bot never hears about this payment
+
+
+def test_delivered_fee_payment_retains_exact_snapshot(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """After the full lifecycle (create -> verify at payable -> deliver),
+    every money field still reads exactly as at creation time."""
+    policy_id = set_fee_policy(session_factory, 1000)
+    create_order(client, settings, order_id="ntf-final-1", amount=500_000)
+    payment = get_payment(session_factory, "ntf-final-1")
+    stub.verify_result = verify_ok_response(amount=550_000)
+    assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+    run_pass(session_factory, notifier, settings)
+
+    final = get_payment(session_factory, "ntf-final-1")
+    assert final.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    assert (
+        final.amount,
+        final.fee_policy_id,
+        final.fee_rate_bps,
+        final.fee_amount,
+        final.payable_amount,
+    ) == (500_000, policy_id, 1000, 50_000, 550_000)
