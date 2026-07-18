@@ -42,7 +42,7 @@ invisible to the selling bot.
 
 ### Unchanged bot notification payload
 
-The bot notification remains byte-for-byte:
+The bot notification remains exactly this JSON object and field set:
 
 ```
 Token: BOT_NOTIFY_TOKEN
@@ -51,7 +51,8 @@ Token: BOT_NOTIFY_TOKEN
 ```
 
 No amount, fee, payable, or reference field is ever sent to the bot.
-A byte-exact regression test enforces this.
+A regression test parses the raw request body and asserts the exact
+JSON object, the exact field set, and the Token header.
 
 ### Fee CLI and scheduled changes
 
@@ -65,10 +66,15 @@ A byte-exact regression test enforces this.
   DESC, then id DESC, cancelled excluded); a scheduled policy activates
   at exactly its `effective_at` with no restart; history is permanent
   and fully audited (`fee_policy_created/scheduled/cancelled`).
+- `fee cancel` accepts only future scheduled policies; cancelling the
+  effective policy is refused (it would silently fall back to an older
+  rate) — the current rate changes only via explicit `fee set`.
 - The admin Telegram bot gains a strictly read-only `/fee` command.
 - The installer asks for the initial fee percentage (default 0) and
-  applies it with `--ensure-initial`: a rerun never resets an existing
-  policy.
+  applies it with `--ensure-initial`: it creates a policy only when no
+  policy row has ever existed (scheduled/cancelled history counts), so
+  a rerun never resets or injects a fee; concurrent reruns are
+  serialized by a database advisory lock.
 
 ### Migration 0006
 

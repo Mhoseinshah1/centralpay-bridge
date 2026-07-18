@@ -29,6 +29,23 @@ performed on a real host and the results are recorded below.**
 | End-to-end `curl \| sudo bash` install | — | **not tested** |
 | `centralpay update` / `rollback` against a real GitHub release | logic + checksum-verification tests with fixtures | **not tested (real)** |
 
+## Supported vs. validated OS matrix
+
+| Ubuntu | Installer accepts | CI test matrix | Real-host evidence recorded |
+|---|---|---|---|
+| 22.04 | yes | yes | **none** |
+| 24.04 | yes | yes | **none** |
+| 26.04 | yes | no | **none** |
+
+The operator has reported using an Ubuntu 26.04 VPS, but no sanitized
+evidence (OS/kernel/Docker versions, dates, logs) has been supplied, so
+**no result is recorded** — this file only ever records supplied,
+sanitized evidence. Accepting 26.04 in the installer's OS check is code
+support only; it does not prove production validation on any Ubuntu
+version, and CI exercises 22.04/24.04 runners only. Blocker B1 requires
+separately recorded evidence for 22.04 and 24.04 (26.04 evidence is
+additionally welcome but does not substitute).
+
 ## Required procedure (to close blocker B1)
 
 Run on fresh Ubuntu 22.04 **and** 24.04 hosts (amd64; arm64 if
@@ -36,8 +53,10 @@ available), each with a real DNS record and ports 80/443 open:
 
 1. `curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main/install.sh | sudo bash`
    — answer prompts from `/dev/tty`; confirm no secret is ever echoed.
-2. `centralpay status` — all services healthy; `centralpay health` OK.
-3. Caddy obtains a real certificate; `https://<domain>/health` returns 200.
+2. `centralpay status` — all services healthy; `centralpay diagnose`
+   shows no failures.
+3. Caddy obtains a real certificate; `https://<domain>/health/live`
+   and `https://<domain>/health/ready` both return 200.
 4. `centralpay backup`, then `centralpay backups` and a
    `centralpay restore FILE` round-trip per `BACKUP_RESTORE_FA.md`.
 5. A full sandbox payment (see `STAGING_VALIDATION.md`).

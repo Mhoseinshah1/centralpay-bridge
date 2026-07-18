@@ -175,7 +175,8 @@ alerts. [T] reason-code assertions across all suites;
 **F21 — The bot's original invoice amount never includes the fee, and the
 bot payload never carries any amount.** `payments.amount` is exactly what
 the bot sent; the fee lives only in the snapshot columns; the bot
-notification payload stays byte-for-byte `{"order_id", "actions"}` with
+notification payload stays exactly the JSON object
+`{"order_id", "actions"}` (exact field set) with
 the `Token` header, so the bot always credits its own original invoice.
 Enforced: `payments.py` (snapshot columns separate from `amount`),
 `notification.py` (payload construction untouched). [T]
@@ -212,7 +213,14 @@ or cancelled, never edited or deleted; selection is `effective_at DESC,
 id DESC` with future and cancelled rows excluded, so every replica
 observes the same policy through PostgreSQL and scheduled changes
 activate at exactly `effective_at`. Mutations are host-CLI-root-only
-(`centralpay fee`); the admin bot is read-only. Every change emits a
+(`centralpay fee`); the admin bot is read-only. `fee cancel` accepts
+only FUTURE scheduled policies — cancelling the effective policy (or
+superseded history) is refused because selection would silently fall
+back to an older rate; the current rate changes only via explicit
+`fee set`. `--ensure-initial` creates a policy only when fee_policies
+has ZERO rows (scheduled or cancelled history counts as history) and
+is serialized across concurrent installer reruns by a PostgreSQL
+transaction-level advisory lock. Every change emits a
 permanent `fee_policy_*` audit event, and backups carry the full history.
 [DB] `ck_fee_policies_rate_bps_range`, `ck_fee_policies_note_not_empty`,
 `ck_fee_policies_cancellation_consistent`; FK

@@ -17,7 +17,8 @@ closed.** Release notes: `RELEASE_NOTES_0.6.0_RC1.md`.
   getLink charges the payable amount; verify must report exactly the
   payable amount (mismatch → manual review with
   `verify_payable_amount_mismatch`). The bot notification payload is
-  byte-for-byte unchanged and still carries no amounts. Fee policies are
+  unchanged (exact JSON object and field set) and still carries no
+  amounts. Fee policies are
   append-only, fully audited, selected deterministically, changeable
   only via the root host CLI (`centralpay fee
   status|set|schedule|history|cancel`), read-only in the admin bot

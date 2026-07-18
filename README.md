@@ -119,7 +119,7 @@ the adversarial review, and a green release workflow. Original topics:
   to the selling bot: original invoice preserved, immutable per-payment
   fee snapshot, integer round-half-up arithmetic, getLink charges the
   payable amount, verify enforces it, and the bot notification payload
-  is byte-for-byte unchanged — see
+  is unchanged (exact JSON object and field set) — see
   [Dynamic service fee](#dynamic-service-fee-percentage)
 - Append-only audited `fee_policies` with deterministic selection and
   restart-free scheduled changes; `centralpay fee` host CLI (root-only
@@ -248,7 +248,7 @@ The request schema rejects anything outside this contract with a generic
   authentication, error `amount_out_of_range`); the schema additionally
   enforces an absolute backstop of 10¹² TOMAN.
 - `order_id` — opaque non-empty string, at most 128 characters, no
-  control characters, no NUL. Passed through byte-exact: never trimmed,
+  control characters, no NUL. Passed through unchanged: never trimmed,
   case-folded, or Unicode-normalized.
 
 ### Idempotency contract
@@ -492,16 +492,21 @@ centralpay fee status                                # current + next scheduled
 centralpay fee set 10 --note "launch fee"            # root only
 centralpay fee schedule 2.5 --at 2026-08-01T00:00:00+03:30 --note "summer"
 centralpay fee history                               # full append-only history
-centralpay fee cancel 3 --note "wrong rate"          # cancel a scheduled policy
+centralpay fee cancel 3 --note "wrong rate"          # cancel a SCHEDULED policy only
 ```
 
 Rates are 0–100 with at most two decimals; signs, scientific notation,
 separators, and anything else are rejected. Mutations require root and
 delegate to the typed Python ops command (`python -m app.ops fee ...`) —
 never shell-generated SQL. The admin Telegram bot's `/fee` command is
-strictly read-only. The installer asks for the initial fee percentage
-(default 0) and applies it with `--ensure-initial`, which is a no-op when
-any policy already exists — an installer re-run can never reset the fee.
+strictly read-only. `fee cancel` refuses the currently effective policy
+(and superseded history): cancelling it would silently fall back to an
+older rate — change the current fee only with `fee set` (`fee set 0` to
+remove it). The installer asks for the initial fee percentage (default
+0) and applies it with `--ensure-initial`, which creates a policy only
+when no policy row has ever existed (scheduled and cancelled history
+count) — an installer re-run can never reset or inject a fee, and
+concurrent reruns are serialized by a database advisory lock.
 
 **Operator obligation:** the fee is charged to the payer, so the payer
 must be told the final payable amount before paying. Disclose the fee in

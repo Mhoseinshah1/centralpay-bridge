@@ -27,7 +27,7 @@ class CreatePaymentRequest(BaseModel):
       MIN/MAX_PAYMENT_AMOUNT_TOMAN, enforced after authentication.
     - order_id: opaque non-empty string, at most 128 characters, no
       control characters and no NUL (NUL previously reached PostgreSQL
-      and produced a 500). It is passed through byte-exact — never
+      and produced a 500). It is passed through unchanged — never
       trimmed, case-folded, or Unicode-normalized — because the bot
       contract treats it as an opaque identifier.
     """

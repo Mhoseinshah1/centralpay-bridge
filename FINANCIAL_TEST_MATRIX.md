@@ -31,7 +31,7 @@ fails the build if CI ever lacks the database (no silent skips).
 | F18 | test_logging_redaction.py (sentinel + real sig/ct); test_callback_responses_never_echo…; test_get_link/verify_never_exposes_gateway_text; deployment sig+ct redaction test; gitleaks (CI) | both |
 | F19 | the whole PG race suite (11 race tests incl. the three final-audit races) | PG |
 | F20 | reason-code assertions across every failure-path test; manual_review event assertions; alert mapping tests | both |
-| F21 | test_bot_notification_payload_contains_no_fee_fields (byte-exact payload); test_fee_snapshot_and_getlink_receives_payable | SQLite |
+| F21 | test_bot_notification_payload_contains_no_fee_fields (exact JSON object and field set from the raw body); test_fee_snapshot_and_getlink_receives_payable | SQLite |
 | F22 | test_duplicate_order_preserves_snapshot_after_policy_change; test_getlink_failed_retry_keeps_original_snapshot; test_concurrent_create_and_fee_change_snapshot_never_mixed; test_concurrent_identical_creates_single_fee_snapshot; test_check_constraints_reject_inconsistent_fee_rows; test_db_check_detects_policyless_fee_corruption | both/PG |
 | F23 | test_fees.py arithmetic + parsing matrix (75 cases); test_fee_rounding_half_up_in_flow; test_payable_above_maximum_rejected_before_any_side_effect; test_payable_exactly_at_maximum_accepted; test_original_below_minimum_still_rejected_with_fee_active | both |
 | F24 | test_fees.py selection/lifecycle suite; test_ops_fee_* (CLI incl. malformed/injection rejection, ensure-initial); test_admin_fee_is_read_only; test_admin_fee_denied_for_unauthorized_user; test_migration_0006_backfills_existing_payments; test_fee_policies_survive_restore_and_stay_decoupled | both/PG |
