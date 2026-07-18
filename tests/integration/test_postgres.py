@@ -13,7 +13,9 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, text
@@ -27,6 +29,7 @@ from tests.conftest import (
     event_types,
     get_events,
     get_payment,
+    getlink_ok_response,
     valid_callback_path,
     verify_ok_response,
 )
@@ -232,3 +235,83 @@ def test_concurrent_worker_claims_use_skip_locked(settings, pg_app, pg_session_f
     payment = get_payment(pg_session_factory, "pg-claim")
     assert payment.bot_notify_attempts == 1
     assert payment.notification_claimed_by is not None
+
+
+def test_concurrent_stale_and_current_token_callbacks(settings, pg_app, pg_session_factory):
+    """Callback replay audit: a stale-token callback racing the legitimate
+    one must never reach verify. Exactly one verify call, one verified fact,
+    one queued notification — regardless of lock acquisition order."""
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        stub.getlink_result = httpx.ConnectError("connection refused")
+        assert create_order(client, settings, order_id="pg-stale", amount=7000).status_code == 502
+        stub.getlink_result = getlink_ok_response()
+        assert create_order(client, settings, order_id="pg-stale", amount=7000).status_code == 200
+        payment = get_payment(pg_session_factory, "pg-stale")
+
+        # The first attempt's token was durably superseded by the second
+        # link. Re-sign it for the current order id to isolate the token
+        # check from the signature check.
+        first_url = str(stub.getlink_requests[0]["returnUrl"])
+        stale_ct = parse_qs(urlsplit(first_url).query)["ct"][0]
+        from app.security import callback_signature
+
+        stale_sig = callback_signature(
+            settings.callback_hmac_secret, payment.gateway_order_id, stale_ct
+        )
+        stale_path = (
+            f"/api/centralpay/callback?orderId={payment.gateway_order_id}"
+            f"&ct={stale_ct}&sig={stale_sig}"
+        )
+        valid_path = valid_callback_path(stub, payment.gateway_order_id)
+        stub.verify_result = verify_ok_response(amount=7000, reference_id="REF-pg-stale")
+        stub.verify_delay_seconds = 0.3
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(client.get, path) for path in (valid_path, stale_path)]
+            responses = [future.result(timeout=30) for future in futures]
+
+    assert sorted(response.status_code for response in responses) == [200, 403]
+    # The stale token NEVER reached CentralPay: verify ran exactly once,
+    # triggered by the legitimate link.
+    assert len(stub.verify_requests) == 1
+
+    payment = get_payment(pg_session_factory, "pg-stale")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("gateway_payment_verified") == 1
+    assert events.count("bot_notification_queued") == 1
+    assert "callback_token_invalid" in events
+
+
+def test_concurrent_replays_after_verification_never_reverify(
+    settings, pg_app, pg_session_factory
+):
+    """At-most-once proof under concurrency: replaying the legitimate signed
+    URL after verification returns the final page from every request while
+    verify is never called again and the notification is never re-queued."""
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="pg-replay", amount=6000).status_code == 200
+        payment = get_payment(pg_session_factory, "pg-replay")
+        stub.verify_result = verify_ok_response(amount=6000, reference_id="REF-pg-replay")
+        path = valid_callback_path(stub, payment.gateway_order_id)
+        assert client.get(path).status_code == 200
+        assert len(stub.verify_requests) == 1
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(client.get, path) for _ in range(4)]
+            responses = [future.result(timeout=30) for future in futures]
+
+    for response in responses:
+        assert response.status_code == 200
+        assert 'data-status="bot_pending"' in response.text
+    # Verified exactly once, queued exactly once, delivery not yet attempted.
+    assert len(stub.verify_requests) == 1
+    payment = get_payment(pg_session_factory, "pg-replay")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert payment.bot_notify_attempts == 0
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("gateway_payment_verified") == 1
+    assert events.count("bot_notification_queued") == 1
+    assert events.count("duplicate_callback_ignored") == 4
