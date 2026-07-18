@@ -105,6 +105,21 @@ secrets in image layers. Installer posture confirmed (keyring-based apt,
 umask 077 config writes). Real-host installer execution remains blocker
 B1; base-image digest pinning remains topic 18.
 
+Status update (final financial audit, audit/final-financial-correctness):
+the entire bridge was re-audited end to end, independently of prior audit
+conclusions. **No remaining financial-correctness bug was found in the
+code.** The twenty financial invariants are documented and mapped to
+tests in FINANCIAL_INVARIANTS.md / FINANCIAL_TEST_MATRIX.md; the state
+machine, crash matrix (FINANCIAL_CRASH_MATRIX.md), and CentralPay
+contract assumptions (CENTRALPAY_CONTRACT_ASSUMPTIONS.md) are documented.
+Hardening added: migration 0005 CHECK constraints (positive amounts,
+non-negative attempts, delivery-requires-verification), a
+verified-fact predicate in the worker claim query, a CI guard against
+silently skipped integration suites, and three further cross-component
+race proofs. Verdict (FINAL_FINANCIAL_AUDIT.md): CODE_FINANCIALLY_SOUND,
+PRODUCTION_VALIDATION_STATUS: INCOMPLETE — blockers B1–B5 and real-bot
+confirmation remain; no tag, no real payments.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection

@@ -271,3 +271,16 @@ unaccounted for — the top priority of AGENTS.md.
 It must not be tagged, published, or used for real payments until B1,
 B2, B4, and B5 are closed (and B3 if the admin bot is to be enabled),
 and a human approval is recorded.
+
+**Final-audit classification (audit/final-financial-correctness):**
+after six focused audits plus the final end-to-end audit, **no code
+blocker remains** — see `FINAL_FINANCIAL_AUDIT.md`
+(CODE_FINANCIALLY_SOUND / PRODUCTION_VALIDATION_STATUS: INCOMPLETE).
+Every open register item is one of: real-host blocker (B1),
+real-CentralPay blocker (B2, incl. TOMAN-unit and verify-idempotency
+confirmation), live-Telegram blocker (B3), process blocker (B4
+adversarial review, B5 release-workflow run), real-bot blocker
+(2xx/duplicate semantics confirmation), accepted risk (items 2*, 3, 8
+residual, 10, 11, 13, 14, 15, 16, 17 residual, 18, 21, 23, 24), or
+post-release backlog. Migration 0005 added the financial CHECK
+constraints; no schema work remains open.
