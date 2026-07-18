@@ -90,6 +90,25 @@ validate_admin_ids() {
     [[ "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]
 }
 
+validate_fee_percent() {
+    # EXACTLY the language app/services/fees.py parse_rate_percent accepts:
+    # 0..100 inclusive, at most two decimal places, ASCII digits only, no
+    # signs / whitespace / exponents / commas / newlines. Pure string and
+    # integer comparison — no float arithmetic. 100, 100.0, 100.00 pass;
+    # 100.01, 101, 999 fail. Keep the two implementations in lockstep.
+    local LC_ALL=C
+    local value="$1" whole frac
+    [[ "$value" =~ ^([0-9]{1,3})(\.([0-9]{1,2}))?$ ]] || return 1
+    whole="${BASH_REMATCH[1]}"
+    frac="${BASH_REMATCH[3]:-}"
+    # 10#: force base-10 so leading zeros (e.g. 007) stay decimal.
+    (( 10#$whole <= 100 )) || return 1
+    if (( 10#$whole == 100 )) && [[ -n "$frac" ]] && (( 10#$frac != 0 )); then
+        return 1
+    fi
+    return 0
+}
+
 validate_report_time() {
     [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]
 }
@@ -218,12 +237,12 @@ gather_input() {
     log "Configuration questions (input is read from the terminal):"
 
     while true; do
-        ask PAYMENT_DOMAIN "1/9 Payment domain (e.g. pay.example.com)"
+        ask PAYMENT_DOMAIN "1/10 Payment domain (e.g. pay.example.com)"
         validate_domain "$PAYMENT_DOMAIN" && break
         echo "Invalid domain format." > /dev/tty
     done
 
-    ask BOT_INPUT "2/9 Bot API base domain or URL (e.g. https://bot.example.com)"
+    ask BOT_INPUT "2/10 Bot API base domain or URL (e.g. https://bot.example.com)"
     BOT_PAYMENT_NOTIFY_URL="$(normalize_bot_url "$BOT_INPUT")"
     log "Bot notification endpoint: ${BOT_PAYMENT_NOTIFY_URL}"
 
@@ -231,27 +250,27 @@ gather_input() {
     # getLink.php and verify.php; one prompt fills both variables. The
     # application keeps two variables so a future split key needs no
     # contract change.
-    ask_secret CENTRALPAY_API_KEY "3/9 CentralPay API key"
+    ask_secret CENTRALPAY_API_KEY "3/10 CentralPay API key"
     CENTRALPAY_GETLINK_API_KEY="$CENTRALPAY_API_KEY"
     CENTRALPAY_VERIFY_API_KEY="$CENTRALPAY_API_KEY"
 
-    ask_secret BOT_NOTIFY_TOKEN "4/9 Bot /token2 value"
-    ask_optional TELEGRAM_BOT_USERNAME "5/9 Telegram bot username"
+    ask_secret BOT_NOTIFY_TOKEN "4/10 Bot /token2 value"
+    ask_optional TELEGRAM_BOT_USERNAME "5/10 Telegram bot username"
 
     while true; do
-        ask TLS_EMAIL "6/9 Email for automatic TLS certificates"
+        ask TLS_EMAIL "6/10 Email for automatic TLS certificates"
         validate_email "$TLS_EMAIL" && break
         echo "Invalid email format." > /dev/tty
     done
 
     while true; do
-        ask MIN_PAYMENT_AMOUNT_TOMAN "7/9 Minimum payment amount in TOMAN" "1000"
+        ask MIN_PAYMENT_AMOUNT_TOMAN "7/10 Minimum payment amount in TOMAN" "1000"
         validate_positive_int "$MIN_PAYMENT_AMOUNT_TOMAN" && break
         echo "Must be a positive integer." > /dev/tty
     done
 
     while true; do
-        ask MAX_PAYMENT_AMOUNT_TOMAN "8/9 Maximum payment amount in TOMAN" "100000000"
+        ask MAX_PAYMENT_AMOUNT_TOMAN "8/10 Maximum payment amount in TOMAN" "100000000"
         if validate_positive_int "$MAX_PAYMENT_AMOUNT_TOMAN" \
             && [[ "$MAX_PAYMENT_AMOUNT_TOMAN" -gt "$MIN_PAYMENT_AMOUNT_TOMAN" ]]; then
             break
@@ -261,10 +280,8 @@ gather_input() {
 
     while true; do
         ask PAYMENT_FEE_PERCENT "9/10 Payment fee percentage (0-100, up to 2 decimals)" "0"
-        if [[ "$PAYMENT_FEE_PERCENT" =~ ^[0-9]{1,3}(\.[0-9]{1,2})?$ ]]; then
-            break
-        fi
-        echo "Use 0..100 with at most two decimal places (e.g. 0, 10, 7.5, 2.25)." > /dev/tty
+        validate_fee_percent "$PAYMENT_FEE_PERCENT" && break
+        echo "Use 0 to 100 inclusive with at most two decimal places (e.g. 0, 10, 7.5, 2.25, 100)." > /dev/tty
     done
 
     while true; do
@@ -526,12 +543,19 @@ ensure_initial_fee_policy() {
     # changing an existing fee always requires the explicit
     # 'centralpay fee set' command.
     local percent="${PAYMENT_FEE_PERCENT:-0}"
+    # Belt and braces: the prompt already validated this, but the value may
+    # come from a rerun environment — never hand an unvalidated rate to the
+    # typed parser only to fail late.
+    validate_fee_percent "$percent" \
+        || fail "Invalid payment fee percentage '${percent}' (allowed: 0-100 with up to 2 decimals)."
     cd "$INSTALL_DIR"
     if docker compose run --rm migrate python -m app.ops fee set "$percent" \
         --note "Initial installation fee" --actor installer --ensure-initial; then
-        log "Fee policy ensured (${percent}%; existing policies are never overwritten)."
+        log "Fee policy ensured (${percent}%; existing policy history is never overwritten)."
     else
-        warn "Could not create the initial fee policy; set it later with: centralpay fee set ${percent} --note '...'"
+        # The installation must NEVER report success while the operator's
+        # requested fee configuration was silently not applied.
+        fail "Could not ensure the initial fee policy (${percent}%). Fix the error above and re-run the installer, or apply it manually with: centralpay fee set ${percent} --note 'Initial installation fee'"
     fi
 }
 
