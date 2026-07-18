@@ -91,7 +91,7 @@ def _snapshot(engine):
     with engine.connect() as connection:
         counts = {
             table: connection.execute(
-                text(f"SELECT count(*) FROM {table}")  # noqa: S608 - fixed table names
+                text(f"SELECT count(*) FROM {table}")  # fixed table names, not user input
             ).scalar_one()
             for table in _TABLES
         }
