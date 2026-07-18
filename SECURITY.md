@@ -33,6 +33,24 @@ CentralPay confirmation, or lost silently is always critical.
   only on an explicit success marker; financial fields are parsed with
   typed coercion and malformed values route to manual review with explicit
   reason codes — success is never inferred from truthy values.
+- **Gateway-controlled data policy (audit):** every byte of a gateway
+  response body (message text, HTML, JSON values) is treated as
+  attacker-influenceable content. It is classified inside
+  `app/centralpay.py` into a fixed internal reason-code vocabulary
+  (`gateway_rejected`, `gateway_response_invalid`, `gateway_missing_data`,
+  `gateway_invalid_redirect_url`, `gateway_invalid_reference_id`,
+  `gateway_invalid_amount`, `gateway_invalid_user_id`) and then discarded —
+  raw gateway text never reaches logs, exceptions, audit events, stored
+  errors, or API responses. Gateway logs carry only the endpoint name, the
+  order id, the HTTP status, the internal reason code, and a fixed-value
+  marker naming which failure signal was present.
+- **Redirect URL validation policy (audit):** the `redirectUrl` returned by
+  getLink is parsed with `urllib.parse.urlsplit` (never substring checks)
+  and accepted only when it is HTTPS with a non-empty hostname, carries no
+  userinfo credentials, contains no whitespace or control characters, has
+  a well-formed port, and is at most 2048 characters. HTTPS-only is a
+  deliberate decision: CentralPay serves its payment pages over HTTPS, and
+  an `http://` redirect would downgrade the payer to cleartext.
 - **Rate limiting (0.5.0-rc1):** application-level sliding windows for
   invalid API keys, invalid callback signatures, and payment-create bursts;
   `X-Forwarded-For` is never trusted for limiter identity. Limiters are
