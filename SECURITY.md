@@ -90,12 +90,38 @@ CentralPay confirmation, or lost silently is always critical.
   all log output; access logs redact callback signatures; only the final
   four card digits are ever stored.
 - **Network exposure:** only Caddy publishes ports 80/443; the API and
-  PostgreSQL are reachable solely on the internal Docker network; TLS is
+  PostgreSQL are reachable solely on internal Docker networks; TLS is
   automatic; the Caddy admin API is disabled; only the four public routes
-  are proxied.
-- **Runtime:** non-root containers, pinned-bounded dependencies, log
-  rotation, health-gated deployments (API/worker never start on a failed
-  migration).
+  are proxied. Since the deployment audit the networks are split: Caddy
+  sits on an **edge** network that reaches only the API, and PostgreSQL
+  sits on the **internal** network that Caddy cannot reach at all.
+- **Runtime:** non-root containers (fixed UID/GID 10001), pinned-bounded
+  dependencies, log rotation, health-gated deployments (API/worker never
+  start on a failed migration). The api, worker, migrate, and admin-bot
+  services all run with a read-only root filesystem, tmpfs `/tmp`,
+  `cap_drop: ALL`, and `no-new-privileges`; db and caddy keep the vendor
+  capabilities they require but also run with `no-new-privileges`.
+- **Container trust boundary (audit):** no Docker socket, no privileged
+  containers, no host network/PID/IPC, no broad host mounts anywhere.
+  Per-service secrets are minimized: Caddy receives no application env
+  file or secrets; the worker has CentralPay keys, the inbound API key,
+  and the callback HMAC secret masked (it needs only the database URL and
+  bot-notify settings); the admin bot masks everything payment-related.
+  **Impact of a compromised container:** Caddy → can reach only the API's
+  public routes (no DB route, no secrets); worker → can read/write the
+  database and the bot token but cannot forge callbacks or talk to
+  CentralPay; API → the widest (DB + gateway keys + HMAC), which is why
+  the callback/creation paths carry the strictest validation; none of
+  them can touch Docker, the host filesystem, deployment configuration,
+  or the backups directory. Access logs redact both the callback
+  signature (`sig`) and the one-time token (`ct`).
+- **Update trust model:** production updates pin a release tag; the
+  published artifact checksum (SHA256SUMS) is verified before deployment,
+  which then happens via `git checkout` of the fetched ref over HTTPS —
+  no archive is ever extracted, so archive path-traversal/symlink attacks
+  have no surface. Signed tags remain pre-1.0 backlog. Rollback reuses
+  the previously recorded local version, never touches configuration or
+  secrets, and never downgrades the schema.
 - **Audit:** every financial state transition is recorded in the permanent
   append-only `payment_events` table; migrations refuse to drop it.
 - **Admin Telegram bot (optional, off by default):** read-only; authorizes

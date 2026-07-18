@@ -24,6 +24,21 @@ x-logging: &default-logging
     max-size: "20m"
     max-file: "5"
 
+# Shared hardening for the application services (same profile the admin-bot
+# service has run since Phase 4): immutable root filesystem with a tmpfs for
+# the heartbeat/temp files, no Linux capabilities, no privilege escalation.
+# The db and caddy services keep their vendor defaults where required
+# (PostgreSQL needs setuid/chown capabilities, Caddy binds 80/443 and writes
+# its certificate volumes) but still run with no-new-privileges.
+x-app-hardening: &app-hardening
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
 services:
   db:
     image: postgres:16
@@ -38,7 +53,10 @@ services:
       - db_data:/var/lib/postgresql/data
     networks:
       - internal
-    # No published ports: PostgreSQL is never publicly reachable.
+    security_opt:
+      - no-new-privileges:true
+    # No published ports: PostgreSQL is never publicly reachable, and it is
+    # NOT on the edge network — a compromised Caddy cannot reach it.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U centralpay -d centralpay"]
       interval: 10s
@@ -49,7 +67,7 @@ services:
     logging: *default-logging
 
   migrate:
-    <<: [*app-image, *app-env]
+    <<: [*app-image, *app-env, *app-hardening]
     command: ["alembic", "upgrade", "head"]
     restart: "no"
     depends_on:
@@ -62,7 +80,7 @@ services:
     logging: *default-logging
 
   api:
-    <<: [*app-image, *app-env]
+    <<: [*app-image, *app-env, *app-hardening]
     restart: unless-stopped
     depends_on:
       db:
@@ -71,6 +89,9 @@ services:
       migrate:
         condition: service_completed_successfully
     networks:
+      # edge: reachable from Caddy. internal: reaches PostgreSQL. The API is
+      # the only service on both.
+      - edge
       - internal
     # No published ports: only Caddy reaches the API.
     healthcheck:
@@ -82,8 +103,18 @@ services:
     logging: *default-logging
 
   worker:
-    <<: [*app-image, *app-env]
+    <<: [*app-image, *app-env, *app-hardening]
     command: ["python", "-m", "app.worker"]
+    # Least privilege: the worker delivers bot notifications and reads the
+    # database; it never talks to CentralPay and never validates inbound
+    # requests, so those secrets are masked with placeholders (environment:
+    # entries override env_file values). It keeps DATABASE_URL and the
+    # BOT_NOTIFY_* configuration.
+    environment:
+      CENTRALPAY_GETLINK_API_KEY: not-used-by-worker
+      CENTRALPAY_VERIFY_API_KEY: not-used-by-worker
+      INBOUND_API_KEY: not-used-by-worker-x
+      CALLBACK_HMAC_SECRET: not-used-by-worker-x
     restart: unless-stopped
     depends_on:
       db:
@@ -174,7 +205,11 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     networks:
-      - internal
+      # Edge only: Caddy reaches the API and nothing else — it has no route
+      # to PostgreSQL and receives no application or database secrets.
+      - edge
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "caddy", "version"]
       interval: 30s
@@ -183,6 +218,10 @@ services:
     logging: *default-logging
 
 networks:
+  # Public-facing hop: Caddy <-> API only.
+  edge:
+    driver: bridge
+  # Application plane: API/worker/migrate/admin-bot <-> PostgreSQL.
   internal:
     driver: bridge
 

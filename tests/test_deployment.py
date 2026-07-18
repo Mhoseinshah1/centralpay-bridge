@@ -456,3 +456,118 @@ def test_db_check_command_exposed():
         ["bash", str(MANAGEMENT), "help"], capture_output=True, text=True, timeout=30
     )
     assert "db-check" in result.stdout
+
+
+# --- deployment security audit ----------------------------------------------
+
+DOCKERIGNORE = PROJECT_ROOT / ".dockerignore"
+
+
+def test_no_privileged_or_host_namespaces(compose):
+    for name, svc in compose["services"].items():
+        assert not svc.get("privileged"), name
+        assert svc.get("network_mode") != "host", name
+        assert svc.get("pid") != "host", name
+        assert svc.get("ipc") != "host", name
+
+
+def test_no_docker_socket_or_broad_host_mounts(compose):
+    for name, svc in compose["services"].items():
+        for volume in svc.get("volumes", []):
+            spec = volume if isinstance(volume, str) else str(volume)
+            assert "docker.sock" not in spec, name
+            source = spec.split(":")[0]
+            assert source not in ("/", "/etc", "/root", "/home", "/var"), name
+
+
+def test_app_services_fully_hardened(compose):
+    """api/worker/migrate share the hardening profile the admin-bot service
+    has run since Phase 4: immutable root fs, tmpfs /tmp, no capabilities,
+    no privilege escalation."""
+    for name in ("api", "worker", "migrate", "admin-bot"):
+        svc = compose["services"][name]
+        assert svc.get("read_only") is True, name
+        assert "ALL" in svc.get("cap_drop", []), name
+        assert "no-new-privileges:true" in svc.get("security_opt", []), name
+        assert any(str(t).startswith("/tmp") for t in svc.get("tmpfs", [])), name
+
+
+def test_every_service_denies_privilege_escalation(compose):
+    for name, svc in compose["services"].items():
+        assert "no-new-privileges:true" in svc.get("security_opt", []), name
+
+
+def test_caddy_cannot_reach_database(compose):
+    services = compose["services"]
+    # Caddy lives on the edge network only; PostgreSQL on internal only.
+    assert services["caddy"]["networks"] == ["edge"]
+    assert services["db"]["networks"] == ["internal"]
+    assert sorted(services["api"]["networks"]) == ["edge", "internal"]
+    for name in ("worker", "migrate", "admin-bot"):
+        assert services[name]["networks"] == ["internal"], name
+    # Caddy receives no application env file and no secrets.
+    assert "env_file" not in services["caddy"]
+    assert "secrets" not in services["caddy"]
+
+
+def test_worker_masks_unneeded_secrets(compose):
+    env = compose["services"]["worker"]["environment"]
+    assert env["CENTRALPAY_GETLINK_API_KEY"] == "not-used-by-worker"
+    assert env["CENTRALPAY_VERIFY_API_KEY"] == "not-used-by-worker"
+    assert env["INBOUND_API_KEY"] == "not-used-by-worker-x"
+    assert env["CALLBACK_HMAC_SECRET"] == "not-used-by-worker-x"
+
+
+def test_dockerignore_excludes_sensitive_files():
+    entries = {
+        line.strip()
+        for line in DOCKERIGNORE.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+    for required in (
+        ".git", ".env", ".env.*", "credentials*", "*.dump", "*.sqlite",
+        "*.pem", "*.key", "backups", ".idea", ".vscode", "tests", ".venv",
+    ):
+        assert required in entries, required
+
+
+def test_dockerfile_nonroot_fixed_uid_no_secrets():
+    text = DOCKERFILE.read_text()
+    assert "USER centralpay" in text
+    assert "--uid 10001" in text
+    assert "--gid 10001" in text
+    # Only explicit paths are copied — never the whole context, never env
+    # files; secrets cannot be baked into layers.
+    assert "COPY . " not in text
+    assert ".env" not in text
+    for line in text.splitlines():
+        if line.startswith("COPY"):
+            assert "secret" not in line.lower()
+
+
+def test_caddy_redacts_signature_and_token_queries():
+    text = CADDY_TEMPLATE.read_text()
+    assert "replace sig REDACTED" in text
+    assert "replace ct REDACTED" in text  # one-time callback token
+
+
+def test_logs_commands_use_component_allowlist():
+    text = MANAGEMENT.read_text()
+    allow = text.split("validate_component()")[1].split("}")[0]
+    assert "api|worker|db|caddy|admin-bot|migrate" in allow
+    logs_body = text.split("cmd_logs()")[1].split("cmd_migrate()")[0]
+    assert logs_body.count("validate_component") >= 2
+
+
+def test_update_never_extracts_archives():
+    """The release artifact is downloaded and checksum-verified only;
+    deployment happens via git checkout of the pinned ref. No archive is
+    ever extracted, so archive path-traversal/symlink attacks have no
+    surface in the update or backup paths."""
+    text = MANAGEMENT.read_text()
+    assert "sha256sum -c" in text
+    for extraction in ("tar -x", "tar x", "unzip", "tar --extract"):
+        assert extraction not in text, extraction
+    backup_text = BACKUP_SCRIPT.read_text()
+    for extraction in ("tar -x", "unzip"):
+        assert extraction not in backup_text

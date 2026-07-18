@@ -18,3 +18,22 @@ Dockerfile
 .github
 *.md
 !README.md
+# Secrets, credentials, and key material must never enter the build context.
+credentials*
+*.pem
+*.key
+*.crt
+id_rsa*
+id_ed25519*
+# Database dumps and local databases.
+*.dump
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+backups
+# Editor/agent state.
+.idea
+.vscode
+.claude
+.dockerignore

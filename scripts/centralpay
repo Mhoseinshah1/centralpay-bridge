@@ -166,10 +166,20 @@ cmd_status() {
     echo "  application: $(app_version)"
 }
 
+validate_component() {
+    # Allowlist (audit): log commands accept only known service names —
+    # never arbitrary Compose service names or option-like values.
+    case "$1" in
+        api|worker|db|caddy|admin-bot|migrate) return 0 ;;
+        *) fail "Unknown component: $1 (use api|worker|db|caddy|admin-bot|migrate)" ;;
+    esac
+}
+
 cmd_logs() {
     require_install
     local svc="${1:-}"
     if [[ -n "$svc" ]]; then
+        validate_component "$svc"
         compose logs --tail 200 -f "$svc"
     else
         compose logs --tail 100 -f
@@ -180,7 +190,10 @@ cmd_logs_errors() {
     require_install
     local svc="${1:-}"
     local -a target=()
-    [[ -n "$svc" ]] && target=("$svc")
+    if [[ -n "$svc" ]]; then
+        validate_component "$svc"
+        target=("$svc")
+    fi
     # Structured JSON logs carry "level"; plain logs are matched by keyword.
     compose logs --tail 1000 "${target[@]}" 2>&1 \
         | grep -Ei '"level": ?"(warning|error|critical)"|\b(error|warning|critical|fatal)\b' \
