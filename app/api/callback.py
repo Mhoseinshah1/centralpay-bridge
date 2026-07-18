@@ -38,7 +38,12 @@ class SignatureFailureTracker:
         self.window_seconds = window_seconds
         self._events: deque[float] = deque()
         self._lock = threading.Lock()
-        self._last_reported = 0.0
+        # None means "never reported". A numeric sentinel like 0.0 would be
+        # wrong: time.monotonic() has an arbitrary epoch, and on a freshly
+        # booted machine (CI runners, newly provisioned servers) it can be
+        # SMALLER than window_seconds, which would suppress the very first
+        # storm report.
+        self._last_reported: float | None = None
 
     def record(self, now: float | None = None) -> int | None:
         """Record one failure; returns the count when a storm should be
@@ -51,11 +56,18 @@ class SignatureFailureTracker:
                 self._events.popleft()
             count = len(self._events)
             if count >= self.threshold and (
-                now - self._last_reported >= self.window_seconds
+                self._last_reported is None
+                or now - self._last_reported >= self.window_seconds
             ):
                 self._last_reported = now
                 return count
         return None
+
+    def reset(self) -> None:
+        """Return to the initial state (used by tests)."""
+        with self._lock:
+            self._events.clear()
+            self._last_reported = None
 
 
 signature_failure_tracker = SignatureFailureTracker()
