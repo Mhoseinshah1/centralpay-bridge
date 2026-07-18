@@ -62,7 +62,7 @@
 ## ۵. سلامت و پایش
 
 - [ ] `centralpay status` همهٔ سرویس‌ها را سالم نشان می‌دهد.
-- [ ] `centralpay health` و `GET /health/details` (داخلی) پاسخ سالم
+- [ ] `centralpay status` و `centralpay diagnose` و `GET /health/details` (داخلی) پاسخ سالم
       می‌دهند و `migration_revision` برابر 0004 است.
 - [ ] ضربان worker تازه است (`worker_heartbeat_age_seconds` کوچک).
 - [ ] در صورت فعال‌بودن ربات مدیر: `/health` و `/status` پاسخ می‌دهند و

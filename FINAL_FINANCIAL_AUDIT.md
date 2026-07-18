@@ -129,7 +129,8 @@ F21–F24 in `FINANCIAL_INVARIANTS.md`):
 - getLink now charges `payable_amount`; verification compares the
   gateway-reported amount against `payable_amount` (mismatch event
   renamed `verify_payable_amount_mismatch`). The bot notification payload
-  is unchanged byte-for-byte and still carries no amounts.
+  is unchanged (exact JSON object and field set, parsed from the raw
+  request body) and still carries no amounts.
 - `MAX_PAYMENT_AMOUNT_TOMAN` now explicitly bounds the FINAL payable
   amount (rejection code `payable_amount_out_of_range`, before any row or
   gateway call); the minimum still bounds the original amount.
@@ -174,10 +175,11 @@ source and the test evidence:
 9. Migration 0006 backfills pre-existing payments as
    `fee_rate_bps=0, fee_amount=0, payable_amount=amount` (proven with a
    populated 0005 database). ✓
-10–11. The bot notification is byte-for-byte
-   `{"order_id", "actions": "custom_payment_verify"}` with the `Token`
-   header and carries no amount or fee field (byte-exact regression
-   test). ✓
+10–11. The bot notification is exactly the JSON object
+   `{"order_id", "actions": "custom_payment_verify"}` — exact field
+   set, parsed from the raw request body — with the `Token` header and
+   no amount or fee field (regression test; byte-level serialization
+   of the JSON encoder is deliberately not pinned). ✓
 12. A payable mismatch moves to `manual_review`, is never verified, and
    the worker can never deliver it (claim requires
    `bot_notify_pending` AND `gateway_verified_at IS NOT NULL`; new
@@ -185,7 +187,7 @@ source and the test evidence:
 13. Concurrent fee change vs creation cannot produce a mixed snapshot
    (single policy read; PG barrier race proof). ✓
 14. Backup/restore preserves active, scheduled, and cancelled policies
-   and payment snapshots byte-for-byte, ids included. ✓
+   and payment snapshots field-for-field, ids included. ✓
 15. db-check reports fee corruption read-only; it never rewrites
    financial history. ✓
 16. `scripts/backup.sh` is executable in Git (mode 100755) and

@@ -583,7 +583,7 @@ def test_installer_asks_for_one_centralpay_key_filling_both_variables():
     value in both environment variables."""
     text = INSTALLER.read_text()
     # Exactly one CentralPay key prompt, read silently.
-    assert text.count('ask_secret CENTRALPAY_API_KEY "3/9 CentralPay API key"') == 1
+    assert text.count('ask_secret CENTRALPAY_API_KEY "3/10 CentralPay API key"') == 1
     assert "getLink API key" not in text
     assert "verify API key" not in text
     # The single value fills both variables the application reads.
@@ -624,7 +624,9 @@ def test_installer_asks_fee_percentage_with_strict_pattern():
     assert re.search(
         r'ask PAYMENT_FEE_PERCENT "9/10 Payment fee percentage[^"]*" "0"', text
     )
-    assert r"^[0-9]{1,3}(\.[0-9]{1,2})?$" in text
+    # The prompt loop delegates to the range-enforcing validator (the old
+    # inline regex accepted 101/999/100.01 — zero-based-audit finding 1).
+    assert 'validate_fee_percent "$PAYMENT_FEE_PERCENT" && break' in text
 
 
 def test_installer_creates_initial_fee_policy_after_migrations():
@@ -688,3 +690,122 @@ def test_management_cli_fee_commands_and_privileges():
     assert 'require_root "fee ${sub}"' in fee_body
     assert 'python -m app.ops fee "$sub" "$@"' in fee_body
     assert "psql" not in fee_body
+
+
+# --- zero-based audit: fee validator, numbering, doc consistency -------------
+
+FEE_ACCEPT = ["0", "10", "7.5", "2.25", "100", "100.0", "100.00", "007", "0.01", "99.99"]
+FEE_REJECT = [
+    "101", "999", "100.01", "100.99",  # above 100 (the old regex accepted these)
+    "-5", "+5",  # signs
+    " 10", "10 ",  # whitespace
+    "1e2", "1E2",  # exponents
+    "10,5", "1,000",  # commas
+    "", "abc", "10.555", "10.", ".5", "0x10",
+    "١٠",  # noqa: RUF001 — non-ASCII digits
+    "10;echo x", "$(id)", "`id`",  # injection-shaped
+]
+
+
+def test_installer_fee_validator_accepts_full_documented_range():
+    for value in FEE_ACCEPT:
+        result = installer_call(f"validate_fee_percent '{value}'")
+        assert result.returncode == 0, f"{value!r} must be accepted"
+
+
+def test_installer_fee_validator_rejects_hostile_and_out_of_range_input():
+    for value in FEE_REJECT:
+        result = installer_call(f"validate_fee_percent '{value}'")
+        assert result.returncode != 0, f"{value!r} must be rejected"
+    # Embedded newline (bash $'...' quoting so the newline is literal).
+    result = installer_call("validate_fee_percent $'10\\n'")
+    assert result.returncode != 0, "trailing newline must be rejected"
+
+
+def test_installer_fee_validator_matches_python_parser():
+    """No split-brain validation: everything the bash validator accepts,
+    parse_rate_percent accepts, and everything it rejects, Python rejects."""
+    from app.services.fees import parse_rate_percent
+
+    for value in FEE_ACCEPT:
+        parse_rate_percent(value)  # must not raise
+    for value in [*FEE_REJECT, "10\n"]:
+        try:
+            parse_rate_percent(value)
+        except ValueError:
+            continue
+        raise AssertionError(f"python parser accepted {value!r} which bash rejects")
+
+
+def test_installer_prompt_numbering_is_consistent():
+    """Every numbered question reads N/10, in order 1..10 (the pre-audit
+    installer mixed 1/9..8/9 with 9/10 and 10/10)."""
+    text = INSTALLER.read_text()
+    numbered = re.findall(r'"(\d+)/(\d+) ', text)
+    assert [int(n) for n, _ in numbered] == list(range(1, 11))
+    assert {total for _, total in numbered} == {"10"}
+
+
+def test_installer_fee_initialization_failure_is_fatal():
+    """The installer must never finish successfully while silently failing
+    to create the fee policy the operator asked for."""
+    text = INSTALLER.read_text()
+    body = text[text.index("ensure_initial_fee_policy() {"):]
+    body = body[:body.index("\n}")]
+    assert 'fail "Could not ensure the initial fee policy' in body
+    assert "warn " not in body  # warn-and-continue is exactly the audited bug
+    # And the value is re-validated before use even on reruns.
+    assert 'validate_fee_percent "$percent"' in body
+
+
+_DOCS_WITH_COMMANDS = (
+    "README.md", "README_FA.md", "INSTALL_FA.md", "OPERATIONS_FA.md",
+    "REAL_HOST_VALIDATION.md", "STAGING_VALIDATION.md",
+    "PRODUCTION_CHECKLIST_FA.md", "MIGRATION_GUIDE.md",
+    "RELEASE_NOTES_0.6.0_RC1.md",
+)
+
+
+def _known_cli_words() -> set[str]:
+    # Every case label across scripts/centralpay (top-level dispatch plus
+    # subcommand dispatchers) — a documented `centralpay X` must start
+    # with one of these words.
+    text = MANAGEMENT.read_text()
+    words: set[str] = set()
+    for label in re.findall(r"^\s+([a-z0-9|-]+)\)", text, re.MULTILINE):
+        words.update(part for part in label.split("|") if re.fullmatch(r"[a-z-]+", part))
+    return words
+
+
+def test_docs_reference_only_real_cli_commands():
+    """Zero-based audit finding: docs referenced `centralpay health`,
+    which does not exist. Every documented command must exist."""
+    known = _known_cli_words()
+    assert "status" in known and "diagnose" in known  # parser sanity
+    for name in _DOCS_WITH_COMMANDS:
+        text = (PROJECT_ROOT / name).read_text()
+        for match in re.finditer(r"centralpay ([a-z][a-z-]*)", text):
+            assert match.group(1) in known, (
+                f"{name} documents nonexistent command: centralpay {match.group(1)}"
+            )
+
+
+def test_docs_reference_only_real_public_health_routes():
+    """The public health routes are /health/live and /health/ready (plus
+    the internal /health/details). A bare /health URL does not exist."""
+    for name in _DOCS_WITH_COMMANDS:
+        text = (PROJECT_ROOT / name).read_text()
+        for match in re.finditer(r"https?://[^\s`\")>]*/health(?![/a-z])", text):
+            raise AssertionError(f"{name} documents nonexistent route: {match.group(0)}")
+
+
+def test_pyproject_version_matches_app_version():
+    """Zero-based audit finding: pyproject.toml still carried 0.5.0rc1
+    after the 0.6.0-rc1 bump — package/SBOM metadata must track the
+    application version (PEP 440 normalizes 0.6.0-rc1 to 0.6.0rc1)."""
+    import tomllib
+
+    from app.version import APP_VERSION
+
+    data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+    assert data["project"]["version"] == APP_VERSION.replace("-rc", "rc")

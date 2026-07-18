@@ -164,11 +164,24 @@ def create_policy(
     return policy
 
 
+def _as_utc(value: datetime) -> datetime:
+    """SQLite returns naive datetimes; every write in this codebase is UTC."""
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def cancel_policy(
     db: Session, *, policy_id: int, actor: str, note: str, now: datetime | None = None
 ) -> FeePolicy:
-    """Cancel a policy (normally a scheduled one). Append-only: the row
-    stays in history with its cancellation metadata. The caller commits."""
+    """Cancel a FUTURE scheduled policy. Append-only: the row stays in
+    history with its cancellation metadata. The caller commits.
+
+    Only a policy whose ``effective_at`` is still in the future may be
+    cancelled. Cancelling the currently effective policy (or superseded
+    history) is refused: selection falls back to the next-best row, so it
+    would silently reactivate an OLD rate — a hidden fee change. The one
+    way to change the current rate is an explicit ``fee set`` (``fee set
+    0`` to remove the fee), which records intent in history.
+    """
     now = now or datetime.now(UTC)
     note = _validate_note(note)
     policy = db.execute(
@@ -178,6 +191,13 @@ def cancel_policy(
         raise ValueError(f"fee policy {policy_id} does not exist")
     if policy.cancelled_at is not None:
         raise ValueError(f"fee policy {policy_id} is already cancelled")
+    if _as_utc(policy.effective_at) <= now:
+        raise ValueError(
+            f"fee policy {policy_id} is (or was) effective and cannot be "
+            "cancelled: cancellation would silently fall back to an older "
+            "rate. Change the current fee explicitly with 'fee set' "
+            "(use 'fee set 0' to remove the fee)."
+        )
     policy.cancelled_at = now
     policy.cancelled_by = actor
     policy.cancellation_note = note

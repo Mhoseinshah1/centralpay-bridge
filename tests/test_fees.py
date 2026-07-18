@@ -314,3 +314,50 @@ def test_cancel_rejects_missing_and_double_cancel(session_factory):
         db.commit()
     with session_factory() as db, pytest.raises(ValueError, match="already cancelled"):
         cancel_policy(db, policy_id=policy_id, actor="t", note="second", now=NOW)
+
+
+# --- zero-based audit: cancellation contract ---------------------------------
+
+
+def test_cancel_rejects_currently_effective_policy(session_factory):
+    """Cancelling the ACTIVE policy would silently fall back to an older
+    rate (reproduced in the zero-based audit: cancelling a current 10%
+    policy reactivated a stale 90% one). It must be refused; the only way
+    to change the current rate is an explicit `fee set`."""
+    _add_policy(session_factory, rate_bps=9000, effective_at=PAST - timedelta(days=30))
+    active = _add_policy(session_factory, rate_bps=1000, effective_at=PAST)
+    with session_factory() as db:
+        with pytest.raises(ValueError, match="fee set"):
+            cancel_policy(db, policy_id=active, actor="t", note="oops", now=NOW)
+        db.rollback()
+    with session_factory() as db:
+        selected = select_effective_policy(db, now=NOW)
+    # The 10% policy is still the active one; the 90% relic never returned.
+    assert selected is not None
+    assert selected.id == active
+    assert selected.rate_bps == 1000
+
+
+def test_cancel_rejects_superseded_history(session_factory):
+    """Historical (superseded) policies are financial history, not
+    cancellable configuration."""
+    old = _add_policy(session_factory, rate_bps=500, effective_at=PAST - timedelta(days=30))
+    _add_policy(session_factory, rate_bps=1000, effective_at=PAST)
+    with session_factory() as db, pytest.raises(ValueError, match="cannot be cancelled"):
+        cancel_policy(db, policy_id=old, actor="t", note="cleanup", now=NOW)
+
+
+def test_cancel_scheduled_policy_leaves_active_rate_untouched(session_factory):
+    active = _add_policy(session_factory, rate_bps=1000, effective_at=PAST)
+    scheduled = _add_policy(session_factory, rate_bps=250, effective_at=FUTURE)
+    with session_factory() as db:
+        cancel_policy(db, policy_id=scheduled, actor="t", note="wrong rate", now=NOW)
+        db.commit()
+    with session_factory() as db:
+        now_active = select_effective_policy(db, now=NOW)
+        later_active = select_effective_policy(db, now=FUTURE + timedelta(days=1))
+    assert now_active is not None and now_active.id == active
+    # Even after the cancelled policy's would-be activation, the rate
+    # never changes on its own.
+    assert later_active is not None and later_active.id == active
+    assert later_active.rate_bps == 1000

@@ -123,7 +123,7 @@ via manual review (with audit trail), then upgrade.
 centralpay backup
 centralpay update --check   # shows current vs target, checksum status
 centralpay update           # pre-update backup, checksum verify, deploy, migrate
-centralpay status && centralpay health
+centralpay status && centralpay diagnose
 ```
 
 Rollback (application only — schema stays at 0004):
