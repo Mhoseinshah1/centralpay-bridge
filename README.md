@@ -7,6 +7,14 @@ reliability, recoverability, observability.
 The authoritative project contract is [AGENTS.md](AGENTS.md). The delivery
 roadmap is GitHub issue #1.
 
+## Verification status
+
+> Automated adversarial verification and the full test suite were deferred
+> and have not yet been completed. This implementation must not be
+> considered production-ready until those checks are completed.
+
+Unresolved review topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
+
 ## Status
 
 **Phase 1 — Core payment API** (this code):
