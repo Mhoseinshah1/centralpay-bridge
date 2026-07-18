@@ -45,7 +45,19 @@ class Payment(Base):
         String(32), nullable=False, default=PaymentStatus.CREATED.value, index=True
     )
     redirect_url: Mapped[str | None] = mapped_column(Text)
-    reference_id: Mapped[str | None] = mapped_column(String(128))
+    # Unique across payments: CentralPay must never report one referenceId
+    # for two different payments (collision => manual review, never overwrite).
+    reference_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    # SHA-256 hex of the one-time callback token embedded in the returnUrl.
+    # The plaintext token exists only inside the signed callback URL; a
+    # database leak alone cannot forge callbacks.
+    callback_token_hash: Mapped[str | None] = mapped_column(String(64))
+    callback_token_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Manual-review operational metadata (appended; financial fields are
+    # never overwritten by review operations).
+    review_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    review_resolution: Mapped[str | None] = mapped_column(String(64))
     # Only the final four card digits may ever be stored.
     card_last4: Mapped[str | None] = mapped_column(String(4))
     last_error: Mapped[str | None] = mapped_column(Text)

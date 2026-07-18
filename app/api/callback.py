@@ -11,12 +11,12 @@ import threading
 import time as time_module
 from collections import deque
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
 from app.api.pages import payment_status_page
-from app.exceptions import InvalidCallbackSignatureError
+from app.exceptions import InvalidCallbackSignatureError, RateLimitedError
 from app.security import verify_callback_signature
 from app.services.verification import process_callback
 
@@ -75,14 +75,21 @@ signature_failure_tracker = SignatureFailureTracker()
 
 @router.get("/api/centralpay/callback", response_class=HTMLResponse)
 def centralpay_callback(
+    request: Request,
     db: DbDep,
     settings: SettingsDep,
     client: CentralPayDep,
     order_id: int = Query(alias="orderId"),
+    ct: str = Query(min_length=1, max_length=64),
     sig: str = Query(min_length=1, max_length=128),
 ) -> HTMLResponse:
-    if not verify_callback_signature(settings.callback_hmac_secret, order_id, sig):
+    # The signature binds orderId and the one-time callback token together;
+    # both are validated cryptographically before any database work. The
+    # token's durable consumption state is checked inside the row lock.
+    if not verify_callback_signature(settings.callback_hmac_secret, order_id, ct, sig):
         logger.warning("callback_signature_invalid", extra={"gateway_order_id": order_id})
+        limiters = request.app.state.rate_limiters
+        rate_ok = limiters.check(limiters.invalid_signature, "invalid_callback_signature")
         storm_count = signature_failure_tracker.record()
         if storm_count is not None:
             # Best-effort aggregated alert; failure never affects the response.
@@ -99,8 +106,12 @@ def centralpay_callback(
                 db.commit()
             except Exception:
                 logger.exception("signature_storm_alert_failed")
+        if not rate_ok:
+            raise RateLimitedError()
         raise InvalidCallbackSignatureError()
-    result = process_callback(db, client, gateway_order_id=order_id)
+    result = process_callback(
+        db, client, gateway_order_id=order_id, callback_token=ct, settings=settings
+    )
     # Once CentralPay verification has succeeded the payer always gets a
     # success page, even while bot delivery is pending or under review.
     return HTMLResponse(

@@ -10,6 +10,7 @@ Flow:
 
 import logging
 import secrets
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -26,7 +27,7 @@ from app.exceptions import (
     OrderUnderReviewError,
 )
 from app.models import Payment, PaymentStatus
-from app.security import build_callback_url
+from app.security import build_callback_url, callback_token_hash, generate_callback_token
 
 logger = logging.getLogger("app.services.payments")
 
@@ -143,7 +144,14 @@ def create_payment(
     if payment.status == PaymentStatus.GETLINK_FAILED.value:
         payment.gateway_order_id = _generate_gateway_order_id(db)
 
-    return_url = build_callback_url(settings, payment.gateway_order_id)
+    # Fresh one-time callback token per link-creation attempt. Only its hash
+    # is stored; tokens from earlier attempts become stale and are rejected
+    # before any CentralPay verify call.
+    callback_token = generate_callback_token()
+    payment.callback_token_hash = callback_token_hash(callback_token)
+    payment.callback_token_issued_at = datetime.now(UTC)
+
+    return_url = build_callback_url(settings, payment.gateway_order_id, callback_token)
     try:
         redirect_url = client.get_link(
             amount=payment.amount,

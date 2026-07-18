@@ -10,7 +10,10 @@ import enum
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.config import Settings
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,10 +22,12 @@ from app.audit import record_event
 from app.centralpay import CentralPayClient, VerifyResult
 from app.exceptions import (
     CentralPayError,
+    InvalidCallbackTokenError,
     PaymentNotFoundError,
     VerificationFailedError,
 )
 from app.models import Payment, PaymentStatus
+from app.security import callback_token_matches
 from app.services.notification import queue_notification
 
 logger = logging.getLogger("app.services.verification")
@@ -82,7 +87,7 @@ def _move_to_manual_review(
 
 
 def _validate_and_apply_verification(
-    db: Session, payment: Payment, result: VerifyResult
+    db: Session, payment: Payment, result: VerifyResult, settings: "Settings | None" = None
 ) -> CallbackResult:
     """Apply a gateway-successful verify result after validating its fields.
 
@@ -90,12 +95,13 @@ def _validate_and_apply_verification(
     a financial anomaly: the payment moves to manual_review and is never
     auto-verified.
     """
+    field_errors = list(result.field_errors)
     if result.reference_id is None:
         _move_to_manual_review(
             db,
             payment,
             mismatch_event="verify_missing_reference_id",
-            data={"gateway_order_id": payment.gateway_order_id},
+            data={"gateway_order_id": payment.gateway_order_id, "field_errors": field_errors},
         )
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
     if result.amount != payment.amount:
@@ -107,6 +113,7 @@ def _validate_and_apply_verification(
                 "gateway_order_id": payment.gateway_order_id,
                 "expected_amount": payment.amount,
                 "reported_amount": result.amount,
+                "field_errors": field_errors,
             },
         )
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
@@ -119,6 +126,26 @@ def _validate_and_apply_verification(
                 "gateway_order_id": payment.gateway_order_id,
                 "expected_user_id": payment.gateway_user_id,
                 "reported_user_id": result.user_id,
+                "field_errors": field_errors,
+            },
+        )
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
+
+    # CentralPay must never report one referenceId for two different
+    # payments. On collision: manual review, never overwrite either payment.
+    collision = db.execute(
+        select(Payment.id)
+        .where(Payment.reference_id == result.reference_id, Payment.id != payment.id)
+        .limit(1)
+    ).first()
+    if collision is not None:
+        _move_to_manual_review(
+            db,
+            payment,
+            mismatch_event="reference_id_collision",
+            data={
+                "gateway_order_id": payment.gateway_order_id,
+                "colliding_payment_id": collision[0],
             },
         )
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
@@ -142,6 +169,8 @@ def _validate_and_apply_verification(
         },
     )
     queue_notification(db, payment, now=now)
+    if settings is not None and settings.first_payment_guard_enabled:
+        _maybe_record_first_payment(db, payment)
     db.commit()
     logger.info(
         "bot_notification_queued",
@@ -154,11 +183,39 @@ def _validate_and_apply_verification(
     return CallbackResult(CallbackStatus.BOT_PENDING, payment.bot_order_id)
 
 
+def _maybe_record_first_payment(db: Session, payment: Payment) -> None:
+    """First-production-payment guardrail (flushed in the caller's
+    transaction; must never alter financial correctness)."""
+    from sqlalchemy import func
+
+    verified_count = db.execute(
+        select(func.count(Payment.id)).where(Payment.gateway_verified_at.is_not(None))
+    ).scalar_one()
+    if verified_count == 1:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="first_production_payment_verified",
+            level="critical",
+            data={
+                "gateway_order_id": payment.gateway_order_id,
+                "amount": payment.amount,
+                "checklist": "run the first-payment checklist (PRODUCTION_CHECKLIST_FA.md)",
+            },
+        )
+        logger.critical(
+            "first_production_payment_verified",
+            extra={"payment_id": payment.id, "gateway_order_id": payment.gateway_order_id},
+        )
+
+
 def process_callback(
     db: Session,
     client: CentralPayClient,
     *,
     gateway_order_id: int,
+    callback_token: str,
+    settings: "Settings | None" = None,
 ) -> CallbackResult:
     payment = db.execute(
         select(Payment).where(Payment.gateway_order_id == gateway_order_id).with_for_update()
@@ -174,6 +231,21 @@ def process_callback(
         )
         db.commit()
         raise PaymentNotFoundError()
+
+    # One-time-token consumption state, checked under the row lock and
+    # BEFORE any CentralPay verify call. A stale token (from a superseded
+    # link-creation attempt) is rejected; the token value itself is never
+    # stored in events or logs.
+    if not callback_token_matches(callback_token, payment.callback_token_hash):
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="callback_token_invalid",
+            level="warning",
+            data={"gateway_order_id": gateway_order_id, "payment_status": payment.status},
+        )
+        db.commit()
+        raise InvalidCallbackTokenError()
 
     record_event(
         db,
@@ -235,4 +307,4 @@ def process_callback(
         db.commit()
         raise VerificationFailedError()
 
-    return _validate_and_apply_verification(db, payment, result)
+    return _validate_and_apply_verification(db, payment, result, settings)
