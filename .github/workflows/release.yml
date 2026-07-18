@@ -1,0 +1,285 @@
+name: Release
+
+# Release-candidate gate. Runs on version tags (vX.Y.Z / vX.Y.Z-rcN) and on
+# demand. Every job must pass before the packaged artifacts are attached to a
+# DRAFT GitHub release. Publishing the release is always a manual, human
+# decision — this workflow never publishes, and drafting happens only after
+# all gates are green.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Quality gates (Python, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: centralpay
+          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_DB: centralpay_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U centralpay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check .
+      - name: mypy
+        run: mypy app tests
+      - name: Tag matches application version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          app_version=$(python -c "from app.version import APP_VERSION; print(APP_VERSION)")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$app_version" != "$tag" ]; then
+            echo "::error::Tag v${tag} does not match app.version APP_VERSION=${app_version}"
+            exit 1
+          fi
+      - name: Migration chain (empty database, one revision at a time)
+        env:
+          DATABASE_URL: postgresql+psycopg://centralpay:ci_test_password@localhost:5432/centralpay_test
+        run: |
+          for rev in 0001 0002 0003 0004; do
+            alembic upgrade "$rev"
+          done
+          # A repeated upgrade to head must be a no-op.
+          alembic upgrade head
+          alembic current
+      - name: pytest (unit + PostgreSQL integration + backup/restore)
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://centralpay:ci_test_password@localhost:5432/centralpay_test
+        run: pytest -q
+      - name: Security-critical suites explicitly
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://centralpay:ci_test_password@localhost:5432/centralpay_test
+        run: >
+          pytest -q
+          tests/test_logging_redaction.py
+          tests/test_fault_injection.py
+          tests/test_phase5_hardening.py
+          tests/test_admin_auth.py
+          tests/integration/test_backup_restore.py
+
+  shell:
+    name: ShellCheck and installer checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          bash -n install.sh
+          bash -n scripts/centralpay
+          bash -n scripts/backup.sh
+      - name: ShellCheck
+        run: shellcheck install.sh scripts/centralpay scripts/backup.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Installer and deployment tests
+        run: |
+          pip install -e ".[dev]"
+          pytest -q tests/test_deployment.py tests/test_admin_deployment.py
+
+  docker:
+    name: Docker build, scan, and SBOM
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml (default and admin-bot profile)
+        run: |
+          mkdir -p /tmp/cfg
+          echo dummy > /tmp/cfg/db_password
+          touch /tmp/cfg/centralpay.env /tmp/cfg/Caddyfile
+          export CENTRALPAY_ENV_FILE=/tmp/cfg/centralpay.env
+          export CENTRALPAY_DB_PASSWORD_FILE=/tmp/cfg/db_password
+          export CENTRALPAY_CADDYFILE=/tmp/cfg/Caddyfile
+          docker compose config --quiet
+          docker compose --profile admin-bot config --quiet
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (amd64, loaded for testing)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: centralpay-bridge:release
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build image (arm64, build-only validation)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/arm64
+          tags: centralpay-bridge:release-arm64
+          build-args: |
+            BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha
+      - name: Image smoke test (non-root, version, imports)
+        run: |
+          docker run --rm --entrypoint python centralpay-bridge:release - <<'EOF'
+          import os
+          from app.version import APP_VERSION
+          import app.main, app.worker, app.ops  # noqa: F401
+          assert os.getuid() != 0, "container must not run as root"
+          print("version:", APP_VERSION)
+          EOF
+      - name: Validate Caddyfile template
+        run: |
+          sed -e 's/{{PAYMENT_DOMAIN}}/pay.example.com/' -e 's/{{TLS_EMAIL}}/ops@example.com/' \
+            deploy/caddy/Caddyfile.template > /tmp/Caddyfile
+          docker run --rm -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2 \
+            caddy validate --config /etc/caddy/Caddyfile
+      - name: Trivy vulnerability scan (image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: centralpay-bridge:release
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+      - name: Syft SBOM (SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: centralpay-bridge:release
+          format: spdx-json
+          output-file: sbom-centralpay-bridge.spdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-centralpay-bridge.spdx.json
+          if-no-files-found: error
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit
+        run: |
+          pip install .
+          pip install pip-audit
+          pip-audit
+
+  docs:
+    name: Documentation checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Required release documents exist
+        run: |
+          for f in CHANGELOG.md RELEASE_NOTES_0.5.0_RC1.md RELEASE_RISK_REGISTER.md \
+                   MIGRATION_GUIDE.md REAL_HOST_VALIDATION.md STAGING_VALIDATION.md \
+                   ADMIN_BOT_VALIDATION.md PRODUCTION_CHECKLIST_FA.md \
+                   README.md README_FA.md INSTALL_FA.md OPERATIONS_FA.md \
+                   BACKUP_RESTORE_FA.md ADMIN_BOT_FA.md SECURITY.md; do
+            [ -f "$f" ] || { echo "::error::missing required document: $f"; exit 1; }
+          done
+      - name: Local links resolve
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --no-progress --include-fragments "**/*.md"
+          fail: true
+
+  package:
+    name: Package artifacts and draft release
+    needs: [quality, shell, docker, secret-scan, dependency-scan, docs]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Determine version
+        id: version
+        run: |
+          pip install -e . >/dev/null
+          echo "version=$(python -c 'from app.version import APP_VERSION; print(APP_VERSION)')" \
+            >> "$GITHUB_OUTPUT"
+      - name: Build source artifact (tracked files only)
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          git archive --format=tar.gz \
+            --prefix="centralpay-bridge-${version}/" \
+            -o "centralpay-bridge-${version}.tar.gz" HEAD
+      - name: Verify artifact contains no secrets or dumps
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if tar -tzf "centralpay-bridge-${version}.tar.gz" \
+              | grep -E '(^|/)\.env$|\.dump$|\.pem$|\.key$'; then
+            echo "::error::artifact contains files that must never ship"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+      - name: SHA256SUMS
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sha256sum "centralpay-bridge-${version}.tar.gz" \
+            sbom-centralpay-bridge.spdx.json > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            centralpay-bridge-*.tar.gz
+            sbom-centralpay-bridge.spdx.json
+            SHA256SUMS
+          if-no-files-found: error
+      - name: Create DRAFT release (never published automatically)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "centralpay-bridge ${version}" \
+            --notes-file "RELEASE_NOTES_0.5.0_RC1.md" \
+            "centralpay-bridge-${version}.tar.gz" \
+            sbom-centralpay-bridge.spdx.json \
+            SHA256SUMS
+          echo "Draft release created. Publishing requires an explicit human decision."
