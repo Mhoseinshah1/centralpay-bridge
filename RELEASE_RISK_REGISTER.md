@@ -202,8 +202,16 @@ unaccounted for — the top priority of AGENTS.md.
 
 ### 21. Off-site backup replication — **ACCEPTED RISK; backlog**
 - Backups are local; replication is a documented manual recommendation
-  (`BACKUP_RESTORE_FA.md`). The restore path itself is now proven by an
-  automated pg_dump/pg_restore round-trip integration test.
+  (`BACKUP_RESTORE_FA.md`). **A local backup on the same VPS is not
+  disaster recovery** — this is stated explicitly in the operator docs.
+- Backup-audit update: backups now carry SHA-256 manifests verified
+  before restore (legacy files require RESTORE-LEGACY), backup/restore
+  hold a shared exclusive lock, restores run --exit-on-error with all
+  writers stopped (admin bot included), and service startup is gated on
+  a post-restore integrity check with sequence repair
+  (`centralpay db-check`). Full-state restore fidelity (every payment
+  state + audit history + alert outbox + sequence safety) is proven by
+  integration tests on real PostgreSQL.
 
 ## Topics 22–25 (Phase 4)
 

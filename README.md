@@ -58,7 +58,9 @@ the adversarial review, and a green release workflow. Original topics:
 - One-line interactive installer for Ubuntu 22.04 / 24.04 / 26.04
 - `centralpay` management command (status, logs, diagnose, backup, restore,
   update, ssl, uninstall, …)
-- Validated daily PostgreSQL backups via a host systemd timer
+- Validated daily PostgreSQL backups via a host systemd timer — atomic
+  creation, SHA-256 manifest sidecars, checksum-verified restores with a
+  post-restore integrity check (`centralpay db-check`)
 - Configurable payment amount bounds; application version in `/health/live`
 - GitHub Actions CI (tests, lint, types, ShellCheck, Docker build, compose
   validation, secret and dependency scanning)

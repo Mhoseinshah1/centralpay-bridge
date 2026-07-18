@@ -28,6 +28,9 @@ curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main
 راهنمای کامل نصب: [INSTALL_FA.md](INSTALL_FA.md) —
 بهره‌برداری: [OPERATIONS_FA.md](OPERATIONS_FA.md) —
 پشتیبان‌گیری و بازیابی: [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md)
+(بکاپ‌ها با checksum اعتبارسنجی می‌شوند و بازیابی پیش از راه‌اندازی
+سرویس‌ها یکپارچگی پایگاه‌داده را بررسی می‌کند؛ **بکاپ محلی، بازیابی
+از فاجعه نیست**)
 
 ## وضعیت فازها
 
