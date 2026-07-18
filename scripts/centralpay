@@ -46,6 +46,14 @@ Inspection:
   manual-review          Payments requiring administrator review
   credentials            Show the installation summary (root only)
 
+Administrator Telegram bot:
+  admin-bot status       Admin bot container state and configuration state
+  admin-bot logs         Admin bot logs
+  admin-bot restart      Restart the admin bot service
+  admin-bot enable       Validate configuration and start the admin bot
+  admin-bot disable      Stop the admin bot (configuration preserved)
+  admin-bot test-alert   Queue a clearly marked test message to administrators
+
 Removal:
   uninstall              Remove services (data and backups preserved by default)
 EOF
@@ -61,7 +69,13 @@ require_install() {
 }
 
 compose() {
-    docker compose --project-directory "$INSTALL_DIR" "$@"
+    # The admin-bot service lives behind a Compose profile keyed off the
+    # single source of truth in the config env file.
+    local -a profile_args=()
+    if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        profile_args=(--profile admin-bot)
+    fi
+    docker compose --project-directory "$INSTALL_DIR" "${profile_args[@]}" "$@"
 }
 
 env_value() {
@@ -372,6 +386,75 @@ cmd_version() {
     echo "docker:      $(docker --version 2>/dev/null || echo unavailable)"
 }
 
+cmd_admin_bot() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status)
+            require_install
+            local enabled="disabled"
+            grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null && enabled="enabled"
+            echo "configuration: ${enabled}"
+            local ids
+            ids=$(env_value ADMIN_TELEGRAM_IDS)
+            if [[ -n "$ids" ]]; then
+                echo "administrators: $(echo "$ids" | tr ',' '\n' | grep -c .) configured"
+            else
+                echo "administrators: none configured"
+            fi
+            local cid
+            cid=$(compose ps -q admin-bot 2>/dev/null || true)
+            if [[ -n "$cid" ]]; then
+                echo "container: $(docker inspect -f '{{.State.Status}} (health: {{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}})' "$cid")"
+            else
+                echo "container: not running"
+            fi
+            ;;
+        logs)
+            require_install
+            compose logs --tail 200 -f admin-bot
+            ;;
+        restart)
+            require_root admin-bot restart
+            require_install
+            compose restart admin-bot
+            ;;
+        enable)
+            require_root admin-bot enable
+            require_install
+            # Validate presence without ever printing the token value.
+            [[ -n "$(env_value ADMIN_BOT_TOKEN)" ]] \
+                || fail "ADMIN_BOT_TOKEN is empty in ${ENV_FILE}. Add the BotFather token first."
+            local ids
+            ids=$(env_value ADMIN_TELEGRAM_IDS)
+            [[ "$ids" =~ ^[0-9]+(,[0-9]+)*$ ]] \
+                || fail "ADMIN_TELEGRAM_IDS must be comma-separated numeric Telegram user IDs."
+            sed -i 's/^ADMIN_BOT_ENABLED=.*/ADMIN_BOT_ENABLED=true/' "$ENV_FILE"
+            compose up -d --wait admin-bot
+            log "Admin bot enabled and started."
+            ;;
+        disable)
+            require_root admin-bot disable
+            require_install
+            # Stop the service; configuration (including the token) is
+            # preserved unless the administrator edits the env file.
+            compose --profile admin-bot stop admin-bot 2>/dev/null || true
+            sed -i 's/^ADMIN_BOT_ENABLED=.*/ADMIN_BOT_ENABLED=false/' "$ENV_FILE"
+            log "Admin bot disabled. Configuration preserved in ${ENV_FILE}."
+            ;;
+        test-alert)
+            require_root admin-bot test-alert
+            require_install
+            grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null \
+                || fail "Admin bot is disabled. Enable it first: centralpay admin-bot enable"
+            compose exec -T api python -m app.ops test-alert
+            ;;
+        *)
+            fail "Unknown admin-bot subcommand: ${sub} (status|logs|restart|enable|disable|test-alert)"
+            ;;
+    esac
+}
+
 cmd_uninstall() {
     require_root uninstall
     require_install
@@ -435,6 +518,7 @@ main() {
         retry-queue)   cmd_app_cli retry-queue "$@" ;;
         manual-review) cmd_app_cli manual-review "$@" ;;
         credentials)   cmd_credentials "$@" ;;
+        admin-bot)     cmd_admin_bot "$@" ;;
         ssl)           cmd_ssl "$@" ;;
         version)       cmd_version "$@" ;;
         uninstall)     cmd_uninstall "$@" ;;

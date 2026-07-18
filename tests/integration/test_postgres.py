@@ -45,9 +45,14 @@ pytestmark = [
 
 def _drop_all(engine) -> None:
     with engine.begin() as connection:
-        connection.execute(text("DROP TABLE IF EXISTS payment_events CASCADE"))
-        connection.execute(text("DROP TABLE IF EXISTS payments CASCADE"))
-        connection.execute(text("DROP TABLE IF EXISTS alembic_version CASCADE"))
+        for table in (
+            "admin_alerts",
+            "worker_heartbeats",
+            "payment_events",
+            "payments",
+            "alembic_version",
+        ):
+            connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
 
 
 @pytest.fixture

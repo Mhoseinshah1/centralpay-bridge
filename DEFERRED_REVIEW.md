@@ -23,6 +23,14 @@ run in the development sandbox (registry access blocked by network policy)
 and is delegated to the CI `docker` job. The multi-agent adversarial
 review remains outstanding.
 
+Status update (Phase 4): optional read-only administrator Telegram bot
+added (alert outbox, health monitor, daily report, worker DB heartbeats,
+hardened admin-bot container). Focused Phase 4 tests, the full quick
+suite, PostgreSQL integration (migration 0003), Ruff, mypy, ShellCheck,
+and compose validation pass. Live Telegram delivery was not exercised
+(mocked in tests, per instruction). The multi-agent adversarial review
+remains outstanding.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection
@@ -184,6 +192,30 @@ version logic is validated in tests instead.
 ### 21. Off-site backup replication
 Backups are local to the server. Replication to off-site storage is
 documented as a manual recommendation only.
+
+## New unresolved topics from Phase 4
+
+### 22. Live Telegram integration untested
+All Telegram interaction is exercised against mocks/fakes (per phase
+instructions). A supervised test against the real Telegram Bot API
+(polling, 429 behavior, HTML rendering of Persian messages) is required
+before relying on alerts operationally.
+
+### 23. Duplicate alert delivery on stale-claim recovery
+A crashed admin-bot instance releases its `sending` claims back to
+pending; the alert may then be sent twice. Accepted deliberately (alerts
+are operational, never financial), but reviewers should confirm the
+duplicate-message trade-off.
+
+### 24. Health monitor counters are in-memory
+Consecutive-failure/recovery counters reset on admin-bot restart, which
+can delay (never fabricate) an unhealthy or recovery alert by one cycle.
+
+### 25. Admin bot resolution tooling still absent
+The bot is read-only by design (per AGENTS.md a Telegram /retry command
+must not exist until retry safety and authorization are separately
+reviewed). Resolving manual_review payments still requires direct,
+audited database work.
 
 ## Deferred checks
 
