@@ -33,10 +33,22 @@ class SignatureFailureTracker:
     once per window.
     """
 
-    def __init__(self, threshold: int = 5, window_seconds: float = 600.0) -> None:
+    def __init__(
+        self,
+        threshold: int = 5,
+        window_seconds: float = 600.0,
+        max_events: int = 1000,
+    ) -> None:
         self.threshold = threshold
         self.window_seconds = window_seconds
-        self._events: deque[float] = deque()
+        # Bounded deque (audit fix): every invalid-signature request used to
+        # append a timestamp with no cap, so an unauthenticated flood could
+        # grow this deque without limit for the whole window (memory
+        # exhaustion on the public callback path). With maxlen, the oldest
+        # timestamps are discarded once the bound is hit; the reported count
+        # then means "at least N within the window", which is all the storm
+        # alert needs.
+        self._events: deque[float] = deque(maxlen=max_events)
         self._lock = threading.Lock()
         # None means "never reported". A numeric sentinel like 0.0 would be
         # wrong: time.monotonic() has an arbitrary epoch, and on a freshly
@@ -79,10 +91,28 @@ def centralpay_callback(
     db: DbDep,
     settings: SettingsDep,
     client: CentralPayDep,
-    order_id: int = Query(alias="orderId"),
-    ct: str = Query(min_length=1, max_length=64),
-    sig: str = Query(min_length=1, max_length=128),
+    # Bounds and charsets mirror what this bridge itself generates:
+    # gateway_order_id is a positive integer well inside BIGINT, ct is
+    # lowercase hex from secrets.token_hex, sig is lowercase hex SHA-256.
+    # Anything else is rejected by validation before any HMAC or database
+    # work.
+    order_id: int = Query(alias="orderId", ge=1, le=999_999_999_999_999_999),
+    ct: str = Query(min_length=1, max_length=64, pattern="^[0-9a-f]+$"),
+    sig: str = Query(min_length=1, max_length=128, pattern="^[0-9a-f]+$"),
 ) -> HTMLResponse:
+    # HTTP parameter pollution defence (audit fix): frameworks and
+    # intermediaries disagree on whether the first or the last duplicate
+    # query parameter wins (Starlette uses the last), so a request carrying
+    # ANY repeated security parameter is rejected outright — before
+    # signature validation. CentralPay redirects the payer to the exact URL
+    # this bridge generated, which contains each parameter exactly once, so
+    # legitimate traffic is unaffected.
+    for name in ("orderId", "ct", "sig"):
+        if len(request.query_params.getlist(name)) != 1:
+            logger.warning(
+                "callback_duplicate_query_parameter", extra={"parameter": name}
+            )
+            raise InvalidCallbackSignatureError()
     # The signature binds orderId and the one-time callback token together;
     # both are validated cryptographically before any database work. The
     # token's durable consumption state is checked inside the row lock.
