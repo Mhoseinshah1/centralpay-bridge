@@ -46,6 +46,21 @@ tests now prove the crash-window behavior of topic 5. Release blockers B1
 (release workflow green) remain open — see the risk register for the
 authoritative status of every item.
 
+Status update (payment-creation audit, audit/payment-creation-idempotency):
+the creation path was audited end to end. Fixed: lax Pydantic coercion
+(bool True→1, integral floats, numeric strings were silently accepted as
+amounts) and control characters/NUL in order_id (NUL reached PostgreSQL
+and produced a 500) — the schema is now strict with no side effects for
+malformed requests. Confirmed safe and now regression-tested: idempotency
+under 10-way identical concurrency (one row, one getLink, one link
+event), conflicting-amount races, unique random gateway-id allocation
+(DB-unique, restore-safe, guess-resistant), crash recovery before and
+after getLink with atomic token+URL persistence, and duplicate handling
+for verified and manual-review payments. The getLink transaction model is
+documented as model A (row lock held across getLink, bounded by
+CENTRALPAY_TIMEOUT_SECONDS). Topics 8 and part of 10 are substantially
+narrowed by these tests; the full adversarial review (B4) remains open.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection

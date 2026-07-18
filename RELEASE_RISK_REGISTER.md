@@ -102,6 +102,11 @@ unaccounted for — the top priority of AGENTS.md.
   `SKIP LOCKED` worker claims, PostgreSQL concurrency tests (concurrent
   callbacks verify exactly once; concurrent creates return one link;
   racing workers claim once), fault-injection at transaction boundaries.
+- Narrowed by the callback and payment-creation audits: 10-way identical
+  create races (one row, one getLink, one event), conflicting-amount
+  races, unique gateway-id allocation under concurrency, stale-token
+  callback races, and post-verification replay storms are now
+  deterministically tested on real PostgreSQL.
 - Residual: the full adversarial concurrency review (lock pile-ups under
   callback floods, gateway latency at the lock boundary) was never
   completed → part of **blocker B4**.

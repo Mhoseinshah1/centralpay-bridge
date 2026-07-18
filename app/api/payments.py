@@ -3,7 +3,7 @@
 import logging
 
 from fastapi import APIRouter, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
 from app.exceptions import AmountOutOfRangeError, InvalidApiKeyError, RateLimitedError
@@ -16,9 +16,27 @@ router = APIRouter()
 
 
 class CreatePaymentRequest(BaseModel):
-    api_key: str
-    amount: int = Field(gt=0, description="Amount in TOMAN")
-    order_id: str = Field(min_length=1, max_length=128)
+    """Strict request contract (audit: no silent coercion).
+
+    - api_key: string; never logged, never echoed in errors.
+    - amount: JSON **integer** TOMAN. Booleans, floats, and numeric
+      strings are rejected, never coerced (bool is a Python int subtype
+      and would otherwise coerce True -> 1). The ``le`` bound is an
+      absolute schema backstop far above any legitimate payment and far
+      below BIGINT; the operational policy bounds are
+      MIN/MAX_PAYMENT_AMOUNT_TOMAN, enforced after authentication.
+    - order_id: opaque non-empty string, at most 128 characters, no
+      control characters and no NUL (NUL previously reached PostgreSQL
+      and produced a 500). It is passed through byte-exact — never
+      trimmed, case-folded, or Unicode-normalized — because the bot
+      contract treats it as an opaque identifier.
+    """
+
+    api_key: StrictStr
+    amount: StrictInt = Field(gt=0, le=1_000_000_000_000, description="Amount in TOMAN")
+    order_id: StrictStr = Field(
+        min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$"
+    )
 
 
 class CreatePaymentResponse(BaseModel):
@@ -45,6 +63,12 @@ def create_custom_payment(
         raise InvalidApiKeyError()
     if not limiters.check(limiters.create, "create_payment"):
         raise RateLimitedError()
+    # Logged only AFTER authentication so unauthenticated probes cannot
+    # write attacker-chosen order ids into this event stream.
+    logger.info(
+        "payment_create_requested",
+        extra={"bot_order_id": body.order_id, "amount": body.amount},
+    )
     if not (
         settings.min_payment_amount_toman <= body.amount <= settings.max_payment_amount_toman
     ):

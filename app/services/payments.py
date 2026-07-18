@@ -41,12 +41,23 @@ _GATEWAY_ORDER_ID_ATTEMPTS = 5
 
 
 def _generate_gateway_order_id(db: Session) -> int:
+    """Allocate a random 12-digit gateway order id.
+
+    Random (not a sequence) deliberately: ids are payer-visible in the
+    CentralPay flow, so they must not be guessable or reveal volume, and
+    random allocation has no sequence to drift or reset after a backup
+    restore. Uniqueness is not probabilistic — it is enforced by the
+    unique index on payments.gateway_order_id; this pre-check plus the
+    IntegrityError path in _ensure_payment_row handle the (negligible)
+    collision case, and a fresh id is drawn on retry.
+    """
     for _ in range(_GATEWAY_ORDER_ID_ATTEMPTS):
         candidate = _GATEWAY_ORDER_ID_MIN + secrets.randbelow(_GATEWAY_ORDER_ID_SPAN)
         exists = db.execute(
             select(Payment.id).where(Payment.gateway_order_id == candidate)
         ).first()
         if exists is None:
+            logger.info("gateway_order_id_allocated", extra={"gateway_order_id": candidate})
             return candidate
     raise GatewayOrderIdAllocationError()
 
@@ -136,6 +147,14 @@ def create_payment(
         raise OrderUnderReviewError()
     if payment.status == PaymentStatus.LINK_CREATED.value and payment.redirect_url:
         db.rollback()
+        logger.info(
+            "payment_duplicate_returned",
+            extra={
+                "payment_id": payment.id,
+                "bot_order_id": bot_order_id,
+                "gateway_order_id": payment.gateway_order_id,
+            },
+        )
         return payment.redirect_url
 
     # Status is created or getlink_failed: attempt link creation while holding
@@ -152,6 +171,10 @@ def create_payment(
     payment.callback_token_issued_at = datetime.now(UTC)
 
     return_url = build_callback_url(settings, payment.gateway_order_id, callback_token)
+    logger.info(
+        "payment_link_creation_started",
+        extra={"payment_id": payment.id, "gateway_order_id": payment.gateway_order_id},
+    )
     try:
         redirect_url = client.get_link(
             amount=payment.amount,
