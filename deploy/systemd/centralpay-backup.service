@@ -1,0 +1,10 @@
+[Unit]
+Description=CentralPay Bridge PostgreSQL backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/centralpay-bridge/scripts/backup.sh
+Nice=10
+IOSchedulingClass=idle

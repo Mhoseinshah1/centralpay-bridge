@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# CentralPay Bridge management command. Installed to /usr/local/bin/centralpay.
+# Never prints API keys, tokens, database passwords, callback secrets, or the
+# full environment file.
+
+set -Eeuo pipefail
+
+INSTALL_DIR="${CENTRALPAY_INSTALL_DIR:-/opt/centralpay-bridge}"
+CONFIG_DIR="${CENTRALPAY_CONFIG_DIR:-/etc/centralpay-bridge}"
+BACKUP_DIR="${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}"
+ENV_FILE="${CONFIG_DIR}/centralpay.env"
+CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
+
+log()  { printf '\033[1;32m[centralpay]\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m[centralpay] WARNING:\033[0m %s\n' "$*" >&2; }
+fail() { printf '\033[1;31m[centralpay] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
+trap 'printf "\033[1;31m[centralpay] Command failed.\033[0m\n" >&2' ERR
+
+usage() {
+    cat <<'EOF'
+Usage: centralpay COMMAND [ARGS]
+
+Service:
+  status                 Overall health and state summary
+  logs [COMPONENT]       Recent + live logs (api|worker|db|caddy)
+  logs-errors [COMPONENT] Warning/error events only
+  restart | stop | start Service lifecycle
+  version                Application and stack versions
+
+Deployment:
+  update                 Backup, fetch configured ref, rebuild, migrate, restart
+  migrate [SUB]          Run migrations (SUB: upgrade|current|history; default upgrade)
+  ssl                    Re-check DNS and retry TLS certificate issuance
+
+Data:
+  backup                 Create a validated PostgreSQL backup now
+  backups                List backups with validation state
+  restore FILE [--yes]   Restore a backup (asks for confirmation)
+
+Inspection:
+  diagnose               Full system diagnosis (no secrets printed)
+  payment ORDER_ID       One payment with its audit history
+  recent                 Most recent payments
+  retry-queue            Payments awaiting bot notification
+  manual-review          Payments requiring administrator review
+  credentials            Show the installation summary (root only)
+
+Removal:
+  uninstall              Remove services (data and backups preserved by default)
+EOF
+}
+
+require_root() {
+    [[ "$(id -u)" -eq 0 ]] || fail "This command requires root. Use: sudo centralpay $*"
+}
+
+require_install() {
+    [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] \
+        || fail "No installation found in ${INSTALL_DIR}. Run the installer first."
+}
+
+compose() {
+    docker compose --project-directory "$INSTALL_DIR" "$@"
+}
+
+env_value() {
+    # $1 = variable name; reads the config env file without exposing others.
+    grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true
+}
+
+payment_domain() {
+    env_value PUBLIC_BASE_URL | sed -E 's#^https?://##'
+}
+
+psql_count() {
+    # $1 = SQL; prints a number or "n/a".
+    compose exec -T db psql -U centralpay -d centralpay -tAc "$1" 2>/dev/null | tr -d '[:space:]' || echo "n/a"
+}
+
+app_version() {
+    grep -E '^APP_VERSION' "${INSTALL_DIR}/app/version.py" 2>/dev/null \
+        | sed -E 's/.*"(.*)".*/\1/' || echo "unknown"
+}
+
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    require_install
+    local domain
+    domain=$(payment_domain)
+    echo "CentralPay Bridge status"
+    echo "========================"
+    echo
+    echo "-- Containers --"
+    compose ps 2>/dev/null || warn "Cannot query containers (is Docker running?)"
+    echo
+    echo "-- Health --"
+    for svc in api worker db caddy; do
+        local cid state health
+        cid=$(compose ps -q "$svc" 2>/dev/null || true)
+        if [[ -n "$cid" ]]; then
+            state=$(docker inspect -f '{{.State.Status}}' "$cid" 2>/dev/null || echo unknown)
+            health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}}' "$cid" 2>/dev/null || echo n/a)
+            printf '  %-8s state=%s health=%s\n' "$svc" "$state" "$health"
+        else
+            printf '  %-8s not running\n' "$svc"
+        fi
+    done
+    echo
+    echo "-- Public health --"
+    if [[ -n "$domain" ]]; then
+        local code
+        code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "https://${domain}/health/ready" 2>/dev/null || echo "000")
+        echo "  https://${domain}/health/ready -> HTTP ${code}"
+        if [[ "$code" == "200" ]]; then
+            echo "  TLS: active"
+        else
+            echo "  TLS: not confirmed (DNS pending, certificate pending, or service down)"
+        fi
+    else
+        echo "  (domain unknown — configuration unreadable)"
+    fi
+    echo
+    echo "-- Queues --"
+    echo "  pending notifications: $(psql_count "SELECT count(*) FROM payments WHERE status='bot_notify_pending'")"
+    echo "  manual review:         $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review'")"
+    echo
+    echo "-- Backups --"
+    local last_backup
+    last_backup=$(find "$BACKUP_DIR" -name '*.dump' -type f -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2- || true)
+    if [[ -n "$last_backup" ]]; then
+        echo "  last backup: ${last_backup} ($(date -u -r "$last_backup" +%Y-%m-%dT%H:%M:%SZ))"
+    else
+        echo "  last backup: none found in ${BACKUP_DIR}"
+    fi
+    echo
+    echo "-- System --"
+    echo "  disk: $(df -h / | awk 'NR==2 {print $4 " free of " $2 " (" $5 " used)"}')"
+    echo "  docker compose: $(docker compose version --short 2>/dev/null || echo unavailable)"
+    echo "  application: $(app_version)"
+}
+
+cmd_logs() {
+    require_install
+    local svc="${1:-}"
+    if [[ -n "$svc" ]]; then
+        compose logs --tail 200 -f "$svc"
+    else
+        compose logs --tail 100 -f
+    fi
+}
+
+cmd_logs_errors() {
+    require_install
+    local svc="${1:-}"
+    local -a target=()
+    [[ -n "$svc" ]] && target=("$svc")
+    # Structured JSON logs carry "level"; plain logs are matched by keyword.
+    compose logs --tail 1000 "${target[@]}" 2>&1 \
+        | grep -Ei '"level": ?"(warning|error|critical)"|\b(error|warning|critical|fatal)\b' \
+        || echo "No warning or error events in the recent logs."
+}
+
+cmd_migrate() {
+    require_root migrate
+    require_install
+    local sub="${1:-upgrade}"
+    case "$sub" in
+        upgrade) compose run --rm migrate alembic upgrade head ;;
+        current) compose run --rm migrate alembic current ;;
+        history) compose run --rm migrate alembic history ;;
+        *) fail "Unknown migrate subcommand: ${sub} (use upgrade|current|history)" ;;
+    esac
+}
+
+cmd_update() {
+    require_root update
+    require_install
+    local ref previous
+    ref=$(env_value CENTRALPAY_UPDATE_REF)
+    ref="${ref:-main}"
+    previous=$(git -C "$INSTALL_DIR" rev-parse HEAD)
+    if [[ "$ref" == "main" ]]; then
+        warn "Update ref is 'main' (DEVELOPMENT MODE). Pin CENTRALPAY_UPDATE_REF to a release tag for production."
+    fi
+    log "Creating pre-update backup..."
+    "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-update backup failed; update aborted."
+    log "Fetching ${ref}..."
+    git -C "$INSTALL_DIR" fetch --tags origin "$ref"
+    git -C "$INSTALL_DIR" checkout -q FETCH_HEAD
+    log "Building images..."
+    compose build --quiet
+    log "Applying migrations and restarting services..."
+    if compose up -d --wait; then
+        log "Update complete: $(git -C "$INSTALL_DIR" rev-parse --short HEAD) (was ${previous:0:7})"
+        cmd_status || true
+    else
+        warn "Health checks FAILED after update."
+        warn "Roll back with:"
+        warn "  git -C ${INSTALL_DIR} checkout ${previous}"
+        warn "  centralpay restart"
+        warn "If the database schema changed, restore the pre-update backup:"
+        warn "  centralpay backups   # find the newest file"
+        warn "  centralpay restore FILE"
+        exit 1
+    fi
+}
+
+cmd_backup() {
+    require_root backup
+    require_install
+    "${INSTALL_DIR}/scripts/backup.sh"
+}
+
+cmd_backups() {
+    echo "Backups in ${BACKUP_DIR}:"
+    local file
+    local found=false
+    for file in "${BACKUP_DIR}"/*.dump; do
+        [[ -e "$file" ]] || continue
+        found=true
+        local state="UNVALIDATED"
+        [[ -f "${file}.ok" ]] && state="OK"
+        printf '  %s  %8s  %s  %s\n' \
+            "$(date -u -r "$file" +%Y-%m-%dT%H:%M:%SZ)" \
+            "$(du -h "$file" | cut -f1)" \
+            "$state" \
+            "$file"
+    done
+    [[ "$found" == "true" ]] || echo "  (none)"
+}
+
+cmd_restore() {
+    require_root restore
+    require_install
+    local file="${1:-}" confirm="${2:-}"
+    [[ -n "$file" ]] || fail "Usage: centralpay restore FILE [--yes]"
+    [[ -f "$file" ]] || fail "Backup file not found: ${file}"
+
+    log "Verifying backup file..."
+    compose exec -T db pg_restore --list < "$file" > /dev/null \
+        || fail "The file is not a valid pg_dump custom-format backup."
+
+    if [[ "$confirm" != "--yes" ]]; then
+        echo "This will REPLACE the current database with: ${file}"
+        echo "A pre-restore backup will be created first."
+        local answer
+        read -r -p "Type RESTORE to continue: " answer < /dev/tty
+        [[ "$answer" == "RESTORE" ]] || fail "Restore cancelled."
+    fi
+
+    log "Creating pre-restore backup..."
+    "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-restore backup failed; restore aborted."
+
+    log "Stopping API and worker..."
+    compose stop api worker
+
+    log "Restoring database..."
+    compose exec -T db psql -U centralpay -d postgres -c \
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='centralpay' AND pid <> pg_backend_pid();" >/dev/null
+    compose exec -T db psql -U centralpay -d postgres -c "DROP DATABASE IF EXISTS centralpay;" >/dev/null
+    compose exec -T db psql -U centralpay -d postgres -c "CREATE DATABASE centralpay OWNER centralpay;" >/dev/null
+    compose exec -T db pg_restore -U centralpay -d centralpay --no-owner --role=centralpay < "$file"
+
+    log "Running migrations..."
+    compose run --rm migrate alembic upgrade head
+
+    log "Restarting services..."
+    compose up -d --wait || fail "Services failed health checks after restore."
+    logger -t centralpay "database restore completed from ${file}" 2>/dev/null || true
+    log "Restore complete. The supplied backup file was preserved."
+}
+
+cmd_diagnose() {
+    require_install
+    local domain
+    domain=$(payment_domain)
+    echo "CentralPay Bridge diagnostics (no secrets are printed)"
+    echo "======================================================"
+    # shellcheck disable=SC1091
+    echo "OS:            $(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}")"
+    echo "Architecture:  $(uname -m)"
+    echo "Memory:        $(awk '/MemTotal/ {printf "%d MB", $2/1024}' /proc/meminfo)"
+    echo "Disk:          $(df -h / | awk 'NR==2 {print $4 " free of " $2}')"
+    echo "Docker:        $(docker --version 2>/dev/null || echo unavailable)"
+    echo "Compose:       $(docker compose version --short 2>/dev/null || echo unavailable)"
+    echo
+    echo "-- Containers --"
+    compose ps 2>/dev/null || echo "unavailable"
+    echo
+    echo "-- Database --"
+    echo "readiness:     $(compose exec -T db pg_isready -U centralpay -d centralpay 2>/dev/null || echo 'NOT READY')"
+    echo "migration:     $(psql_count "SELECT version_num FROM alembic_version")"
+    echo "pending queue: $(psql_count "SELECT count(*) FROM payments WHERE status='bot_notify_pending'")"
+    echo "manual review: $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review'")"
+    echo
+    echo "-- API --"
+    echo "local ready:   $(compose exec -T api curl -fsS --max-time 5 http://127.0.0.1:8000/health/ready 2>/dev/null || echo 'NOT READY')"
+    if [[ -n "$domain" ]]; then
+        echo "public ready:  HTTP $(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "https://${domain}/health/ready" 2>/dev/null || echo 000)"
+        echo
+        echo "-- Network --"
+        echo "DNS:           ${domain} -> $(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1 {print $1}' || echo 'does not resolve')"
+        echo "port 80:       $(ss -ltnH 'sport = :80' | head -1 | awk '{print $4}' || echo 'not listening')"
+        echo "port 443:      $(ss -ltnH 'sport = :443' | head -1 | awk '{print $4}' || echo 'not listening')"
+        echo "TLS cert:      $(echo | openssl s_client -servername "$domain" -connect "${domain}:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null || echo 'no certificate')"
+        echo "CentralPay:    $(curl -sS --max-time 10 -o /dev/null -w 'HTTP %{http_code}' https://centralapi.org 2>/dev/null || echo unreachable)"
+        local bot_url bot_host
+        bot_url=$(env_value BOT_PAYMENT_NOTIFY_URL)
+        if [[ -n "$bot_url" ]]; then
+            bot_host=$(echo "$bot_url" | sed -E 's#^https?://([^/:]+).*#\1#')
+            echo "Bot API host:  ${bot_host} -> $(curl -sS --max-time 10 -o /dev/null -w 'HTTP %{http_code}' "https://${bot_host}" 2>/dev/null || echo unreachable)"
+        fi
+    fi
+    echo
+    echo "-- Backups --"
+    cmd_backups
+    echo
+    echo "-- Recent errors (last 200 lines) --"
+    compose logs --tail 200 2>&1 \
+        | grep -Ei '"level": ?"(error|critical)"' \
+        | tail -20 || echo "none"
+}
+
+cmd_ssl() {
+    require_root ssl
+    require_install
+    local domain
+    domain=$(payment_domain)
+    [[ -n "$domain" ]] || fail "Cannot determine the payment domain from configuration."
+    log "Checking DNS for ${domain}..."
+    local server_ip domain_ip
+    server_ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)
+    domain_ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1 {print $1}' || true)
+    if [[ -z "$domain_ip" ]]; then
+        fail "DNS for ${domain} does not resolve yet. Point it to ${server_ip:-this server} and retry."
+    fi
+    if [[ -n "$server_ip" && "$domain_ip" != "$server_ip" ]]; then
+        warn "DNS resolves to ${domain_ip} but this server appears to be ${server_ip}. Certificates may fail."
+    fi
+    log "Restarting Caddy to retry certificate issuance..."
+    compose restart caddy
+    sleep 5
+    local code
+    code=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "https://${domain}/health/live" 2>/dev/null || echo "000")
+    if [[ "$code" == "200" ]]; then
+        log "HTTPS is active: https://${domain}/health/live"
+    else
+        warn "HTTPS not confirmed yet (HTTP ${code}). Certificate issuance can take a minute; check: centralpay logs caddy"
+    fi
+}
+
+cmd_app_cli() {
+    require_install
+    compose exec -T api python -m app.cli "$@"
+}
+
+cmd_credentials() {
+    require_root credentials
+    [[ -f "$CREDENTIALS_FILE" ]] || fail "No credentials file at ${CREDENTIALS_FILE}."
+    cat "$CREDENTIALS_FILE"
+}
+
+cmd_version() {
+    echo "application: $(app_version)"
+    if [[ -d "${INSTALL_DIR}/.git" ]]; then
+        echo "git:         $(git -C "$INSTALL_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    fi
+    echo "compose:     $(docker compose version --short 2>/dev/null || echo unavailable)"
+    echo "docker:      $(docker --version 2>/dev/null || echo unavailable)"
+}
+
+cmd_uninstall() {
+    require_root uninstall
+    require_install
+    echo "This stops and removes the CentralPay Bridge containers."
+    echo "By default it PRESERVES: the PostgreSQL data volume, backups, and credentials."
+    local answer
+    read -r -p "Type UNINSTALL to continue: " answer < /dev/tty
+    [[ "$answer" == "UNINSTALL" ]] || fail "Uninstall cancelled."
+
+    systemctl disable --now centralpay-backup.timer 2>/dev/null || true
+    rm -f /etc/systemd/system/centralpay-backup.service /etc/systemd/system/centralpay-backup.timer
+    systemctl daemon-reload 2>/dev/null || true
+
+    compose down
+
+    read -r -p "ALSO DELETE the PostgreSQL data volume (ALL PAYMENT RECORDS)? Type DELETE-DATA to confirm, anything else to keep: " answer < /dev/tty
+    if [[ "$answer" == "DELETE-DATA" ]]; then
+        compose down -v
+        warn "PostgreSQL data volume deleted."
+    else
+        log "PostgreSQL data volume preserved."
+    fi
+
+    read -r -p "ALSO DELETE backups in ${BACKUP_DIR}? Type DELETE-BACKUPS to confirm, anything else to keep: " answer < /dev/tty
+    if [[ "$answer" == "DELETE-BACKUPS" ]]; then
+        rm -rf "$BACKUP_DIR"
+        warn "Backups deleted."
+    else
+        log "Backups preserved in ${BACKUP_DIR}."
+    fi
+
+    log "Configuration and credentials preserved in ${CONFIG_DIR}."
+    read -r -p "Remove the 'centralpay' command itself? [y/N]: " answer < /dev/tty
+    if [[ "$answer" =~ ^[Yy] ]]; then
+        rm -f /usr/local/bin/centralpay
+        log "Management command removed."
+    fi
+    log "Uninstall finished."
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        status)        cmd_status "$@" ;;
+        logs)          cmd_logs "$@" ;;
+        logs-errors)   cmd_logs_errors "$@" ;;
+        restart)       require_root restart; require_install; compose restart ;;
+        stop)          require_root stop; require_install; compose stop ;;
+        start)         require_root start; require_install; compose up -d --wait ;;
+        update)        cmd_update "$@" ;;
+        migrate)       cmd_migrate "$@" ;;
+        backup)        cmd_backup "$@" ;;
+        backups)       cmd_backups "$@" ;;
+        restore)       cmd_restore "$@" ;;
+        diagnose)      cmd_diagnose "$@" ;;
+        payment)       cmd_app_cli payment "$@" ;;
+        recent)        cmd_app_cli recent "$@" ;;
+        retry-queue)   cmd_app_cli retry-queue "$@" ;;
+        manual-review) cmd_app_cli manual-review "$@" ;;
+        credentials)   cmd_credentials "$@" ;;
+        ssl)           cmd_ssl "$@" ;;
+        version)       cmd_version "$@" ;;
+        uninstall)     cmd_uninstall "$@" ;;
+        help|-h|--help|"") usage ;;
+        *) usage; fail "Unknown command: ${cmd}" ;;
+    esac
+}
+
+main "$@"
