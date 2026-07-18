@@ -31,7 +31,7 @@ topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
 - Permanent `payment_events` audit trail
 - Structured JSON logs with request IDs and secret redaction
 
-**Phase 2 — Bot notification and recovery** (this code):
+**Phase 2 — Bot notification and recovery:**
 
 - Safe delivery of verified payments to the bot API with explicit reason
   codes for every non-success state (no generic "stuck")
@@ -42,10 +42,62 @@ topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
   under review)
 - Read-only inspection CLI (`python -m app.cli`)
 
-Not yet implemented (later phases): Docker deployment, installer,
-`centralpay` management command, backups, admin Telegram bot, CI workflows.
+**Phase 3 — Deployment and operations** (this code):
 
-Persian documentation: [README_FA.md](README_FA.md).
+- Production Dockerfile (multi-stage, non-root, amd64/arm64) and Docker
+  Compose stack: `caddy` (TLS) → `api` → `db`, plus `worker` and a one-shot
+  `migrate` service that gates API/worker startup on successful migrations
+- One-line interactive installer for Ubuntu 22.04 / 24.04 / 26.04
+- `centralpay` management command (status, logs, diagnose, backup, restore,
+  update, ssl, uninstall, …)
+- Validated daily PostgreSQL backups via a host systemd timer
+- Configurable payment amount bounds; application version in `/health/live`
+- GitHub Actions CI (tests, lint, types, ShellCheck, Docker build, compose
+  validation, secret and dependency scanning)
+
+Not yet implemented (later phases): admin Telegram bot and alerts (Phase 4),
+remaining hardening/documentation (Phase 5).
+
+Persian documentation: [README_FA.md](README_FA.md),
+[INSTALL_FA.md](INSTALL_FA.md), [OPERATIONS_FA.md](OPERATIONS_FA.md),
+[BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md). Security policy:
+[SECURITY.md](SECURITY.md).
+
+## Production installation
+
+On a fresh Ubuntu 22.04/24.04/26.04 server (amd64 or arm64) with DNS for
+your payment domain pointed at it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main/install.sh | sudo bash
+```
+
+The installer asks for domains, CentralPay keys, the bot token, TLS email,
+amount bounds, and the retry mode; generates the inbound API key, callback
+HMAC secret, and database password; deploys the Docker Compose stack; and
+prints the URLs and generated API token at the end. Configuration and
+secrets live in `/etc/centralpay-bridge/` (mode 0700/0600), never in the
+Git checkout. Backups go to `/var/backups/centralpay-bridge/` daily at
+03:15 with 14-day retention.
+
+Architecture:
+
+```text
+Internet ──► Caddy :80/:443 (automatic TLS) ──► API :8000 ──► PostgreSQL :5432
+                                                     ▲
+             Worker ── PostgreSQL ── Bot API ────────┘   (internal network only;
+                                                          only Caddy publishes ports)
+```
+
+Manage the installation with `centralpay`:
+
+```text
+centralpay status | logs [api|worker|db|caddy] | logs-errors | diagnose
+centralpay restart | stop | start | update | migrate | ssl | version
+centralpay backup | backups | restore FILE
+centralpay payment ORDER_ID | recent | retry-queue | manual-review
+centralpay credentials | uninstall
+```
 
 ## Requirements
 
@@ -248,6 +300,10 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `BOT_NOTIFY_CONNECT_TIMEOUT_SECONDS` / `BOT_NOTIFY_READ_TIMEOUT_SECONDS` | Bot HTTP timeouts (5 / 15) |
 | `BOT_NOTIFY_WORKER_INTERVAL_SECONDS` | Worker poll interval (default 10) |
 | `BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` | Stale-claim threshold; must exceed connect+read timeouts (default 120) |
+| `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |
+| `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |
+| `LOG_FORMAT` | `json` (default) or `text`; both redact secrets |
+| `CALLBACK_SECRET` | Accepted alias for `CALLBACK_HMAC_SECRET` |
 
 ## Security notes
 

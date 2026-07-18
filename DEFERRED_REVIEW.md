@@ -15,6 +15,14 @@ suite, PostgreSQL integration tests, Ruff, mypy, and Alembic migration
 validation were run and pass. The multi-agent adversarial review remains
 outstanding.
 
+Status update (Phase 3): deployment tooling added (Docker Compose, Caddy,
+installer, management command, backups, CI workflows). Focused Phase 3
+deployment tests, the full quick suite, Ruff, mypy, ShellCheck, and
+`docker compose config` validation pass. The Docker image build could not
+run in the development sandbox (registry access blocked by network policy)
+and is delegated to the CI `docker` job. The multi-agent adversarial
+review remains outstanding.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection
@@ -144,6 +152,38 @@ tested (load testing was explicitly out of scope).
 Only verified payments get the payer-facing HTML page. Signature failures,
 unknown payments, and gateway-declined verifications still return JSON
 errors; a payer-friendly failure page is deferred.
+
+## New unresolved topics from Phase 3
+
+### 17. No rate limiting at the proxy
+Stock Caddy has no rate-limit module; adding one requires a custom Caddy
+build (plugin) or an alternative mechanism. Until then, unauthenticated
+endpoints (callback, health) rely on request-size limits, signature
+validation, and upstream capacity. Amount bounds and API-key auth protect
+`custom-payment`. Review before production exposure.
+
+### 18. Base images not digest-pinned
+`python:3.12-slim`, `postgres:16`, and `caddy:2` are tag-pinned, not
+digest-pinned; supply-chain reviewers may want digests plus an update
+process for them.
+
+### 19. Update channel is a Git ref without signature verification
+`centralpay update` fetches `CENTRALPAY_UPDATE_REF` (default `main` —
+development mode) from GitHub over HTTPS but does not verify tags or
+commit signatures. Pin a release tag for production and review signed
+releases before 1.0.
+
+### 20. Installer end-to-end run not executed on real target OSes
+Installer logic is unit-tested (OS/arch rejection, validation, secret
+handling) and ShellCheck-clean, but a full `curl | sudo bash` install has
+not been executed on live Ubuntu 22.04/24.04/26.04 hosts from this
+environment. Required before claiming installer completion (AGENTS.md
+completion criteria). Ubuntu 26.04 CI runners are not yet available;
+version logic is validated in tests instead.
+
+### 21. Off-site backup replication
+Backups are local to the server. Replication to off-site storage is
+documented as a manual recommendation only.
 
 ## Deferred checks
 
