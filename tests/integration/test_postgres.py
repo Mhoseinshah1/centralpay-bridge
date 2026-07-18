@@ -465,3 +465,149 @@ def test_four_workers_drain_queue_exactly_once(
         assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
         assert payment.bot_notify_attempts == 1  # exactly one attempt each
         assert payment.notification_claimed_at is None  # claims released
+
+
+def test_race_duplicate_create_against_callback(settings, pg_app, pg_session_factory):
+    """Final audit race 2: a duplicate create request racing the verifying
+    callback. Whichever wins the row lock, every invariant holds: exactly
+    one verify call, one queued notification, and the create response is
+    either the existing link (200) or the explicit already-verified 409 —
+    never a new link, never a 500."""
+    stub = pg_app.state.centralpay_stub
+    barrier = threading.Barrier(2)
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="pg-cvc", amount=11000).status_code == 200
+        payment = get_payment(pg_session_factory, "pg-cvc")
+        stub.verify_result = verify_ok_response(amount=11000, reference_id="REF-pg-cvc")
+        stub.verify_delay_seconds = 0.3
+        callback_path = valid_callback_path(stub, payment.gateway_order_id)
+
+        def do_create():
+            barrier.wait(timeout=10)
+            return ("create", create_order(client, settings, order_id="pg-cvc", amount=11000))
+
+        def do_callback():
+            barrier.wait(timeout=10)
+            return ("callback", client.get(callback_path))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results = dict(
+                future.result(timeout=60)
+                for future in [pool.submit(do_create), pool.submit(do_callback)]
+            )
+
+    assert results["callback"].status_code == 200
+    create_response = results["create"]
+    assert create_response.status_code in (200, 409)
+    if create_response.status_code == 200:
+        # The pre-existing link was returned; a fresh link was never issued.
+        assert create_response.json()["url"]
+        assert len(stub.getlink_requests) == 1
+    else:
+        assert create_response.json()["error"]["code"] == "order_already_verified"
+
+    assert len(stub.verify_requests) == 1
+    payment = get_payment(pg_session_factory, "pg-cvc")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert payment.reference_id == "REF-pg-cvc"
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("gateway_payment_verified") == 1
+    assert events.count("bot_notification_queued") == 1
+
+
+def test_race_duplicate_callback_against_worker(
+    settings, pg_app, pg_session_factory, bot_stub, notifier
+):
+    """Final audit race 4: a replayed callback racing the delivering worker.
+    Verify runs once total, the bot receives exactly one request, and the
+    callback replay returns a stable final page without resetting state."""
+    from app.services.notification import run_worker_pass
+
+    stub = pg_app.state.centralpay_stub
+    barrier = threading.Barrier(2)
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="pg-cbw", amount=7500).status_code == 200
+        payment = get_payment(pg_session_factory, "pg-cbw")
+        stub.verify_result = verify_ok_response(amount=7500, reference_id="REF-pg-cbw")
+        callback_path = valid_callback_path(stub, payment.gateway_order_id)
+        assert client.get(callback_path).status_code == 200  # verified + queued
+
+        def replay_callback():
+            barrier.wait(timeout=10)
+            return client.get(callback_path)
+
+        def run_worker():
+            barrier.wait(timeout=10)
+            session = pg_session_factory()
+            try:
+                return run_worker_pass(session, notifier, settings, worker_id="pg-race-worker")
+            finally:
+                session.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            callback_future = pool.submit(replay_callback)
+            worker_future = pool.submit(run_worker)
+            replay = callback_future.result(timeout=60)
+            worker_result = worker_future.result(timeout=60)
+
+    assert replay.status_code == 200  # stable final page, whichever state won
+    assert worker_result["processed"] == 1
+    assert len(stub.verify_requests) == 1  # never re-verified
+    assert len(bot_stub.requests) == 1  # delivered exactly once
+    payment = get_payment(pg_session_factory, "pg-cbw")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    assert payment.bot_notify_attempts == 1
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("gateway_payment_verified") == 1
+    assert events.count("bot_notification_queued") == 1
+    assert events.count("bot_notification_accepted") == 1
+
+
+def test_race_review_acknowledge_against_callback(
+    settings, pg_app, pg_session_factory, monkeypatch
+):
+    """Final audit race 7: the manual-review CLI acknowledging while a
+    callback replays against the same payment. The callback can never reset
+    review state; the acknowledgment is durably recorded."""
+    import app.ops as ops_module
+    from app.ops import main as ops_main
+
+    stub = pg_app.state.centralpay_stub
+    barrier = threading.Barrier(2)
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="pg-rvc", amount=9000).status_code == 200
+        payment = get_payment(pg_session_factory, "pg-rvc")
+        # Amount mismatch routes to manual review without a verified fact.
+        stub.verify_result = verify_ok_response(amount=1, reference_id="REF-pg-rvc")
+        callback_path = valid_callback_path(stub, payment.gateway_order_id)
+        assert client.get(callback_path).status_code == 200
+        assert get_payment(pg_session_factory, "pg-rvc").status == PaymentStatus.MANUAL_REVIEW.value
+
+        monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+        monkeypatch.setattr(ops_module, "create_session_factory", lambda url: pg_session_factory)
+        monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+        def acknowledge():
+            barrier.wait(timeout=10)
+            return ops_main(["review", "acknowledge", "pg-rvc", "--note", "race-audit check"])
+
+        def replay_callback():
+            barrier.wait(timeout=10)
+            return client.get(callback_path)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            ack_future = pool.submit(acknowledge)
+            replay_future = pool.submit(replay_callback)
+            ack_code = ack_future.result(timeout=60)
+            replay = replay_future.result(timeout=60)
+
+    assert ack_code == 0
+    assert replay.status_code == 200
+    assert 'data-status="under_review"' in replay.text  # review never reset
+    payment = get_payment(pg_session_factory, "pg-rvc")
+    assert payment.status == PaymentStatus.MANUAL_REVIEW.value
+    assert payment.review_acknowledged_at is not None  # ack survived the race
+    assert payment.gateway_verified_at is None  # never fabricated
+    assert len(stub.verify_requests) == 1  # manual review never re-verifies
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert "manual_review_acknowledged" in events

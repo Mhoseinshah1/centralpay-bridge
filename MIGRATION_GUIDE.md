@@ -2,6 +2,14 @@
 
 How to move an existing installation between versions. General rules:
 
+> **Migration `0005` (final financial audit):** adds three CHECK
+> constraints to `payments` (`amount > 0`, `bot_notify_attempts >= 0`,
+> and delivery-states-require-`gateway_verified_at`). All constraints are
+> valid for every state the application can have produced, so the
+> migration is safe on existing data; adding a CHECK takes a brief
+> table-scan lock (negligible at this system's row counts). Applied
+> automatically by the `migrate` service.
+
 - **Migrations are forward-only.** Audit and financial data are never
   rewritten; the database schema is **never downgraded**.
   `centralpay rollback` rolls back the *application* only.

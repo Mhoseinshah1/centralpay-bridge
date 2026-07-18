@@ -130,6 +130,13 @@ def claim_next_due(db: Session, *, worker_id: str, now: datetime) -> ClaimedPaym
         select(Payment)
         .where(
             Payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value,
+            # Invariant F1/F8 belt-and-braces: a notification is only ever
+            # claimable for a payment whose gateway-verified fact is
+            # durably recorded (queue_notification runs in the verification
+            # transaction, and migration 0005 enforces this at the DB
+            # level; this predicate makes the claim itself refuse anything
+            # anomalous).
+            Payment.gateway_verified_at.is_not(None),
             or_(Payment.next_retry_at.is_(None), Payment.next_retry_at <= now),
             Payment.notification_claimed_at.is_(None),
         )
