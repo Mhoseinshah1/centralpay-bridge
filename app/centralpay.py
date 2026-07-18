@@ -1,12 +1,20 @@
 """HTTP client for the CentralPay basic web service (getLink and verify).
 
 Request payloads contain API keys and must never be logged. Only safe
-metadata (endpoint name, HTTP status, orderId) may appear in logs.
+metadata (endpoint name, HTTP status, orderId, internal reason codes) may
+appear in logs, exceptions, audit events, or API responses.
+
+Gateway-controlled data policy: every byte of a gateway response body
+(message text, HTML, JSON values) is attacker-influenceable-by-gateway
+content. It is parsed, classified into one of the fixed internal reason
+codes below, and then discarded — raw response text never leaves this
+module.
 """
 
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -18,7 +26,16 @@ from app.exceptions import (
 
 logger = logging.getLogger("app.centralpay")
 
-_SAFE_REASON_MAX_LENGTH = 200
+# --- Internal reason codes -------------------------------------------------
+# The ONLY vocabulary allowed to describe a gateway response outside this
+# module. Fixed strings; never derived from response content.
+GATEWAY_RESPONSE_INVALID = "gateway_response_invalid"
+GATEWAY_REJECTED = "gateway_rejected"
+GATEWAY_MISSING_DATA = "gateway_missing_data"
+GATEWAY_INVALID_REDIRECT_URL = "gateway_invalid_redirect_url"
+GATEWAY_INVALID_REFERENCE_ID = "gateway_invalid_reference_id"
+GATEWAY_INVALID_AMOUNT = "gateway_invalid_amount"
+GATEWAY_INVALID_USER_ID = "gateway_invalid_user_id"
 
 # Explicit gateway failure markers. Success detection is conservative: a
 # response is only treated as successful when a data object is present and
@@ -35,7 +52,7 @@ class VerifyResult:
     card_number: str | None
     failure_reason: str | None
     # Explicit parse-level reason codes for gateway-successful responses
-    # whose fields were missing or mistyped (e.g. verify_invalid_amount).
+    # whose fields were missing or mistyped (e.g. gateway_invalid_amount).
     field_errors: tuple[str, ...] = ()
 
 
@@ -81,29 +98,61 @@ def _to_nonempty_str(value: object) -> str | None:
     return None
 
 
-def _safe_reason(body: object) -> str:
-    """Extract a short, safe failure reason from a gateway response body."""
-    if isinstance(body, dict):
-        for key in ("message", "error", "msg", "description"):
-            value = body.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()[:_SAFE_REASON_MAX_LENGTH]
-    return "gateway response did not indicate success"
+def gateway_reason_code(body: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Classify a gateway response into an internal (reason, marker) pair.
 
-
-def _explicit_failure(body: dict[str, Any]) -> str | None:
+    Returns ``(None, None)`` for an explicitly successful response. Both
+    values come from fixed vocabularies — the response's own text is never
+    returned. The marker records WHICH failure signal was present (for
+    debugging) without exposing gateway-controlled content.
+    """
     if body.get("success") is False:
-        return "success=false"
+        return GATEWAY_REJECTED, "success_false"
     status = body.get("status")
     if (
         not isinstance(status, bool)
         and isinstance(status, int | str)
         and str(status).strip().lower() in _FAILURE_STATUS_VALUES
     ):
-        return f"status={status}"
+        return GATEWAY_REJECTED, "failure_status"
     if body.get("error"):
-        return _safe_reason(body)
-    return None
+        return GATEWAY_REJECTED, "error_field"
+    if not _explicit_success(body):
+        # No explicit positive marker: success is never guessed.
+        return GATEWAY_RESPONSE_INVALID, "no_success_marker"
+    return None, None
+
+
+# Redirect URL policy (documented in SECURITY.md): parsed with urlsplit,
+# never substring checks. HTTPS only — CentralPay serves its payment pages
+# over HTTPS, and an http:// redirect would downgrade the payer to
+# cleartext. Bounded length; non-empty hostname; no userinfo credentials;
+# no whitespace or control characters.
+_REDIRECT_URL_MAX_LENGTH = 2048
+
+
+def _validate_redirect_url(value: object) -> str | None:
+    """Return the validated redirect URL, or None if it must be rejected."""
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or len(url) > _REDIRECT_URL_MAX_LENGTH:
+        return None
+    if any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in url):
+        return None
+    try:
+        parts = urlsplit(url)
+        hostname = parts.hostname
+        _ = parts.port  # raises ValueError for a malformed port (":abc")
+    except ValueError:
+        return None
+    if parts.scheme != "https":
+        return None
+    if not hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    return url
 
 
 class CentralPayClient:
@@ -163,28 +212,35 @@ class CentralPayClient:
             "returnUrl": return_url,
         }
         body = self._post_json("getLink.php", payload)
-        failure = _explicit_failure(body)
-        if failure is not None:
-            reason = f"getlink_rejected: {failure}"
-        elif not _explicit_success(body):
-            # No explicit positive marker: success is never guessed.
-            reason = "getlink_response_unrecognized"
-        else:
+        reason, marker = gateway_reason_code(body)
+        redirect_url: str | None = None
+        if reason is None:
             data = body.get("data")
             if not isinstance(data, dict):
-                reason = "getlink_missing_data"
+                reason = GATEWAY_MISSING_DATA
             else:
-                redirect_url = data.get("redirectUrl")
-                if (
-                    isinstance(redirect_url, str)
-                    and redirect_url.strip().startswith(("https://", "http://"))
-                ):
-                    logger.info("centralpay_getlink_ok", extra={"gateway_order_id": order_id})
-                    return redirect_url.strip()
-                reason = "getlink_invalid_redirect_url"
+                redirect_url = _validate_redirect_url(data.get("redirectUrl"))
+                if redirect_url is None:
+                    reason = GATEWAY_INVALID_REDIRECT_URL
+        if redirect_url is not None:
+            logger.info(
+                "centralpay_getlink_ok",
+                extra={
+                    "endpoint": "getLink.php",
+                    "gateway_order_id": order_id,
+                    "http_status": 200,
+                },
+            )
+            return redirect_url
         logger.warning(
             "centralpay_getlink_rejected",
-            extra={"gateway_order_id": order_id, "reason": reason},
+            extra={
+                "endpoint": "getLink.php",
+                "gateway_order_id": order_id,
+                "http_status": 200,
+                "reason": reason,
+                "marker": marker,
+            },
         )
         raise CentralPayRejectedError(f"getLink rejected: {reason}")
 
@@ -194,16 +250,20 @@ class CentralPayClient:
         reports the payment as unsuccessful."""
         payload = {"api_key": self._verify_api_key, "orderId": order_id}
         body = self._post_json("verify.php", payload)
-        failure = _explicit_failure(body)
+        failure, marker = gateway_reason_code(body)
         data = body.get("data")
-        if failure is None and not _explicit_success(body):
-            failure = "verify_response_unrecognized"
         if failure is None and not isinstance(data, dict):
-            failure = "verify_missing_data"
+            failure = GATEWAY_MISSING_DATA
         if failure is not None:
             logger.warning(
                 "centralpay_verify_not_successful",
-                extra={"gateway_order_id": order_id, "reason": failure},
+                extra={
+                    "endpoint": "verify.php",
+                    "gateway_order_id": order_id,
+                    "http_status": 200,
+                    "reason": failure,
+                    "marker": marker,
+                },
             )
             return VerifyResult(
                 gateway_success=False,
@@ -221,16 +281,21 @@ class CentralPayClient:
         field_errors: list[str] = []
         reference_id = _to_nonempty_str(data.get("referenceId"))
         if reference_id is None:
-            field_errors.append("verify_empty_reference_id")
+            field_errors.append(GATEWAY_INVALID_REFERENCE_ID)
         amount = _to_int(data.get("amount"))
         if amount is None:
-            field_errors.append("verify_invalid_amount")
+            field_errors.append(GATEWAY_INVALID_AMOUNT)
         user_id = _to_int(data.get("userId"))
         if user_id is None:
-            field_errors.append("verify_invalid_user_id")
+            field_errors.append(GATEWAY_INVALID_USER_ID)
         logger.info(
             "centralpay_verify_ok",
-            extra={"gateway_order_id": order_id, "field_errors": field_errors or None},
+            extra={
+                "endpoint": "verify.php",
+                "gateway_order_id": order_id,
+                "http_status": 200,
+                "field_errors": field_errors or None,
+            },
         )
         return VerifyResult(
             gateway_success=True,
