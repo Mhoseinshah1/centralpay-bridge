@@ -226,7 +226,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Required release documents exist
         run: |
-          for f in CHANGELOG.md RELEASE_NOTES_0.5.0_RC1.md RELEASE_RISK_REGISTER.md \
+          for f in CHANGELOG.md RELEASE_NOTES_0.6.0_RC1.md RELEASE_RISK_REGISTER.md \
                    MIGRATION_GUIDE.md REAL_HOST_VALIDATION.md STAGING_VALIDATION.md \
                    ADMIN_BOT_VALIDATION.md PRODUCTION_CHECKLIST_FA.md \
                    README.md README_FA.md INSTALL_FA.md OPERATIONS_FA.md \
@@ -296,7 +296,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --draft \
             --title "centralpay-bridge ${version}" \
-            --notes-file "RELEASE_NOTES_0.5.0_RC1.md" \
+            --notes-file "RELEASE_NOTES_0.6.0_RC1.md" \
             "centralpay-bridge-${version}.tar.gz" \
             sbom-centralpay-bridge.spdx.json \
             SHA256SUMS

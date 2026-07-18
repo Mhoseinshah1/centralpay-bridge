@@ -1,12 +1,12 @@
-# Release risk register — 0.5.0-rc1
+# Release risk register — 0.6.0-rc1
 
 Triage of every unresolved topic from `DEFERRED_REVIEW.md` for the
-0.5.0-rc1 release candidate. Each item records a classification
+0.6.0-rc1 release candidate. Each item records a classification
 (**fixed** / **accepted risk** / **release blocker** / **post-release
 backlog**), severity, financial impact, exploitability, likelihood,
 mitigation, test coverage, and the release decision.
 
-**Bottom line: 0.5.0-rc1 may NOT be tagged and may NOT be used for real
+**Bottom line: 0.6.0-rc1 may NOT be tagged and may NOT be used for real
 payments while any release blocker below is open.** The blockers are
 summarized at the end.
 
@@ -267,7 +267,7 @@ unaccounted for — the top priority of AGENTS.md.
 | B4 | Multi-agent adversarial review (started for Phase 1, stopped, never completed; not run for Phases 2–5) | `DEFERRED_REVIEW.md` |
 | B5 | Release workflow (`.github/workflows/release.yml`) has not yet run green: Docker builds, Trivy scan, SBOM, and artifact packaging are CI-delegated and unverified locally | GitHub Actions |
 
-**Release decision:** 0.5.0-rc1 is a code-complete release candidate.
+**Release decision:** 0.6.0-rc1 is a code-complete release candidate.
 It must not be tagged, published, or used for real payments until B1,
 B2, B4, and B5 are closed (and B3 if the admin bot is to be enabled),
 and a human approval is recorded.
@@ -306,3 +306,17 @@ Residual risks:
 - **Operator error** (wrong rate): mitigated by strict rate grammar,
   root-only mutation, append-only audited history, scheduling with
   cancellation, and `/fee` visibility — not eliminated.
+
+## Topic 31 (release/0.6.0-rc1)
+
+### 31. pip-audit finding in a dev-only dependency — **ACCEPTED for RC; post-release backlog**
+
+`pip-audit` over the full development environment reports
+PYSEC-2026-1845 in pytest 8.4.2 (fixed in 9.0.3). pytest is a
+`dev`-extra dependency only: it is never installed in the production
+image (the Dockerfile runs `pip install .` — runtime dependencies
+only) and never ships in the release artifact, and CI's dependency
+scan of the runtime dependency set is clean. Migrating the test suite
+to pytest 9 is deliberately NOT done inside a release-candidate branch
+(major-version test-framework bump ≠ release hardening); it is recorded
+here as post-release backlog.

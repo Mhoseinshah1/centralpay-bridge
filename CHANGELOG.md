@@ -2,7 +2,11 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
-## [Unreleased]
+## [0.6.0-rc1] — 2026-07-18 (release candidate — NOT production-ready)
+
+**Known release blockers remain open in `RELEASE_RISK_REGISTER.md`;
+this version must not be used for real payments until they are
+closed.** Release notes: `RELEASE_NOTES_0.6.0_RC1.md`.
 
 ### Added
 - Dynamic percentage service fee (migration 0006). The bot's original

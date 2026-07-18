@@ -205,7 +205,7 @@ def test_worker_records_database_heartbeat(session_factory):
         )
     assert len(rows) == 1
     assert rows[0].last_error_code == "RuntimeError"
-    assert rows[0].version == "0.5.0-rc1"
+    assert rows[0].version == "0.6.0-rc1"
 
 
 def test_signature_storm_creates_single_aggregated_alert(

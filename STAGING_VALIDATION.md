@@ -1,4 +1,4 @@
-# Staging validation — 0.5.0-rc1
+# Staging validation — 0.6.0-rc1
 
 **Status: NOT PERFORMED — part of RELEASE BLOCKER B2.**
 

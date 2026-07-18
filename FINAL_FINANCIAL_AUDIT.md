@@ -153,3 +153,66 @@ no tag, no real payments, and the live customer bot must stay disabled
 until B1–B5 are closed.** The payer must be shown the final payable
 amount before paying — fee disclosure in the bot's purchase flow is an
 operator go-live requirement in `PRODUCTION_CHECKLIST_FA.md`.
+
+## 0.6.0-rc1 release re-audit (`release/0.6.0-rc1`, 2026-07-18)
+
+One final independent pass over the complete merged codebase (fee
+feature included), re-verifying each release-audit point against the
+source and the test evidence:
+
+1. `payments.amount` is assigned exactly once, at row insert, and no
+   code path reassigns it (exhaustive grep; F2/F21/F22). ✓
+2. getLink is called with `amount=payment.payable_amount`
+   (`app/services/payments.py`). ✓
+3. verify compares `result.amount != payment.payable_amount` — never
+   the original amount (`app/services/verification.py`). ✓
+4. Fee arithmetic is exactly `(amount * fee_rate_bps + 5000) // 10000`
+   — integer round half up, no floats anywhere in money paths. ✓
+5–8. Snapshot immutability: written once inside the creation
+   transaction; duplicates, policy changes, and getlink-failed retries
+   preserve it (unit + PG race proofs). ✓
+9. Migration 0006 backfills pre-existing payments as
+   `fee_rate_bps=0, fee_amount=0, payable_amount=amount` (proven with a
+   populated 0005 database). ✓
+10–11. The bot notification is byte-for-byte
+   `{"order_id", "actions": "custom_payment_verify"}` with the `Token`
+   header and carries no amount or fee field (byte-exact regression
+   test). ✓
+12. A payable mismatch moves to `manual_review`, is never verified, and
+   the worker can never deliver it (claim requires
+   `bot_notify_pending` AND `gateway_verified_at IS NOT NULL`; new
+   regression `test_payable_mismatch_never_notifies_bot`). ✓
+13. Concurrent fee change vs creation cannot produce a mixed snapshot
+   (single policy read; PG barrier race proof). ✓
+14. Backup/restore preserves active, scheduled, and cancelled policies
+   and payment snapshots byte-for-byte, ids included. ✓
+15. db-check reports fee corruption read-only; it never rewrites
+   financial history. ✓
+16. `scripts/backup.sh` is executable in Git (mode 100755) and
+   installed root:root 0750 by the installer. ✓
+17. Secret/callback-parameter redaction re-verified (logging suite,
+   audit-event secret checks, Caddy sig+ct redaction). ✓
+18. No previously established invariant (F1–F24) was weakened; no test
+   was removed, skipped, or xfailed — the suite only grew (343 → 465).
+
+New regression tests added by this re-audit:
+`test_payable_mismatch_never_notifies_bot`,
+`test_delivered_fee_payment_retains_exact_snapshot`.
+
+### Verdict (0.6.0-rc1)
+
+```
+CODE_FINANCIALLY_SOUND
+
+PRODUCTION_VALIDATION_STATUS: INCOMPLETE
+```
+
+No real CentralPay payment (with or without a fee), no real
+payable-amount report from the gateway, no mock-bot delivery outside
+the test stubs, and no real bot integration have been observed — none
+of those external tests are claimed to have occurred. The blockers
+table above stands. The 0.6.0-rc1 PR may be merged after human review;
+**the `v0.6.0-rc1` tag may be created only after merge, as an explicit
+human decision** (the tag-triggered workflow produces a draft-only
+release); real payments and the live customer bot remain prohibited
+until B1–B5 close.
