@@ -29,9 +29,18 @@ Service:
   version                Application and stack versions
 
 Deployment:
-  update                 Backup, fetch configured ref, rebuild, migrate, restart
+  update --check         Show installed vs available version
+  update                 Verify release checksum, backup, deploy, migrate, restart
+  rollback               Roll application files back to the previous version
   migrate [SUB]          Run migrations (SUB: upgrade|current|history; default upgrade)
   ssl                    Re-check DNS and retry TLS certificate issuance
+
+Manual review (host-only; never changes financial records):
+  review list [--all]    Unresolved manual-review payments
+  review show ORDER_ID   Full review detail
+  review acknowledge ORDER_ID --note TEXT
+  review resolve ORDER_ID --resolution VALUE --note TEXT
+  review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
 
 Data:
   backup                 Create a validated PostgreSQL backup now
@@ -189,6 +198,67 @@ cmd_migrate() {
     esac
 }
 
+VERSION_HISTORY_FILE="${CONFIG_DIR}/version_history"
+REPO_SLUG="Mhoseinshah1/centralpay-bridge"
+
+record_version_history() {
+    # $1 = new sha; keeps current and previous for rollback.
+    local new_sha="$1" current_sha=""
+    [[ -f "$VERSION_HISTORY_FILE" ]] \
+        && current_sha=$(grep -E '^current=' "$VERSION_HISTORY_FILE" | cut -d= -f2- || true)
+    umask 077
+    {
+        echo "current=${new_sha}"
+        echo "previous=${current_sha}"
+        echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$VERSION_HISTORY_FILE"
+    chmod 600 "$VERSION_HISTORY_FILE"
+}
+
+verify_release_artifact() {
+    # $1 = release tag. Downloads the release artifact and SHA256SUMS and
+    # verifies the checksum as an integrity gate before deploying the tag.
+    local tag="$1" tmp
+    tmp=$(mktemp -d)
+    local base="https://github.com/${REPO_SLUG}/releases/download/${tag}"
+    local artifact="centralpay-bridge-${tag#v}.tar.gz"
+    log "Verifying release artifact checksum for ${tag}..."
+    if ! curl -fsSL -o "${tmp}/${artifact}" "${base}/${artifact}" \
+        || ! curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"; then
+        rm -rf "$tmp"
+        if grep -qE '^CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true$' "$ENV_FILE" 2>/dev/null; then
+            warn "Release artifact/SHA256SUMS not downloadable; continuing UNVERIFIED (CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true)."
+            return 0
+        fi
+        fail "Cannot download the release artifact and SHA256SUMS for ${tag}. Publish the GitHub release first, or set CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true (not recommended)."
+    fi
+    if (cd "$tmp" && grep " ${artifact}\$" SHA256SUMS | sha256sum -c --quiet); then
+        log "Checksum verified: ${artifact}"
+        rm -rf "$tmp"
+        return 0
+    fi
+    rm -rf "$tmp"
+    fail "CHECKSUM MISMATCH for ${artifact}. Aborting update."
+}
+
+cmd_update_check() {
+    require_install
+    local ref current remote
+    ref=$(env_value CENTRALPAY_UPDATE_REF); ref="${ref:-main}"
+    current=$(git -C "$INSTALL_DIR" rev-parse HEAD)
+    git -C "$INSTALL_DIR" fetch --tags origin "$ref" >/dev/null 2>&1 \
+        || fail "Cannot fetch ${ref} from origin."
+    remote=$(git -C "$INSTALL_DIR" rev-parse FETCH_HEAD)
+    echo "configured ref:  ${ref}"
+    echo "installed:       ${current}"
+    echo "available:       ${remote}"
+    if [[ "$current" == "$remote" ]]; then
+        echo "status:          up to date"
+    else
+        echo "status:          update available (run: centralpay update)"
+    fi
+}
+
 cmd_update() {
     require_root update
     require_install
@@ -196,30 +266,86 @@ cmd_update() {
     ref=$(env_value CENTRALPAY_UPDATE_REF)
     ref="${ref:-main}"
     previous=$(git -C "$INSTALL_DIR" rev-parse HEAD)
-    if [[ "$ref" == "main" ]]; then
-        warn "Update ref is 'main' (DEVELOPMENT MODE). Pin CENTRALPAY_UPDATE_REF to a release tag for production."
+    if [[ "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        verify_release_artifact "$ref"
+    else
+        warn "Update ref '${ref}' is not a release tag (DEVELOPMENT MODE, no artifact checksum). Pin CENTRALPAY_UPDATE_REF to a release tag for production."
     fi
     log "Creating pre-update backup..."
     "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-update backup failed; update aborted."
     log "Fetching ${ref}..."
     git -C "$INSTALL_DIR" fetch --tags origin "$ref"
     git -C "$INSTALL_DIR" checkout -q FETCH_HEAD
+    record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)"
     log "Building images..."
     compose build --quiet
-    log "Applying migrations and restarting services..."
+    log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
         log "Update complete: $(git -C "$INSTALL_DIR" rev-parse --short HEAD) (was ${previous:0:7})"
         cmd_status || true
     else
         warn "Health checks FAILED after update."
-        warn "Roll back with:"
-        warn "  git -C ${INSTALL_DIR} checkout ${previous}"
-        warn "  centralpay restart"
-        warn "If the database schema changed, restore the pre-update backup:"
-        warn "  centralpay backups   # find the newest file"
-        warn "  centralpay restore FILE"
+        warn "Application rollback: centralpay rollback"
+        warn "Database schema is NOT downgraded automatically (migrations are"
+        warn "forward-only; see MIGRATION_GUIDE.md). If the schema changed,"
+        warn "restore the pre-update backup: centralpay backups && centralpay restore FILE"
         exit 1
     fi
+}
+
+cmd_rollback() {
+    require_root rollback
+    require_install
+    local previous
+    previous=$(grep -E '^previous=' "$VERSION_HISTORY_FILE" 2>/dev/null | cut -d= -f2- || true)
+    [[ -n "$previous" ]] || fail "No previous version recorded in ${VERSION_HISTORY_FILE}."
+    echo "This rolls back APPLICATION FILES to ${previous:0:12}."
+    echo "The database schema is never downgraded automatically (forward-only"
+    echo "migrations); if the newer schema is incompatible, restore a backup."
+    local answer
+    read -r -p "Type ROLLBACK to continue: " answer < /dev/tty
+    [[ "$answer" == "ROLLBACK" ]] || fail "Rollback cancelled."
+    log "Creating pre-rollback backup..."
+    "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-rollback backup failed; aborted."
+    git -C "$INSTALL_DIR" checkout -q "$previous" \
+        || fail "Cannot check out ${previous}."
+    record_version_history "$previous"
+    compose build --quiet
+    if compose up -d --wait; then
+        log "Rollback complete: now at ${previous:0:12}."
+    else
+        warn "Health checks failed after rollback; inspect: centralpay diagnose"
+        exit 1
+    fi
+}
+
+cmd_review() {
+    require_root review
+    require_install
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list|show)
+            compose exec -T api python -m app.ops review "$sub" "$@"
+            ;;
+        acknowledge)
+            compose exec -T api python -m app.ops review acknowledge "$@"
+            ;;
+        resolve)
+            echo "Resolving marks the payment's operational review complete."
+            echo "It never changes amounts, verification facts, or customer balances."
+            local answer
+            read -r -p "Type RESOLVE to continue: " answer < /dev/tty
+            [[ "$answer" == "RESOLVE" ]] || fail "Cancelled."
+            compose exec -T api python -m app.ops review resolve "$@"
+            ;;
+        resend)
+            compose exec -T api python -m app.ops review resend "$@"
+            ;;
+        *)
+            fail "Unknown review subcommand: ${sub} (list|show|acknowledge|resolve|resend)"
+            ;;
+    esac
 }
 
 cmd_backup() {
@@ -507,7 +633,15 @@ main() {
         restart)       require_root restart; require_install; compose restart ;;
         stop)          require_root stop; require_install; compose stop ;;
         start)         require_root start; require_install; compose up -d --wait ;;
-        update)        cmd_update "$@" ;;
+        update)
+            if [[ "${1:-}" == "--check" ]]; then
+                cmd_update_check
+            else
+                cmd_update "$@"
+            fi
+            ;;
+        rollback)      cmd_rollback "$@" ;;
+        review)        cmd_review "$@" ;;
         migrate)       cmd_migrate "$@" ;;
         backup)        cmd_backup "$@" ;;
         backups)       cmd_backups "$@" ;;

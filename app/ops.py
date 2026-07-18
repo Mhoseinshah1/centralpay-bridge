@@ -2,22 +2,42 @@
 
 Used by host-side scripts (backup.sh) and the centralpay management command
 to record operational events in the database. These are append-only
-operational records — never financial mutations.
+operational records — never financial mutations: no command here changes an
+amount, fabricates a verification, alters a reference id, or deletes events.
 
 Commands:
   backup-event {success|failure} [--size TEXT] [--file-name TEXT]
                                  [--retention-days N] [--detail TEXT]
   test-alert
+  review list | show ORDER_ID | acknowledge ORDER_ID --note TEXT
+  review resolve ORDER_ID --resolution VALUE --note TEXT
+  review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
 """
 
 import argparse
+import json
 import sys
+from datetime import UTC, datetime
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.adminbot.alerts import configure_alert_creation, create_alert
 from app.audit import record_event
 from app.config import Settings
 from app.db import create_session_factory
 from app.logging_setup import configure_logging
+from app.models import Payment, PaymentStatus
+
+# Non-financial operational resolution states only.
+ALLOWED_RESOLUTIONS = (
+    "confirmed_by_bot_operator",
+    "duplicate_notification_confirmed_safe",
+    "bot_not_credited",
+    "refund_required",
+    "false_positive",
+    "configuration_fixed",
+)
 
 
 def _cmd_backup_event(args: argparse.Namespace) -> int:
@@ -68,6 +88,159 @@ def _cmd_test_alert(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- manual review operations (host CLI; never through Telegram) -----------
+
+
+def _review_summary(payment: Payment) -> dict[str, object]:
+    return {
+        "bot_order_id": payment.bot_order_id,
+        "gateway_order_id": payment.gateway_order_id,
+        "amount": payment.amount,
+        "status": payment.status,
+        "gateway_verified": payment.gateway_verified_at is not None,
+        "reason": payment.bot_notify_reason or payment.last_error,
+        "attempts": payment.bot_notify_attempts,
+        "reference_id": payment.reference_id,
+        "manual_review_at": (
+            payment.manual_review_at.isoformat() if payment.manual_review_at else None
+        ),
+        "acknowledged_at": (
+            payment.review_acknowledged_at.isoformat()
+            if payment.review_acknowledged_at
+            else None
+        ),
+        "resolved_at": (
+            payment.review_resolved_at.isoformat() if payment.review_resolved_at else None
+        ),
+        "resolution": payment.review_resolution,
+    }
+
+
+def _load_review_payment(db: Session, order_id: str) -> Payment | None:
+    payment = db.execute(
+        select(Payment).where(Payment.bot_order_id == order_id).with_for_update()
+    ).scalar_one_or_none()
+    if payment is None and order_id.isdigit():
+        payment = db.execute(
+            select(Payment)
+            .where(Payment.gateway_order_id == int(order_id))
+            .with_for_update()
+        ).scalar_one_or_none()
+    return payment
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    settings = Settings()
+    configure_logging(settings)
+    configure_alert_creation(settings)
+    session_factory = create_session_factory(settings.database_url)
+
+    with session_factory() as db:
+        if args.review_command == "list":
+            payments = db.execute(
+                select(Payment)
+                .where(Payment.status == PaymentStatus.MANUAL_REVIEW.value)
+                .order_by(Payment.manual_review_at.asc().nulls_first())
+            ).scalars()
+            shown = 0
+            for row in payments:
+                if row.review_resolved_at is not None and not args.all:
+                    continue
+                print(json.dumps(_review_summary(row), ensure_ascii=False))
+                shown += 1
+            if shown == 0:
+                print("no unresolved manual-review payments" if not args.all else "none")
+            return 0
+
+        payment = _load_review_payment(db, args.order_id)
+        if payment is None:
+            print(f"payment not found: {args.order_id}", file=sys.stderr)
+            return 1
+
+        if args.review_command == "show":
+            db.rollback()
+            print(json.dumps(_review_summary(payment), ensure_ascii=False, indent=2))
+            return 0
+
+        if payment.status != PaymentStatus.MANUAL_REVIEW.value:
+            print(
+                f"payment is not in manual_review (status={payment.status})",
+                file=sys.stderr,
+            )
+            db.rollback()
+            return 1
+
+        now = datetime.now(UTC)
+        if args.review_command == "acknowledge":
+            payment.review_acknowledged_at = now
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="manual_review_acknowledged",
+                data={"note": args.note[:500], "operator": "host-cli"},
+            )
+            db.commit()
+            print(f"acknowledged {payment.bot_order_id}")
+            return 0
+
+        if args.review_command == "resolve":
+            # Operational resolution only: financial fields (amount,
+            # reference_id, verification facts, status history) are never
+            # modified, and no customer balance is ever touched from here.
+            payment.review_acknowledged_at = payment.review_acknowledged_at or now
+            payment.review_resolved_at = now
+            payment.review_resolution = args.resolution
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="manual_review_resolved",
+                data={
+                    "resolution": args.resolution,
+                    "note": args.note[:500],
+                    "operator": "host-cli",
+                },
+            )
+            db.commit()
+            print(f"resolved {payment.bot_order_id}: {args.resolution}")
+            return 0
+
+        if args.review_command == "resend":
+            if settings.bot_notify_retry_mode != "idempotent":
+                print(
+                    "resend refused: BOT_NOTIFY_RETRY_MODE is not 'idempotent'. "
+                    "In safe mode ambiguous deliveries must be resolved manually.",
+                    file=sys.stderr,
+                )
+                db.rollback()
+                return 1
+            if payment.gateway_verified_at is None:
+                print(
+                    "resend refused: payment was never gateway-verified.",
+                    file=sys.stderr,
+                )
+                db.rollback()
+                return 1
+            payment.status = PaymentStatus.BOT_NOTIFY_PENDING.value
+            payment.next_retry_at = now
+            payment.notification_claimed_at = None
+            payment.notification_claimed_by = None
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="manual_review_resend_requested",
+                level="warning",
+                data={
+                    "operator": "host-cli",
+                    "previous_reason": payment.bot_notify_reason,
+                    "retry_mode": settings.bot_notify_retry_mode,
+                },
+            )
+            db.commit()
+            print(f"requeued {payment.bot_order_id} for bot notification")
+            return 0
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.ops", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -78,6 +251,24 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--retention-days", type=int, default=0)
     backup.add_argument("--detail", default="")
     sub.add_parser("test-alert", help="queue a clearly marked test alert")
+
+    review = sub.add_parser("review", help="manual-review operations (host only)")
+    review_sub = review.add_subparsers(dest="review_command", required=True)
+    review_list = review_sub.add_parser("list")
+    review_list.add_argument("--all", action="store_true", help="include resolved")
+    review_show = review_sub.add_parser("show")
+    review_show.add_argument("order_id")
+    review_ack = review_sub.add_parser("acknowledge")
+    review_ack.add_argument("order_id")
+    review_ack.add_argument("--note", required=True)
+    review_resolve = review_sub.add_parser("resolve")
+    review_resolve.add_argument("order_id")
+    review_resolve.add_argument("--resolution", required=True, choices=ALLOWED_RESOLUTIONS)
+    review_resolve.add_argument("--note", required=True)
+    review_resend = review_sub.add_parser("resend")
+    review_resend.add_argument("order_id")
+    review_resend.add_argument("--confirm-idempotent-bot", action="store_true")
+    review_resend.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -85,6 +276,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "backup-event":
         return _cmd_backup_event(args)
+    if args.command == "review":
+        if args.review_command == "resend" and not (
+            args.confirm_idempotent_bot and args.yes
+        ):
+            print(
+                "resend requires --confirm-idempotent-bot AND --yes "
+                "(only after the bot developer confirmed duplicate delivery is idempotent)",
+                file=sys.stderr,
+            )
+            return 1
+        if args.review_command in ("acknowledge", "resolve") and not args.note.strip():
+            print("a non-empty --note is required", file=sys.stderr)
+            return 1
+        return _cmd_review(args)
     return _cmd_test_alert(args)
 
 

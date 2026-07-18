@@ -112,6 +112,16 @@ services:
   admin-bot:
     <<: [*app-image, *app-env]
     command: ["python", "-m", "app.adminbot"]
+    # Least privilege: the admin bot never talks to CentralPay or the sales
+    # bot, so those secrets are masked with placeholders (environment:
+    # entries override env_file values). It keeps only DATABASE_URL and its
+    # own ADMIN_BOT_* configuration.
+    environment:
+      CENTRALPAY_GETLINK_API_KEY: not-used-by-admin-bot
+      CENTRALPAY_VERIFY_API_KEY: not-used-by-admin-bot
+      BOT_NOTIFY_TOKEN: ""
+      INBOUND_API_KEY: not-used-by-admin-bot-x
+      CALLBACK_HMAC_SECRET: not-used-by-admin-bot-x
     # Only started when the admin-bot profile is enabled (the centralpay
     # command adds --profile admin-bot when ADMIN_BOT_ENABLED=true).
     profiles: ["admin-bot"]
