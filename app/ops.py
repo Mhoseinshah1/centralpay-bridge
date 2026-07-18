@@ -12,14 +12,16 @@ Commands:
   review list | show ORDER_ID | acknowledge ORDER_ID --note TEXT
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
+  db-check [--repair-sequences]   read-only integrity checks (restore verification)
 """
 
 import argparse
 import json
 import sys
 from datetime import UTC, datetime
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.adminbot.alerts import configure_alert_creation, create_alert
@@ -127,6 +129,121 @@ def _load_review_payment(db: Session, order_id: str) -> Payment | None:
             .with_for_update()
         ).scalar_one_or_none()
     return payment
+
+
+_SEQUENCE_TABLES = ("payments", "payment_events", "admin_alerts", "worker_heartbeats")
+
+
+def _cmd_db_check(args: argparse.Namespace) -> int:
+    """Database integrity checks used after a restore (and on demand).
+
+    Read-only by default. --repair-sequences advances any PostgreSQL
+    sequence that fell behind its table maximum (safe: setval to MAX(id),
+    schema-qualified names taken from pg_get_serial_sequence itself).
+    Never touches financial data.
+    """
+    settings = Settings()
+    configure_logging(settings)
+    session_factory = create_session_factory(settings.database_url)
+    failures: list[str] = []
+    report: dict[str, object] = {}
+
+    with session_factory() as db:
+        from app.models import PaymentEvent
+
+        try:
+            revision = db.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one_or_none()
+        except Exception:
+            # Clear the aborted transaction so the remaining checks run.
+            db.rollback()
+            revision = None
+        report["alembic_revision"] = revision
+        if revision is None:
+            failures.append("alembic_version_missing")
+
+        def dup_count(column: Any) -> int:
+            sub = (
+                select(column)
+                .where(column.is_not(None))
+                .group_by(column)
+                .having(func.count() > 1)
+                .subquery()
+            )
+            return int(db.execute(select(func.count()).select_from(sub)).scalar_one())
+
+        checks: dict[str, int] = {
+            "invalid_payment_status": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        Payment.status.not_in([status.value for status in PaymentStatus])
+                    )
+                ).scalar_one()
+            ),
+            "duplicate_bot_order_id": dup_count(Payment.bot_order_id),
+            "duplicate_gateway_order_id": dup_count(Payment.gateway_order_id),
+            "duplicate_reference_id": dup_count(Payment.reference_id),
+            "orphan_payment_events": int(
+                db.execute(
+                    select(func.count(PaymentEvent.id)).where(
+                        PaymentEvent.payment_id.is_not(None),
+                        PaymentEvent.payment_id.not_in(select(Payment.id)),
+                    )
+                ).scalar_one()
+            ),
+            "claims_on_non_pending_payments": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        Payment.notification_claimed_at.is_not(None),
+                        Payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value,
+                    )
+                ).scalar_one()
+            ),
+        }
+        report["checks"] = checks
+        failures.extend(name for name, value in checks.items() if value != 0)
+
+        sequences: dict[str, dict[str, object]] = {}
+        if db.get_bind().dialect.name == "postgresql":
+            repaired: list[str] = []
+            for table in _SEQUENCE_TABLES:
+                seq_name = db.execute(
+                    text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table}
+                ).scalar_one_or_none()
+                if seq_name is None:
+                    continue
+                max_id = int(
+                    db.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {table}")).scalar_one()
+                )
+                # seq_name comes from PostgreSQL itself (schema-qualified),
+                # never from user input.
+                last_value, is_called = db.execute(
+                    text(f"SELECT last_value, is_called FROM {seq_name}")
+                ).one()
+                behind = max_id > 0 and (
+                    int(last_value) < max_id or (int(last_value) == max_id and not is_called)
+                )
+                sequences[table] = {
+                    "sequence": seq_name,
+                    "max_id": max_id,
+                    "last_value": int(last_value),
+                    "behind": behind,
+                }
+                if behind and args.repair_sequences:
+                    db.execute(text(f"SELECT setval('{seq_name}', {max_id})"))
+                    repaired.append(table)
+                elif behind:
+                    failures.append(f"sequence_behind:{table}")
+            if repaired:
+                db.commit()
+                report["repaired_sequences"] = repaired
+        report["sequences"] = sequences
+
+    report["status"] = "ok" if not failures else "failed"
+    report["failures"] = failures
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if not failures else 1
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
@@ -252,6 +369,13 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--detail", default="")
     sub.add_parser("test-alert", help="queue a clearly marked test alert")
 
+    db_check = sub.add_parser("db-check", help="database integrity checks (restore verification)")
+    db_check.add_argument(
+        "--repair-sequences",
+        action="store_true",
+        help="advance sequences that fell behind their table maxima",
+    )
+
     review = sub.add_parser("review", help="manual-review operations (host only)")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     review_list = review_sub.add_parser("list")
@@ -276,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "backup-event":
         return _cmd_backup_event(args)
+    if args.command == "db-check":
+        return _cmd_db_check(args)
     if args.command == "review":
         if args.review_command == "resend" and not (
             args.confirm_idempotent_bot and args.yes
