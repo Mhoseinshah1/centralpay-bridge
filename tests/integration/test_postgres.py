@@ -18,10 +18,10 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
-from app.models import Base, PaymentStatus
+from app.models import Base, Payment, PaymentStatus
 from tests.conftest import (
     CentralPayStub,
     build_app,
@@ -315,3 +315,97 @@ def test_concurrent_replays_after_verification_never_reverify(
     assert events.count("gateway_payment_verified") == 1
     assert events.count("bot_notification_queued") == 1
     assert events.count("duplicate_callback_ignored") == 4
+
+
+def test_many_identical_concurrent_creates(settings, pg_app, pg_session_factory):
+    """Creation audit: 10 identical concurrent requests, released through a
+    barrier, must produce exactly one payment row, one gateway order id,
+    one getLink call, one payment_link_created event, and one URL."""
+    stub = pg_app.state.centralpay_stub
+    barrier = threading.Barrier(10)
+
+    def submit(client):
+        barrier.wait(timeout=10)
+        return create_order(client, settings, order_id="pg-many", amount=12000)
+
+    with (
+        TestClient(pg_app, raise_server_exceptions=False) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool,
+    ):
+        futures = [pool.submit(submit, client) for _ in range(10)]
+        responses = [future.result(timeout=60) for future in futures]
+
+    assert [r.status_code for r in responses] == [200] * 10
+    assert len({r.json()["url"] for r in responses}) == 1  # deterministic result
+    assert len(stub.getlink_requests) == 1  # gateway called at most once
+
+    with pg_session_factory() as session:
+        rows = session.execute(
+            select(Payment).where(Payment.bot_order_id == "pg-many")
+        ).scalars().all()
+    assert len(rows) == 1
+    events = event_types(get_events(pg_session_factory, rows[0].id))
+    assert events.count("payment_created") == 1
+    assert events.count("payment_link_created") == 1
+
+
+def test_concurrent_conflicting_amounts_single_row(settings, pg_app, pg_session_factory):
+    """Same order id with different amounts concurrently: exactly one row,
+    one winning amount, one getLink; the loser gets the explicit 409
+    amount-mismatch code — never a 500 or a second payment."""
+    barrier = threading.Barrier(2)
+    stub = pg_app.state.centralpay_stub
+
+    def submit(client, amount):
+        barrier.wait(timeout=10)
+        return create_order(client, settings, order_id="pg-conflict", amount=amount)
+
+    with (
+        TestClient(pg_app, raise_server_exceptions=False) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        futures = [pool.submit(submit, client, amount) for amount in (10000, 20000)]
+        responses = [future.result(timeout=60) for future in futures]
+
+    assert sorted(r.status_code for r in responses) == [200, 409]
+    rejected = next(r for r in responses if r.status_code == 409)
+    assert rejected.json()["error"]["code"] == "duplicate_order_amount_mismatch"
+    assert len(stub.getlink_requests) == 1
+
+    with pg_session_factory() as session:
+        rows = session.execute(
+            select(Payment).where(Payment.bot_order_id == "pg-conflict")
+        ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].amount in (10000, 20000)
+    winner = next(r for r in responses if r.status_code == 200)
+    assert winner.json()["url"]
+
+
+def test_concurrent_distinct_orders_get_unique_gateway_ids(
+    settings, pg_app, pg_session_factory
+):
+    """Gateway order id allocation under concurrency: distinct orders always
+    receive distinct ids (unique index enforced), one getLink each."""
+    barrier = threading.Barrier(10)
+
+    def submit(client, index):
+        barrier.wait(timeout=10)
+        return create_order(client, settings, order_id=f"pg-uid-{index}", amount=9000)
+
+    with (
+        TestClient(pg_app, raise_server_exceptions=False) as client,
+        concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool,
+    ):
+        futures = [pool.submit(submit, client, i) for i in range(10)]
+        responses = [future.result(timeout=60) for future in futures]
+
+    assert [r.status_code for r in responses] == [200] * 10
+    stub = pg_app.state.centralpay_stub
+    assert len(stub.getlink_requests) == 10
+    with pg_session_factory() as session:
+        gateway_ids = session.execute(
+            select(Payment.gateway_order_id).where(Payment.bot_order_id.like("pg-uid-%"))
+        ).scalars().all()
+    assert len(gateway_ids) == 10
+    assert len(set(gateway_ids)) == 10
