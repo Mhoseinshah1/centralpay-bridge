@@ -56,6 +56,12 @@ async def _unhandled_error_handler(request: Request, exc: Exception) -> JSONResp
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings()
     configure_logging(settings)
+    # Enables admin alert outbox rows (a no-op when the admin bot is
+    # disabled). The API never contacts Telegram; a Telegram outage can
+    # never affect payment processing.
+    from app.adminbot.alerts import configure_alert_creation
+
+    configure_alert_creation(settings)
 
     app = FastAPI(
         title="CentralPay Bridge",
