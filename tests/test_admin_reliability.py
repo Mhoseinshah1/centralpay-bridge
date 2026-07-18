@@ -216,8 +216,7 @@ def test_signature_storm_creates_single_aggregated_alert(
     payment = make_verified_pending(
         client, settings, session_factory, stub, order_id="rel-sig"
     )
-    signature_failure_tracker._events.clear()
-    signature_failure_tracker._last_reported = 0.0
+    signature_failure_tracker.reset()
     for _ in range(6):
         response = client.get(
             f"/api/centralpay/callback?orderId={payment.gateway_order_id}&sig={'0' * 64}"
@@ -226,3 +225,21 @@ def test_signature_storm_creates_single_aggregated_alert(
     alerts = get_alerts(session_factory, "callback_signature_failures")
     assert len(alerts) == 1  # aggregated, not one per request
     assert alerts[0].payload["count"] >= 5
+
+
+def test_signature_storm_reports_on_freshly_booted_machine():
+    """Regression (CI failure on GitHub Actions runners): time.monotonic()
+    has an arbitrary epoch and is SMALLER than the window on a freshly
+    booted machine. The first storm must still be reported."""
+    from app.api.callback import SignatureFailureTracker
+
+    tracker = SignatureFailureTracker(threshold=5, window_seconds=600.0)
+    # Clock values below window_seconds — a machine up for under 10 minutes.
+    results = [tracker.record(now=100.0 + i) for i in range(6)]
+    assert results[4] == 5  # fifth failure crosses the threshold and reports
+    assert results[5] is None  # and only once per window
+    # A second storm within the same window stays suppressed...
+    assert tracker.record(now=200.0) is None
+    # ...but reports again after the window has passed.
+    late_results = [tracker.record(now=800.0 + i) for i in range(5)]
+    assert late_results[-1] is not None
