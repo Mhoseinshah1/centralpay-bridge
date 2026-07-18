@@ -38,6 +38,14 @@ CentralPay confirmation, or lost silently is always critical.
   migration).
 - **Audit:** every financial state transition is recorded in the permanent
   append-only `payment_events` table; migrations refuse to drop it.
+- **Admin Telegram bot (optional, off by default):** read-only; authorizes
+  by numeric Telegram ID only (usernames never trusted), private chats
+  only; unauthorized attempts get a generic denial and are audited. Alerts
+  flow through a database outbox so Telegram can never block payments. The
+  container is hardened (no ports, read-only filesystem, all capabilities
+  dropped, no privilege escalation, no Docker socket). API keys, tokens,
+  secrets, signatures, full card numbers, redirect URLs, raw external
+  error text, and backup paths are never sent to Telegram.
 
 ## Known gaps
 

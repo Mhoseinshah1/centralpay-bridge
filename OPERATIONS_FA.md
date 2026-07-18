@@ -108,10 +108,25 @@ centralpay uninstall
 حذف هر کدام تأیید جداگانه می‌خواهد. سوابق پرداخت هرگز بی‌سروصدا حذف
 نمی‌شوند.
 
+## ربات تلگرام مدیریتی
+
+<div dir="ltr">
+
+```bash
+centralpay admin-bot status | logs | restart | enable | disable | test-alert
+```
+
+</div>
+
+سرویس اختیاری و فقط‌خواندنی برای دیدبانی و هشدار. راهنمای کامل
+(راه‌اندازی با BotFather، مرجع دستورها و هشدارها، رفع اشکال):
+[ADMIN_BOT_FA.md](ADMIN_BOT_FA.md)
+
 ## رفع اشکال سریع
 
 - سرویس بالا نمی‌آید: `centralpay diagnose` سپس `centralpay logs-errors`
 - HTTPS فعال نیست: [INSTALL_FA.md](INSTALL_FA.md) بخش SSL
 - بکاپ/بازیابی: [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md)
+- ربات مدیریتی: [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md)
 
 </div>

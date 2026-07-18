@@ -55,12 +55,32 @@ topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
 - GitHub Actions CI (tests, lint, types, ShellCheck, Docker build, compose
   validation, secret and dependency scanning)
 
-Not yet implemented (later phases): admin Telegram bot and alerts (Phase 4),
-remaining hardening/documentation (Phase 5).
+**Phase 4 — Administrator Telegram bot** (this code):
+
+- Optional, read-only, admin-only Telegram bot (`admin-bot` Compose
+  service behind a profile — never started unless explicitly enabled)
+- Authorization by numeric Telegram ID only, private chats only; generic
+  denial for everyone else
+- 12 inspection commands (`/status`, `/health`, `/recent`, `/stuck`,
+  `/manual_review`, `/errors`, `/payment`, `/retry_queue`,
+  `/backup_status`, `/version`, `/start`, `/help`)
+- Durable alert outbox (`admin_alerts` table): alert rows are created
+  inside payment transactions; the admin-bot service delivers them
+  best-effort with bounded retries, dedup windows, and stale-claim
+  recovery — a Telegram outage can never block payment processing
+- Health monitor with consecutive-failure thresholds and recovery alerts;
+  optional daily report (Asia/Tehran default, restart-safe dedup);
+  worker heartbeats recorded in the database
+- Persian message formatting (Jalali timestamps) with HTML escaping of
+  every dynamic value
+
+Not yet implemented (Phase 5): remaining hardening, complete workflows,
+architecture diagram, end-to-end installation test.
 
 Persian documentation: [README_FA.md](README_FA.md),
 [INSTALL_FA.md](INSTALL_FA.md), [OPERATIONS_FA.md](OPERATIONS_FA.md),
-[BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md). Security policy:
+[BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md),
+[ADMIN_BOT_FA.md](ADMIN_BOT_FA.md). Security policy:
 [SECURITY.md](SECURITY.md).
 
 ## Production installation
@@ -97,6 +117,7 @@ centralpay restart | stop | start | update | migrate | ssl | version
 centralpay backup | backups | restore FILE
 centralpay payment ORDER_ID | recent | retry-queue | manual-review
 centralpay credentials | uninstall
+centralpay admin-bot status | logs | restart | enable | disable | test-alert
 ```
 
 ## Requirements
@@ -304,6 +325,10 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |
 | `LOG_FORMAT` | `json` (default) or `text`; both redact secrets |
 | `CALLBACK_SECRET` | Accepted alias for `CALLBACK_HMAC_SECRET` |
+| `ADMIN_BOT_ENABLED` | Admin Telegram bot (default `false`); see [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md) |
+| `ADMIN_BOT_TOKEN` / `ADMIN_TELEGRAM_IDS` | BotFather token + comma-separated numeric admin IDs |
+| `ADMIN_BOT_*_ALERTS` | Per-category alert toggles (payment-success off by default) |
+| `ADMIN_BOT_DAILY_REPORT_*` / `ADMIN_BOT_TIMEZONE` | Daily report time and timezone (Asia/Tehran) |
 
 ## Security notes
 
