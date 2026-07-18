@@ -201,6 +201,7 @@ def test_installer_reads_secrets_silently():
     # Secret values never reach the terminal: any echo/printf of a secret
     # variable must be redirected into a file (e.g. the 0600 password file).
     secret_vars = (
+        "CENTRALPAY_API_KEY",
         "CENTRALPAY_GETLINK_API_KEY",
         "CENTRALPAY_VERIFY_API_KEY",
         "BOT_NOTIFY_TOKEN",
@@ -571,3 +572,42 @@ def test_update_never_extracts_archives():
     backup_text = BACKUP_SCRIPT.read_text()
     for extraction in ("tar -x", "unzip"):
         assert extraction not in backup_text
+
+
+# --- single CentralPay API key -----------------------------------------------
+
+
+def test_installer_asks_for_one_centralpay_key_filling_both_variables():
+    """CentralPay issues a single API key used by both getLink.php and
+    verify.php: the installer prompts once (hidden) and stores the same
+    value in both environment variables."""
+    text = INSTALLER.read_text()
+    # Exactly one CentralPay key prompt, read silently.
+    assert text.count('ask_secret CENTRALPAY_API_KEY "3/9 CentralPay API key"') == 1
+    assert "getLink API key" not in text
+    assert "verify API key" not in text
+    # The single value fills both variables the application reads.
+    assert 'CENTRALPAY_GETLINK_API_KEY="$CENTRALPAY_API_KEY"' in text
+    assert 'CENTRALPAY_VERIFY_API_KEY="$CENTRALPAY_API_KEY"' in text
+    # The key is never echoed or logged (no echo/printf/log line carries it
+    # outside a file redirection; covered in detail by
+    # test_installer_reads_secrets_silently, which includes
+    # CENTRALPAY_API_KEY in its secret list).
+    gather = text.split("gather_input()")[1].split("gather_admin_bot_input()")[0]
+    assert gather.count("CENTRALPAY_API_KEY") == 3  # prompt + two assignments
+
+
+def test_installer_rerun_preserves_existing_centralpay_keys():
+    """Backward compatibility: on rerun, keeping the existing configuration
+    skips gather_input and write_configuration entirely, so previously
+    stored (possibly distinct) key values are never overwritten unless the
+    operator explicitly chooses to reconfigure."""
+    text = INSTALLER.read_text()
+    assert "Keep existing configuration?" in text
+    keep_branch = text.split("Keep existing configuration?")[1]
+    # gather_input runs only in the reconfigure branch...
+    assert 'if [[ "$KEEP_EXISTING" == "true" ]]' in keep_branch
+    # ...and configuration writing is likewise gated.
+    assert 'if [[ "$KEEP_EXISTING" != "true" ]]' in keep_branch
+    write_gate = keep_branch.split('if [[ "$KEEP_EXISTING" != "true" ]]')[1]
+    assert "write_configuration" in write_gate.split("\n    fi")[0]

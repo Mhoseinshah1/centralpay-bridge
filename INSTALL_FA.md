@@ -34,18 +34,19 @@ curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main
 1. **Payment domain** — دامنهٔ درگاه پرداخت، مثل `pay.example.com`
 2. **Bot API base domain or URL** — دامنه یا آدرس API ربات، مثل
    `https://bot.example.com` (نصاب خودش `/api/payment` را اضافه می‌کند)
-3. **CentralPay getLink API key** — کلید ساخت لینک پرداخت CentralPay
-4. **CentralPay verify API key** — کلید تأیید پرداخت CentralPay
-   (این دو کلید متفاوت‌اند؛ هر دو را از پنل CentralPay بگیرید)
-5. **Bot /token2 value** — توکن ربات که با دستور `/token2` می‌گیرید.
+3. **CentralPay API key** — کلید API درگاه CentralPay (مخفی وارد
+   می‌شود). CentralPay فقط **یک** کلید می‌دهد و همان کلید هم برای ساخت
+   لینک (getLink) و هم برای تأیید (verify) استفاده می‌شود؛ نصاب همین
+   یک مقدار را در هر دو متغیر تنظیم می‌کند.
+4. **Bot /token2 value** — توکن ربات که با دستور `/token2` می‌گیرید.
    این با توکن BotFather فرق دارد و فقط برای اعلام پرداخت به API ربات است.
-6. **Telegram bot username** — اختیاری؛ برای لینک «بازگشت به ربات»
-7. **Email for TLS** — ایمیل برای گواهی Let's Encrypt
-8. **Minimum payment amount** — حداقل مبلغ به تومان (پیش‌فرض ۱۰۰۰)
-9. **Maximum payment amount** — حداکثر مبلغ به تومان (پیش‌فرض ۱۰۰٬۰۰۰٬۰۰۰)
-10. **Retry mode** — حالت تلاش مجدد اعلان (`safe` پیش‌فرض و توصیه‌شده؛
+5. **Telegram bot username** — اختیاری؛ برای لینک «بازگشت به ربات»
+6. **Email for TLS** — ایمیل برای گواهی Let's Encrypt
+7. **Minimum payment amount** — حداقل مبلغ به تومان (پیش‌فرض ۱۰۰۰)
+8. **Maximum payment amount** — حداکثر مبلغ به تومان (پیش‌فرض ۱۰۰٬۰۰۰٬۰۰۰)
+9. **Retry mode** — حالت تلاش مجدد اعلان (`safe` پیش‌فرض و توصیه‌شده؛
     `idempotent` فقط با تأیید صریح توسعه‌دهندهٔ ربات)
-11. **Enable administrator Telegram bot? [y/N]** — اختیاری و پیش‌فرض
+10. **Enable administrator Telegram bot? [y/N]** — اختیاری و پیش‌فرض
     غیرفعال. در صورت فعال‌سازی: توکن BotFather (مخفی)، شناسه‌های عددی
     مدیران (با کاما)، هشدار پرداخت موفق (پیش‌فرض خاموش)، گزارش روزانه و
     ساعت آن، و منطقهٔ زمانی. راهنما: [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md)

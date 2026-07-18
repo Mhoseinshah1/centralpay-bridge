@@ -25,6 +25,9 @@ curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main
 
 </div>
 
+نکته: CentralPay فقط **یک** کلید API می‌دهد؛ نصاب همان یک کلید را
+می‌پرسد و برای هر دو عملیات ساخت لینک و تأیید استفاده می‌کند.
+
 راهنمای کامل نصب: [INSTALL_FA.md](INSTALL_FA.md) —
 بهره‌برداری: [OPERATIONS_FA.md](OPERATIONS_FA.md) —
 پشتیبان‌گیری و بازیابی: [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md)

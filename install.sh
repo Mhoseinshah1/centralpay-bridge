@@ -218,34 +218,40 @@ gather_input() {
     log "Configuration questions (input is read from the terminal):"
 
     while true; do
-        ask PAYMENT_DOMAIN "1/10 Payment domain (e.g. pay.example.com)"
+        ask PAYMENT_DOMAIN "1/9 Payment domain (e.g. pay.example.com)"
         validate_domain "$PAYMENT_DOMAIN" && break
         echo "Invalid domain format." > /dev/tty
     done
 
-    ask BOT_INPUT "2/10 Bot API base domain or URL (e.g. https://bot.example.com)"
+    ask BOT_INPUT "2/9 Bot API base domain or URL (e.g. https://bot.example.com)"
     BOT_PAYMENT_NOTIFY_URL="$(normalize_bot_url "$BOT_INPUT")"
     log "Bot notification endpoint: ${BOT_PAYMENT_NOTIFY_URL}"
 
-    ask_secret CENTRALPAY_GETLINK_API_KEY "3/10 CentralPay getLink API key"
-    ask_secret CENTRALPAY_VERIFY_API_KEY "4/10 CentralPay verify API key"
-    ask_secret BOT_NOTIFY_TOKEN "5/10 Bot /token2 value"
-    ask_optional TELEGRAM_BOT_USERNAME "6/10 Telegram bot username"
+    # CentralPay issues a single API key that authenticates both
+    # getLink.php and verify.php; one prompt fills both variables. The
+    # application keeps two variables so a future split key needs no
+    # contract change.
+    ask_secret CENTRALPAY_API_KEY "3/9 CentralPay API key"
+    CENTRALPAY_GETLINK_API_KEY="$CENTRALPAY_API_KEY"
+    CENTRALPAY_VERIFY_API_KEY="$CENTRALPAY_API_KEY"
+
+    ask_secret BOT_NOTIFY_TOKEN "4/9 Bot /token2 value"
+    ask_optional TELEGRAM_BOT_USERNAME "5/9 Telegram bot username"
 
     while true; do
-        ask TLS_EMAIL "7/10 Email for automatic TLS certificates"
+        ask TLS_EMAIL "6/9 Email for automatic TLS certificates"
         validate_email "$TLS_EMAIL" && break
         echo "Invalid email format." > /dev/tty
     done
 
     while true; do
-        ask MIN_PAYMENT_AMOUNT_TOMAN "8/10 Minimum payment amount in TOMAN" "1000"
+        ask MIN_PAYMENT_AMOUNT_TOMAN "7/9 Minimum payment amount in TOMAN" "1000"
         validate_positive_int "$MIN_PAYMENT_AMOUNT_TOMAN" && break
         echo "Must be a positive integer." > /dev/tty
     done
 
     while true; do
-        ask MAX_PAYMENT_AMOUNT_TOMAN "9/10 Maximum payment amount in TOMAN" "100000000"
+        ask MAX_PAYMENT_AMOUNT_TOMAN "8/9 Maximum payment amount in TOMAN" "100000000"
         if validate_positive_int "$MAX_PAYMENT_AMOUNT_TOMAN" \
             && [[ "$MAX_PAYMENT_AMOUNT_TOMAN" -gt "$MIN_PAYMENT_AMOUNT_TOMAN" ]]; then
             break
@@ -254,7 +260,7 @@ gather_input() {
     done
 
     while true; do
-        ask BOT_NOTIFY_RETRY_MODE "10/10 Bot notification retry mode (safe/idempotent)" "safe"
+        ask BOT_NOTIFY_RETRY_MODE "9/9 Bot notification retry mode (safe/idempotent)" "safe"
         case "$BOT_NOTIFY_RETRY_MODE" in
             safe|idempotent) break ;;
             *) echo "Choose 'safe' or 'idempotent'. Use 'idempotent' ONLY if the bot developer confirmed duplicate order_id delivery is safe." > /dev/tty ;;

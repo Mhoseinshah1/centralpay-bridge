@@ -439,7 +439,7 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `PUBLIC_BASE_URL` | Public HTTPS base URL of the bridge; used to build the signed CentralPay return URL |
 | `INBOUND_API_KEY` | Key the bot must send in `POST /api/custom-payment` (min 16 chars) |
 | `CALLBACK_HMAC_SECRET` | Secret for HMAC-SHA256 callback signatures (min 16 chars) |
-| `CENTRALPAY_GETLINK_API_KEY` / `CENTRALPAY_VERIFY_API_KEY` | CentralPay web service keys |
+| `CENTRALPAY_GETLINK_API_KEY` / `CENTRALPAY_VERIFY_API_KEY` | CentralPay web service key. The gateway issues a **single** API key used for both getLink and verify — the installer asks for it once and sets the same value in both variables (kept separate so a future split key needs no contract change) |
 | `CENTRALPAY_USER_ID` | Numeric userId sent to getLink and validated on verify |
 | `BOT_PAYMENT_NOTIFY_URL` | Complete bot payment endpoint (e.g. `https://bot.example.com/api/payment`) |
 | `BOT_NOTIFY_TOKEN` | Bot `Token` header value; never logged |
