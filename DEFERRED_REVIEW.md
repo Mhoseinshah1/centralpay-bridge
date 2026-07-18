@@ -61,6 +61,20 @@ documented as model A (row lock held across getLink, bounded by
 CENTRALPAY_TIMEOUT_SECONDS). Topics 8 and part of 10 are substantially
 narrowed by these tests; the full adversarial review (B4) remains open.
 
+Status update (worker audit, audit/worker-retry-and-recovery): the
+worker, retry engine, claim/stale-claim recovery, and crash paths were
+audited. Fixed: interrupted attempts now count against the retry limit in
+idempotent mode (previously a delivery whose worker died on every attempt
+requeued forever); attempt results are recorded only when the row still
+carries the recording worker's claim at the same attempt number
+(stragglers can no longer write against a successor's claim, and the
+discard is audited); stale-claim recovery batches are bounded. Proven by
+new deterministic tests: four workers drain a queue with exactly-once
+delivery on real PostgreSQL, manual review survives restarts and both
+retry modes, scheduled retries survive process restarts, and recovery
+batch bounds. Topics 13 and 15 are narrowed accordingly; load testing
+(15) and the full adversarial review (B4) remain open.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection
