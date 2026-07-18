@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "centralpay-bridge"
-version = "0.1.0"
+version = "0.3.0.dev0"
 description = "Payment bridge between a Telegram bot custom gateway API and CentralPay"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -24,6 +24,8 @@ dev = [
     "pytest>=8,<9",
     "ruff>=0.6",
     "mypy>=1.10",
+    "pyyaml>=6",
+    "types-PyYAML",
 ]
 
 [tool.setuptools.packages.find]

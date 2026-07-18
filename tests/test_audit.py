@@ -25,6 +25,7 @@ def test_full_flow_records_ordered_audit_events(client, settings, session_factor
         "payment_link_created",
         "callback_received",
         "gateway_payment_verified",
+        "bot_notification_queued",
     ]
 
     # Every event carries the request id of the HTTP request that caused it.
@@ -34,6 +35,7 @@ def test_full_flow_records_ordered_audit_events(client, settings, session_factor
     assert [event.request_id for event in events] == [
         create_request_id,
         create_request_id,
+        callback_request_id,
         callback_request_id,
         callback_request_id,
     ]
@@ -68,6 +70,7 @@ def test_audit_events_never_contain_secrets(client, settings, session_factory, s
         settings.callback_hmac_secret,
         settings.centralpay_getlink_api_key,
         settings.centralpay_verify_api_key,
+        settings.bot_notify_token,
     ]
     for event in get_events(session_factory):
         serialized = repr(event.data)

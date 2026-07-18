@@ -146,4 +146,5 @@ def test_create_for_already_verified_order_rejected(client, settings, session_fa
     assert response.json()["error"]["code"] == "order_already_verified"
     # The successful payment record was not overwritten.
     payment = get_payment(session_factory, "order-paid")
-    assert payment.status == PaymentStatus.GATEWAY_VERIFIED.value
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert payment.gateway_verified_at is not None

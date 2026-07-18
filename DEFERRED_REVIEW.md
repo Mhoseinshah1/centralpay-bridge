@@ -1,13 +1,27 @@
 # Deferred review — unresolved topics
 
-Automated adversarial verification and the full test suite were deferred and
-have not yet been completed. This implementation must not be considered
-production-ready until those checks are completed.
+Automated adversarial verification has not yet been completed. This
+implementation must not be considered production-ready until that review
+(and the remaining checks listed at the end of this document) are completed.
 
 An in-depth multi-agent adversarial review of Phase 1 was started and then
-intentionally stopped before completion. This document records every visible
-unresolved review topic so nothing is lost. Each item must be reviewed (and
-fixed or explicitly accepted) before production deployment.
+intentionally stopped before completion; it has not been re-run for Phase 1
+or Phase 2. This document records every visible unresolved review topic so
+nothing is lost. Each item must be reviewed (and fixed or explicitly
+accepted) before production deployment.
+
+Status update (Phase 2): the focused Phase 2 tests, the full quick unit
+suite, PostgreSQL integration tests, Ruff, mypy, and Alembic migration
+validation were run and pass. The multi-agent adversarial review remains
+outstanding.
+
+Status update (Phase 3): deployment tooling added (Docker Compose, Caddy,
+installer, management command, backups, CI workflows). Focused Phase 3
+deployment tests, the full quick suite, Ruff, mypy, ShellCheck, and
+`docker compose config` validation pass. The Docker image build could not
+run in the development sandbox (registry access blocked by network policy)
+and is delegated to the CI `docker` job. The multi-agent adversarial
+review remains outstanding.
 
 ## Unresolved review topics
 
@@ -85,35 +99,105 @@ finished probing duplicate callbacks arriving in *other* states (e.g. during
 longer resolves to a payment and returns 404).
 
 ### 10. Recovery after process crash
-Payments can be left in `created` (crash before getLink) or `getlink_failed`
-states with no automated sweep; recovery currently relies on the bot
-re-requesting the same `order_id`. There is no operator runbook or tooling
-for enumerating and resolving stale rows. Phase 3+ management commands are
-expected to cover this; until then the gap is undocumented.
+Partially addressed in Phase 2: the notification worker recovers
+`bot_notify_pending` payments after restart, and stale claims (a worker
+crashed mid-attempt) are released on every pass with a
+`notification_recovered_after_restart` audit event. Still open: payments
+left in `created` (crash before getLink) or `getlink_failed` have no
+automated sweep — recovery relies on the bot re-requesting the same
+`order_id` — and there is still no operator runbook for those rows
+(Phase 3+ management command scope).
 
 ### 11. Bot notification ambiguity
-Phase 2 scope, recorded here for continuity: the bot API defines no response
-schema and no idempotency guarantee. AGENTS.md mandates conservative
-semantics (HTTP 2xx → `bot_notify_accepted` only, ambiguous timeout →
-`manual_review` in safe mode, no automatic retry of ambiguous deliveries).
-Nothing in Phase 1 sends bot notifications; any interim manual notification
-process must follow the same rules.
+Implemented in Phase 2 per the contract: HTTP 2xx → `bot_notify_accepted`
+only (never treated as balance credit); ambiguous read/write timeouts →
+`manual_review` with reason `bot_timeout_ambiguous` in safe mode; retry of
+ambiguous deliveries only in the explicitly configured idempotent mode.
+Still open for review: confirmation from the bot developer whether
+duplicate `order_id` delivery is idempotent (prerequisite for ever enabling
+idempotent mode in production), and the classification boundaries in
+`app/bot.py` (which httpx failures count as "clearly before transmission").
 
 ### 12. Manual review workflow
-Payments reaching `manual_review` are preserved and recoverable (append-only
-audit trail, no destructive transitions), but there is no administrator
-tooling to inspect or resolve them yet (planned for Phases 3–4). Until that
-exists, resolving a `manual_review` payment requires direct, audited
-database work by an administrator — there is no documented procedure.
+Partially addressed in Phase 2: `python -m app.cli manual-review` /
+`payment ORDER_ID` provide read-only inspection with reason codes, attempt
+counts, and full audit history. Still open: there is no resolution tooling —
+resolving a `manual_review` payment still requires direct, audited database
+work by an administrator, and no manual retry command exists yet (per
+AGENTS.md it must not be added until retry safety and authorization are
+separately reviewed). Administrator alerts arrive with the Phase 4 admin
+bot.
+
+## New unresolved topics from Phase 2
+
+### 13. Stale-claim conservatism in safe mode
+A claim whose worker died is treated as an ambiguous attempt and sent to
+manual review in safe mode, even when the crash may have happened *before*
+the HTTP request was transmitted (the pre-send window is milliseconds, but
+not zero). This is deliberately conservative — availability sacrificed for
+financial correctness — but review whether a durable "request about to be
+sent" marker could narrow the ambiguity window.
+
+### 14. Retry-After handling is integer-seconds only
+HTTP-date `Retry-After` values on 429 responses are ignored (backoff
+schedule applies instead). Confirm this is acceptable for the bot API.
+
+### 15. Worker scaling and batch behavior
+One worker processes up to 20 payments per pass sequentially. Multiple
+workers are safe (SKIP LOCKED), but throughput under a large verified
+backlog and lock-wait behavior under callback floods have not been load
+tested (load testing was explicitly out of scope).
+
+### 16. Callback pages for non-verified outcomes
+Only verified payments get the payer-facing HTML page. Signature failures,
+unknown payments, and gateway-declined verifications still return JSON
+errors; a payer-friendly failure page is deferred.
+
+## New unresolved topics from Phase 3
+
+### 17. No rate limiting at the proxy
+Stock Caddy has no rate-limit module; adding one requires a custom Caddy
+build (plugin) or an alternative mechanism. Until then, unauthenticated
+endpoints (callback, health) rely on request-size limits, signature
+validation, and upstream capacity. Amount bounds and API-key auth protect
+`custom-payment`. Review before production exposure.
+
+### 18. Base images not digest-pinned
+`python:3.12-slim`, `postgres:16`, and `caddy:2` are tag-pinned, not
+digest-pinned; supply-chain reviewers may want digests plus an update
+process for them.
+
+### 19. Update channel is a Git ref without signature verification
+`centralpay update` fetches `CENTRALPAY_UPDATE_REF` (default `main` —
+development mode) from GitHub over HTTPS but does not verify tags or
+commit signatures. Pin a release tag for production and review signed
+releases before 1.0.
+
+### 20. Installer end-to-end run not executed on real target OSes
+Installer logic is unit-tested (OS/arch rejection, validation, secret
+handling) and ShellCheck-clean, but a full `curl | sudo bash` install has
+not been executed on live Ubuntu 22.04/24.04/26.04 hosts from this
+environment. Required before claiming installer completion (AGENTS.md
+completion criteria). Ubuntu 26.04 CI runners are not yet available;
+version logic is validated in tests instead.
+
+### 21. Off-site backup replication
+Backups are local to the server. Replication to off-site storage is
+documented as a manual recommendation only.
 
 ## Deferred checks
 
-The following were intentionally not run for the preservation snapshot on
-this branch and must be completed before production:
+The following must still be completed before production:
 
-- full pytest suite (unit + PostgreSQL integration)
-- Ruff lint and mypy type checking as release gates
 - multi-agent adversarial review (financial correctness, security,
-  contract compliance, test coverage)
+  contract compliance, test coverage) — started for Phase 1, intentionally
+  stopped, never completed; not run for Phase 2
 - dependency vulnerability scan and secret scan (CI, Phase 5)
 - ShellCheck, Docker build, end-to-end installer test (later phases)
+- load testing (explicitly out of scope so far)
+
+Completed for Phase 2 (see the Phase 2 pull request for details): focused
+Phase 2 tests, full quick unit suite, PostgreSQL integration tests
+(migration on an empty database, stepwise 0001→0002 upgrade, SKIP LOCKED
+concurrency), Ruff, mypy, and a local end-to-end smoke test (API + worker +
+fake gateway + fake bot).

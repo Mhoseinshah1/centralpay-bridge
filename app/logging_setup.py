@@ -55,6 +55,7 @@ def collect_secret_values(settings: Settings) -> list[str]:
         settings.callback_hmac_secret,
         settings.centralpay_getlink_api_key,
         settings.centralpay_verify_api_key,
+        settings.bot_notify_token,
     ]
     try:
         password = make_url(settings.database_url).password
@@ -91,10 +92,39 @@ class JsonFormatter(logging.Formatter):
         return line
 
 
+class TextFormatter(logging.Formatter):
+    """Human-readable single-line format for development. Still redacted."""
+
+    def __init__(self, redactor: SecretRedactor | None = None) -> None:
+        super().__init__()
+        self._redactor = redactor
+
+    def format(self, record: logging.LogRecord) -> str:
+        timestamp = datetime.fromtimestamp(record.created, tz=UTC).strftime("%H:%M:%S")
+        parts = [timestamp, record.levelname, record.name, record.getMessage()]
+        request_id = request_id_var.get()
+        if request_id is not None:
+            parts.append(f"request_id={request_id}")
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_ATTRS and not key.startswith("_"):
+                parts.append(f"{key}={value}")
+        if record.exc_info:
+            parts.append(self.formatException(record.exc_info))
+        line = " ".join(str(part) for part in parts)
+        if self._redactor is not None:
+            line = self._redactor.redact(line)
+        return line
+
+
 def configure_logging(settings: Settings) -> None:
     redactor = SecretRedactor(collect_secret_values(settings))
     handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter(redactor))
+    formatter: logging.Formatter
+    if settings.log_format == "text":
+        formatter = TextFormatter(redactor)
+    else:
+        formatter = JsonFormatter(redactor)
+    handler.setFormatter(formatter)
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(settings.log_level.upper())

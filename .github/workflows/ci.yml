@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Tests (Python, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: centralpay
+          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_DB: centralpay_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U centralpay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check .
+      - name: mypy
+        run: mypy app tests
+      - name: pytest (unit + PostgreSQL integration)
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg://centralpay:ci_test_password@localhost:5432/centralpay_test
+        run: pytest -q
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: |
+          bash -n install.sh
+          bash -n scripts/centralpay
+          bash -n scripts/backup.sh
+      - name: ShellCheck
+        run: shellcheck install.sh scripts/centralpay scripts/backup.sh
+
+  docker:
+    name: Docker build and compose validation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: |
+          mkdir -p /tmp/cfg
+          echo dummy > /tmp/cfg/db_password
+          touch /tmp/cfg/centralpay.env /tmp/cfg/Caddyfile
+          CENTRALPAY_ENV_FILE=/tmp/cfg/centralpay.env \
+          CENTRALPAY_DB_PASSWORD_FILE=/tmp/cfg/db_password \
+          CENTRALPAY_CADDYFILE=/tmp/cfg/Caddyfile \
+            docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image (amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: centralpay-bridge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Image smoke test (non-root, version, clean exit)
+        run: |
+          docker run --rm --entrypoint python centralpay-bridge:ci - <<'EOF'
+          import os
+          from app.version import APP_VERSION
+          assert os.getuid() != 0, "container must not run as root"
+          print("version:", APP_VERSION)
+          EOF
+      - name: Validate Caddyfile template
+        run: |
+          sed -e 's/{{PAYMENT_DOMAIN}}/pay.example.com/' -e 's/{{TLS_EMAIL}}/ops@example.com/' \
+            deploy/caddy/Caddyfile.template > /tmp/Caddyfile
+          docker run --rm -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2 \
+            caddy validate --config /etc/caddy/Caddyfile
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit
+        run: |
+          pip install .
+          pip install pip-audit
+          pip-audit

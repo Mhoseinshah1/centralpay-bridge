@@ -21,6 +21,12 @@ class InvalidApiKeyError(BridgeError):
     default_message = "Invalid API key"
 
 
+class AmountOutOfRangeError(BridgeError):
+    code = "amount_out_of_range"
+    http_status = 400
+    default_message = "Amount is outside the configured payment bounds"
+
+
 class DuplicateOrderAmountMismatchError(BridgeError):
     code = "duplicate_order_amount_mismatch"
     http_status = 409

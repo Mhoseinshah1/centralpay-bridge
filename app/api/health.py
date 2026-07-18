@@ -5,6 +5,8 @@ import logging
 from fastapi import APIRouter, Request, Response
 from sqlalchemy import text
 
+from app.version import APP_VERSION
+
 logger = logging.getLogger("app.api.health")
 
 router = APIRouter()
@@ -12,7 +14,8 @@ router = APIRouter()
 
 @router.get("/health/live")
 def health_live() -> dict[str, str]:
-    return {"status": "alive"}
+    # Version is non-sensitive and helps operators confirm deployed code.
+    return {"status": "alive", "version": APP_VERSION}
 
 
 @router.get("/health/ready")
