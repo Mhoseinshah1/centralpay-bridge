@@ -409,3 +409,59 @@ def test_concurrent_distinct_orders_get_unique_gateway_ids(
         ).scalars().all()
     assert len(gateway_ids) == 10
     assert len(set(gateway_ids)) == 10
+
+
+def test_four_workers_drain_queue_exactly_once(
+    settings, pg_app, pg_session_factory, bot_stub, notifier
+):
+    """Worker audit: four workers draining a 12-payment queue under real
+    SKIP LOCKED must deliver every payment exactly once — no duplicates, no
+    losses, no deadlocks — with deterministic per-payment attempt counts."""
+    from app.services.notification import run_worker_pass
+
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        for i in range(12):
+            order_id = f"pg-drain-{i}"
+            assert create_order(client, settings, order_id=order_id, amount=5000).status_code == 200
+            payment = get_payment(pg_session_factory, order_id)
+            stub.verify_result = verify_ok_response(amount=5000, reference_id=f"REF-{order_id}")
+            callback = client.get(valid_callback_path(stub, payment.gateway_order_id))
+            assert callback.status_code == 200
+
+    barrier = threading.Barrier(4)
+
+    def drain(worker_index):
+        barrier.wait(timeout=10)
+        session = pg_session_factory()
+        try:
+            total = 0
+            while True:
+                result = run_worker_pass(
+                    session, notifier, settings, worker_id=f"pg-worker-{worker_index}"
+                )
+                total += result["processed"]
+                if result["processed"] == 0:
+                    return total
+        finally:
+            session.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(drain, i) for i in range(4)]
+        totals = [future.result(timeout=120) for future in futures]
+
+    # Every payment delivered exactly once across all workers.
+    assert sum(totals) == 12
+    assert len(bot_stub.requests) == 12
+    delivered_orders = [str(request["order_id"]) for request in bot_stub.requests]
+    assert sorted(delivered_orders) == sorted(f"pg-drain-{i}" for i in range(12))
+
+    with pg_session_factory() as session:
+        payments = session.execute(
+            select(Payment).where(Payment.bot_order_id.like("pg-drain-%"))
+        ).scalars().all()
+    assert len(payments) == 12
+    for payment in payments:
+        assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+        assert payment.bot_notify_attempts == 1  # exactly one attempt each
+        assert payment.notification_claimed_at is None  # claims released
