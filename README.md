@@ -13,9 +13,17 @@ roadmap is GitHub issue #1.
 > implementation must not be considered production-ready until that review
 > and the remaining checks are completed.
 
-The Phase 2 test suite, lint, type checking, and migration validation pass;
-the multi-agent adversarial review remains outstanding. Unresolved review
-topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
+The full test suite (unit + PostgreSQL integration + fault injection +
+backup/restore round-trip), lint, type checking, and migration validation
+pass; the multi-agent adversarial review remains outstanding. Every
+deferred topic has been triaged for 0.5.0-rc1 in
+[RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md) — **open release
+blockers**: real-host installer validation
+([REAL_HOST_VALIDATION.md](REAL_HOST_VALIDATION.md)), staging validation
+against the real gateway ([STAGING_VALIDATION.md](STAGING_VALIDATION.md)),
+live Telegram validation ([ADMIN_BOT_VALIDATION.md](ADMIN_BOT_VALIDATION.md)),
+the adversarial review, and a green release workflow. Original topics:
+[DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
 
 ## Status
 
@@ -74,14 +82,37 @@ topics are tracked in [DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
 - Persian message formatting (Jalali timestamps) with HTML escaping of
   every dynamic value
 
-Not yet implemented (Phase 5): remaining hardening, complete workflows,
-architecture diagram, end-to-end installation test.
+**Phase 5 — Release-candidate hardening (0.5.0-rc1)** (this code):
+
+- One-time callback tokens bound into the HMAC signature (hash-only
+  storage, durable consumption, no hard expiration — legitimate late
+  returns still resolve)
+- Strict CentralPay response parsing: explicit success allowlist and
+  typed field parsing with explicit reason codes (success is never
+  guessed from truthy values)
+- Reference-ID uniqueness; collisions route to manual review with a
+  critical `reference_id_collision` alert and never overwrite
+- Application-level rate limiting (invalid API keys, invalid callback
+  signatures, create bursts)
+- `centralpay review` host CLI (acknowledge/resolve with non-financial
+  resolutions only; gated resend), `centralpay update --check` with
+  release-checksum verification, application-only `centralpay rollback`
+- `GET /health/details` (internal), first-payment guard
+  (`FIRST_PAYMENT_GUARD_ENABLED`), fault-injection and backup/restore
+  integration tests, gated release workflow producing draft-only
+  releases with SBOM and SHA256SUMS
+- Release docs: [CHANGELOG.md](CHANGELOG.md),
+  [RELEASE_NOTES_0.5.0_RC1.md](RELEASE_NOTES_0.5.0_RC1.md),
+  [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md),
+  [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md),
+  [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md)
 
 Persian documentation: [README_FA.md](README_FA.md),
 [INSTALL_FA.md](INSTALL_FA.md), [OPERATIONS_FA.md](OPERATIONS_FA.md),
 [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md),
-[ADMIN_BOT_FA.md](ADMIN_BOT_FA.md). Security policy:
-[SECURITY.md](SECURITY.md).
+[ADMIN_BOT_FA.md](ADMIN_BOT_FA.md),
+[PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md). Security
+policy: [SECURITY.md](SECURITY.md).
 
 ## Production installation
 
