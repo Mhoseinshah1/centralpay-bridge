@@ -109,6 +109,46 @@ services:
       start_period: 30s
     logging: *default-logging
 
+  admin-bot:
+    <<: [*app-image, *app-env]
+    command: ["python", "-m", "app.adminbot"]
+    # Only started when the admin-bot profile is enabled (the centralpay
+    # command adds --profile admin-bot when ADMIN_BOT_ENABLED=true).
+    profiles: ["admin-bot"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    # No published ports; outbound Telegram only. Hardened: read-only root
+    # filesystem, tmpfs for the heartbeat file, no capabilities, no
+    # privilege escalation, no Docker socket, non-root user from the image.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, sys, time
+          path = os.environ.get("ADMIN_BOT_HEARTBEAT_FILE", "/tmp/centralpay-adminbot-heartbeat")
+          fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < 180
+          sys.exit(0 if fresh else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    logging: *default-logging
+
   caddy:
     image: caddy:2
     restart: unless-stopped

@@ -19,7 +19,19 @@ ENV_FILE="${CONFIG_DIR}/centralpay.env"
 DRY_RUN="${BACKUP_DRY_RUN:-0}"
 
 log()  { printf '[centralpay-backup] %s\n' "$*"; }
-fail() { printf '[centralpay-backup] ERROR: %s\n' "$*" >&2; exit 1; }
+
+record_outcome() {
+    # Best-effort operational record for admin alerts and /backup_status.
+    # Never fails the backup itself and passes no secrets.
+    docker compose --project-directory "$INSTALL_DIR" exec -T api \
+        python -m app.ops backup-event "$@" >/dev/null 2>&1 || true
+}
+
+fail() {
+    printf '[centralpay-backup] ERROR: %s\n' "$*" >&2
+    record_outcome failure --detail "$*"
+    exit 1
+}
 
 trap 'printf "[centralpay-backup] Backup FAILED.\n" >&2' ERR
 
@@ -69,6 +81,8 @@ main() {
     : > "${file}.ok"
     chmod 600 "${file}.ok"
     log "Backup created and validated: ${file} ($(du -h "$file" | cut -f1))"
+    record_outcome success --size "$(du -h "$file" | cut -f1)" \
+        --file-name "$(basename "$file")" --retention-days "$days"
 
     # Retention: delete backups older than N days, but never the newest
     # validated backup.

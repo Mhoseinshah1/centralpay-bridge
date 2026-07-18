@@ -85,6 +85,15 @@ validate_positive_int() {
     [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -gt 0 ]]
 }
 
+validate_admin_ids() {
+    # Comma-separated positive numeric Telegram user IDs, never usernames.
+    [[ "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]
+}
+
+validate_report_time() {
+    [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
 normalize_bot_url() {
     # Accepts "bot.example.com", "https://bot.example.com" or a full endpoint;
     # prints the complete bot payment endpoint URL.
@@ -251,6 +260,44 @@ gather_input() {
             *) echo "Choose 'safe' or 'idempotent'. Use 'idempotent' ONLY if the bot developer confirmed duplicate order_id delivery is safe." > /dev/tty ;;
         esac
     done
+
+    gather_admin_bot_input
+}
+
+gather_admin_bot_input() {
+    # Optional administrator Telegram bot. Disabled by default; the token is
+    # read silently and never echoed or logged.
+    ADMIN_BOT_ENABLED="false"
+    ADMIN_BOT_TOKEN=""
+    ADMIN_TELEGRAM_IDS=""
+    ADMIN_BOT_PAYMENT_SUCCESS_ALERTS="false"
+    ADMIN_BOT_DAILY_REPORT_ENABLED="true"
+    ADMIN_BOT_DAILY_REPORT_TIME="09:00"
+    ADMIN_BOT_TIMEZONE="Asia/Tehran"
+
+    local answer
+    read -r -p "Enable administrator Telegram bot? [y/N]: " answer < /dev/tty
+    [[ "$answer" =~ ^[Yy] ]] || return 0
+
+    ADMIN_BOT_ENABLED="true"
+    ask_secret ADMIN_BOT_TOKEN "Telegram bot token (from BotFather)"
+    while true; do
+        ask ADMIN_TELEGRAM_IDS "Administrator Telegram numeric IDs (comma-separated)"
+        validate_admin_ids "$ADMIN_TELEGRAM_IDS" && break
+        echo "Only positive numeric Telegram user IDs separated by commas (e.g. 123456789,987654321)." > /dev/tty
+    done
+    read -r -p "Enable successful-payment alerts (can be noisy)? [y/N]: " answer < /dev/tty
+    [[ "$answer" =~ ^[Yy] ]] && ADMIN_BOT_PAYMENT_SUCCESS_ALERTS="true"
+    read -r -p "Enable daily report? [Y/n]: " answer < /dev/tty
+    [[ "$answer" =~ ^[Nn] ]] && ADMIN_BOT_DAILY_REPORT_ENABLED="false"
+    if [[ "$ADMIN_BOT_DAILY_REPORT_ENABLED" == "true" ]]; then
+        while true; do
+            ask ADMIN_BOT_DAILY_REPORT_TIME "Daily report time (HH:MM)" "09:00"
+            validate_report_time "$ADMIN_BOT_DAILY_REPORT_TIME" && break
+            echo "Use HH:MM 24-hour format." > /dev/tty
+        done
+    fi
+    ask ADMIN_BOT_TIMEZONE "Timezone for reports" "Asia/Tehran"
 }
 
 # ---------------------------------------------------------------------------
@@ -391,6 +438,13 @@ render_template() {
         -e "s|{{BOT_PAYMENT_NOTIFY_URL}}|${BOT_PAYMENT_NOTIFY_URL}|g" \
         -e "s|{{BOT_NOTIFY_TOKEN}}|${BOT_NOTIFY_TOKEN}|g" \
         -e "s|{{BOT_NOTIFY_RETRY_MODE}}|${BOT_NOTIFY_RETRY_MODE}|g" \
+        -e "s|{{ADMIN_BOT_ENABLED}}|${ADMIN_BOT_ENABLED:-false}|g" \
+        -e "s|{{ADMIN_BOT_TOKEN}}|${ADMIN_BOT_TOKEN:-}|g" \
+        -e "s|{{ADMIN_TELEGRAM_IDS}}|${ADMIN_TELEGRAM_IDS:-}|g" \
+        -e "s|{{ADMIN_BOT_PAYMENT_SUCCESS_ALERTS}}|${ADMIN_BOT_PAYMENT_SUCCESS_ALERTS:-false}|g" \
+        -e "s|{{ADMIN_BOT_DAILY_REPORT_ENABLED}}|${ADMIN_BOT_DAILY_REPORT_ENABLED:-true}|g" \
+        -e "s|{{ADMIN_BOT_DAILY_REPORT_TIME}}|${ADMIN_BOT_DAILY_REPORT_TIME:-09:00}|g" \
+        -e "s|{{ADMIN_BOT_TIMEZONE}}|${ADMIN_BOT_TIMEZONE:-Asia/Tehran}|g" \
         "$1" > "$2"
 }
 
@@ -418,6 +472,9 @@ Callback URL:         https://${PAYMENT_DOMAIN}/api/centralpay/callback
 Health URL:           https://${PAYMENT_DOMAIN}/health/ready
 Bot notification URL: ${BOT_PAYMENT_NOTIFY_URL}
 Installed at:         $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+Administrator bot:    ${ADMIN_BOT_ENABLED:-false}
+Administrator IDs:    ${ADMIN_TELEGRAM_IDS:-none}
 
 View again with: centralpay credentials
 EOF
@@ -452,9 +509,13 @@ install_backup_timer() {
 deploy_stack() {
     log "Building images and starting services (migrations run first)..."
     cd "$INSTALL_DIR"
-    docker compose build --quiet
-    if ! docker compose up -d --wait; then
-        docker compose ps >&2 || true
+    local -a profile_args=()
+    if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        profile_args+=(--profile admin-bot)
+    fi
+    docker compose "${profile_args[@]}" build --quiet
+    if ! docker compose "${profile_args[@]}" up -d --wait; then
+        docker compose "${profile_args[@]}" ps >&2 || true
         echo >&2
         docker compose logs --tail 40 migrate >&2 || true
         fail "Deployment failed. If the 'migrate' service failed above, the database schema migration did not succeed and no application service was started with incompatible code. Fix the issue and rerun the installer or 'centralpay migrate'."
@@ -516,6 +577,20 @@ Commands:
   centralpay backup
   centralpay credentials
 EOF
+    if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        local admin_count
+        admin_count=$(grep -E '^ADMIN_TELEGRAM_IDS=' "$ENV_FILE" | cut -d= -f2- | tr ',' '\n' | grep -c . || echo 0)
+        cat <<EOF
+
+Administrator bot:
+  enabled (${admin_count} administrator ID(s); full list in ${CREDENTIALS_FILE})
+
+Commands:
+  centralpay admin-bot status
+  centralpay admin-bot logs
+  centralpay admin-bot test-alert
+EOF
+    fi
     if [[ "$DNS_READY" != "true" ]]; then
         cat <<EOF
 
