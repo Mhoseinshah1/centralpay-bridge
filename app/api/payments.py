@@ -6,7 +6,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
-from app.exceptions import InvalidApiKeyError
+from app.exceptions import AmountOutOfRangeError, InvalidApiKeyError
 from app.security import constant_time_equals
 from app.services.payments import create_payment
 
@@ -38,6 +38,22 @@ def create_custom_payment(
         # The provided key is never logged.
         logger.warning("invalid_inbound_api_key", extra={"bot_order_id": body.order_id})
         raise InvalidApiKeyError()
+    if not (
+        settings.min_payment_amount_toman <= body.amount <= settings.max_payment_amount_toman
+    ):
+        logger.warning(
+            "amount_out_of_range",
+            extra={
+                "bot_order_id": body.order_id,
+                "amount": body.amount,
+                "min_amount": settings.min_payment_amount_toman,
+                "max_amount": settings.max_payment_amount_toman,
+            },
+        )
+        raise AmountOutOfRangeError(
+            f"Amount must be between {settings.min_payment_amount_toman} and "
+            f"{settings.max_payment_amount_toman} TOMAN"
+        )
     url = create_payment(
         db, client, settings, bot_order_id=body.order_id, amount=body.amount
     )

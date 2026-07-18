@@ -34,4 +34,10 @@ def centralpay_callback(
     result = process_callback(db, client, gateway_order_id=order_id)
     # Once CentralPay verification has succeeded the payer always gets a
     # success page, even while bot delivery is pending or under review.
-    return HTMLResponse(payment_status_page(result.status, result.bot_order_id))
+    return HTMLResponse(
+        payment_status_page(
+            result.status,
+            result.bot_order_id,
+            bot_username=settings.telegram_bot_username,
+        )
+    )

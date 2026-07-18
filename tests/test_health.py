@@ -3,9 +3,13 @@ from sqlalchemy.orm import sessionmaker
 
 
 def test_health_live(client):
+    from app.version import APP_VERSION
+
     response = client.get("/health/live")
     assert response.status_code == 200
-    assert response.json() == {"status": "alive"}
+    assert response.json() == {"status": "alive", "version": APP_VERSION}
+    # Semantic versioning, pre-release until first stable.
+    assert APP_VERSION != "1.0.0"
 
 
 def test_health_ready_success(client):

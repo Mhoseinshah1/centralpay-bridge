@@ -36,9 +36,18 @@ _PAGE_TEXTS: dict[CallbackStatus, dict[str, str]] = {
 }
 
 
-def payment_status_page(status: CallbackStatus, bot_order_id: str) -> str:
+def payment_status_page(
+    status: CallbackStatus, bot_order_id: str, *, bot_username: str = ""
+) -> str:
     texts = _PAGE_TEXTS[status]
     order = html.escape(bot_order_id)
+    bot_link = ""
+    if bot_username:
+        username = html.escape(bot_username.lstrip("@"))
+        bot_link = (
+            f'<p><a href="https://t.me/{username}">'
+            f"بازگشت به ربات / Return to bot @{username}</a></p>"
+        )
     return f"""<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -61,6 +70,7 @@ p {{ color: #444; line-height: 1.9; margin: .5rem 0; }}
 <main data-status="{status.value}">
 <h1>{texts["title_fa"]}</h1>
 <p>{texts["body_fa"]}</p>
+{bot_link}
 <div class="en"><strong>{texts["title_en"]}</strong><br>{texts["body_en"]}</div>
 <div class="order">Order: {order}</div>
 </main>

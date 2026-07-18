@@ -16,6 +16,7 @@ import signal
 import socket
 import threading
 import uuid
+from pathlib import Path
 from types import FrameType
 
 from app.bot import BotNotifier
@@ -66,12 +67,19 @@ def main() -> int:
             "max_attempts": settings.bot_notify_max_attempts,
         },
     )
+    heartbeat = Path(settings.worker_heartbeat_file)
     while not stop.is_set():
         session = session_factory()
         try:
             result = run_worker_pass(session, notifier, settings, worker_id=worker_id)
             if result["processed"] or result["recovered"]:
                 logger.info("worker_pass_completed", extra={"worker_id": worker_id, **result})
+            # Liveness heartbeat: container health checks verify this file
+            # stays fresh. Only touched after a completed pass.
+            try:
+                heartbeat.touch()
+            except OSError:
+                logger.warning("worker_heartbeat_write_failed")
         except Exception:
             logger.exception("worker_pass_failed")
         finally:

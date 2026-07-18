@@ -3,7 +3,7 @@
 import re
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HTTP_URL_PATTERN = re.compile(r"^https?://[^\s]+$")
@@ -18,10 +18,14 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     environment: str = "development"
     log_level: str = "INFO"
+    # json (default, production) or text (development convenience). Both
+    # formats pass through secret redaction.
+    log_format: Literal["json", "text"] = "json"
 
     database_url: str = Field(
         default="postgresql+psycopg://centralpay:centralpay@localhost:5432/centralpay",
@@ -35,7 +39,19 @@ class Settings(BaseSettings):
     # Secrets. Minimum lengths guard against accidentally running with a
     # placeholder or truncated value; the installer generates long random values.
     inbound_api_key: str = Field(min_length=16)
-    callback_hmac_secret: str = Field(min_length=16)
+    # CALLBACK_HMAC_SECRET is canonical; CALLBACK_SECRET is accepted as an
+    # alias for deployment-configuration compatibility.
+    callback_hmac_secret: str = Field(
+        min_length=16,
+        validation_alias=AliasChoices("callback_hmac_secret", "callback_secret"),
+    )
+
+    # Payment amount bounds in TOMAN, enforced on POST /api/custom-payment.
+    min_payment_amount_toman: int = Field(default=1_000, gt=0)
+    max_payment_amount_toman: int = Field(default=100_000_000, gt=0)
+
+    # Optional; shown as a "return to bot" link on payer-facing pages.
+    telegram_bot_username: str = ""
 
     centralpay_base_url: str = "https://centralapi.org/webservice/basic"
     centralpay_getlink_api_key: str = Field(min_length=1)
@@ -55,8 +71,19 @@ class Settings(BaseSettings):
     bot_notify_worker_interval_seconds: float = Field(default=10.0, gt=0)
     bot_notify_claim_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # Worker liveness heartbeat file, touched after every pass.
+    worker_heartbeat_file: str = "/tmp/centralpay-worker-heartbeat"
+
     @model_validator(mode="after")
     def _validate_bot_settings(self) -> Self:
+        if self.min_payment_amount_toman >= self.max_payment_amount_toman:
+            raise ValueError(
+                "MIN_PAYMENT_AMOUNT_TOMAN must be less than MAX_PAYMENT_AMOUNT_TOMAN"
+            )
+        if self.telegram_bot_username and not re.fullmatch(
+            r"@?[A-Za-z0-9_]{1,64}", self.telegram_bot_username
+        ):
+            raise ValueError("TELEGRAM_BOT_USERNAME contains invalid characters")
         if self.bot_payment_notify_url and not _HTTP_URL_PATTERN.fullmatch(
             self.bot_payment_notify_url
         ):
