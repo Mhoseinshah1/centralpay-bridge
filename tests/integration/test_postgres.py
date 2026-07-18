@@ -23,11 +23,11 @@ from app.models import Base, PaymentStatus
 from tests.conftest import (
     CentralPayStub,
     build_app,
-    callback_path,
     create_order,
     event_types,
     get_events,
     get_payment,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -135,7 +135,7 @@ def test_full_payment_flow_on_postgres(settings, pg_app, pg_session_factory):
         assert create_order(client, settings, order_id="pg-flow", amount=15000).status_code == 200
         payment = get_payment(pg_session_factory, "pg-flow")
         stub.verify_result = verify_ok_response(amount=15000)
-        response = client.get(callback_path(settings, payment.gateway_order_id))
+        response = client.get(valid_callback_path(stub, payment.gateway_order_id))
         assert response.status_code == 200
         assert 'data-status="bot_pending"' in response.text
 
@@ -160,7 +160,7 @@ def test_concurrent_callbacks_verify_exactly_once(settings, pg_app, pg_session_f
         stub.verify_result = verify_ok_response(amount=20000)
         stub.verify_delay_seconds = 0.5
 
-        path = callback_path(settings, payment.gateway_order_id)
+        path = valid_callback_path(stub, payment.gateway_order_id)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(client.get, path) for _ in range(2)]
             responses = [future.result(timeout=30) for future in futures]
@@ -207,7 +207,7 @@ def test_concurrent_worker_claims_use_skip_locked(settings, pg_app, pg_session_f
         assert create_order(client, settings, order_id="pg-claim", amount=9000).status_code == 200
         payment = get_payment(pg_session_factory, "pg-claim")
         stub.verify_result = verify_ok_response(amount=9000)
-        assert client.get(callback_path(settings, payment.gateway_order_id)).status_code == 200
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
 
     barrier = threading.Barrier(2)
 

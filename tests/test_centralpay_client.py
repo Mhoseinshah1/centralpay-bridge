@@ -33,11 +33,67 @@ def respond_with(response: httpx.Response | Exception):
 def test_get_link_success():
     client = make_client(
         respond_with(
-            httpx.Response(200, json={"data": {"redirectUrl": "https://gateway.test/pay/x"}})
+            httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"redirectUrl": "https://gateway.test/pay/x"},
+                },
+            )
         )
     )
     url = client.get_link(amount=1000, user_id=1, order_id=2, return_url="https://cb.test")
     assert url == "https://gateway.test/pay/x"
+
+
+def test_get_link_without_explicit_success_marker_rejected():
+    """Success is never inferred from the presence of data alone."""
+    client = make_client(
+        respond_with(
+            httpx.Response(200, json={"data": {"redirectUrl": "https://gateway.test/pay/x"}})
+        )
+    )
+    with pytest.raises(CentralPayRejectedError, match="getlink_response_unrecognized"):
+        client.get_link(amount=1000, user_id=1, order_id=2, return_url="https://cb.test")
+
+
+def test_get_link_invalid_redirect_url_rejected():
+    for bad_redirect in ("", "javascript:alert(1)", 42, None):
+        client = make_client(
+            respond_with(
+                httpx.Response(
+                    200, json={"status": "success", "data": {"redirectUrl": bad_redirect}}
+                )
+            )
+        )
+        with pytest.raises(CentralPayRejectedError):
+            client.get_link(amount=1000, user_id=1, order_id=2, return_url="https://cb.test")
+
+
+def test_verify_success_with_mistyped_fields_reports_field_errors():
+    """Gateway says success but fields are malformed: parse strictly, flag
+    explicit reason codes, and let the service route to manual review."""
+    client = make_client(
+        respond_with(
+            httpx.Response(
+                200,
+                json={
+                    "status": "success",
+                    "data": {"referenceId": "", "amount": 12.5, "userId": None},
+                },
+            )
+        )
+    )
+    result = client.verify(order_id=5)
+    assert result.gateway_success is True
+    assert result.reference_id is None
+    assert result.amount is None
+    assert result.user_id is None
+    assert set(result.field_errors) == {
+        "verify_empty_reference_id",
+        "verify_invalid_amount",
+        "verify_invalid_user_id",
+    }
 
 
 def test_get_link_http_error_status():

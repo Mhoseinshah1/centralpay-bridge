@@ -6,12 +6,12 @@ from sqlalchemy import func, select
 from app.models import Payment, PaymentStatus
 from tests.conftest import (
     DEFAULT_REDIRECT_URL,
-    callback_path,
     create_order,
     event_types,
     get_events,
     get_payment,
     getlink_ok_response,
+    valid_callback_path,
     verify_ok_response,
 )
 
@@ -139,7 +139,7 @@ def test_create_for_already_verified_order_rejected(client, settings, session_fa
     assert create_order(client, settings, order_id="order-paid", amount=7000).status_code == 200
     payment = get_payment(session_factory, "order-paid")
     stub.verify_result = verify_ok_response(amount=7000)
-    assert client.get(callback_path(settings, payment.gateway_order_id)).status_code == 200
+    assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
 
     response = create_order(client, settings, order_id="order-paid", amount=7000)
     assert response.status_code == 409

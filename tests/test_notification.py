@@ -15,13 +15,13 @@ from app.services.notification import claim_next_due
 from tests.conftest import (
     TEST_BOT_TOKEN,
     as_utc,
-    callback_path,
     create_order,
     event_types,
     get_events,
     get_payment,
     make_verified_pending,
     run_pass,
+    valid_callback_path,
 )
 
 FIXED_NOW = datetime(2026, 7, 18, 12, 0, 0, tzinfo=UTC)
@@ -49,7 +49,7 @@ def test_notification_never_sent_before_verification(
     # A declined verification never queues a notification either.
     payment = get_payment(session_factory, "ntf-unverified")
     stub.verify_result = httpx.Response(200, json={"status": "error", "message": "not paid"})
-    assert client.get(callback_path(settings, payment.gateway_order_id)).status_code == 409
+    assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 409
     run_pass(session_factory, notifier, settings)
     assert bot_stub.requests == []
 
@@ -331,7 +331,7 @@ def test_accepted_payment_is_never_retried(
     # Further passes, later times, and duplicate callbacks change nothing.
     result = run_pass(session_factory, notifier, settings, now=FIXED_NOW + timedelta(days=1))
     assert result["processed"] == 0
-    duplicate = client.get(callback_path(settings, payment.gateway_order_id))
+    duplicate = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert 'data-status="bot_accepted"' in duplicate.text
     run_pass(session_factory, notifier, settings, now=FIXED_NOW + timedelta(days=2))
     assert len(bot_stub.requests) == 1
@@ -389,7 +389,7 @@ def test_untrusted_response_text_is_never_reflected(
         assert "EVIL_MARKER_9000" not in repr(event.data)
 
     # The payer-facing page for this payment contains no remote text either.
-    page = client.get(callback_path(settings, payment.gateway_order_id))
+    page = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert page.status_code == 200
     assert "EVIL_MARKER_9000" not in page.text
 

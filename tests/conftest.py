@@ -293,13 +293,35 @@ def create_order(
     )
 
 
-def callback_path(settings: Settings, gateway_order_id: int, sig: str | None = None) -> str:
+def callback_path(
+    settings: Settings,
+    gateway_order_id: int,
+    sig: str | None = None,
+    ct: str = "0123456789abcdef0123456789abcdef",
+) -> str:
+    """A correctly signed callback URL with an ARBITRARY token.
+
+    The signature is valid, but the token will not match the stored hash —
+    use `valid_callback_path` (captured from the getLink request) for
+    success-path tests.
+    """
     signature = (
         sig
         if sig is not None
-        else callback_signature(settings.callback_hmac_secret, gateway_order_id)
+        else callback_signature(settings.callback_hmac_secret, gateway_order_id, ct)
     )
-    return f"/api/centralpay/callback?orderId={gateway_order_id}&sig={signature}"
+    return f"/api/centralpay/callback?orderId={gateway_order_id}&ct={ct}&sig={signature}"
+
+
+def valid_callback_path(stub: CentralPayStub, gateway_order_id: int | None = None) -> str:
+    """The real signed callback path (with its one-time token) that was sent
+    to CentralPay inside the returnUrl of the most recent matching getLink."""
+    for request in reversed(stub.getlink_requests):
+        if gateway_order_id is None or request["orderId"] == gateway_order_id:
+            url = str(request["returnUrl"])
+            marker = "/api/centralpay/callback"
+            return url[url.index(marker):]
+    raise AssertionError("no matching getLink request captured")
 
 
 def get_payment(session_factory: sessionmaker[Session], bot_order_id: str) -> Payment:
@@ -367,7 +389,9 @@ def make_verified_pending(
     response = create_order(client, settings, order_id=order_id, amount=amount)
     assert response.status_code == 200
     payment = get_payment(session_factory, order_id)
-    stub.verify_result = verify_ok_response(amount=amount)
-    callback_response = client.get(callback_path(settings, payment.gateway_order_id))
+    # Reference ids are unique per payment (uq_payments_reference_id); reusing
+    # one across payments correctly triggers collision manual-review.
+    stub.verify_result = verify_ok_response(amount=amount, reference_id=f"REF-{order_id}")
+    callback_response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert callback_response.status_code == 200
     return get_payment(session_factory, order_id)
