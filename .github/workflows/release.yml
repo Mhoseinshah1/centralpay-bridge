@@ -174,13 +174,22 @@ jobs:
           docker run --rm -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2 \
             caddy validate --config /etc/caddy/Caddyfile
       - name: Trivy vulnerability scan (image)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: centralpay-bridge:release
-          format: table
-          exit-code: "1"
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
+        # The marketplace pin aquasecurity/trivy-action@0.28.0 stopped
+        # resolving ("unable to find version") and broke the first release
+        # run before any step executed. The official Trivy CLI image is
+        # used instead: Docker Hub version tags are immutable, and the
+        # scan flags below mirror the old action inputs exactly.
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-cache"
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
+            aquasecurity/trivy:0.58.0 image \
+            --format table \
+            --exit-code 1 \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            centralpay-bridge:release
       - name: Syft SBOM (SPDX JSON)
         uses: anchore/sbom-action@v0
         with:

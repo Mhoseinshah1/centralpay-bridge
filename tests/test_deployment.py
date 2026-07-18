@@ -809,3 +809,39 @@ def test_pyproject_version_matches_app_version():
 
     data = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
     assert data["project"]["version"] == APP_VERSION.replace("-rc", "rc")
+
+
+# --- release-gate regression: workflow action pins and gitleaks config -------
+
+
+def test_release_workflow_does_not_use_unresolvable_trivy_action():
+    """First tag-gate run failed at job setup: aquasecurity/trivy-action's
+    0.28.0 tag no longer resolves. The scan now runs the official Trivy
+    CLI image (Docker Hub version tags are immutable)."""
+    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    uses = [line for line in text.splitlines() if "uses:" in line]
+    assert not any("trivy-action" in line for line in uses)
+    assert "aquasecurity/trivy:" in text
+    # The scan still fails the release on findings, with the same scope.
+    assert "--exit-code 1" in text
+    assert "--severity CRITICAL,HIGH" in text
+
+
+def test_gitleaks_config_allowlists_only_test_fixture_shapes():
+    """First tag-gate run failed on a full-history gitleaks scan flagging
+    the deliberate TEST_* dummy credentials. The allowlist must keep
+    default rules enabled and match only the fixture value shape."""
+    import re
+    import tomllib
+
+    with open(PROJECT_ROOT / ".gitleaks.toml", "rb") as fh:
+        config = tomllib.load(fh)
+    assert config["extend"]["useDefault"] is True
+    [pattern] = [re.compile(r) for r in config["allowlist"]["regexes"]]
+    assert pattern.search('TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"')
+    assert pattern.search('TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6"')
+    # A real-looking value never matches, even under a TEST_ name.
+    assert not pattern.search('TEST_KEY = "AKIA1234REALKEY"')
+    assert not pattern.search('API_KEY = "sk-live-4242424242"')
+    # No path-based allowlisting: app/deploy/docs stay fully scanned.
+    assert "paths" not in config["allowlist"]
