@@ -75,6 +75,19 @@ retry modes, scheduled retries survive process restarts, and recovery
 batch bounds. Topics 13 and 15 are narrowed accordingly; load testing
 (15) and the full adversarial review (B4) remain open.
 
+Status update (backup audit, audit/backup-restore-integrity): backups now
+have SHA-256 manifests (atomic sidecar; verified before restore, with an
+explicit RESTORE-LEGACY path for pre-manifest files that --yes cannot
+bypass), an exclusive lock shared between backup and restore, magic-byte
+and zero-size validation before the .ok marker, and retention that can
+never convert a successful backup into a reported failure. Restores
+refuse symlinks, stop every writer including the admin bot, run
+pg_restore --exit-on-error, and gate service startup behind
+`centralpay db-check --repair-sequences`; mid-restore failures leave
+services stopped with printed recovery steps. Full-state restore fidelity
+and sequence safety are proven on real PostgreSQL. Off-site replication
+(topic 21) remains manual — a local backup is NOT disaster recovery.
+
 ## Unresolved review topics
 
 ### 1. Callback replay protection

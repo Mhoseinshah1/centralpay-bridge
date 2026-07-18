@@ -70,6 +70,20 @@ CentralPay confirmation, or lost silently is always critical.
 - **Update integrity (0.5.0-rc1):** `centralpay update` pins a release tag
   by default and verifies the published `SHA256SUMS` before deploying;
   rollback is application-only — the database schema is never downgraded.
+- **Backup integrity (audit):** backups are created atomically
+  (`.partial` → validate → rename), validated before the `.ok` marker
+  exists (non-empty, `PGDMP` magic, `pg_restore --list`), and carry an
+  atomically-written SHA-256 manifest sidecar (no secrets, no payment
+  data). Restores refuse symlinks, verify the checksum before any
+  destructive action (legacy files need an explicit `RESTORE-LEGACY`
+  confirmation that `--yes` cannot bypass), hold an exclusive lock shared
+  with the backup job, stop every writer including the admin bot, run
+  `pg_restore --exit-on-error`, and gate service startup behind a
+  post-restore integrity check (`centralpay db-check`) with sequence
+  repair. A mid-restore failure leaves services stopped with exact
+  recovery instructions — never running against a half-restored database.
+  Backup files and manifests are 0600 in a 0700 directory; the backup
+  script never reads or logs database credentials.
 - **Secret handling:** secrets live in `/etc/centralpay-bridge/` (0700
   directory, 0600 files), outside the Git checkout; `.env` files are
   git-ignored; a log-redaction backstop strips every configured secret from
