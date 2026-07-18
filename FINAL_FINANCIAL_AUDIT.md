@@ -113,3 +113,43 @@ releases, load testing, payer failure pages, pre-send markers).
 - **A release tag may NOT be created** (B1/B2/B5 open).
 - **Real payments may NOT be enabled** (B1–B5 + real-bot confirmation
   open; `PRODUCTION_CHECKLIST_FA.md` gates go-live).
+
+## Addendum — dynamic percentage fee (`feat/dynamic-payment-fee`, 2026-07-18)
+
+The dynamic-fee feature changes the money model after this audit's
+snapshot. Summary of the financial deltas (full statements: invariants
+F21–F24 in `FINANCIAL_INVARIANTS.md`):
+
+- `payments.amount` remains the ORIGINAL bot invoice. New immutable
+  snapshot columns `fee_policy_id` / `fee_rate_bps` / `fee_amount` /
+  `payable_amount` are written once, at creation, in the same
+  transaction as the insert (`payment_fee_snapshotted` event).
+  `fee_amount = (amount * fee_rate_bps + 5000) // 10000` — integer
+  round-half-up, never floats.
+- getLink now charges `payable_amount`; verification compares the
+  gateway-reported amount against `payable_amount` (mismatch event
+  renamed `verify_payable_amount_mismatch`). The bot notification payload
+  is unchanged byte-for-byte and still carries no amounts.
+- `MAX_PAYMENT_AMOUNT_TOMAN` now explicitly bounds the FINAL payable
+  amount (rejection code `payable_amount_out_of_range`, before any row or
+  gateway call); the minimum still bounds the original amount.
+- Fee policies are append-only rows in `fee_policies` (never env vars),
+  selected deterministically, mutable only via the root host CLI, fully
+  audited, and included in backups. Migration **0006** backfills existing
+  payments as fee-less (`payable_amount = amount`) and adds CHECK
+  constraints binding `payable = amount + fee` at the storage layer.
+
+The verdict statement above is extended by 120 new deterministic tests
+(463 total) covering fee arithmetic, snapshot immutability under races,
+CLI/admin-bot authorization, migration backfill, db-check corruption
+reporting, and backup/restore of policy history. The blockers table is
+UNCHANGED and gains fee-specific staging evidence requirements under B2:
+the real gateway must be observed charging the payable amount and
+reporting it back in verify (including the TOMAN-unit and
+verify-idempotency checks already listed), and the real messages
+("payment is paid", "payment type invalid") must be captured with a
+fee-bearing payment. **PRODUCTION_VALIDATION_STATUS remains INCOMPLETE;
+no tag, no real payments, and the live customer bot must stay disabled
+until B1–B5 are closed.** The payer must be shown the final payable
+amount before paying — fee disclosure in the bot's purchase flow is an
+operator go-live requirement in `PRODUCTION_CHECKLIST_FA.md`.

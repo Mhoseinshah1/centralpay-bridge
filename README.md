@@ -404,6 +404,91 @@ All commands are read-only and print one JSON object per line with order
 IDs, verification status, delivery status, reason code, attempt count, last
 HTTP status, next retry time, reference ID, and timestamps.
 
+## Dynamic service fee (percentage)
+
+The bridge can add a percentage service fee on top of the bot's invoice.
+The fee is **paid by the payer through the gateway** and is invisible to
+the selling bot: the bot's request, the bot's credited amount, and the bot
+notification payload are all unchanged.
+
+### Money model
+
+| Field | Meaning |
+| --- | --- |
+| `payments.amount` | The ORIGINAL bot invoice — exactly what the bot sent and what the bot credits. Never includes the fee. |
+| `payments.fee_rate_bps` | Fee percentage snapshot in basis points (10% = 1000 bps). |
+| `payments.fee_amount` | Fee in TOMAN: `(amount * fee_rate_bps + 5000) // 10000` — pure integer arithmetic, round half up. Floats are never used for money. |
+| `payments.payable_amount` | `amount + fee_amount` — what CentralPay is asked to charge (`getLink` amount) and what `verify` must report back. |
+| `payments.fee_policy_id` | The `fee_policies` row the snapshot came from (`NULL` for pre-fee/zero-fee payments). |
+
+Example: the bot requests 500 000 TOMAN with a 10% fee active → fee 50 000,
+CentralPay charges 550 000, verify must report 550 000, and the bot is told
+only `order_id` — it credits its own original 500 000 invoice.
+
+Database `CHECK` constraints enforce the arithmetic at the storage layer
+(`payable_amount = amount + fee_amount`, rate within 0..10000, fee ≥ 0),
+and `centralpay db-check` additionally reports snapshot corruption (it
+never alters financial fields).
+
+### Snapshot immutability
+
+The fee is **snapshotted once, at payment creation**, in the same
+transaction that inserts the row (audit event `payment_fee_snapshotted`).
+After that it never changes:
+
+- Fee policy changes affect **new orders only**; existing payments keep
+  their snapshot forever.
+- Idempotent duplicate requests return the existing link with the original
+  snapshot — even if the fee changed in between.
+- A retry after `getlink_failed` keeps the original snapshot and re-sends
+  the stored `payable_amount`.
+
+### Verification and bounds
+
+- `verify` must report exactly `payable_amount`; anything else (including
+  the original amount, i.e. a fee that was not charged) routes the payment
+  to `manual_review` with the `verify_payable_amount_mismatch` event. The
+  bot is never notified for such a payment.
+- `MIN_PAYMENT_AMOUNT_TOMAN` bounds the **original** amount;
+  `MAX_PAYMENT_AMOUNT_TOMAN` bounds the **final payable** amount. If
+  `amount + fee` would exceed the maximum, creation is rejected with
+  `payable_amount_out_of_range` (HTTP 400) before any row, snapshot, or
+  gateway call — the fee is never silently clamped or reduced.
+
+### Fee policies (append-only, no restarts)
+
+Policies live in the `fee_policies` table — never in an environment
+variable — so every API/worker replica observes changes through
+PostgreSQL, and backups capture the full history. The table is
+append-only: policies are added or cancelled, never edited or deleted.
+The active policy is selected deterministically: highest `effective_at`
+not in the future, ties broken by highest `id`, cancelled rows excluded.
+A scheduled policy activates at exactly its `effective_at` with no
+restart. All changes are recorded as permanent audit events
+(`fee_policy_created` / `fee_policy_scheduled` / `fee_policy_cancelled`).
+
+### Operating the fee
+
+```bash
+centralpay fee status                                # current + next scheduled
+centralpay fee set 10 --note "launch fee"            # root only
+centralpay fee schedule 2.5 --at 2026-08-01T00:00:00+03:30 --note "summer"
+centralpay fee history                               # full append-only history
+centralpay fee cancel 3 --note "wrong rate"          # cancel a scheduled policy
+```
+
+Rates are 0–100 with at most two decimals; signs, scientific notation,
+separators, and anything else are rejected. Mutations require root and
+delegate to the typed Python ops command (`python -m app.ops fee ...`) —
+never shell-generated SQL. The admin Telegram bot's `/fee` command is
+strictly read-only. The installer asks for the initial fee percentage
+(default 0) and applies it with `--ensure-initial`, which is a no-op when
+any policy already exists — an installer re-run can never reset the fee.
+
+**Operator obligation:** the fee is charged to the payer, so the payer
+must be told the final payable amount before paying. Disclose the fee in
+the bot's purchase flow before issuing the payment link.
+
 ## Tests
 
 Unit tests (SQLite in-memory, CentralPay mocked at the HTTP transport layer):

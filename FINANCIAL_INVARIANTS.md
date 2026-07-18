@@ -22,12 +22,19 @@ the callback row lock. [T] `test_callback.py` (success/mismatch suites),
 `test_centralpay_client.py` (parsing), `test_fault_injection.py`.
 [LIMIT] the real CentralPay schema is unobserved (blocker B2).
 
-**F2 — Verified amount equals the original TOMAN amount exactly.**
-Enforced: `verification.py` (`result.amount != payment.amount` → manual
-review, never credit); `amount` is assigned exactly once, at row creation
-(`payments.py`), and no code path reassigns it (verified by exhaustive
-grep). [DB] `ck_payments_amount_positive`. [T]
-`test_verify_amount_mismatch_moves_to_manual_review`,
+**F2 — Verified amount equals the snapshotted payable TOMAN amount
+exactly.** Since the dynamic-fee feature, the gateway charges
+`payable_amount = amount + fee_amount`; verify must report exactly that
+value. Enforced: `verification.py` (`result.amount !=
+payment.payable_amount` → manual review with
+`verify_payable_amount_mismatch`, never credit — including a gateway that
+charged only the original amount, i.e. a fee that was never collected);
+`amount` and the fee snapshot are assigned exactly once, at row creation
+(`payments.py`), and no code path reassigns them (verified by exhaustive
+grep). [DB] `ck_payments_amount_positive`,
+`ck_payments_payable_equals_amount_plus_fee`. [T]
+`test_verify_payable_amount_mismatch_moves_to_manual_review`,
+`test_verify_reporting_original_amount_is_a_mismatch` (fee flow),
 `test_creation_hardening.py` strict-amount matrix.
 
 **F3 — Verified userId matches the configured user.** Enforced:
@@ -165,6 +172,54 @@ with instructions; critical events map to never-deduplicated admin
 alerts. [T] reason-code assertions across all suites;
 `_move_to_manual_review` audit events; alert-mapping tests.
 
+**F21 — The bot's original invoice amount never includes the fee, and the
+bot payload never carries any amount.** `payments.amount` is exactly what
+the bot sent; the fee lives only in the snapshot columns; the bot
+notification payload stays byte-for-byte `{"order_id", "actions"}` with
+the `Token` header, so the bot always credits its own original invoice.
+Enforced: `payments.py` (snapshot columns separate from `amount`),
+`notification.py` (payload construction untouched). [T]
+`test_bot_notification_payload_contains_no_fee_fields`,
+`test_fee_snapshot_and_getlink_receives_payable`.
+
+**F22 — The fee snapshot is immutable from creation.** `fee_policy_id`,
+`fee_rate_bps`, `fee_amount`, `payable_amount` are written once, inside
+the same transaction as the row insert, from a single policy read (never
+a mixed old/new calculation), with the `payment_fee_snapshotted` audit
+event. Duplicate requests, getlink-failed retries, and later policy
+changes never alter them. [DB] `ck_payments_payable_equals_amount_plus_fee`,
+`ck_payments_fee_rate_bps_range`, `ck_payments_fee_amount_non_negative`,
+`ck_payments_payable_positive`; `centralpay db-check` reports (never
+repairs) snapshot corruption the CHECKs cannot express. [TXN] snapshot +
+row + events commit atomically. [T]
+`test_duplicate_order_preserves_snapshot_after_policy_change`,
+`test_getlink_failed_retry_keeps_original_snapshot`,
+`test_concurrent_create_and_fee_change_snapshot_never_mixed`,
+`test_db_check_detects_policyless_fee_corruption`.
+
+**F23 — Fee arithmetic is pure integer, deterministic, and bounded.**
+`fee_amount = (amount * fee_rate_bps + 5000) // 10000` (round half up);
+floats never touch money. `MIN_PAYMENT_AMOUNT_TOMAN` bounds the original
+amount; `MAX_PAYMENT_AMOUNT_TOMAN` bounds the final payable — an
+over-max payable is rejected (`payable_amount_out_of_range`) before any
+row, snapshot, or gateway call, never clamped. [T] `test_fees.py`
+arithmetic matrix,
+`test_payable_above_maximum_rejected_before_any_side_effect`.
+
+**F24 — Fee policy history is append-only, audited, and deterministic.**
+Policies live only in `fee_policies` (never an env var); rows are added
+or cancelled, never edited or deleted; selection is `effective_at DESC,
+id DESC` with future and cancelled rows excluded, so every replica
+observes the same policy through PostgreSQL and scheduled changes
+activate at exactly `effective_at`. Mutations are host-CLI-root-only
+(`centralpay fee`); the admin bot is read-only. Every change emits a
+permanent `fee_policy_*` audit event, and backups carry the full history.
+[DB] `ck_fee_policies_rate_bps_range`, `ck_fee_policies_note_not_empty`,
+`ck_fee_policies_cancellation_consistent`; FK
+`payments.fee_policy_id` RESTRICT. [T] `test_fees.py` selection/lifecycle
+suite, `test_ops_fee_*`, `test_admin_fee_is_read_only`,
+`test_fee_policies_survive_restore_and_stay_decoupled`.
+
 ---
 
 ## Enforcement summary of database constraints
@@ -179,3 +234,11 @@ alerts. [T] reason-code assertions across all suites;
 | `ck_payments_amount_positive` CHECK | 0005 | F2 |
 | `ck_payments_attempts_non_negative` CHECK | 0005 | F14 |
 | `ck_payments_delivery_requires_verification` CHECK | 0005 | F1/F8/F9 |
+| `ck_payments_fee_rate_bps_range` CHECK | 0006 | F22/F23 |
+| `ck_payments_fee_amount_non_negative` CHECK | 0006 | F22 |
+| `ck_payments_payable_positive` CHECK | 0006 | F22 |
+| `ck_payments_payable_equals_amount_plus_fee` CHECK | 0006 | F2/F22 |
+| FK `payments.fee_policy_id` RESTRICT | 0006 | F24 |
+| `ck_fee_policies_rate_bps_range` CHECK | 0006 | F24 |
+| `ck_fee_policies_note_not_empty` CHECK | 0006 | F24 |
+| `ck_fee_policies_cancellation_consistent` CHECK | 0006 | F24 |
