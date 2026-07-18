@@ -4,7 +4,17 @@ import enum
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import JSON
@@ -88,6 +98,21 @@ class Payment(Base):
     __table_args__ = (
         # Worker due-scan: status + next_retry_at.
         Index("ix_payments_notify_due", "status", "next_retry_at"),
+        # Financial invariants enforced at the database level (final audit;
+        # migration 0005 adds them to existing PostgreSQL databases):
+        # F2-adjacent: amounts are always positive integers.
+        CheckConstraint("amount > 0", name="ck_payments_amount_positive"),
+        # F14-adjacent: attempt counters can never go negative.
+        CheckConstraint(
+            "bot_notify_attempts >= 0", name="ck_payments_attempts_non_negative"
+        ),
+        # F1/F9: a payment can only be queued for (or accepted by) the bot
+        # AFTER the gateway-verified fact is durably recorded.
+        CheckConstraint(
+            "status NOT IN ('bot_notify_pending', 'bot_notify_accepted')"
+            " OR gateway_verified_at IS NOT NULL",
+            name="ck_payments_delivery_requires_verification",
+        ),
     )
 
 
