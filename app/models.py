@@ -79,6 +79,72 @@ class Payment(Base):
     )
 
 
+class AlertStatus(enum.StrEnum):
+    PENDING = "pending"
+    SENDING = "sending"
+    DELIVERED = "delivered"
+    RETRY_SCHEDULED = "retry_scheduled"
+    FAILED = "failed"
+    SUPPRESSED = "suppressed"
+
+
+class AdminAlert(Base):
+    """Outbox for administrator Telegram alerts.
+
+    Rows are created inside the same transaction as the financial state
+    change they describe; delivery happens later, out of band, in the
+    admin-bot service. Payment processing never depends on delivery.
+    """
+
+    __tablename__ = "admin_alerts"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    alert_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
+    payment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("payments.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    deduplication_key: Mapped[str | None] = mapped_column(String(160), index=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONColumn)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=AlertStatus.PENDING.value, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(128))
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("ix_admin_alerts_due", "status", "next_retry_at"),)
+
+
+class WorkerHeartbeat(Base):
+    """Operational liveness records for background workers. No secrets."""
+
+    __tablename__ = "worker_heartbeats"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    worker_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    instance_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_cycle_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class PaymentEvent(Base):
     """Permanent audit trail. Rows are append-only and must never be deleted."""
 
