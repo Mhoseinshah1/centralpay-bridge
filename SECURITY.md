@@ -15,6 +15,19 @@ CentralPay confirmation, or lost silently is always critical.
 
 ## Security posture (current)
 
+- **Fee integrity (dynamic fee):** the service fee is snapshotted
+  immutably at payment creation (`fee_amount = (amount * rate_bps +
+  5000) // 10000`, integer-only); the gateway is asked to charge
+  `payable_amount = amount + fee` and verification requires the gateway to
+  report exactly that payable amount — a fee that was not actually
+  collected freezes the payment for manual review
+  (`verify_payable_amount_mismatch`), it is never silently accepted.
+  Fee policies can be changed only by root on the host via
+  `centralpay fee` (typed Python delegation, strict 0–100 two-decimal
+  rate grammar, no shell-generated SQL); the admin Telegram bot is
+  read-only; history is append-only and permanently audited. The bot
+  notification payload carries no amounts, so a compromised transport
+  could not be used to alter what the bot credits.
 - **Verification before trust:** payments are only marked verified after
   CentralPay `verify` succeeds AND amount / userId / referenceId match our
   records; anomalies freeze the payment for manual review.

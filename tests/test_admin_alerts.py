@@ -46,7 +46,7 @@ def test_amount_mismatch_creates_high_severity_alert(
     stub.verify_result = verify_ok_response(amount=999)
     client.get(valid_callback_path(stub, payment.gateway_order_id))
 
-    alerts = get_alerts(session_factory, "verify_amount_mismatch")
+    alerts = get_alerts(session_factory, "verify_payable_amount_mismatch")
     assert len(alerts) == 1
     assert alerts[0].severity == "critical"
     # Never deduplicated: financial-integrity alerts have no dedup key.

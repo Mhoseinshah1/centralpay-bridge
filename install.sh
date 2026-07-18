@@ -260,7 +260,15 @@ gather_input() {
     done
 
     while true; do
-        ask BOT_NOTIFY_RETRY_MODE "9/9 Bot notification retry mode (safe/idempotent)" "safe"
+        ask PAYMENT_FEE_PERCENT "9/10 Payment fee percentage (0-100, up to 2 decimals)" "0"
+        if [[ "$PAYMENT_FEE_PERCENT" =~ ^[0-9]{1,3}(\.[0-9]{1,2})?$ ]]; then
+            break
+        fi
+        echo "Use 0..100 with at most two decimal places (e.g. 0, 10, 7.5, 2.25)." > /dev/tty
+    done
+
+    while true; do
+        ask BOT_NOTIFY_RETRY_MODE "10/10 Bot notification retry mode (safe/idempotent)" "safe"
         case "$BOT_NOTIFY_RETRY_MODE" in
             safe|idempotent) break ;;
             *) echo "Choose 'safe' or 'idempotent'. Use 'idempotent' ONLY if the bot developer confirmed duplicate order_id delivery is safe." > /dev/tty ;;
@@ -501,7 +509,30 @@ configure_firewall() {
 
 install_management_command() {
     install -m 0755 "${INSTALL_DIR}/scripts/centralpay" /usr/local/bin/centralpay
+    # Deployment scripts get explicit safe modes: a plain git clone does not
+    # guarantee the executable bit, and a non-executable backup.sh broke the
+    # systemd backup timer with "Permission denied" on real hosts.
+    chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay"
+    chmod 0750 "${INSTALL_DIR}/scripts/backup.sh"
+    chmod 0755 "${INSTALL_DIR}/scripts/centralpay"
     log "Installed management command: /usr/local/bin/centralpay"
+}
+
+ensure_initial_fee_policy() {
+    # Runs AFTER migrations. Creates the initial fee policy through the
+    # typed Python operations command (never shell SQL). --ensure-initial
+    # makes this a no-op when any policy already exists, so a rerun can
+    # never reset or silently replace an operator's fee configuration —
+    # changing an existing fee always requires the explicit
+    # 'centralpay fee set' command.
+    local percent="${PAYMENT_FEE_PERCENT:-0}"
+    cd "$INSTALL_DIR"
+    if docker compose run --rm migrate python -m app.ops fee set "$percent" \
+        --note "Initial installation fee" --actor installer --ensure-initial; then
+        log "Fee policy ensured (${percent}%; existing policies are never overwritten)."
+    else
+        warn "Could not create the initial fee policy; set it later with: centralpay fee set ${percent} --note '...'"
+    fi
 }
 
 install_backup_timer() {
@@ -651,6 +682,7 @@ main() {
     install_management_command
     install_backup_timer
     deploy_stack
+    ensure_initial_fee_policy
     verify_deployment
     print_summary
 }

@@ -44,3 +44,22 @@ On a staging host with a throwaway BotFather token and a test admin ID:
 ## Results
 
 _None recorded. Blocker open._
+
+## Dynamic fee additions (feat/dynamic-payment-fee)
+
+When the live-Telegram validation (blocker B3) is performed, also verify:
+
+- `/fee` shows the current fee, the policy id, and any scheduled change,
+  and states that changes affect NEW orders only.
+- `/fee` is strictly read-only: no argument to it (or any other command)
+  can create, change, schedule, or cancel a fee policy from Telegram —
+  mutations exist only in the root host CLI (`centralpay fee`).
+- An unauthorized Telegram account receives the generic denial for
+  `/fee`, like every other command.
+- `/payment ORDER_ID` for a fee-bearing payment clearly separates the
+  original bot invoice, the fee, and the amount paid through the gateway
+  (the gateway figure is never labelled as the bot invoice).
+- The daily report separates original-invoice, fee, and
+  collected-via-gateway totals.
+
+_Not performed yet — same blocker, no live Telegram run._

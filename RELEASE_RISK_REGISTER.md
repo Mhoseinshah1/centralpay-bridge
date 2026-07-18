@@ -284,3 +284,25 @@ adversarial review, B5 release-workflow run), real-bot blocker
 residual, 10, 11, 13, 14, 15, 16, 17 residual, 18, 21, 23, 24), or
 post-release backlog. Migration 0005 added the financial CHECK
 constraints; no schema work remains open.
+
+## Topic 30 (feat/dynamic-payment-fee)
+
+### 30. Dynamic percentage fee — **NEW FEATURE; staging evidence folded into B2**
+
+The fee is snapshotted immutably at creation (integer round-half-up
+arithmetic, DB CHECK constraints binding `payable = amount + fee`),
+charged via getLink's amount, and enforced at verify (payable mismatch →
+manual review). The bot payload and credited amount are unchanged.
+Residual risks:
+
+- **Real-gateway fee behavior is unobserved** (B2): the assumption that
+  CentralPay charges exactly the requested payable amount and reports it
+  back in verify — including the TOMAN unit — needs staging evidence
+  with a fee-bearing payment.
+- **Payer-disclosure obligation:** the payer sees the payable amount on
+  the gateway page, but disclosing the fee BEFORE the link is issued is
+  a bot-flow/operator obligation the bridge cannot enforce (go-live
+  checklist item in PRODUCTION_CHECKLIST_FA.md).
+- **Operator error** (wrong rate): mitigated by strict rate grammar,
+  root-only mutation, append-only audited history, scheduling with
+  cancellation, and `/fee` visibility — not eliminated.

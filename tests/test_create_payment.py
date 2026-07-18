@@ -45,6 +45,7 @@ def test_create_payment_success(client, settings, session_factory, stub):
 
     assert event_types(get_events(session_factory, payment.id)) == [
         "payment_created",
+        "payment_fee_snapshotted",
         "payment_link_created",
     ]
 
@@ -103,7 +104,11 @@ def test_getlink_rejected_response(client, settings, session_factory, stub):
     assert payment.last_error
     assert "invalid merchant" not in payment.last_error
     events = get_events(session_factory, payment.id)
-    assert event_types(events) == ["payment_created", "centralpay_getlink_failed"]
+    assert event_types(events) == [
+        "payment_created",
+        "payment_fee_snapshotted",
+        "centralpay_getlink_failed",
+    ]
     assert events[-1].level == "error"
     # ...nor the stored audit trail: internal reason codes only.
     assert "invalid merchant" not in str(events[-1].data)

@@ -22,6 +22,7 @@ def test_full_flow_records_ordered_audit_events(client, settings, session_factor
     events = get_events(session_factory, payment.id)
     assert event_types(events) == [
         "payment_created",
+        "payment_fee_snapshotted",
         "payment_link_created",
         "callback_received",
         "gateway_payment_verified",
@@ -33,6 +34,7 @@ def test_full_flow_records_ordered_audit_events(client, settings, session_factor
     callback_request_id = callback_response.headers["x-request-id"]
     assert create_request_id != callback_request_id
     assert [event.request_id for event in events] == [
+        create_request_id,
         create_request_id,
         create_request_id,
         callback_request_id,

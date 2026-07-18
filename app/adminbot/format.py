@@ -37,6 +37,16 @@ def fmt_amount(amount: int | None) -> str:
     return f"{amount:,}"
 
 
+def fmt_fee_rate(rate_bps: int | None) -> str:
+    """Basis points as a percent string (1000 -> '10%', 225 -> '2.25%')."""
+    if rate_bps is None:
+        return "—"
+    whole, frac = divmod(rate_bps, 100)
+    if frac == 0:
+        return f"{whole}%"
+    return (f"{whole}.{frac:02d}").rstrip("0") + "%"
+
+
 def fmt_time(value: datetime | None, tz_name: str) -> str:
     """Jalali date + time in the configured timezone."""
     if value is None:
@@ -93,7 +103,14 @@ def payment_block(payment: Payment, tz_name: str) -> str:
     lines = [
         f"شماره سفارش:\n<b>{esc(payment.bot_order_id)}</b>",
         f"شماره درگاه:\n{payment.gateway_order_id}",
-        f"مبلغ:\n<b>{fmt_amount(payment.amount)}</b> تومان",
+        # Amounts are labelled unambiguously: the ORIGINAL bot invoice (what
+        # the bot credits) vs what the payer paid THROUGH THE GATEWAY
+        # (original + fee). The gateway figure is never labelled as the
+        # credited or invoice amount.
+        f"فاکتور اصلی ربات:\n<b>{fmt_amount(payment.amount)}</b> تومان",
+        f"نرخ کارمزد:\n{fmt_fee_rate(payment.fee_rate_bps)}",
+        f"مبلغ کارمزد:\n{fmt_amount(payment.fee_amount)} تومان",
+        f"پرداختی از درگاه:\n{fmt_amount(payment.payable_amount)} تومان",
         f"وضعیت:\n{payment_status_fa(payment.status)}",
     ]
     gateway_state = (
@@ -118,7 +135,7 @@ _ALERT_TITLES_FA = {
     "manual_review_required": "پرداخت نیازمند بررسی",
     "bot_timeout_ambiguous": "تحویل مبهم به ربات — نیازمند بررسی",
     "retry_limit_reached": "پایان تلاش‌های ارسال — نیازمند بررسی",
-    "verify_amount_mismatch": "مغایرت مبلغ در تأیید پرداخت",
+    "verify_payable_amount_mismatch": "مغایرت مبلغ در تأیید پرداخت",
     "verify_user_id_mismatch": "مغایرت شناسهٔ کاربر در تأیید پرداخت",
     "verify_missing_reference_id": "نبود کد پیگیری در تأیید پرداخت",
     "centralpay_getlink_failed": "خطا در ایجاد لینک پرداخت",

@@ -48,6 +48,13 @@ Data:
   restore FILE [--yes]   Restore a backup (asks for confirmation)
   db-check [--repair-sequences]  Database integrity checks (read-only by default)
 
+Service fee (changes apply to NEW orders only; history is permanent):
+  fee status             Current fee, policy ID, and next scheduled change
+  fee set RATE --note TEXT          Set the fee now (e.g. RATE=10 or 7.5)
+  fee schedule RATE --at ISO --note TEXT   Schedule a future fee change
+  fee history            Full append-only policy history
+  fee cancel POLICY_ID --note TEXT  Cancel a scheduled policy (kept in history)
+
 Inspection:
   diagnose               Full system diagnosis (no secrets printed)
   payment ORDER_ID       One payment with its audit history
@@ -511,9 +518,31 @@ cmd_restore() {
 cmd_db_check() {
     require_install
     # Read-only integrity checks (constraints, orphans, statuses, claim
-    # anomalies, sequence positions). --repair-sequences additionally
-    # advances any sequence that fell behind its table maximum.
+    # anomalies, fee snapshots, sequence positions). --repair-sequences
+    # additionally advances any sequence that fell behind its table maximum.
     compose run --rm migrate python -m app.ops db-check "$@"
+}
+
+cmd_fee() {
+    require_install
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status|history)
+            compose run --rm migrate python -m app.ops fee "$sub"
+            ;;
+        set|schedule|cancel)
+            # Mutations are root-only, delegated to the typed Python
+            # operations command (no shell-generated SQL, no env-file
+            # mutation). All arguments pass through verbatim as an argv
+            # array — never interpolated into a shell string.
+            require_root "fee ${sub}"
+            compose run --rm migrate python -m app.ops fee "$sub" "$@"
+            ;;
+        *)
+            fail "Unknown fee subcommand: ${sub} (use status|set|schedule|history|cancel)"
+            ;;
+    esac
 }
 
 cmd_diagnose() {
@@ -750,6 +779,7 @@ main() {
         backups)       cmd_backups "$@" ;;
         restore)       cmd_restore "$@" ;;
         db-check)      cmd_db_check "$@" ;;
+        fee)           cmd_fee "$@" ;;
         diagnose)      cmd_diagnose "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;

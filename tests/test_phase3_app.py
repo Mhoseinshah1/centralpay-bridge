@@ -32,7 +32,11 @@ def test_amount_above_maximum_rejected(client, settings, session_factory):
         client, settings, order_id="p3-high", amount=settings.max_payment_amount_toman + 1
     )
     assert response.status_code == 400
-    assert response.json()["error"]["code"] == "amount_out_of_range"
+    # Since the dynamic-fee feature, MAX_PAYMENT_AMOUNT_TOMAN explicitly
+    # bounds the FINAL payable amount (original + fee); with zero fee the
+    # payable equals the original, so an over-max original is rejected with
+    # the payable code — still before any gateway call or payment row.
+    assert response.json()["error"]["code"] == "payable_amount_out_of_range"
     assert _count_payments(session_factory) == 0
 
 

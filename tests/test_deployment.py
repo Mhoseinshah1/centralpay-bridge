@@ -611,3 +611,80 @@ def test_installer_rerun_preserves_existing_centralpay_keys():
     assert 'if [[ "$KEEP_EXISTING" != "true" ]]' in keep_branch
     write_gate = keep_branch.split('if [[ "$KEEP_EXISTING" != "true" ]]')[1]
     assert "write_configuration" in write_gate.split("\n    fi")[0]
+
+
+# --- dynamic fee: installer question, permissions, management CLI ------------
+
+
+def test_installer_asks_fee_percentage_with_strict_pattern():
+    text = INSTALLER.read_text()
+    assert "Payment fee percentage" in text
+    # The same 0..100-with-at-most-two-decimals grammar the Python parser
+    # enforces, and a default of 0: an untouched install adds no fee.
+    assert re.search(
+        r'ask PAYMENT_FEE_PERCENT "9/10 Payment fee percentage[^"]*" "0"', text
+    )
+    assert r"^[0-9]{1,3}(\.[0-9]{1,2})?$" in text
+
+
+def test_installer_creates_initial_fee_policy_after_migrations():
+    text = INSTALLER.read_text()
+    # Typed Python ops delegation with --ensure-initial: a rerun can never
+    # reset or replace an operator's existing fee configuration.
+    assert "--ensure-initial" in text
+    assert "python -m app.ops fee set" in text
+    # Ordering: the policy is ensured only after the stack (and therefore
+    # the migrations that create fee_policies) has been deployed.
+    main_body = text[text.index("\nmain() {"):]
+    assert main_body.index("deploy_stack") < main_body.index("ensure_initial_fee_policy")
+    assert (
+        main_body.index("ensure_initial_fee_policy") < main_body.index("verify_deployment")
+    )
+
+
+def test_installer_sets_explicit_script_modes():
+    """Regression for the real-host incident: a git clone without the
+    executable bit made the systemd backup timer fail with
+    'Permission denied' on backup.sh."""
+    text = INSTALLER.read_text()
+    assert 'chmod 0750 "${INSTALL_DIR}/scripts/backup.sh"' in text
+    assert 'chmod 0755 "${INSTALL_DIR}/scripts/centralpay"' in text
+    assert (
+        'chown root:root "${INSTALL_DIR}/scripts/backup.sh"'
+        ' "${INSTALL_DIR}/scripts/centralpay"' in text
+    )
+
+
+def test_deployment_scripts_are_executable_in_git_and_on_disk():
+    """The executable bit is committed (git mode 100755) so a plain clone
+    yields runnable scripts — not left to chance on the target host."""
+    import os
+
+    scripts = ("install.sh", "scripts/backup.sh", "scripts/centralpay")
+    for script in scripts:
+        assert os.access(PROJECT_ROOT / script, os.X_OK), f"{script} not executable"
+    listing = subprocess.run(
+        ["git", "ls-files", "-s", *scripts],
+        cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=30,
+    ).stdout
+    modes = {line.split()[3]: line.split()[0] for line in listing.strip().splitlines()}
+    assert modes == dict.fromkeys(scripts, "100755")
+
+
+def test_management_cli_fee_commands_and_privileges():
+    result = subprocess.run(
+        ["bash", str(MANAGEMENT), "help"], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0
+    for phrase in ("fee status", "fee set RATE", "fee schedule RATE", "fee history",
+                   "fee cancel POLICY_ID"):
+        assert phrase in result.stdout, f"help must document '{phrase}'"
+    assert "NEW orders only" in result.stdout
+
+    text = MANAGEMENT.read_text()
+    # Mutations are root-only and delegate to the typed Python ops command
+    # as an argv array — never shell-generated SQL.
+    fee_body = text[text.index("cmd_fee()"):text.index("cmd_diagnose()")]
+    assert 'require_root "fee ${sub}"' in fee_body
+    assert 'python -m app.ops fee "$sub" "$@"' in fee_body
+    assert "psql" not in fee_body

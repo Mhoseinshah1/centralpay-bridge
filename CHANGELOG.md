@@ -2,6 +2,35 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
+## [Unreleased]
+
+### Added
+- Dynamic percentage service fee (migration 0006). The bot's original
+  invoice amount is stored unchanged; an immutable per-payment fee
+  snapshot (`fee_policy_id`, `fee_rate_bps`, `fee_amount`,
+  `payable_amount`) is written at creation with pure-integer
+  round-half-up arithmetic (`(amount * rate_bps + 5000) // 10000`).
+  getLink charges the payable amount; verify must report exactly the
+  payable amount (mismatch → manual review with
+  `verify_payable_amount_mismatch`). The bot notification payload is
+  byte-for-byte unchanged and still carries no amounts. Fee policies are
+  append-only, fully audited, selected deterministically, changeable
+  only via the root host CLI (`centralpay fee
+  status|set|schedule|history|cancel`), read-only in the admin bot
+  (`/fee`), backfilled as zero-fee for existing payments, and included
+  in backups. `MAX_PAYMENT_AMOUNT_TOMAN` now explicitly bounds the final
+  payable amount (`payable_amount_out_of_range`). The installer asks for
+  the initial fee percentage (default 0) and never resets an existing
+  policy on rerun.
+
+### Fixed
+- Deployment scripts (`install.sh`, `scripts/backup.sh`,
+  `scripts/centralpay`) are committed with the executable bit (git mode
+  100755) and the installer sets explicit modes (backup.sh 0750
+  root:root, centralpay 0755) — a plain clone previously produced a
+  non-executable backup.sh, breaking the systemd backup timer with
+  "Permission denied" on real hosts.
+
 ## [0.5.0-rc1] — 2026-07-18 (release candidate — NOT production-ready)
 
 Release-candidate hardening. **Known release blockers are tracked in

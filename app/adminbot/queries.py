@@ -193,7 +193,7 @@ def errors_summary(db: Session, *, hours: int = 24) -> dict[str, int]:
                 [
                     "centralpay_getlink_failed",
                     "centralpay_verify_failed",
-                    "verify_amount_mismatch",
+                    "verify_payable_amount_mismatch",
                     "verify_user_id_mismatch",
                     "verify_missing_reference_id",
                     "bot_notification_failed",
@@ -256,11 +256,17 @@ def worker_heartbeat_age_seconds(db: Session) -> float | None:
 
 def daily_report_payload(db: Session, *, report_date: str, hours: int = 24) -> dict[str, Any]:
     cutoff = _utcnow() - timedelta(hours=hours)
-    verified_amount = db.execute(
-        select(func.coalesce(func.sum(Payment.amount), 0)).where(
+    # Three unambiguous totals: the bot's original invoices, the service
+    # fees, and what payers actually paid through CentralPay.
+    verified_amount, verified_fees, verified_payable = db.execute(
+        select(
+            func.coalesce(func.sum(Payment.amount), 0),
+            func.coalesce(func.sum(Payment.fee_amount), 0),
+            func.coalesce(func.sum(Payment.payable_amount), 0),
+        ).where(
             Payment.gateway_verified_at.is_not(None), Payment.gateway_verified_at >= cutoff
         )
-    ).scalar_one()
+    ).one()
     backup_ok = latest_backup_alert(db, "backup_succeeded")
     backup_failed = latest_backup_alert(db, "backup_failed")
     backup_status = "بدون اطلاعات"
@@ -278,6 +284,9 @@ def daily_report_payload(db: Session, *, report_date: str, hours: int = 24) -> d
         "gateway_verified": event_count_since(db, "gateway_payment_verified", hours=hours),
         "bot_accepted": event_count_since(db, "bot_notification_accepted", hours=hours),
         "total_verified_toman": int(verified_amount),
+        "total_original_invoices_toman": int(verified_amount),
+        "total_fees_toman": int(verified_fees),
+        "total_collected_via_gateway_toman": int(verified_payable),
         "manual_review": count_by_status(db, "manual_review"),
         "pending_retry": count_by_status(db, "bot_notify_pending"),
         "getlink_failures": event_count_since(db, "centralpay_getlink_failed", hours=hours),

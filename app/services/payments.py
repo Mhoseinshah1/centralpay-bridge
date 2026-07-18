@@ -25,9 +25,11 @@ from app.exceptions import (
     GatewayOrderIdAllocationError,
     OrderAlreadyVerifiedError,
     OrderUnderReviewError,
+    PayableAmountOutOfRangeError,
 )
 from app.models import Payment, PaymentStatus
 from app.security import build_callback_url, callback_token_hash, generate_callback_token
+from app.services.fees import calculate_fee, select_effective_policy
 
 logger = logging.getLogger("app.services.payments")
 
@@ -71,16 +73,53 @@ def _lock_payment_by_bot_order_id(db: Session, bot_order_id: str) -> Payment | N
 def _ensure_payment_row(
     db: Session, settings: Settings, *, bot_order_id: str, amount: int
 ) -> None:
-    """Create the payment row in its own committed transaction if missing."""
+    """Create the payment row in its own committed transaction if missing.
+
+    The fee snapshot is taken HERE, exactly once, inside the same
+    transaction as the insert: the effective policy is read and the four
+    snapshot fields (fee_policy_id, fee_rate_bps, fee_amount,
+    payable_amount) all derive from that single read — a concurrent fee
+    change yields entirely the old or entirely the new policy, never a
+    mixed calculation. Later policy changes never touch this payment.
+    """
     exists = db.execute(select(Payment.id).where(Payment.bot_order_id == bot_order_id)).first()
     db.rollback()
     if exists is not None:
         return
+
+    policy = select_effective_policy(db)
+    rate_bps = policy.rate_bps if policy is not None else 0
+    fee_amount, payable_amount = calculate_fee(amount, rate_bps)
+    # The configured MAXIMUM bounds the final gateway amount. Rejecting
+    # here means: no payment row, no fee snapshot, no gateway call, no
+    # silent clamping, no fee reduction.
+    if payable_amount > settings.max_payment_amount_toman:
+        db.rollback()
+        logger.warning(
+            "payable_amount_out_of_range",
+            extra={
+                "bot_order_id": bot_order_id,
+                "original_amount": amount,
+                "fee_rate_bps": rate_bps,
+                "payable_amount": payable_amount,
+                "max_amount": settings.max_payment_amount_toman,
+            },
+        )
+        raise PayableAmountOutOfRangeError(
+            f"Payable amount {payable_amount} TOMAN (original {amount} + fee "
+            f"{fee_amount}) exceeds the maximum "
+            f"{settings.max_payment_amount_toman} TOMAN"
+        )
+
     payment = Payment(
         bot_order_id=bot_order_id,
         gateway_order_id=_generate_gateway_order_id(db),
         gateway_user_id=settings.centralpay_user_id,
         amount=amount,
+        fee_policy_id=policy.id if policy is not None else None,
+        fee_rate_bps=rate_bps,
+        fee_amount=fee_amount,
+        payable_amount=payable_amount,
         status=PaymentStatus.CREATED.value,
     )
     db.add(payment)
@@ -98,7 +137,22 @@ def _ensure_payment_row(
         data={
             "bot_order_id": bot_order_id,
             "gateway_order_id": payment.gateway_order_id,
-            "amount": amount,
+            "original_amount": amount,
+            "fee_rate_bps": rate_bps,
+            "fee_amount": fee_amount,
+            "payable_amount": payable_amount,
+        },
+    )
+    record_event(
+        db,
+        payment_id=payment.id,
+        event_type="payment_fee_snapshotted",
+        data={
+            "fee_policy_id": payment.fee_policy_id,
+            "fee_rate_bps": rate_bps,
+            "original_amount": amount,
+            "fee_amount": fee_amount,
+            "payable_amount": payable_amount,
         },
     )
     db.commit()
@@ -176,8 +230,10 @@ def create_payment(
         extra={"payment_id": payment.id, "gateway_order_id": payment.gateway_order_id},
     )
     try:
+        # CentralPay charges the FINAL payable amount (original + fee); the
+        # snapshot was taken at creation and is reused verbatim on retries.
         redirect_url = client.get_link(
-            amount=payment.amount,
+            amount=payment.payable_amount,
             user_id=payment.gateway_user_id,
             order_id=payment.gateway_order_id,
             return_url=return_url,
@@ -206,7 +262,13 @@ def create_payment(
         db,
         payment_id=payment.id,
         event_type="payment_link_created",
-        data={"gateway_order_id": payment.gateway_order_id},
+        data={
+            "gateway_order_id": payment.gateway_order_id,
+            "original_amount": payment.amount,
+            "fee_rate_bps": payment.fee_rate_bps,
+            "fee_amount": payment.fee_amount,
+            "payable_amount": payment.payable_amount,
+        },
     )
     db.commit()
     return redirect_url

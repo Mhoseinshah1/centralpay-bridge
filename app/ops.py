@@ -29,7 +29,7 @@ from app.audit import record_event
 from app.config import Settings
 from app.db import create_session_factory
 from app.logging_setup import configure_logging
-from app.models import Payment, PaymentStatus
+from app.models import FeePolicy, Payment, PaymentStatus
 
 # Non-financial operational resolution states only.
 ALLOWED_RESOLUTIONS = (
@@ -97,7 +97,11 @@ def _review_summary(payment: Payment) -> dict[str, object]:
     return {
         "bot_order_id": payment.bot_order_id,
         "gateway_order_id": payment.gateway_order_id,
+        "original_bot_invoice": payment.amount,
         "amount": payment.amount,
+        "fee_rate_bps": payment.fee_rate_bps,
+        "fee_amount": payment.fee_amount,
+        "paid_through_gateway": payment.payable_amount,
         "status": payment.status,
         "gateway_verified": payment.gateway_verified_at is not None,
         "reason": payment.bot_notify_reason or payment.last_error,
@@ -131,7 +135,135 @@ def _load_review_payment(db: Session, order_id: str) -> Payment | None:
     return payment
 
 
-_SEQUENCE_TABLES = ("payments", "payment_events", "admin_alerts", "worker_heartbeats")
+def _cmd_fee(args: argparse.Namespace) -> int:
+    """Fee policy operations (host CLI delegates here; no shell SQL).
+
+    Mutations are append-only and permanently audited. Fee changes affect
+    NEW payment orders only: existing payments keep their immutable
+    snapshot forever.
+    """
+    from app.services.fees import (
+        cancel_policy,
+        create_policy,
+        format_rate_percent,
+        next_scheduled_policy,
+        parse_rate_percent,
+        select_effective_policy,
+    )
+
+    settings = Settings()
+    configure_logging(settings)
+    session_factory = create_session_factory(settings.database_url)
+
+    with session_factory() as db:
+        if args.fee_command == "status":
+            active = select_effective_policy(db)
+            scheduled = next_scheduled_policy(db)
+            if active is None:
+                print("Current fee: 0% (no fee policy configured)")
+            else:
+                print(f"Current fee: {format_rate_percent(active.rate_bps)}")
+                print(f"Rate basis points: {active.rate_bps}")
+                print(f"Effective since: {active.effective_at.isoformat()}")
+                print(f"Policy ID: {active.id}")
+            if scheduled is not None:
+                print(
+                    f"Next scheduled: {format_rate_percent(scheduled.rate_bps)} "
+                    f"at {scheduled.effective_at.isoformat()} (policy {scheduled.id})"
+                )
+            print("Applies to: new payment orders only")
+            db.rollback()
+            return 0
+
+        if args.fee_command == "history":
+            policies = (
+                db.execute(select(FeePolicy).order_by(FeePolicy.id.asc())).scalars().all()
+            )
+            if not policies:
+                print("No fee policies recorded.")
+            for policy in policies:
+                state = "cancelled" if policy.cancelled_at is not None else "active/scheduled"
+                print(
+                    json.dumps(
+                        {
+                            "policy_id": policy.id,
+                            "rate_bps": policy.rate_bps,
+                            "rate": format_rate_percent(policy.rate_bps),
+                            "effective_at": policy.effective_at.isoformat(),
+                            "created_at": policy.created_at.isoformat()
+                            if policy.created_at
+                            else None,
+                            "created_by": policy.created_by,
+                            "note": policy.note,
+                            "state": state,
+                            "cancelled_at": policy.cancelled_at.isoformat()
+                            if policy.cancelled_at
+                            else None,
+                            "cancelled_by": policy.cancelled_by,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            db.rollback()
+            return 0
+
+        actor = args.actor
+        try:
+            if args.fee_command in ("set", "schedule"):
+                rate_bps = parse_rate_percent(args.rate)
+                if args.fee_command == "schedule":
+                    effective_at = datetime.fromisoformat(args.at)
+                    if effective_at.tzinfo is None:
+                        raise ValueError(
+                            "--at must be an ISO timestamp with an explicit timezone"
+                        )
+                    if effective_at <= datetime.now(UTC):
+                        raise ValueError("--at must be in the future (use 'fee set' for now)")
+                    scheduled_flag = True
+                else:
+                    effective_at = datetime.now(UTC)
+                    scheduled_flag = False
+                if args.ensure_initial and select_effective_policy(db) is not None:
+                    print("A fee policy already exists; keeping it unchanged.")
+                    db.rollback()
+                    return 0
+                policy = create_policy(
+                    db,
+                    rate_bps=rate_bps,
+                    effective_at=effective_at,
+                    actor=actor,
+                    note=args.note,
+                    scheduled=scheduled_flag,
+                )
+                db.commit()
+                verb = "scheduled" if scheduled_flag else "set"
+                print(
+                    f"Fee {verb}: {format_rate_percent(rate_bps)} "
+                    f"(policy {policy.id}, effective {effective_at.isoformat()})"
+                )
+                print("Applies to: new payment orders only")
+                return 0
+
+            # cancel
+            policy = cancel_policy(
+                db, policy_id=args.policy_id, actor=actor, note=args.note
+            )
+            db.commit()
+            print(f"Fee policy {policy.id} cancelled (history preserved).")
+            return 0
+        except ValueError as exc:
+            db.rollback()
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+
+_SEQUENCE_TABLES = (
+    "payments",
+    "payment_events",
+    "admin_alerts",
+    "worker_heartbeats",
+    "fee_policies",
+)
 
 
 def _cmd_db_check(args: argparse.Namespace) -> int:
@@ -197,6 +329,65 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
                     select(func.count(Payment.id)).where(
                         Payment.notification_claimed_at.is_not(None),
                         Payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value,
+                    )
+                ).scalar_one()
+            ),
+            # Fee snapshot integrity. db-check REPORTS corruption; it never
+            # recalculates or overwrites historical financial snapshots.
+            "invalid_fee_rate": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        (Payment.fee_rate_bps < 0) | (Payment.fee_rate_bps > 10000)
+                    )
+                ).scalar_one()
+            ),
+            "negative_fee_amount": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(Payment.fee_amount < 0)
+                ).scalar_one()
+            ),
+            "payable_amount_mismatch": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        Payment.payable_amount != Payment.amount + Payment.fee_amount
+                    )
+                ).scalar_one()
+            ),
+            "missing_payable_amount": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(Payment.payable_amount.is_(None))
+                ).scalar_one()
+            ),
+            "orphan_fee_policy_reference": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        Payment.fee_policy_id.is_not(None),
+                        Payment.fee_policy_id.not_in(select(FeePolicy.id)),
+                    )
+                ).scalar_one()
+            ),
+            # Legacy backfill / policy-less payments must be zero-fee.
+            "policyless_payment_with_fee": int(
+                db.execute(
+                    select(func.count(Payment.id)).where(
+                        Payment.fee_policy_id.is_(None),
+                        (Payment.fee_rate_bps != 0) | (Payment.fee_amount != 0),
+                    )
+                ).scalar_one()
+            ),
+            "invalid_fee_policy_rows": int(
+                db.execute(
+                    select(func.count(FeePolicy.id)).where(
+                        (FeePolicy.rate_bps < 0)
+                        | (FeePolicy.rate_bps > 10000)
+                        | (FeePolicy.note == "")
+                        | (
+                            FeePolicy.cancelled_at.is_not(None)
+                            & (
+                                FeePolicy.cancelled_by.is_(None)
+                                | FeePolicy.cancellation_note.is_(None)
+                            )
+                        )
                     )
                 ).scalar_one()
             ),
@@ -376,6 +567,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="advance sequences that fell behind their table maxima",
     )
 
+    fee = sub.add_parser("fee", help="fee policy operations (append-only, audited)")
+    fee_sub = fee.add_subparsers(dest="fee_command", required=True)
+    fee_sub.add_parser("status")
+    fee_sub.add_parser("history")
+    fee_set = fee_sub.add_parser("set")
+    fee_set.add_argument("rate")
+    fee_set.add_argument("--note", required=True)
+    fee_set.add_argument("--actor", default="host-cli")
+    fee_set.add_argument(
+        "--ensure-initial",
+        action="store_true",
+        help="create the policy only when none exists (installer; never resets)",
+    )
+    fee_schedule = fee_sub.add_parser("schedule")
+    fee_schedule.add_argument("rate")
+    fee_schedule.add_argument("--at", required=True)
+    fee_schedule.add_argument("--note", required=True)
+    fee_schedule.add_argument("--actor", default="host-cli")
+    fee_cancel = fee_sub.add_parser("cancel")
+    fee_cancel.add_argument("policy_id", type=int)
+    fee_cancel.add_argument("--note", required=True)
+    fee_cancel.add_argument("--actor", default="host-cli")
+
     review = sub.add_parser("review", help="manual-review operations (host only)")
     review_sub = review.add_subparsers(dest="review_command", required=True)
     review_list = review_sub.add_parser("list")
@@ -402,6 +616,13 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_backup_event(args)
     if args.command == "db-check":
         return _cmd_db_check(args)
+    if args.command == "fee":
+        if args.fee_command in ("set", "schedule", "cancel") and not args.note.strip():
+            print("a non-empty --note is required", file=sys.stderr)
+            return 1
+        if args.fee_command in ("schedule", "cancel"):
+            args.ensure_initial = False
+        return _cmd_fee(args)
     if args.command == "review":
         if args.review_command == "resend" and not (
             args.confirm_idempotent_bot and args.yes

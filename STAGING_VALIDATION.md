@@ -24,6 +24,8 @@ real bot `/api/payment` semantics.
 | Callback redirect flow (payer browser) | | ✔ (TestClient) | real redirect |
 | One-time token + HMAC on real URLs | | ✔ | real gateway URL handling |
 | Bot notification `POST /api/payment` | | ✔ (stub bot) | real bot |
+| Fee: getLink charges payable, verify reports payable | | ✔ (stub) | real gateway with fee |
+| Real gateway messages ("payment is paid", "payment type invalid") | | | real schema/text |
 | Caddy TLS + header behavior | config validated | | real TLS traffic |
 | PostgreSQL behavior | ✔ (real PG 16 in tests/CI) | | production sizing |
 | Backup/restore round-trip | ✔ (real pg_dump/pg_restore) | | real host cron/timer |
@@ -46,7 +48,18 @@ On a staging install (after `REAL_HOST_VALIDATION.md` steps 1–4), with
    route to manual review, never credit.
 5. Confirm `FIRST_PAYMENT_GUARD_ENABLED=true` produces the one-time
    critical alert on the first verified payment.
-6. Record dates, versions, redacted request/response shapes (no keys,
+6. **Fee flow (dynamic fee):** set a staging fee (`centralpay fee set 10
+   --note "staging"`), create a payment for a small original amount, and
+   confirm: the CentralPay page asks the payer for the PAYABLE amount
+   (original + fee, TOMAN unit), verify reports the payable amount and
+   the payment verifies, and the bot notification carries only
+   `order_id`/`actions` and the bot credits the ORIGINAL amount. Record
+   the real gateway response shapes for a fee-bearing payment, including
+   the exact "payment is paid" / "payment type invalid" message texts —
+   our handling of those strings currently rests on stub assumptions.
+7. Confirm the fee is disclosed to the payer in the bot's purchase flow
+   BEFORE the payment link is issued (operator/bot-side obligation).
+8. Record dates, versions, redacted request/response shapes (no keys,
    no card data beyond last4) in this file.
 
 ## Results

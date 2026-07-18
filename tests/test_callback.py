@@ -136,6 +136,7 @@ def test_verify_success(client, settings, session_factory, stub):
 
     assert event_types(get_events(session_factory, payment.id)) == [
         "payment_created",
+        "payment_fee_snapshotted",
         "payment_link_created",
         "callback_received",
         "gateway_payment_verified",
@@ -143,7 +144,9 @@ def test_verify_success(client, settings, session_factory, stub):
     ]
 
 
-def test_verify_amount_mismatch_moves_to_manual_review(client, settings, session_factory, stub):
+def test_verify_payable_amount_mismatch_moves_to_manual_review(
+    client, settings, session_factory, stub
+):
     payment = _create_paid_order(
         client, settings, session_factory, stub, order_id="cb-amount", amount=10000
     )
@@ -158,7 +161,7 @@ def test_verify_amount_mismatch_moves_to_manual_review(client, settings, session
     assert payment.reference_id is None
 
     types = event_types(get_events(session_factory, payment.id))
-    assert "verify_amount_mismatch" in types
+    assert "verify_payable_amount_mismatch" in types
     assert "manual_review_required" in types
     assert "gateway_payment_verified" not in types
 

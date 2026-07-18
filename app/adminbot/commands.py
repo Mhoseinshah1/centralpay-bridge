@@ -139,6 +139,7 @@ class CommandHandlers:
             "retry_queue": self.cmd_retry_queue,
             "backup_status": self.cmd_backup_status,
             "version": self.cmd_version,
+            "fee": self.cmd_fee,
         }
 
     def _split(self, text: str) -> list[str]:
@@ -155,7 +156,7 @@ class CommandHandlers:
                 f"نسخه: {esc(APP_VERSION)}",
                 "",
                 "دستورها: /status /health /recent /stuck /manual_review",
-                "/errors /payment /retry_queue /backup_status /version /help",
+                "/errors /payment /retry_queue /backup_status /version /fee /help",
                 "",
                 f"{WARN} این ربات فقط برای دیدبانی عملیاتی است. "
                 "پاسخ 2xx ربات فروش به معنی واریز قطعی اعتبار مشتری نیست.",
@@ -178,9 +179,39 @@ class CommandHandlers:
                 "/retry_queue — صف ارسال به ربات فروش",
                 "/backup_status — وضعیت پشتیبان‌گیری",
                 "/version — نسخهٔ برنامه و مهاجرت",
+                "/fee — کارمزد فعلی (فقط‌خواندنی؛ تغییر فقط از CLI سرور)",
             ]
         )
         return self._split(text)
+
+    def cmd_fee(self, db: Session, args: list[str]) -> list[str]:
+        """Read-only fee view. This bot can never set, schedule, cancel, or
+        mutate fee policies — only the host CLI may change them."""
+        from app.adminbot.format import fmt_fee_rate
+        from app.services.fees import next_scheduled_policy, select_effective_policy
+
+        active = select_effective_policy(db)
+        scheduled = next_scheduled_policy(db)
+        lines = ["<b>کارمزد خدمات</b>", ""]
+        if active is None:
+            lines.append("کارمزد فعلی: 0% (هیچ سیاستی ثبت نشده)")
+        else:
+            lines.append(f"کارمزد فعلی: <b>{fmt_fee_rate(active.rate_bps)}</b>")
+            lines.append(f"شناسهٔ سیاست: {active.id}")
+            lines.append(
+                f"اجرا از: {fmt_time(active.effective_at, self._settings.admin_bot_timezone)}"
+            )
+        if scheduled is not None:
+            lines.append(
+                f"سیاست بعدی: {fmt_fee_rate(scheduled.rate_bps)} از "
+                f"{fmt_time(scheduled.effective_at, self._settings.admin_bot_timezone)}"
+                f" (شناسه {scheduled.id})"
+            )
+        lines.append("")
+        lines.append("تغییر کارمزد فقط روی سفارش‌های جدید اثر دارد؛ سفارش‌های موجود")
+        lines.append("با همان کارمزد ثبت‌شدهٔ خود می‌مانند. تغییر فقط از طریق")
+        lines.append("<code>centralpay fee</code> روی سرور ممکن است.")
+        return self._split("\n".join(lines))
 
     def cmd_status(self, db: Session, args: list[str]) -> list[str]:
         api = self._probe_api()
@@ -327,7 +358,7 @@ class CommandHandlers:
         labels = {
             "centralpay_getlink_failed": "خطای ایجاد لینک",
             "centralpay_verify_failed": "خطای تأیید",
-            "verify_amount_mismatch": "مغایرت مبلغ",
+            "verify_payable_amount_mismatch": "مغایرت مبلغ",
             "verify_user_id_mismatch": "مغایرت شناسهٔ کاربر",
             "verify_missing_reference_id": "نبود کد پیگیری",
             "bot_notification_failed": "خطای تحویل به ربات",
