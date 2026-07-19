@@ -285,6 +285,11 @@ class ClaimedAlert:
     payment_id: int | None
     payload: dict[str, Any] | None
     attempts: int
+    # The claiming worker's identity. Result recording verifies BOTH the
+    # worker id and the attempt number against the row (a fixed/configured
+    # worker id can legitimately re-claim the same alert later, so identity
+    # alone cannot prove the claim is still this attempt's).
+    worker_id: str
 
 
 def alert_retry_delay_seconds(
@@ -370,6 +375,7 @@ def claim_due_alerts(
                 payment_id=alert.payment_id,
                 payload=alert.payload,
                 attempts=alert.attempts,
+                worker_id=worker_id,
             )
         )
     db.commit()
@@ -388,14 +394,53 @@ def record_delivery_result(
     now: datetime,
     jitter: JitterFn = default_jitter,
 ) -> str:
-    """Record the aggregated outcome of one delivery attempt. Returns status."""
+    """Record the aggregated outcome of one delivery attempt. Returns status.
+
+    Claim-ownership contract: the result is persisted ONLY while the row
+    still carries this claim — status `sending`, the same worker id, the
+    same attempt number, and a live `claimed_at` — all verified under the
+    FOR UPDATE row lock taken here. A late result from a claim that was
+    released as stale (and possibly re-claimed by a successor, or by the
+    SAME worker id at a later attempt) is discarded without touching the
+    row: it must never clear the successor's claim, overwrite its state,
+    cancel its retry, or forge delivery history. Mirrors the financial
+    notification worker's ownership rules; admin alerts stay
+    non-financial. Returns "discarded" for such results.
+    """
     alert = db.execute(
         select(AdminAlert).where(AdminAlert.id == claimed.alert_id).with_for_update()
     ).scalar_one()
+    from app.audit import record_event  # local import to avoid cycle
+
+    if (
+        alert.status != AlertStatus.SENDING.value
+        or alert.claimed_by != claimed.worker_id
+        or alert.attempts != claimed.attempts
+        or alert.claimed_at is None
+    ):
+        # Safe metadata only — never the payload, message text, chat ids,
+        # tokens, or exception text.
+        discard_data = {
+            "alert_id": alert.id,
+            "stale_attempt": claimed.attempts,
+            "stale_worker_id": claimed.worker_id,
+            "observed_status": alert.status,
+            "observed_attempts": alert.attempts,
+        }
+        record_event(
+            db,
+            payment_id=alert.payment_id,
+            event_type="admin_alert_result_discarded",
+            level="warning",
+            data=discard_data,
+        )
+        logger.warning("admin_alert_result_discarded", extra=discard_data)
+        db.commit()  # commits ONLY the audit event; the row is untouched
+        return "discarded"
+
     alert.claimed_at = None
     alert.claimed_by = None
     alert.last_error_code = error_code
-    from app.audit import record_event  # local import to avoid cycle
 
     if delivered_count > 0:
         alert.status = AlertStatus.DELIVERED.value
