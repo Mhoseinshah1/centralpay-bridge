@@ -244,10 +244,105 @@ def test_installer_bot_url_normalization():
         "https://bot.example.com": "https://bot.example.com/api/payment",
         "https://bot.example.com/": "https://bot.example.com/api/payment",
         "https://bot.example.com/api/payment": "https://bot.example.com/api/payment",
+        # The scheme is detected case-insensitively and canonicalized to
+        # lowercase https:// (previously HTTPS:// missed the scheme check
+        # and was mangled into https://HTTPS://...).
+        "HTTPS://bot.example.com": "https://bot.example.com/api/payment",
+        "HtTpS://bot.example.com": "https://bot.example.com/api/payment",
+        "HTTPS://bot.example.com/api/payment": "https://bot.example.com/api/payment",
     }
     for given, expected in cases.items():
         result = installer_call(f"normalize_bot_url '{given}'")
+        assert result.returncode == 0, given
         assert result.stdout.strip() == expected
+        # Canonical output only: exactly one scheme, always lowercase https.
+        assert result.stdout.count("://") == 1, given
+
+
+# --- installer bot-URL scheme gate (case-insensitive) -------------------------
+
+BOT_SCHEME_ACCEPTED = [
+    "bot.example.com",
+    "https://bot.example.com",
+    "HTTPS://bot.example.com",
+    "HtTpS://bot.example.com",
+    "https://bot.example.com/api/payment",
+]
+BOT_SCHEME_CLEARTEXT = [
+    "http://bot.example.com",
+    "HTTP://bot.example.com",
+    "HtTp://bot.example.com",
+]
+BOT_SCHEME_UNSUPPORTED = [
+    "ftp://bot.example.com",
+    "file:///tmp/socket",
+    "ws://bot.example.com",
+    "javascript:alert(1)",
+]
+
+
+def test_installer_bot_scheme_gate_accepts_https_any_case_and_domains():
+    for value in BOT_SCHEME_ACCEPTED:
+        result = installer_call(f"validate_bot_input_scheme '{value}'")
+        assert result.returncode == 0, value
+        # The gate prints nothing, ever.
+        assert result.stdout == "" and result.stderr == "", value
+
+
+def test_installer_bot_scheme_gate_rejects_cleartext_http_in_any_case():
+    """Pre-fix, the ^http:// check was case-sensitive: HTTP:// and HtTp://
+    slipped past the interactive boundary and were mangled by
+    normalize_bot_url into https://HTTP://... — rejected only later at
+    application startup. The gate now classifies them as cleartext (rc 2)."""
+    for value in BOT_SCHEME_CLEARTEXT:
+        result = installer_call(f"validate_bot_input_scheme '{value}'")
+        assert result.returncode == 2, value
+        # The rejected input never reaches stdout/stderr (the ERR-trap text
+        # is fixed and carries no input either).
+        assert "bot.example.com" not in result.stdout + result.stderr, value
+        assert result.stdout == "", value
+
+
+def test_installer_bot_scheme_gate_rejects_unsupported_schemes():
+    """ftp/file/ws/javascript input must fail — never be silently prefixed
+    with https:// into a double-scheme URL."""
+    for value in BOT_SCHEME_UNSUPPORTED:
+        result = installer_call(f"validate_bot_input_scheme '{value}'")
+        assert result.returncode == 3, value
+        assert "tmp/socket" not in result.stdout + result.stderr, value
+        assert "bot.example.com" not in result.stdout + result.stderr, value
+        assert "alert" not in result.stdout + result.stderr, value
+        assert result.stdout == "", value
+
+
+def test_installer_normalize_bot_url_fails_closed_on_rejected_schemes():
+    """Defense in depth: even called without the gate, normalize_bot_url
+    refuses cleartext and unsupported schemes and prints nothing — a
+    bypassed prompt loop still cannot mint an insecure or mangled URL."""
+    for value in BOT_SCHEME_CLEARTEXT + BOT_SCHEME_UNSUPPORTED:
+        result = installer_call(f"normalize_bot_url '{value}'")
+        assert result.returncode != 0, value
+        assert result.stdout == "", value
+        assert "bot.example.com" not in result.stderr, value
+
+
+def test_installer_bot_prompt_loop_uses_gate_and_fixed_messages():
+    """The interactive loop delegates to validate_bot_input_scheme and
+    prints only the two fixed safe messages — it never echoes $BOT_INPUT."""
+    text = INSTALLER.read_text()
+    loop = text.split('ask BOT_INPUT "2/10')[1].split("normalize_bot_url")[0]
+    assert 'validate_bot_input_scheme "$BOT_INPUT"' in loop
+    assert "Cleartext http:// is not allowed for the bot URL; use https://." in loop
+    assert "Unsupported URL scheme for the bot URL; use https://." in loop
+    # No echo/printf of the raw input inside the prompt loop.
+    for line in loop.splitlines():
+        if re.search(r"(echo|printf)", line):
+            assert "BOT_INPUT" not in line, line.strip()
+    # No installer option ever enables insecure HTTP: the generated env
+    # file records the flag as a fixed false (via the template) and no
+    # installer prompt can flip it.
+    assert "ALLOW_INSECURE_BOT_NOTIFY_URL=false" in ENV_TEMPLATE.read_text()
+    assert "ALLOW_INSECURE" not in text
 
 
 def test_installer_email_validation():

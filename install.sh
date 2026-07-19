@@ -113,12 +113,41 @@ validate_report_time() {
     [[ "$1" =~ ^([01]?[0-9]|2[0-3]):[0-5][0-9]$ ]]
 }
 
+validate_bot_input_scheme() {
+    # Case-insensitive scheme gate for the bot URL question. Returns:
+    #   0 — https:// in any ASCII case, or scheme-less input (a domain,
+    #       optionally with :port and /path);
+    #   2 — cleartext http:// in any ASCII case;
+    #   3 — any other explicit scheme (ftp://, file://, ws://,
+    #       javascript:, ...), which must never be silently rewritten
+    #       to https://.
+    # Never prints the input (or anything else).
+    local lowered="${1,,}" after
+    case "$lowered" in
+        https://*) return 0 ;;
+        http://*) return 2 ;;
+        *://*) return 3 ;;
+    esac
+    if [[ "$lowered" == *:* ]]; then
+        # host:port[/path] is domain input; anything else with a colon is
+        # a scheme (javascript:alert(1), mailto:x, ...).
+        after="${lowered#*:}"
+        [[ "$after" =~ ^[0-9]+(/.*)?$ ]] && return 0
+        return 3
+    fi
+    return 0
+}
+
 normalize_bot_url() {
-    # Accepts "bot.example.com", "https://bot.example.com" or a full endpoint;
-    # prints the complete bot payment endpoint URL.
+    # Accepts "bot.example.com", "https://bot.example.com" (scheme in any
+    # ASCII case) or a full endpoint; prints the complete bot payment
+    # endpoint URL with the scheme canonicalized to lowercase https://.
+    # Fails (printing nothing) on http:// or any unsupported scheme, so a
+    # caller that skips the gate still cannot mint an insecure URL.
     local input="$1" base
-    if [[ "$input" =~ ^https?:// ]]; then
-        base="$input"
+    validate_bot_input_scheme "$input" || return 1
+    if [[ "${input,,}" == https://* ]]; then
+        base="https://${input#*://}"
     else
         base="https://$input"
     fi
@@ -245,15 +274,22 @@ gather_input() {
     while true; do
         ask BOT_INPUT "2/10 Bot API base domain or URL (e.g. https://bot.example.com)"
         # The bot Token header must never cross the network without TLS:
-        # cleartext http:// input is rejected here, and the application
-        # enforces the same contract at startup (the insecure escape hatch
-        # exists only for private mock bots and is never set by the
-        # installer).
-        if [[ "$BOT_INPUT" =~ ^http:// ]]; then
+        # cleartext http:// input is rejected here in ANY letter case, and
+        # the application enforces the same contract at startup (the
+        # insecure escape hatch exists only for private mock bots and is
+        # never set by the installer). Unsupported schemes (ftp, file, ws,
+        # javascript, ...) fail here instead of being silently rewritten
+        # to https://. Only these fixed messages are printed — never the
+        # rejected input.
+        scheme_rc=0
+        validate_bot_input_scheme "$BOT_INPUT" || scheme_rc=$?
+        if [[ "$scheme_rc" -eq 0 ]]; then
+            break
+        elif [[ "$scheme_rc" -eq 2 ]]; then
             echo "Cleartext http:// is not allowed for the bot URL; use https://." > /dev/tty
-            continue
+        else
+            echo "Unsupported URL scheme for the bot URL; use https://." > /dev/tty
         fi
-        break
     done
     BOT_PAYMENT_NOTIFY_URL="$(normalize_bot_url "$BOT_INPUT")"
     log "Bot notification endpoint: ${BOT_PAYMENT_NOTIFY_URL}"
