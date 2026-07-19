@@ -30,12 +30,26 @@ from app.adminbot.format import (
 )
 from app.audit import record_event
 from app.config import Settings
+from app.services.bulk_resend import (
+    PREVIEW_ORDER_LIMIT,
+    BulkResendPreview,
+    BulkResendResult,
+    preview_bulk_resend,
+    requeue_failed_deliveries,
+)
 from app.version import APP_VERSION
 
 logger = logging.getLogger("app.adminbot.commands")
 
 RECENT_DEFAULT = 10
 RECENT_MAX = 50
+
+# Fixed rejection shown for /resend_failed (preview AND confirm) when the
+# customer bot's idempotency is not guaranteed. No payment row is modified.
+BULK_RESEND_SAFE_MODE_MESSAGE = (
+    "ارسال مجدد گروهی غیرفعال است؛ ربات فروش باید دریافت تکراری order_id را "
+    "idempotent تضمین کند و BOT_NOTIFY_RETRY_MODE=idempotent باشد."
+)
 
 # check_api_health() -> {"live": bool, "ready": bool}
 ApiProbe = Callable[[], dict[str, bool]]
@@ -86,7 +100,7 @@ class CommandHandlers:
             "command": command,
         }
         logger.info("admin_command_started", extra=log_extra)
-        handler = self._registry().get(command)
+        handler = self._registry(ctx).get(command)
         with self._session_factory() as db:
             record_event(
                 db,
@@ -125,8 +139,10 @@ class CommandHandlers:
         )
         return messages
 
-    def _registry(self) -> dict[str, Callable[[Session, list[str]], list[str]]]:
-        return {
+    def _registry(
+        self, ctx: UpdateContext | None = None
+    ) -> dict[str, Callable[[Session, list[str]], list[str]]]:
+        registry: dict[str, Callable[[Session, list[str]], list[str]]] = {
             "start": self.cmd_start,
             "help": self.cmd_help,
             "status": self.cmd_status,
@@ -141,6 +157,14 @@ class CommandHandlers:
             "version": self.cmd_version,
             "fee": self.cmd_fee,
         }
+        # resend_failed is the only mutating command; it needs the authorized
+        # caller's numeric id for the audit trail, threaded explicitly (never
+        # via shared state — handlers run in a thread pool). Bound only when a
+        # real context is present (handle() always supplies one); a bare
+        # _registry() call is introspection-only.
+        if ctx is not None:
+            registry["resend_failed"] = lambda db, args: self.cmd_resend_failed(db, ctx, args)
+        return registry
 
     def _split(self, text: str) -> list[str]:
         return split_message(text, self._settings.admin_bot_max_message_length)
@@ -156,7 +180,7 @@ class CommandHandlers:
                 f"نسخه: {esc(APP_VERSION)}",
                 "",
                 "دستورها: /status /health /recent /stuck /manual_review",
-                "/errors /payment /retry_queue /backup_status /version /fee /help",
+                "/errors /payment /retry_queue /resend_failed /backup_status /version /fee /help",
                 "",
                 f"{WARN} این ربات فقط برای دیدبانی عملیاتی است. "
                 "پاسخ 2xx ربات فروش به معنی واریز قطعی اعتبار مشتری نیست.",
@@ -177,6 +201,8 @@ class CommandHandlers:
                 "/errors — خلاصهٔ خطاهای ۲۴ ساعت اخیر",
                 "/payment ORDER_ID — جزئیات یک پرداخت",
                 "/retry_queue — صف ارسال به ربات فروش",
+                "/resend_failed — پیش‌نمایش ارسال مجدد موارد تحویل‌نشده",
+                "/resend_failed confirm — بازگرداندن گروهی به صف، فقط در حالت idempotent",
                 "/backup_status — وضعیت پشتیبان‌گیری",
                 "/version — نسخهٔ برنامه و مهاجرت",
                 "/fee — کارمزد فعلی (فقط‌خواندنی؛ تغییر فقط از CLI سرور)",
@@ -461,6 +487,70 @@ class CommandHandlers:
         if self._settings.git_commit_sha:
             lines.append(f"کامیت: <code>{esc(self._settings.git_commit_sha[:12])}</code>")
         return self._split("\n".join(lines))
+
+    def cmd_resend_failed(
+        self, db: Session, ctx: UpdateContext, args: list[str]
+    ) -> list[str]:
+        """Preview (default) or execute (``confirm``) a bulk requeue of
+        delivery-failed manual-review payments.
+
+        This bot never calls the customer bot: it only changes notification
+        state so the existing worker performs the real delivery. Requires
+        idempotent retry mode; in safe mode BOTH preview and confirm are
+        rejected with a fixed message and no row is modified.
+        """
+        if self._settings.bot_notify_retry_mode != "idempotent":
+            return self._split(BULK_RESEND_SAFE_MODE_MESSAGE)
+
+        confirm = bool(args) and args[0].strip().lower() == "confirm"
+        if not confirm:
+            preview = preview_bulk_resend(db)
+            return self._split(self._render_resend_preview(preview))
+
+        result = requeue_failed_deliveries(
+            db, telegram_user_id=ctx.user_id, now=datetime.now(UTC)
+        )
+        return self._split(self._render_resend_result(result))
+
+    def _render_resend_preview(self, preview: BulkResendPreview) -> str:
+        lines = [
+            "<b>پیش‌نمایش ارسال مجدد گروهی</b>",
+            "",
+            f"پرداخت‌های واجد شرایط: {fmt_amount(preview.count)}",
+            f"مبلغ اصلی مجموع: {fmt_amount(preview.total_amount)} تومان",
+            "",
+            f"{WARN} هنوز هیچ ارسال شبکه‌ای انجام نشده است.",
+        ]
+        if preview.order_ids:
+            lines.append("")
+            lines.append(f"شناسه‌ها (حداکثر {PREVIEW_ORDER_LIMIT}):")
+            lines.extend(f"• <code>{esc(order_id)}</code>" for order_id in preview.order_ids)
+        else:
+            lines.append("")
+            lines.append("هیچ پرداخت واجد شرایطی برای ارسال مجدد وجود ندارد.")
+        lines.append("")
+        lines.append("برای اجرا این دستور را بفرستید:")
+        lines.append("/resend_failed confirm")
+        return "\n".join(lines)
+
+    def _render_resend_result(self, result: BulkResendResult) -> str:
+        # Requeued for DELIVERY only — never a claim that credit was applied.
+        lines = [
+            f"{OK} {fmt_amount(result.requeued_count)} پرداخت دوباره وارد صف ارسال شد.",
+            "",
+            f"مبلغ اصلی مجموع: {fmt_amount(result.total_amount)} تومان",
+            "ارسال واقعی توسط Worker انجام می‌شود.",
+            "شمارنده تلاش‌ها بازنشانی نشد.",
+        ]
+        if result.skipped_count > 0:
+            lines.append(
+                f"{WARN} {fmt_amount(result.skipped_count)} مورد به‌دلیل پردازش "
+                "همزمان توسط اجرای دیگری رد شد."
+            )
+        lines.append("")
+        lines.append("برای مشاهده صف:")
+        lines.append("/retry_queue")
+        return "\n".join(lines)
 
     # -- helpers -----------------------------------------------------------
 
