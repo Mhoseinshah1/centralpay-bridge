@@ -69,6 +69,20 @@ CentralPay confirmation, or lost silently is always critical.
   errors, or API responses. Gateway logs carry only the endpoint name, the
   order id, the HTTP status, the internal reason code, and a fixed-value
   marker naming which failure signal was present.
+- **Outbound transport (fix/outbound-url-transport-security):**
+  CentralPay transport is always HTTPS — `CENTRALPAY_BASE_URL` rejects
+  cleartext `http://` with no exception, because getLink/verify carry the
+  API key in POST bodies. Bot notification transport is HTTPS by
+  default; cleartext `http://` requires the explicit opt-in
+  `ALLOW_INSECURE_BOT_NOTIFY_URL=true` **and** a syntactically
+  private/internal destination (localhost, loopback/private/link-local
+  IP literals, single-label service names, `*.internal`/`*.local`) —
+  intended only for a mock bot on an isolated network. The opt-in
+  transmits the `Token` header without TLS and must never be used over a
+  public or untrusted network; public hostnames and public IP literals
+  are rejected even with the flag. No DNS resolution is performed during
+  validation, and validation errors never echo the submitted URL, the
+  Token, or the API keys.
 - **PUBLIC_BASE_URL contract (fix/public-base-url-security-validation):**
   the callback base URL is an HTTPS origin only — scheme, host, and
   optional port (`https://host[:port]`). Paths, queries, fragments,
