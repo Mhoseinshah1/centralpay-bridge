@@ -315,3 +315,171 @@ def test_update_command_aborts_before_side_effects_on_mismatch():
     # The checkout deploys the verified commit, never a raw FETCH_HEAD.
     assert 'checkout -q "$target_commit"' in body
     assert "checkout -q FETCH_HEAD" not in body
+
+
+# --- strict SHA256SUMS manifest parsing + exact SOURCE_COMMIT byte grammar ---
+#
+# These exercise verify_manifest_and_extract_commit directly with byte-exact
+# inputs (no git, no downloads): it must accept ONLY a manifest with exactly
+# one entry each for the exact artifact filename and the exact filename
+# "SOURCE_COMMIT" (each line `[0-9a-f]{64}  <name>`), and a SOURCE_COMMIT file
+# whose raw bytes full-match `[0-9a-f]{40}` or `[0-9a-f]{40}\n`.
+
+ARTIFACT_NAME = "centralpay-bridge-1.2.3.tar.gz"
+ARTIFACT_BYTES = b"dummy source tarball"
+COMMIT40 = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"  # 40 lowercase hex
+
+
+def _sha_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def run_verify(
+    tmp_path: Path,
+    *,
+    manifest: bytes,
+    source: bytes,
+    artifact_name: str = ARTIFACT_NAME,
+    artifact: bytes = ARTIFACT_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    (tmp_path / "SHA256SUMS").write_bytes(manifest)
+    (tmp_path / artifact_name).write_bytes(artifact)
+    (tmp_path / "SOURCE_COMMIT").write_bytes(source)
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; verify_manifest_and_extract_commit "$2" "$3" "$4" "$5"',
+            "_",
+            str(CLI),
+            str(tmp_path / "SHA256SUMS"),
+            artifact_name,
+            str(tmp_path / artifact_name),
+            str(tmp_path / "SOURCE_COMMIT"),
+        ],
+        env={**os.environ, "CENTRALPAY_CLI_SOURCE_ONLY": "1"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _line(name: str, data: bytes) -> str:
+    return f"{_sha_hex(data)}  {name}"
+
+
+def _good_manifest(source: bytes, *, artifact: bytes = ARTIFACT_BYTES) -> bytes:
+    return (
+        _line(ARTIFACT_NAME, artifact)
+        + "\n"
+        + _line("SOURCE_COMMIT", source)
+        + "\n"
+        + f"{'a' * 64}  sbom-centralpay-bridge.spdx.json\n"
+    ).encode()
+
+
+# --- acceptance --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("source", [COMMIT40.encode(), (COMMIT40 + "\n").encode()])
+def test_verify_accepts_exact_40_byte_commit_with_optional_newline(tmp_path, source):
+    result = run_verify(tmp_path, manifest=_good_manifest(source), source=source)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == COMMIT40
+
+
+# --- manifest exactness (rejections) -----------------------------------------
+
+
+def _manifest_reject_cases() -> dict[str, bytes]:
+    src = (COMMIT40 + "\n").encode()
+    src_line = _line("SOURCE_COMMIT", src)
+    art_line = _line(ARTIFACT_NAME, ARTIFACT_BYTES)
+    good_hash = _sha_hex(src)
+    return {
+        "two_source_no_artifact": f"{src_line}\n{src_line}\n".encode(),
+        "two_artifact_no_source": f"{art_line}\n{art_line}\n".encode(),
+        "duplicate_source_plus_artifact": f"{art_line}\n{src_line}\n{src_line}\n".encode(),
+        "duplicate_artifact_plus_source": f"{art_line}\n{art_line}\n{src_line}\n".encode(),
+        "dot_slash_source": f"{art_line}\n{good_hash}  ./SOURCE_COMMIT\n".encode(),
+        "path_source": f"{art_line}\n{good_hash}  sub/SOURCE_COMMIT\n".encode(),
+        "source_dot_old": f"{art_line}\n{good_hash}  SOURCE_COMMIT.old\n".encode(),
+        "similarly_named_artifact": (
+            f"{good_hash}  centralpay-bridge-1.2.3.tar.gz.bak\n{src_line}\n".encode()
+        ),
+        "missing_artifact_entry": f"{src_line}\n".encode(),
+        "missing_source_entry": f"{art_line}\n".encode(),
+        "uppercase_source_hash": f"{art_line}\n{good_hash.upper()}  SOURCE_COMMIT\n".encode(),
+        "short_source_hash": f"{art_line}\n{good_hash[:63]}  SOURCE_COMMIT\n".encode(),
+        "binary_marker_source": f"{art_line}\n{good_hash} *SOURCE_COMMIT\n".encode(),
+        "single_space_source": f"{art_line}\n{good_hash} SOURCE_COMMIT\n".encode(),
+        "trailing_space_after_name": f"{art_line}\n{src_line} \n".encode(),
+        "leading_junk_source": f"{art_line}\n x{src_line}\n".encode(),
+    }
+
+
+@pytest.mark.parametrize("name,manifest", list(_manifest_reject_cases().items()))
+def test_verify_rejects_inexact_manifest(tmp_path, name, manifest):
+    source = (COMMIT40 + "\n").encode()
+    result = run_verify(tmp_path, manifest=manifest, source=source)
+    assert result.returncode != 0, name
+    assert result.stdout.strip() == "", name
+
+
+# --- SOURCE_COMMIT byte grammar (rejections) ---------------------------------
+
+
+def _byte_reject_cases() -> dict[str, bytes]:
+    return {
+        "embedded_newline": (COMMIT40[:20] + "\n" + COMMIT40[20:] + "\n").encode(),
+        "two_trailing_newlines": (COMMIT40 + "\n\n").encode(),
+        "crlf": (COMMIT40 + "\r\n").encode(),
+        "leading_space": (" " + COMMIT40).encode(),
+        "trailing_space": (COMMIT40 + " ").encode(),
+        "trailing_space_before_newline": (COMMIT40 + " \n").encode(),
+        "tab": (COMMIT40 + "\t").encode(),
+        "nul": (COMMIT40 + "\x00").encode(),
+        "uppercase_hex": ("A" * 40).encode(),
+        "two_hashes": (COMMIT40 + COMMIT40).encode(),
+        "too_short": COMMIT40[:39].encode(),
+        "too_long_non_newline": (COMMIT40 + "a").encode(),
+        "empty": b"",
+    }
+
+
+@pytest.mark.parametrize("name,source", list(_byte_reject_cases().items()))
+def test_verify_rejects_malformed_source_commit_bytes(tmp_path, name, source):
+    # A valid manifest (hashes computed over the actual malformed bytes) so the
+    # ONLY failing gate is the byte grammar, which is checked before checksums.
+    result = run_verify(tmp_path, manifest=_good_manifest(source), source=source)
+    assert result.returncode != 0, name
+    assert result.stdout.strip() == "", name
+
+
+# --- checksum enforcement against the individually selected expected hashes ---
+
+
+def test_verify_rejects_artifact_hash_mismatch(tmp_path):
+    source = (COMMIT40 + "\n").encode()
+    manifest = _good_manifest(source, artifact=b"the-manifest-hash-covers-this")
+    result = run_verify(
+        tmp_path, manifest=manifest, source=source, artifact=b"but-the-file-is-different"
+    )
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""
+
+
+def test_verify_rejects_source_hash_mismatch(tmp_path):
+    source = (COMMIT40 + "\n").encode()
+    # Manifest's SOURCE_COMMIT hash covers a DIFFERENT valid commit than the
+    # file, so the bytes are well-formed but the checksum must fail.
+    other = ("b" * 40 + "\n").encode()
+    manifest = (
+        _line(ARTIFACT_NAME, ARTIFACT_BYTES)
+        + "\n"
+        + _line("SOURCE_COMMIT", other)
+        + "\n"
+    ).encode()
+    result = run_verify(tmp_path, manifest=manifest, source=source)
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""

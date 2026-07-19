@@ -242,6 +242,97 @@ is_release_tag() {
     [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]
 }
 
+verify_manifest_and_extract_commit() {
+    # $1 = SHA256SUMS path, $2 = exact runtime artifact filename,
+    # $3 = downloaded artifact path, $4 = downloaded SOURCE_COMMIT path.
+    #
+    # Prints the 40-char lowercase-hex commit on stdout and returns 0 ONLY when
+    # ALL of the following hold; otherwise prints a fixed reason to stderr,
+    # nothing to stdout, and returns non-zero:
+    #   * SHA256SUMS contains EXACTLY one line for the exact artifact filename
+    #     and EXACTLY one line for the exact filename "SOURCE_COMMIT", each
+    #     formatted precisely as `[0-9a-f]{64}  <exact filename>` (64 lowercase
+    #     hex, two spaces, exact name). No wildcard is used to locate entries;
+    #     "./SOURCE_COMMIT", "path/SOURCE_COMMIT", "SOURCE_COMMIT.old",
+    #     similarly named artifacts, binary "*" markers, uppercase or malformed
+    #     hashes, duplicates, and leading/trailing junk are all rejected.
+    #   * The SOURCE_COMMIT file bytes full-match `[0-9a-f]{40}` or
+    #     `[0-9a-f]{40}\n` — read as RAW BYTES, so embedded newlines, a second
+    #     trailing newline, CRLF, leading/trailing spaces, tabs, NUL/control
+    #     bytes, uppercase hex, and any length other than 40 or 41 bytes are
+    #     rejected (no normalization of malformed input into validity).
+    #   * The artifact and SOURCE_COMMIT files hash to their individually
+    #     selected expected values from the manifest.
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import hashlib
+import re
+import sys
+
+manifest_path, artifact_name, artifact_path, source_path = sys.argv[1:5]
+
+
+def die(msg):
+    sys.stderr.write("SOURCE_COMMIT/manifest verification failed: " + msg + "\n")
+    raise SystemExit(1)
+
+
+try:
+    with open(manifest_path, "rb") as fh:
+        manifest = fh.read()
+except OSError:
+    die("cannot read SHA256SUMS")
+
+
+def exact_hashes(name):
+    # Whole-line match: 64 lowercase hex, exactly two spaces, exact filename.
+    pattern = re.compile(rb"^([0-9a-f]{64})  " + re.escape(name.encode()) + rb"$")
+    found = []
+    for line in manifest.split(b"\n"):
+        if line == b"":
+            continue
+        m = pattern.fullmatch(line)
+        if m is not None:
+            found.append(m.group(1).decode())
+    return found
+
+
+artifact_hashes = exact_hashes(artifact_name)
+source_hashes = exact_hashes("SOURCE_COMMIT")
+if len(artifact_hashes) != 1:
+    die("expected exactly one artifact entry (%s), found %d" % (artifact_name, len(artifact_hashes)))
+if len(source_hashes) != 1:
+    die("expected exactly one SOURCE_COMMIT entry, found %d" % len(source_hashes))
+
+try:
+    with open(source_path, "rb") as fh:
+        raw = fh.read()
+except OSError:
+    die("cannot read SOURCE_COMMIT")
+if re.fullmatch(rb"[0-9a-f]{40}\n?", raw) is None:
+    die("SOURCE_COMMIT is not exactly one 40-char lowercase hex commit (with at most one trailing newline)")
+commit = raw[:40].decode()
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        die("cannot read " + path)
+    return h.hexdigest()
+
+
+if sha256_file(artifact_path) != artifact_hashes[0]:
+    die("artifact checksum mismatch")
+if sha256_file(source_path) != source_hashes[0]:
+    die("SOURCE_COMMIT checksum mismatch")
+
+sys.stdout.write(commit + "\n")
+PY
+}
+
 resolve_verified_update_commit() {
     # $1 = update ref. Prints (stdout) the exact Git commit SHA to deploy and
     # returns 0; prints NOTHING to stdout and returns non-zero on any failure.
@@ -283,25 +374,15 @@ resolve_verified_update_commit() {
         fi
         fail "Cannot download the release assets (artifact, SOURCE_COMMIT, SHA256SUMS) for ${ref}. Publish the GitHub release first, or set CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true (not recommended)."
     fi
-    # Verify checksums for BOTH the artifact and SOURCE_COMMIT. The SBOM line
-    # in SHA256SUMS references a file we intentionally do not download here,
-    # so filter to exactly the two entries and require both to be present.
-    if ! (
-        cd "$tmp" || exit 3
-        grep -E ' (SOURCE_COMMIT|centralpay-bridge-.*\.tar\.gz)$' SHA256SUMS > check.sums
-        [ "$(wc -l < check.sums)" -eq 2 ] || exit 4
-        sha256sum -c --quiet check.sums
-    ) >/dev/null 2>&1; then
+    # Strict manifest parsing + exact SOURCE_COMMIT byte grammar + both
+    # checksums, all in one fail-closed helper (no wildcard entry matching, no
+    # newline normalization). Returns the verified 40-hex commit on stdout.
+    if ! source_commit=$(verify_manifest_and_extract_commit \
+        "${tmp}/SHA256SUMS" "$artifact" "${tmp}/${artifact}" "${tmp}/SOURCE_COMMIT"); then
         rm -rf "$tmp"
-        fail "Release asset verification FAILED for ${ref} (missing entry or checksum mismatch for the artifact or SOURCE_COMMIT). Aborting update."
+        fail "Release asset verification FAILED for ${ref} (SHA256SUMS did not contain exactly one valid entry each for ${artifact} and SOURCE_COMMIT, the SOURCE_COMMIT bytes were malformed, or a checksum did not match). Aborting update."
     fi
-    # Validate SOURCE_COMMIT grammar: exactly 40 lowercase hex, one optional
-    # trailing newline, nothing else.
-    source_commit=$(tr -d '\n' < "${tmp}/SOURCE_COMMIT")
     rm -rf "$tmp"
-    if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
-        fail "SOURCE_COMMIT is malformed for ${ref} (expected one 40-character lowercase hex commit). Aborting update."
-    fi
     # Require the fetched tag commit to equal the verified SOURCE_COMMIT.
     if [[ "$fetched" != "$source_commit" ]]; then
         fail "Deployed-commit mismatch for ${ref}: the tag resolves to ${fetched:0:12} but the verified SOURCE_COMMIT is ${source_commit:0:12}. The tag may have been moved after the release was built. Aborting update BEFORE any change."

@@ -6,6 +6,7 @@ daemon required, no destructive operations.
 """
 
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -680,11 +681,14 @@ def test_logs_commands_use_component_allowlist():
 
 def test_update_never_extracts_archives():
     """The release artifact is downloaded and checksum-verified only;
-    deployment happens via git checkout of the pinned ref. No archive is
+    deployment happens via git checkout of the verified commit. No archive is
     ever extracted, so archive path-traversal/symlink attacks have no
     surface in the update or backup paths."""
     text = MANAGEMENT.read_text()
-    assert "sha256sum -c" in text
+    # Checksums are verified in the strict Python manifest helper (hashlib),
+    # not by shelling out; the artifact is downloaded and hashed, never opened.
+    assert "verify_manifest_and_extract_commit" in text
+    assert "hashlib.sha256" in text
     for extraction in ("tar -x", "tar x", "unzip", "tar --extract"):
         assert extraction not in text, extraction
     backup_text = BACKUP_SCRIPT.read_text()
@@ -780,6 +784,60 @@ def test_installer_persists_and_recovers_the_initial_fee():
     body = body[: body.index("\n}")]
     assert "INSTALLER_INITIAL_FEE_PERCENT:-${PAYMENT_FEE_PERCENT:-}" in body
     assert ':-0}' not in body  # no silent 0% default anywhere in the ensure step
+
+
+def test_installer_fee_recovery_shell_orchestration(tmp_path):
+    """CANON-1 shell orchestration: after a first-run ensure failure leaves no
+    policy, a keep-existing rerun reloads INSTALLER_INITIAL_FEE_PERCENT from
+    the generated env file and passes the ORIGINAL non-zero rate to app.ops —
+    never a zero or a missing --percent. Docker is stubbed to capture the argv
+    the installer would run; no container, daemon, or database is touched."""
+    install_dir = tmp_path / "install"
+    config_dir = tmp_path / "config"
+    bindir = tmp_path / "bin"
+    for d in (install_dir, config_dir, bindir):
+        d.mkdir()
+    # The env file the first (failed) run generated, carrying the recovery
+    # metadata that the fee-policy step never got to apply.
+    (config_dir / "centralpay.env").write_text(
+        "PUBLIC_BASE_URL=https://pay.example.com\nINSTALLER_INITIAL_FEE_PERCENT=7\n"
+    )
+    capture = tmp_path / "docker_argv.txt"
+    docker_stub = bindir / "docker"
+    docker_stub.write_text(
+        "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> "
+        + shlex.quote(str(capture))
+        + "\nexit 0\n"
+    )
+    docker_stub.chmod(0o755)
+
+    # Reload exactly as main()'s keep-existing branch does, then run the
+    # ensure step (Docker stubbed on PATH).
+    script = (
+        'source "$1"\n'
+        "INSTALLER_INITIAL_FEE_PERCENT=$(grep -E '^INSTALLER_INITIAL_FEE_PERCENT=' "
+        '"$ENV_FILE" | cut -d= -f2- || true)\n'
+        "ensure_initial_fee_policy\n"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "_", str(INSTALLER)],
+        env={
+            "PATH": f"{bindir}:/usr/bin:/bin",
+            "CENTRALPAY_INSTALL_SOURCE_ONLY": "1",
+            "CENTRALPAY_INSTALL_DIR": str(install_dir),
+            "CENTRALPAY_CONFIG_DIR": str(config_dir),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    captured = capture.read_text()
+    # The recovered original non-zero rate is passed through.
+    assert "fee ensure-initial --percent 7" in captured
+    # Never a zero and never a missing percentage on the recovery path.
+    assert "--percent 0" not in captured
+    assert "--percent" in captured
 
 
 def test_installer_sets_explicit_script_modes():
