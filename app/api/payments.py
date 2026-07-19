@@ -65,6 +65,12 @@ class CreatePaymentResponse(BaseModel):
 # (request_body max_size 64KB). The legitimate body is ~150 bytes.
 _MAX_BODY_BYTES = 64 * 1024
 _REQUIRED_FIELDS = ("api_key", "amount", "order_id")
+# Bound on the number of application/x-www-form-urlencoded pairs accepted from
+# an unauthenticated request. The legitimate body carries exactly the three
+# required fields; a legacy sender adds at most a handful of unrelated fields.
+# 32 leaves generous headroom while capping attacker-controlled fan-out well
+# below what the 64 KB size limit alone would allow (~21k blank pairs).
+_MAX_FORM_PAIRS = 32
 # ASCII decimal only: `[0-9]` never matches Persian/Arabic digits, and re.ASCII
 # keeps it strict. No sign, separators, whitespace, exponent, or decimal point.
 _ASCII_DECIMAL = re.compile(r"[0-9]+", re.ASCII)
@@ -72,10 +78,15 @@ _ASCII_DECIMAL = re.compile(r"[0-9]+", re.ASCII)
 
 class _CompatReject(Exception):
     """Carries the sanitized representation category up to the top-level parser
-    for logging; converted to the project's standard 422 validation error."""
+    for logging; converted to the project's standard 422 validation error.
 
-    def __init__(self, category: str) -> None:
+    ``detail`` may carry ONLY safe, non-attacker-controlled diagnostics (counts
+    and the fixed required-field names) — never a submitted field name or value.
+    """
+
+    def __init__(self, category: str, detail: dict[str, Any] | None = None) -> None:
         self.category = category
+        self.detail = detail or {}
 
 
 def _media_type(request: Request) -> str:
@@ -127,6 +138,13 @@ def _decode_json_layers(
 
 
 def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
+    """Decode a legacy form body, tolerating unrelated extra fields.
+
+    Each of the three required fields must appear **exactly once**; any other
+    field is ignored — never collected, never validated, never logged. The
+    returned dict contains ONLY the three required fields, so nothing else can
+    reach the strict model, the database, or the gateway.
+    """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -135,15 +153,33 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
         pairs = parse_qsl(text, keep_blank_values=True, strict_parsing=True)
     except ValueError as exc:
         raise _CompatReject("urlencoded") from exc
-    result: dict[str, str] = {}
+    # Bound the pair count before inspecting values: unauthenticated,
+    # attacker-controlled input must never drive unbounded work.
+    total_pairs = len(pairs)
+    if total_pairs > _MAX_FORM_PAIRS:
+        raise _CompatReject("urlencoded", {"total_pair_count": total_pairs})
+    # Count occurrences of the REQUIRED fields only; every extra field is
+    # dropped here and its name/value is neither retained nor logged.
+    counts = dict.fromkeys(_REQUIRED_FIELDS, 0)
+    values: dict[str, str] = {}
     for key, value in pairs:
-        if key in result:
-            raise _CompatReject("urlencoded")  # a field appeared more than once
-        result[key] = value
-    # Exactly the three required fields, each exactly once; no extras.
-    if set(result) != set(_REQUIRED_FIELDS):
-        raise _CompatReject("urlencoded")
-    return "urlencoded", result
+        if key in counts:
+            counts[key] += 1
+            values[key] = value
+    missing = [field for field in _REQUIRED_FIELDS if counts[field] == 0]
+    duplicate = [field for field in _REQUIRED_FIELDS if counts[field] > 1]
+    if missing or duplicate:
+        # Diagnostics use ONLY the fixed required-field names and counts —
+        # never an extra field's (attacker-controlled) name or any value.
+        detail: dict[str, Any] = {
+            "total_pair_count": total_pairs,
+            "extra_field_count": total_pairs - sum(counts.values()),
+            "missing_required_fields": missing,
+            "duplicate_required_fields": duplicate,
+        }
+        raise _CompatReject("urlencoded", detail)
+    # A NEW dict with ONLY the three required fields, each present exactly once.
+    return "urlencoded", {field: values[field] for field in _REQUIRED_FIELDS}
 
 
 def _decode(media_type: str, raw: bytes) -> tuple[str, dict[str, Any]]:
@@ -186,14 +222,24 @@ def _sanitized_validation_error() -> RequestValidationError:
     )
 
 
-def _reject(category: str, media_type: str, body_size: int | None) -> NoReturn:
+def _reject(
+    category: str,
+    media_type: str,
+    body_size: int | None,
+    detail: dict[str, Any] | None = None,
+) -> NoReturn:
     # Pre-auth diagnostic: representation category, content-type, and byte
     # length ONLY — never a field value (in particular never order_id) or the
     # raw body, since this request is unauthenticated and possibly hostile.
-    logger.warning(
-        "custom_payment_body_rejected",
-        extra={"representation": category, "content_type": media_type, "body_size": body_size},
-    )
+    # ``detail`` adds only safe counts / fixed field names (see _CompatReject).
+    extra: dict[str, Any] = {
+        "representation": category,
+        "content_type": media_type,
+        "body_size": body_size,
+    }
+    if detail:
+        extra.update(detail)
+    logger.warning("custom_payment_body_rejected", extra=extra)
     raise _sanitized_validation_error()
 
 
@@ -209,13 +255,13 @@ async def parse_create_payment_request(request: Request) -> CreatePaymentRequest
     except _CompatReject as reject:
         declared = request.headers.get("content-length")
         size = int(declared) if declared and declared.isdigit() else None
-        _reject(reject.category, media_type, size)
+        _reject(reject.category, media_type, size, reject.detail)
     body_size = len(raw)
     try:
         representation, data = _decode(media_type, raw)
         normalized = _normalize(data)
     except _CompatReject as reject:
-        _reject(reject.category, media_type, body_size)
+        _reject(reject.category, media_type, body_size, reject.detail)
     # Accepted representation — safe pre-auth observability (no field values).
     logger.info(
         "custom_payment_body_normalized",
