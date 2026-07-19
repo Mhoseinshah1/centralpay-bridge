@@ -96,10 +96,19 @@ def _validate_and_apply_verification(
     """
     field_errors = list(result.field_errors)
     if result.reference_id is None:
+        # A referenceId that was PRESENT but violated the storage contract
+        # (over-length, NUL/control characters, unsupported type) is a
+        # different financial fact than one the gateway never sent — the
+        # audit trail must not call it "missing". In both cases the raw
+        # value never left app/centralpay.py, so neither event can leak it.
         _move_to_manual_review(
             db,
             payment,
-            mismatch_event="verify_missing_reference_id",
+            mismatch_event=(
+                "verify_invalid_reference_id"
+                if result.reference_id_invalid
+                else "verify_missing_reference_id"
+            ),
             data={"gateway_order_id": payment.gateway_order_id, "field_errors": field_errors},
         )
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
