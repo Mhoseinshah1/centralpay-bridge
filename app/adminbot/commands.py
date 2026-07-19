@@ -361,6 +361,7 @@ class CommandHandlers:
             "verify_payable_amount_mismatch": "مغایرت مبلغ",
             "verify_user_id_mismatch": "مغایرت شناسهٔ کاربر",
             "verify_missing_reference_id": "نبود کد پیگیری",
+            "verify_invalid_reference_id": "کد پیگیری نامعتبر از درگاه",
             "bot_notification_failed": "خطای تحویل به ربات",
             "bot_timeout_ambiguous": "تایم‌اوت مبهم",
             "notification_recovered_after_restart": "بازیابی ورکر",

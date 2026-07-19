@@ -196,6 +196,7 @@ def errors_summary(db: Session, *, hours: int = 24) -> dict[str, int]:
                     "verify_payable_amount_mismatch",
                     "verify_user_id_mismatch",
                     "verify_missing_reference_id",
+                    "verify_invalid_reference_id",
                     "bot_notification_failed",
                     "bot_timeout_ambiguous",
                     "notification_recovered_after_restart",
