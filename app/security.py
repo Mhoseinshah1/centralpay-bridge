@@ -45,14 +45,26 @@ def callback_token_matches(callback_token: str, stored_hash: str | None) -> bool
     return hmac.compare_digest(callback_token_hash(callback_token), stored_hash)
 
 
+# The one public callback path. Shared by the URL builder, the FastAPI
+# route, and the deployment tests that pin the Caddy public-route matcher
+# to it — so the three can never drift apart.
+CALLBACK_PATH = "/api/centralpay/callback"
+
+
 def build_callback_url(
     settings: Settings, gateway_order_id: int, callback_token: str
 ) -> str:
     signature = callback_signature(
         settings.callback_hmac_secret, gateway_order_id, callback_token
     )
+    # Settings validation canonicalized public_base_url to a bare HTTPS
+    # origin (https://host[:port] — no path/query/fragment/userinfo), so
+    # this concatenation cannot be influenced by the base URL: the path is
+    # the fixed constant and every query parameter is generated here, from
+    # application-controlled values (int order id, hex token, hex HMAC),
+    # each appearing exactly once. The rstrip is belt-and-braces only.
     base = settings.public_base_url.rstrip("/")
     return (
-        f"{base}/api/centralpay/callback"
+        f"{base}{CALLBACK_PATH}"
         f"?orderId={gateway_order_id}&ct={callback_token}&sig={signature}"
     )
