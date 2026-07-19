@@ -89,6 +89,18 @@ class _CompatReject(Exception):
         self.detail = detail or {}
 
 
+class _UrlencodedSyntaxError(Exception):
+    """The body is not syntactically valid urlencoded data (bad UTF-8 or a
+    malformed pair under strict parsing).
+
+    Deliberately distinct from _CompatReject: the urlencoded path may fall
+    back to the JSON decoder ONLY on this syntax failure (the legacy sales
+    bot declares the form content type but actually sends JSON). A form that
+    PARSED but failed a semantic rule — missing/duplicate required field,
+    too many pairs — raises _CompatReject and must never reach the fallback.
+    """
+
+
 def _media_type(request: Request) -> str:
     return (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
 
@@ -144,15 +156,19 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
     field is ignored — never collected, never validated, never logged. The
     returned dict contains ONLY the three required fields, so nothing else can
     reach the strict model, the database, or the gateway.
+
+    Raises _UrlencodedSyntaxError when the body is not urlencoded data at all
+    (the caller may then try the JSON fallback) and _CompatReject for every
+    semantic failure of a validly parsed form (which must NOT fall back).
     """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise _CompatReject("urlencoded") from exc
+        raise _UrlencodedSyntaxError() from exc
     try:
         pairs = parse_qsl(text, keep_blank_values=True, strict_parsing=True)
     except ValueError as exc:
-        raise _CompatReject("urlencoded") from exc
+        raise _UrlencodedSyntaxError() from exc
     # Bound the pair count before inspecting values: unauthenticated,
     # attacker-controlled input must never drive unbounded work.
     total_pairs = len(pairs)
@@ -190,7 +206,26 @@ def _decode(media_type: str, raw: bytes) -> tuple[str, dict[str, Any]]:
             raw, object_category="json_object", string_category="json_string_object"
         )
     if media_type == "application/x-www-form-urlencoded":
-        return _decode_urlencoded(raw)
+        try:
+            return _decode_urlencoded(raw)
+        except _UrlencodedSyntaxError:
+            # Production evidence: the inaccessible legacy sales bot declares
+            # this content type while sending a JSON document, which strict
+            # form parsing cannot even tokenize. ONLY in that case — a body
+            # that is not urlencoded syntax at all — fall back to the same
+            # bounded one-extra-layer JSON decoder. A validly parsed form
+            # with a semantic failure (missing/duplicate required field, too
+            # many pairs) raises _CompatReject above and never lands here.
+            try:
+                return _decode_json_layers(
+                    raw,
+                    object_category="urlencoded_json_object",
+                    string_category="urlencoded_json_string_object",
+                )
+            except _CompatReject as exc:
+                # Neither parser could read the body; a single fixed label so
+                # rejection logs stay free of guesses about what was sent.
+                raise _CompatReject("urlencoded_unparseable") from exc
     if media_type == "text/plain":
         return _decode_json_layers(
             raw, object_category="text_json", string_category="text_json"
