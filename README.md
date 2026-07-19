@@ -278,9 +278,14 @@ relaxed. Accepted representations:
 - **`application/json`** — a JSON object, **or** a JSON *string* whose
   content is exactly one JSON object (at most one extra decode layer; a
   string-in-a-string is **not** unwrapped recursively).
-- **`application/x-www-form-urlencoded`** — exactly the three fields
-  `api_key`, `amount`, `order_id`, each present **once**; a duplicated,
-  missing, or extra field is rejected.
+- **`application/x-www-form-urlencoded`** — the three fields `api_key`,
+  `amount`, `order_id`, each present **exactly once**; a duplicated or
+  missing required field is rejected, unrelated extra fields are ignored
+  (never validated, stored, or logged), and at most 32 form pairs are
+  accepted. If the body is **not urlencoded syntax at all** (the legacy
+  sales bot declares this content type while sending JSON), the parser
+  falls back to the same one-extra-layer JSON decoder above — a validly
+  parsed form that fails a semantic rule never falls back.
 - **`text/plain`** — one JSON object, or one JSON string containing one
   JSON object (same one-layer rule).
 - A missing `Content-Type` is treated as JSON (the historical default).
