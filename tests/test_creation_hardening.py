@@ -44,8 +44,11 @@ def _post(client, settings, body):
         False,
         10000.0,  # integral float; used to coerce
         10000.5,
-        "10000",  # numeric string; used to coerce
-        "1e4",
+        # NOTE: a plain ASCII-decimal string ("10000") is now accepted and
+        # converted by the legacy-body compatibility layer — see
+        # tests/test_custom_payment_legacy_body.py. Only non-decimal strings
+        # remain invalid here.
+        "1e4",  # exponent notation: never a valid integer
         0,
         -100,
         1_000_000_000_001,  # above the absolute schema backstop
