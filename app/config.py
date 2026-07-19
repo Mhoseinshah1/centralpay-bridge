@@ -1,5 +1,6 @@
 """Application configuration loaded from environment variables."""
 
+import ipaddress
 import re
 from typing import Literal, Self
 from urllib.parse import urlsplit
@@ -12,6 +13,11 @@ _HTTP_URL_PATTERN = re.compile(r"^https?://[^\s]+$")
 # Fixed error text for an invalid PUBLIC_BASE_URL. The submitted value is
 # deliberately never echoed anywhere (a malformed URL may embed userinfo,
 # tokens, or other secrets); the message names only the variable.
+# DNS-style label for registered hostnames: letters/digits/hyphen, no
+# leading or trailing hyphen, no underscore, no percent encoding. Labels
+# are bounded at 63 octets and the full hostname at 253.
+_HOST_LABEL_PATTERN = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?")
+
 _PUBLIC_BASE_URL_ERROR = (
     "PUBLIC_BASE_URL must be an HTTPS origin only: https://host[:port] with "
     "no path, query, fragment, userinfo, whitespace, or control characters"
@@ -32,10 +38,17 @@ def normalize_public_base_url(value: object) -> str:
     generated callback. The application enforces the contract itself;
     installer correctness is not a sufficient security control.
 
-    Accepted: absolute HTTPS URL with a non-empty ASCII hostname
-    (IPv4 / registered name / bracketed IPv6), an optional numeric port
-    (1-65535), and at most a bare "/" path. Internationalized hostnames
-    are explicitly rejected — operators must supply the punycode form.
+    Accepted: absolute HTTPS URL with a non-empty ASCII hostname —
+    structurally valid IPv4, bracketed IPv6 (ipaddress-validated), or a
+    registered name of DNS-style labels (letters/digits/hyphen, no
+    leading/trailing hyphen, no underscore, no empty labels, label <= 63
+    and hostname <= 253 chars) — an optional numeric port (1-65535), and
+    at most a bare "/" path. Internationalized hostnames are explicitly
+    rejected — operators must supply the punycode form (which satisfies
+    the label grammar). Percent signs anywhere in the authority are
+    rejected: percent-encoded host syntax is parser-dependent ambiguity,
+    never decoded-and-accepted. An explicit ":" port delimiter must be
+    followed by digits — a dangling colon is rejected, not repaired.
     Nothing is silently repaired; the ONLY normalization applied is
     scheme/host lowercasing and dropping a lone trailing slash.
 
@@ -57,25 +70,75 @@ def normalize_public_base_url(value: object) -> str:
     # HTTPS only; a missing scheme also rejects protocol-relative values.
     if parts.scheme.lower() != "https":
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
-    if parts.username is not None or parts.password is not None:
-        raise ValueError(_PUBLIC_BASE_URL_ERROR)
     if parts.query or parts.fragment:
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
     if parts.path not in ("", "/"):
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
-    try:
-        hostname = parts.hostname
-        port = parts.port  # raises ValueError for non-numeric/out-of-range
-    except ValueError:
-        raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
-    if not hostname:
+    # The RAW authority is validated character by character; urlsplit's
+    # convenience accessors are deliberately not trusted for acceptance
+    # decisions because they silently repair malformed authorities (a
+    # dangling ":" yields port=None, and percent-encoded bytes pass
+    # through as hostname text). Nothing here is repaired: an authority
+    # that would change on reconstruction — beyond the documented
+    # case/slash normalizations — is rejected.
+    netloc = parts.netloc
+    if not netloc or "@" in netloc or "%" in netloc:
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
-    if port is not None and not (1 <= port <= 65535):
-        raise ValueError(_PUBLIC_BASE_URL_ERROR)
-    # Reconstruct the canonical origin from parsed components only —
-    # never from the raw string.
-    host_out = f"[{hostname}]" if ":" in hostname else hostname
-    return f"https://{host_out}:{port}" if port is not None else f"https://{host_out}"
+    host_canonical, port_text = _split_raw_authority(netloc)
+    port: int | None = None
+    if port_text is not None:
+        # An explicit ":" delimiter demands one or more ASCII digits —
+        # a dangling colon is malformed input, not "no port".
+        if not port_text or not port_text.isdigit():
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    return f"https://{host_canonical}:{port}" if port is not None else f"https://{host_canonical}"
+
+
+def _split_raw_authority(netloc: str) -> tuple[str, str | None]:
+    """Split a raw (already ASCII, userinfo-free, percent-free) authority
+    into a canonical lower-cased host and the raw port text.
+
+    Returns ``(host, None)`` when no ":" delimiter is present and
+    ``(host, port_text)`` — possibly empty — when one is. Raises for
+    malformed brackets, invalid hostname grammar, or trailing junk.
+    """
+    if netloc.startswith("["):
+        closing = netloc.find("]")
+        if closing == -1:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+        host_raw = netloc[1:closing]
+        rest = netloc[closing + 1 :]
+        try:
+            ipaddress.IPv6Address(host_raw)
+        except ValueError:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+        if rest == "":
+            return f"[{host_raw.lower()}]", None
+        if not rest.startswith(":"):
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)  # e.g. "[::1]extra"
+        return f"[{host_raw.lower()}]", rest[1:]
+    host_raw, sep, port_text = netloc.partition(":")
+    host = host_raw.lower()
+    labels = host.split(".")
+    if any(not label for label in labels):
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)  # empty label ("..", leading/trailing dot)
+    if all(label.isdigit() for label in labels):
+        # All-numeric dotted form MUST be a structurally valid IPv4 address
+        # (rejects 999.999.999.999 and 1.2.3.4.5 alike).
+        try:
+            ipaddress.IPv4Address(host)
+        except ValueError:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+    else:
+        if len(host) > 253:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+        for label in labels:
+            if len(label) > 63 or not _HOST_LABEL_PATTERN.fullmatch(label):
+                raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    return host, port_text if sep else None
 
 
 class Settings(BaseSettings):
