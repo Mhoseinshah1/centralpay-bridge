@@ -559,7 +559,9 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `CALLBACK_HMAC_SECRET` | Secret for HMAC-SHA256 callback signatures (min 16 chars) |
 | `CENTRALPAY_GETLINK_API_KEY` / `CENTRALPAY_VERIFY_API_KEY` | CentralPay web service key. The gateway issues a **single** API key used for both getLink and verify — the installer asks for it once and sets the same value in both variables (kept separate so a future split key needs no contract change) |
 | `CENTRALPAY_USER_ID` | Numeric userId sent to getLink and validated on verify |
-| `BOT_PAYMENT_NOTIFY_URL` | Complete bot payment endpoint (e.g. `https://bot.example.com/api/payment`) |
+| `BOT_PAYMENT_NOTIFY_URL` | Complete bot payment endpoint (e.g. `https://bot.example.com/api/payment`). HTTPS required by default; validated strictly (no userinfo/query/fragment; path stored exactly) |
+| `ALLOW_INSECURE_BOT_NOTIFY_URL` | Default `false`. When `true`, cleartext `http://` is allowed ONLY for private/internal hosts (localhost, private IP literals, single-label service names, `*.internal`/`*.local`) — for isolated mock-bot networks; the `Token` header then crosses without TLS. Public hosts stay rejected. No DNS is consulted |
+| `CENTRALPAY_BASE_URL` | CentralPay service base (default `https://centralapi.org/webservice/basic`). Always HTTPS — no insecure exception; the API key travels in request bodies |
 | `BOT_NOTIFY_TOKEN` | Bot `Token` header value; never logged |
 | `BOT_NOTIFY_RETRY_MODE` | `safe` (default) or `idempotent` — see retry modes above |
 | `BOT_NOTIFY_MAX_ATTEMPTS` | Attempts before `manual_review` with `retry_limit_reached` (default 6) |

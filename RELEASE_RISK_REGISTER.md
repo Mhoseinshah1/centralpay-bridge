@@ -323,7 +323,15 @@ here as post-release backlog.
 
 ## Topic 32 (fix/public-base-url-security-validation)
 
-### 32. Adjacent URL configuration can still be cleartext HTTP — **DOCUMENTED; not changed in this PR**
+### 32. Adjacent URL configuration can still be cleartext HTTP — **FIXED (fix/outbound-url-transport-security)**
+
+Resolution: `CENTRALPAY_BASE_URL` now rejects cleartext HTTP
+unconditionally (validated HTTPS base with strict authority/path
+grammar). `BOT_PAYMENT_NOTIFY_URL` requires HTTPS by default; the
+explicit `ALLOW_INSECURE_BOT_NOTIFY_URL=true` opt-in permits `http://`
+only for syntactically private/internal destinations (mock bots on
+isolated networks) and public hosts remain rejected even with the flag.
+No DNS is consulted. The original finding below is kept for history.
 
 While enforcing the PUBLIC_BASE_URL HTTPS-origin contract, the adjacent
 outbound URLs were audited:

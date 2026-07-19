@@ -8,7 +8,28 @@ from urllib.parse import urlsplit
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_HTTP_URL_PATTERN = re.compile(r"^https?://[^\s]+$")
+# Fixed error texts for outbound URLs. Submitted values are never echoed
+# (they may embed credentials or tokens); each message names ONLY its
+# variable and the applicable contract.
+_CENTRALPAY_BASE_URL_ERROR = (
+    "CENTRALPAY_BASE_URL must be an HTTPS service base URL "
+    "(https://host[:port]/base-path) with no userinfo, query, fragment, "
+    "endpoint filename, whitespace, or control characters — cleartext "
+    "http:// is never accepted because the API key travels in request bodies"
+)
+_BOT_NOTIFY_URL_ERROR = (
+    "BOT_PAYMENT_NOTIFY_URL must be an HTTPS endpoint URL "
+    "(https://host[:port]/path) with no userinfo, query, fragment, "
+    "whitespace, or control characters; cleartext http:// is accepted only "
+    "with ALLOW_INSECURE_BOT_NOTIFY_URL=true and only for private/internal "
+    "hosts (localhost, loopback/private/link-local IP literals, single-label "
+    "service names, or *.internal/*.local) — the Token header would "
+    "otherwise cross the network without TLS"
+)
+
+# Path-segment grammar shared by the outbound URLs: clean slash-separated
+# segments, no empty segments, no dot-segments, no percent encoding.
+_PATH_SEGMENT_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 
 # Fixed error text for an invalid PUBLIC_BASE_URL. The submitted value is
 # deliberately never echoed anywhere (a malformed URL may embed userinfo,
@@ -93,25 +114,137 @@ def normalize_public_base_url(value: object) -> str:
     if not netloc or "@" in netloc or "%" in netloc:
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
     host_canonical, port_text = _split_raw_authority(netloc)
-    port: int | None = None
-    if port_text is not None:
-        # An explicit ":" delimiter demands one or more ASCII digits —
-        # a dangling colon is malformed input, not "no port".
-        if not port_text or not port_text.isdigit():
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)
-        port = int(port_text)
-        if not 1 <= port <= 65535:
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)
-        # The raw decimal spelling must already be canonical: a
-        # zero-padded port (":0443") would be silently rewritten by the
-        # int() round-trip, and the documented normalizations are case
-        # folding and one trailing slash ONLY.
-        if port_text != str(port):
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    # An explicit ":" delimiter demands canonical decimal digits — a
+    # dangling colon or zero-padded spelling is malformed, not repaired.
+    port = _parse_canonical_port(port_text, _PUBLIC_BASE_URL_ERROR)
     return f"https://{host_canonical}:{port}" if port is not None else f"https://{host_canonical}"
 
 
-def _split_raw_authority(netloc: str) -> tuple[str, str | None]:
+def _parse_canonical_port(port_text: str | None, error: str) -> int | None:
+    """Validate an explicit raw port spelling: ASCII digits, range 1..65535,
+    canonical decimal form (no zero padding). None means no delimiter."""
+    if port_text is None:
+        return None
+    if not port_text or not port_text.isdigit():
+        raise ValueError(error)
+    port = int(port_text)
+    if not 1 <= port <= 65535 or port_text != str(port):
+        raise ValueError(error)
+    return port
+
+
+def _parse_outbound_url(value: object, error: str) -> tuple[str, str, int | None, str]:
+    """Shared strict parsing for outbound URLs (CentralPay base, bot
+    endpoint). Returns (scheme, canonical host, port, raw path) or raises
+    ``ValueError(error)``. Reuses exactly the PUBLIC_BASE_URL authority
+    grammar (_split_raw_authority) so there is one hostname contract, and
+    the same raw-delimiter rules: no whitespace/control characters, no
+    backslash, no '?'/'#' anywhere (even empty), no '%' or '@' in the
+    authority, canonical port spelling."""
+    if not isinstance(value, str) or not value or not value.isascii():
+        raise ValueError(error)
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in value) or "\\" in value:
+        raise ValueError(error)
+    if "?" in value or "#" in value:
+        raise ValueError(error)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise ValueError(error) from None
+    netloc = parts.netloc
+    if not netloc or "@" in netloc or "%" in netloc:
+        raise ValueError(error)
+    host, port_text = _split_raw_authority(netloc, error=error)
+    port = _parse_canonical_port(port_text, error)
+    return parts.scheme.lower(), host, port, parts.path
+
+
+def _validate_path_segments(path: str, error: str) -> None:
+    """An absolute path of clean segments: no empty ('//'), no '.'/'..',
+    no percent encoding, characters limited to [A-Za-z0-9._~-]."""
+    if not path.startswith("/") or "%" in path:
+        raise ValueError(error)
+    for segment in path[1:].split("/"):
+        if (
+            not segment
+            or segment in (".", "..")
+            or not _PATH_SEGMENT_PATTERN.fullmatch(segment)
+        ):
+            raise ValueError(error)
+
+
+def normalize_centralpay_base_url(value: object) -> str:
+    """Validate CENTRALPAY_BASE_URL: HTTPS always — no escape hatch exists,
+    because getLink/verify carry the API key in POST bodies. The path is a
+    canonical service BASE (the client appends getLink.php/verify.php), so
+    an endpoint filename (*.php) is rejected. The only normalizations are
+    scheme/host lowercasing and dropping one trailing slash (the client
+    rstrips anyway, so generated endpoint URLs are unchanged for every
+    currently valid configuration). Raises with a fixed message that never
+    echoes the value.
+    """
+    scheme, host, port, path = _parse_outbound_url(value, _CENTRALPAY_BASE_URL_ERROR)
+    if scheme != "https":
+        raise ValueError(_CENTRALPAY_BASE_URL_ERROR)
+    if path in ("", "/"):
+        path = ""
+    else:
+        if path.endswith("/"):
+            path = path[:-1]  # documented: one trailing slash
+        _validate_path_segments(path, _CENTRALPAY_BASE_URL_ERROR)
+        if path.rsplit("/", 1)[-1].lower().endswith(".php"):
+            raise ValueError(_CENTRALPAY_BASE_URL_ERROR)
+    port_part = f":{port}" if port is not None else ""
+    return f"https://{host}{port_part}{path}"
+
+
+def _is_private_bot_host(host: str) -> bool:
+    """Purely syntactic private/internal classification — never DNS.
+
+    ``host`` is the canonical lowercase output of _split_raw_authority:
+    a bracketed IPv6 literal, a structurally valid IPv4 literal, or a
+    grammar-valid registered name.
+    """
+    if host.startswith("["):
+        ip6 = ipaddress.IPv6Address(host[1:-1])
+        return ip6.is_loopback or ip6.is_private or ip6.is_link_local
+    labels = host.split(".")
+    if all(label.isdigit() for label in labels):
+        ip4 = ipaddress.IPv4Address(host)
+        return ip4.is_loopback or ip4.is_private or ip4.is_link_local
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    if "." not in host:
+        return True  # single-label container/service name (mock-bot, bot, ...)
+    return host.endswith(".internal") or host.endswith(".local")
+
+
+def normalize_bot_notify_url(value: object, *, allow_insecure: bool) -> str:
+    """Validate BOT_PAYMENT_NOTIFY_URL — a COMPLETE endpoint URL.
+
+    HTTPS is required by default. Cleartext http:// is accepted only when
+    ALLOW_INSECURE_BOT_NOTIFY_URL=true AND the host is syntactically
+    private/internal (see _is_private_bot_host) — intended solely for a
+    mock bot on an isolated/container network; the Token header crosses
+    the wire without TLS there. Public-looking hosts and public IP
+    literals are rejected even with the flag. The configured path is
+    stored exactly (no appending, no trailing-slash handling); the only
+    normalizations are scheme/host lowercasing. Never echoes the value.
+    """
+    scheme, host, port, path = _parse_outbound_url(value, _BOT_NOTIFY_URL_ERROR)
+    if scheme == "http":
+        if not allow_insecure or not _is_private_bot_host(host):
+            raise ValueError(_BOT_NOTIFY_URL_ERROR)
+    elif scheme != "https":
+        raise ValueError(_BOT_NOTIFY_URL_ERROR)
+    _validate_path_segments(path, _BOT_NOTIFY_URL_ERROR)
+    port_part = f":{port}" if port is not None else ""
+    return f"{scheme}://{host}{port_part}{path}"
+
+
+def _split_raw_authority(
+    netloc: str, error: str = _PUBLIC_BASE_URL_ERROR
+) -> tuple[str, str | None]:
     """Split a raw (already ASCII, userinfo-free, percent-free) authority
     into a canonical lower-cased host and the raw port text.
 
@@ -122,36 +255,36 @@ def _split_raw_authority(netloc: str) -> tuple[str, str | None]:
     if netloc.startswith("["):
         closing = netloc.find("]")
         if closing == -1:
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+            raise ValueError(error)
         host_raw = netloc[1:closing]
         rest = netloc[closing + 1 :]
         try:
             ipaddress.IPv6Address(host_raw)
         except ValueError:
-            raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+            raise ValueError(error) from None
         if rest == "":
             return f"[{host_raw.lower()}]", None
         if not rest.startswith(":"):
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)  # e.g. "[::1]extra"
+            raise ValueError(error)  # e.g. "[::1]extra"
         return f"[{host_raw.lower()}]", rest[1:]
     host_raw, sep, port_text = netloc.partition(":")
     host = host_raw.lower()
     labels = host.split(".")
     if any(not label for label in labels):
-        raise ValueError(_PUBLIC_BASE_URL_ERROR)  # empty label ("..", leading/trailing dot)
+        raise ValueError(error)  # empty label ("..", leading/trailing dot)
     if all(label.isdigit() for label in labels):
         # All-numeric dotted form MUST be a structurally valid IPv4 address
         # (rejects 999.999.999.999 and 1.2.3.4.5 alike).
         try:
             ipaddress.IPv4Address(host)
         except ValueError:
-            raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+            raise ValueError(error) from None
     else:
         if len(host) > 253:
-            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+            raise ValueError(error)
         for label in labels:
             if len(label) > 63 or not _HOST_LABEL_PATTERN.fullmatch(label):
-                raise ValueError(_PUBLIC_BASE_URL_ERROR)
+                raise ValueError(error)
     return host, port_text if sep else None
 
 
@@ -208,6 +341,10 @@ class Settings(BaseSettings):
     # can run without notification configured; the worker refuses to start
     # until both are set (see validate_bot_notification_settings).
     bot_payment_notify_url: str = ""
+    # Cleartext-HTTP escape hatch for the bot endpoint: default OFF. When
+    # true, http:// is still limited to private/internal hosts — it can
+    # never become an "http anywhere" switch (see normalize_bot_notify_url).
+    allow_insecure_bot_notify_url: bool = False
     bot_notify_token: str = ""
     bot_notify_retry_mode: Literal["safe", "idempotent"] = "safe"
     bot_notify_max_attempts: int = Field(default=6, gt=0, le=50)
@@ -265,6 +402,12 @@ class Settings(BaseSettings):
     # Admin bot container liveness heartbeat file.
     admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
 
+    @field_validator("centralpay_base_url")
+    @classmethod
+    def _validate_centralpay_base_url(cls, value: object) -> str:
+        # HTTPS always: getLink/verify POST bodies carry the API key.
+        return normalize_centralpay_base_url(value)
+
     @field_validator("public_base_url")
     @classmethod
     def _validate_public_base_url(cls, value: object) -> str:
@@ -283,10 +426,11 @@ class Settings(BaseSettings):
             r"@?[A-Za-z0-9_]{1,64}", self.telegram_bot_username
         ):
             raise ValueError("TELEGRAM_BOT_USERNAME contains invalid characters")
-        if self.bot_payment_notify_url and not _HTTP_URL_PATTERN.fullmatch(
-            self.bot_payment_notify_url
-        ):
-            raise ValueError("BOT_PAYMENT_NOTIFY_URL must be an http(s) URL")
+        if self.bot_payment_notify_url:
+            self.bot_payment_notify_url = normalize_bot_notify_url(
+                self.bot_payment_notify_url,
+                allow_insecure=self.allow_insecure_bot_notify_url,
+            )
         request_budget = (
             self.bot_notify_connect_timeout_seconds + self.bot_notify_read_timeout_seconds
         )

@@ -33,7 +33,11 @@ curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main
 
 1. **Payment domain** — دامنهٔ درگاه پرداخت، مثل `pay.example.com`
 2. **Bot API base domain or URL** — دامنه یا آدرس API ربات، مثل
-   `https://bot.example.com` (نصاب خودش `/api/payment` را اضافه می‌کند)
+   `https://bot.example.com` (نصاب خودش `/api/payment` را اضافه می‌کند).
+   آدرس `http://` پذیرفته نمی‌شود: هدر Token نباید بدون TLS از شبکه
+   عبور کند. استثنای HTTP فقط برای ربات آزمایشی در شبکهٔ داخلی و با
+   تنظیم صریح `ALLOW_INSECURE_BOT_NOTIFY_URL=true` ممکن است و برای
+   میزبان‌های عمومی هرگز کار نمی‌کند.
 3. **CentralPay API key** — کلید API درگاه CentralPay (مخفی وارد
    می‌شود). CentralPay فقط **یک** کلید می‌دهد و همان کلید هم برای ساخت
    لینک (getLink) و هم برای تأیید (verify) استفاده می‌شود؛ نصاب همین
