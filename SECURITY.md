@@ -152,15 +152,21 @@ CentralPay confirmation, or lost silently is always critical.
   capabilities they require but also run with `no-new-privileges`.
 - **Container trust boundary (audit):** no Docker socket, no privileged
   containers, no host network/PID/IPC, no broad host mounts anywhere.
-  Per-service secrets are minimized: Caddy receives no application env
-  file or secrets; the worker has CentralPay keys, the inbound API key,
-  and the callback HMAC secret masked (it needs only the database URL and
-  bot-notify settings); the admin bot masks everything payment-related.
+  Per-service secrets follow an explicit allowlist, enforced by a policy
+  matrix test (each service's Compose `environment:` overrides mask
+  everything outside its role): **API** — payment ingress and CentralPay
+  credentials (database URL, inbound API key, callback HMAC secret,
+  CentralPay keys; the bot and Telegram delivery tokens are blanked);
+  **worker** — the customer-bot notification credential plus the database
+  URL only; **admin bot** — the Telegram administration credential and
+  admin IDs plus the database URL only; **migrate** — the database URL
+  only; **Caddy** — no application env file and no application secrets.
   **Impact of a compromised container:** Caddy → can reach only the API's
   public routes (no DB route, no secrets); worker → can read/write the
-  database and the bot token but cannot forge callbacks or talk to
-  CentralPay; API → the widest (DB + gateway keys + HMAC), which is why
-  the callback/creation paths carry the strictest validation; none of
+  database and the bot token but cannot forge callbacks, talk to
+  CentralPay, or message Telegram admins; API → the widest (DB + gateway
+  keys + HMAC, but no delivery tokens), which is why the
+  callback/creation paths carry the strictest validation; none of
   them can touch Docker, the host filesystem, deployment configuration,
   or the backups directory. Access logs redact both the callback
   signature (`sig`) and the one-time token (`ct`).
