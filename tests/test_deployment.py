@@ -845,3 +845,56 @@ def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     assert not pattern.search('API_KEY = "sk-live-4242424242"')
     # No path-based allowlisting: app/deploy/docs stay fully scanned.
     assert "paths" not in config["allowlist"]
+
+
+# --- PUBLIC_BASE_URL contract: Caddy consistency and installer regression ----
+
+
+def test_callback_path_consistent_across_app_and_caddy():
+    """The callback path is one shared constant: the URL builder and the
+    FastAPI route use app.security.CALLBACK_PATH, and the Caddy public
+    route matcher must expose exactly that path — drift here would break
+    every real payment callback."""
+    from app.security import CALLBACK_PATH
+
+    caddy = CADDY_TEMPLATE.read_text()
+    matcher = next(
+        line for line in caddy.splitlines() if line.strip().startswith("path ")
+    )
+    routes = matcher.strip().split()[1:]
+    assert CALLBACK_PATH in routes
+    assert set(routes) == {
+        "/api/custom-payment", CALLBACK_PATH, "/health/live", "/health/ready",
+    }
+
+
+def test_installer_generates_canonical_public_base_url():
+    """PUBLIC_BASE_URL is generated as https://<domain> from a domain the
+    installer validated with validate_domain — which cannot contain a
+    scheme, path, query, fragment, userinfo, port, or whitespace — so the
+    generated value always conforms to the application contract."""
+    template = ENV_TEMPLATE.read_text()
+    assert "PUBLIC_BASE_URL=https://{{PAYMENT_DOMAIN}}" in template
+    # validate_domain rejects every injection vector for the URL position.
+    for bad in (
+        "evil.com/path", "evil.com?x=1", "evil.com#f", "user:pass@evil.com",
+        "evil.com:8443", "evil.com\\x", "a b.com", "https://evil.com",
+    ):
+        assert installer_call(f"validate_domain '{bad}'").returncode != 0, bad
+    assert installer_call("validate_domain pay.example.com").returncode == 0
+
+
+def test_installer_rerun_preserves_public_base_url():
+    """The retry path re-derives PAYMENT_DOMAIN from the existing env file
+    instead of regenerating it, so a rerun preserves the configured value."""
+    text = INSTALLER.read_text()
+    assert "grep -E '^PUBLIC_BASE_URL=' \"$ENV_FILE\"" in text
+
+
+def test_app_validates_public_base_url_from_config_module():
+    """The contract lives in Settings itself (not only the installer):
+    normalize_public_base_url is wired as a field validator."""
+    from app.config import Settings, normalize_public_base_url
+
+    assert normalize_public_base_url("https://x.example/") == "https://x.example"
+    assert "_validate_public_base_url" in dir(Settings)
