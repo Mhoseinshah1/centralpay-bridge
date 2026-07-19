@@ -79,7 +79,9 @@ the adversarial review, and a green release workflow. Original topics:
   `/manual_review`, `/errors`, `/payment`, `/retry_queue`,
   `/backup_status`, `/version`, `/start`, `/help`)
 - Durable alert outbox (`admin_alerts` table): alert rows are created
-  inside payment transactions; the admin-bot service delivers them
+  inside payment transactions — but inside a database SAVEPOINT, so a
+  failed alert INSERT rolls back only the savepoint and can never abort
+  the financial transaction; the admin-bot service delivers them
   best-effort with bounded retries, dedup windows, and stale-claim
   recovery — a Telegram outage can never block payment processing
 - Health monitor with consecutive-failure thresholds and recovery alerts;

@@ -148,15 +148,50 @@ def on_audit_event(
     payment_id: int | None,
     data: dict[str, Any] | None,
 ) -> None:
-    """Map an audit event to an alert row. Never raises."""
+    """Map an audit event to an alert row. Never raises — and never
+    poisons the caller's transaction.
+
+    The whole mapping runs inside a SAVEPOINT (``begin_nested``). A
+    database-level failure while creating the alert (constraint
+    violation, statement error, …) aborts ONLY the savepoint: PostgreSQL
+    marks just the nested transaction dead, SQLAlchemy rolls it back,
+    and the caller's financial transaction stays fully usable and
+    committable. Merely catching the Python exception is NOT enough —
+    without the savepoint, PostgreSQL keeps the whole outer transaction
+    in the aborted state and the later financial commit fails.
+
+    On success the savepoint is released, so the alert row and its
+    ``admin_alert_created`` event remain part of the caller's
+    transaction: the outer commit commits them, an outer rollback
+    discards them. No separate session or independent commit is ever
+    used, and this function never touches the outer transaction
+    (no ``db.rollback()`` here).
+
+    The boundary is safe because ``record_event`` flushes the caller's
+    pending state BEFORE invoking this hook — nothing of the financial
+    transaction can be swept into (and lost with) the savepoint.
+    ``create_alert`` recursing through ``record_event`` for its
+    ``admin_alert_created`` audit event simply opens one inner savepoint
+    that maps to no alert and releases (bounded depth of two).
+    """
     policy = _policy
     if policy is None:
         return
     try:
-        _map_event(db, policy, event_type=event_type, payment_id=payment_id, data=data or {})
-    except Exception:
-        # Alert creation is best-effort; the financial transaction proceeds.
-        logger.exception("admin_alert_creation_failed", extra={"event_type": event_type})
+        with db.begin_nested():
+            _map_event(
+                db, policy, event_type=event_type, payment_id=payment_id, data=data or {}
+            )
+    except Exception as exc:
+        # Best-effort side effect: the financial transaction proceeds.
+        # Deliberately NOT logger.exception — SQLAlchemy error text embeds
+        # the failed statement and its parameter values (raw alert
+        # payloads); only the fixed event name, the internal event type,
+        # and the exception class are safe to log.
+        logger.error(
+            "admin_alert_creation_failed",
+            extra={"event_type": event_type, "error_class": type(exc).__name__},
+        )
 
 
 def _map_event(
