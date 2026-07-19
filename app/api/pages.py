@@ -9,21 +9,32 @@ import html
 
 from app.services.verification import CallbackStatus
 
+# Wording contract (fix/payer-status-page-accuracy): the bridge KNOWS only
+# (1) CentralPay verification and, for BOT_ACCEPTED, (2) that the bot API
+# accepted the order-processing request (HTTP 2xx = acceptance only —
+# see app/services/notification.py). The final business result inside the
+# customer bot is never known here, so these pages must never claim the
+# order was registered/completed or that credit was applied, and must
+# never promise near-term application. The payer is always directed to
+# the bot for the final order status.
 _PAGE_TEXTS: dict[CallbackStatus, dict[str, str]] = {
     CallbackStatus.BOT_ACCEPTED: {
-        "title_fa": "پرداخت با موفقیت انجام شد",
-        "body_fa": "پرداخت شما تأیید شد و سفارش شما ثبت شد. می‌توانید به ربات بازگردید.",
-        "title_en": "Payment completed",
-        "body_en": "Your payment was verified and your order has been registered. "
-        "You can return to the bot.",
+        "title_fa": "پرداخت تأیید شد",
+        "body_fa": "پرداخت شما تأیید شد و ربات درخواست ثبت سفارش را پذیرفت. "
+        "برای مشاهدهٔ وضعیت نهایی سفارش به ربات بازگردید.",
+        "title_en": "Payment verified",
+        "body_en": "Your payment was verified, and the bot accepted the "
+        "order-processing request. Return to the bot to check the final "
+        "order status.",
     },
     CallbackStatus.BOT_PENDING: {
         "title_fa": "پرداخت تأیید شد",
-        "body_fa": "پرداخت شما تأیید شد. ثبت نهایی سفارش در حال انجام است و "
-        "به‌زودی در ربات اعمال می‌شود.",
+        "body_fa": "پرداخت شما تأیید شد، اما پذیرش درخواست ثبت سفارش توسط ربات "
+        "هنوز تأیید نشده است. لطفاً وضعیت سفارش را در ربات بررسی کنید.",
         "title_en": "Payment verified",
-        "body_en": "Your payment has been verified. Final processing is in progress "
-        "and your order will be applied in the bot shortly.",
+        "body_en": "Your payment was verified, but the bot has not yet confirmed "
+        "acceptance of the order-processing request. Please check the order "
+        "status in the bot.",
     },
     CallbackStatus.UNDER_REVIEW: {
         "title_fa": "پرداخت در حال بررسی است",
