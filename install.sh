@@ -242,7 +242,19 @@ gather_input() {
         echo "Invalid domain format." > /dev/tty
     done
 
-    ask BOT_INPUT "2/10 Bot API base domain or URL (e.g. https://bot.example.com)"
+    while true; do
+        ask BOT_INPUT "2/10 Bot API base domain or URL (e.g. https://bot.example.com)"
+        # The bot Token header must never cross the network without TLS:
+        # cleartext http:// input is rejected here, and the application
+        # enforces the same contract at startup (the insecure escape hatch
+        # exists only for private mock bots and is never set by the
+        # installer).
+        if [[ "$BOT_INPUT" =~ ^http:// ]]; then
+            echo "Cleartext http:// is not allowed for the bot URL; use https://." > /dev/tty
+            continue
+        fi
+        break
+    done
     BOT_PAYMENT_NOTIFY_URL="$(normalize_bot_url "$BOT_INPUT")"
     log "Bot notification endpoint: ${BOT_PAYMENT_NOTIFY_URL}"
 
