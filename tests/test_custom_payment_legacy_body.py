@@ -214,11 +214,13 @@ def test_urlencoded_duplicate_field_rejected(client, settings, session_factory, 
     _assert_no_side_effects(session_factory, stub)
 
 
-def test_urlencoded_extra_field_rejected(client, settings, session_factory, stub):
+def test_urlencoded_extra_field_is_ignored(client, settings, session_factory, stub):
+    # Legacy senders add unrelated fields; they are ignored, not rejected.
+    # (Full extra-field coverage: tests/test_custom_payment_urlencoded_extra_fields.py.)
     body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=x&extra=1"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
-    assert response.status_code == 422
-    _assert_no_side_effects(session_factory, stub)
+    assert response.status_code == 200
+    assert get_payment(session_factory, "x").amount == 10000
 
 
 def test_urlencoded_missing_field_rejected(client, settings, session_factory, stub):
