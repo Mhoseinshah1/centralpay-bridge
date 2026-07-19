@@ -28,6 +28,13 @@ class Base(DeclarativeBase):
     pass
 
 
+# Storage contract for CentralPay reference IDs. The verify parser
+# (app/centralpay.py) validates gateway-reported referenceId values against
+# this exact limit BEFORE any query, assignment, audit event, or log use —
+# the column length and the parser bound must never drift apart.
+CENTRALPAY_REFERENCE_ID_MAX_LENGTH = 128
+
+
 class PaymentStatus(enum.StrEnum):
     CREATED = "created"
     LINK_CREATED = "link_created"
@@ -115,7 +122,9 @@ class Payment(Base):
     redirect_url: Mapped[str | None] = mapped_column(Text)
     # Unique across payments: CentralPay must never report one referenceId
     # for two different payments (collision => manual review, never overwrite).
-    reference_id: Mapped[str | None] = mapped_column(String(128), unique=True)
+    reference_id: Mapped[str | None] = mapped_column(
+        String(CENTRALPAY_REFERENCE_ID_MAX_LENGTH), unique=True
+    )
     # SHA-256 hex of the one-time callback token embedded in the returnUrl.
     # The plaintext token exists only inside the signed callback URL; a
     # database leak alone cannot forge callbacks.

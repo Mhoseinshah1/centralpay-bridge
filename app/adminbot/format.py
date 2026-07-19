@@ -138,6 +138,7 @@ _ALERT_TITLES_FA = {
     "verify_payable_amount_mismatch": "مغایرت مبلغ در تأیید پرداخت",
     "verify_user_id_mismatch": "مغایرت شناسهٔ کاربر در تأیید پرداخت",
     "verify_missing_reference_id": "نبود کد پیگیری در تأیید پرداخت",
+    "verify_invalid_reference_id": "کد پیگیری نامعتبر در تأیید پرداخت",
     "centralpay_getlink_failed": "خطا در ایجاد لینک پرداخت",
     "centralpay_verify_failed": "خطا در تأیید پرداخت",
     "callback_signature_failures": "امضاهای نامعتبر مکرر در کال‌بک",

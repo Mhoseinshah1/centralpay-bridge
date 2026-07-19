@@ -41,11 +41,26 @@ grep). [DB] `ck_payments_amount_positive`,
 `verification.py` (`result.user_id != payment.gateway_user_id` → manual
 review). [T] `test_verify_user_id_mismatch_moves_to_manual_review`.
 
-**F4 — Reference ID non-empty and unique.** Enforced: `centralpay.py`
-(`gateway_invalid_reference_id` field error), `verification.py` (missing
-→ manual review; collision check before assignment →
+**F4 — Reference ID non-empty, unique, and storage-contract valid.**
+Gateway reference IDs are validated against the database storage
+contract (`CENTRALPAY_REFERENCE_ID_MAX_LENGTH` = 128, shared by the
+parser and the column declaration; no NUL or ASCII control characters;
+non-boolean integers rendered in decimal) BEFORE any query, model
+assignment, audit event, or log use. Invalid values are never truncated,
+hashed, or transformed: a present-but-invalid referenceId routes the
+payment to manual review with the precise `verify_invalid_reference_id`
+event (distinct from `verify_missing_reference_id` for genuinely
+absent/empty values), the bot is never notified, and the raw value never
+leaves `app/centralpay.py` — not into logs, exceptions, events, alerts,
+or responses. Enforced: `centralpay.py` (`_parse_reference_id`,
+`gateway_invalid_reference_id` field error), `verification.py` (missing
+or invalid → manual review; collision check before assignment →
 `reference_id_collision` manual review, never overwrite). [DB]
-`uq_payments_reference_id` (0004; PG allows multiple NULLs). [T]
+`uq_payments_reference_id` (0004; PG allows multiple NULLs);
+VARCHAR(128) with a parser/column drift test. [T]
+`test_reference_id_validation.py` boundary matrix,
+`tests/integration/test_reference_id_pg.py` (129-char and NUL values on
+real PostgreSQL — no DataError escapes, verified pre-fix to 500),
 `test_verify_missing_reference_id_moves_to_manual_review`,
 `test_reference_id_collision_goes_to_manual_review`.
 

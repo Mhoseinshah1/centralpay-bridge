@@ -23,6 +23,7 @@ from app.exceptions import (
     CentralPayInvalidResponseError,
     CentralPayRejectedError,
 )
+from app.models import CENTRALPAY_REFERENCE_ID_MAX_LENGTH
 
 logger = logging.getLogger("app.centralpay")
 
@@ -54,6 +55,10 @@ class VerifyResult:
     # Explicit parse-level reason codes for gateway-successful responses
     # whose fields were missing or mistyped (e.g. gateway_invalid_amount).
     field_errors: tuple[str, ...] = ()
+    # True when referenceId was PRESENT but violated the storage contract
+    # (over-length, NUL/control characters, unsupported type) — distinct
+    # from missing. The raw value itself never leaves this module.
+    reference_id_invalid: bool = False
 
 
 # Explicit positive success markers. Success is NEVER inferred from truthy
@@ -88,6 +93,42 @@ def _to_int(value: object) -> int | None:
         if stripped.lstrip("-").isdigit():
             return int(stripped)
     return None
+
+
+def _parse_reference_id(value: object) -> tuple[str | None, bool]:
+    """Validate a gateway-reported referenceId against the storage contract.
+
+    Returns ``(reference_id, present_but_invalid)``. The contract
+    (CENTRALPAY_REFERENCE_ID_MAX_LENGTH, app/models.py): a string — or a
+    non-boolean integer rendered in decimal — that is non-empty after the
+    existing strip() normalization, at most 128 characters, and free of
+    NUL and ASCII control characters. Valid values are stored exactly as
+    normalized: never truncated, hashed, or otherwise transformed.
+
+    ``(None, False)`` means genuinely missing (absent/null/empty), kept
+    distinct from ``(None, True)``: present but unusable (over-length,
+    control characters, unsupported type). The raw invalid value never
+    leaves this module — not in logs, exceptions, events, or fields.
+    """
+    if value is None:
+        return None, False
+    if isinstance(value, bool):
+        return None, True  # unsupported type, not "missing"
+    if isinstance(value, int):
+        decimal = str(value)
+        if len(decimal) > CENTRALPAY_REFERENCE_ID_MAX_LENGTH:
+            return None, True
+        return decimal, False
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized:
+            return None, False  # empty/whitespace-only == missing
+        if len(normalized) > CENTRALPAY_REFERENCE_ID_MAX_LENGTH:
+            return None, True
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized):
+            return None, True  # NUL / control characters
+        return normalized, False
+    return None, True  # float, list, object, ... — present but unusable
 
 
 def _to_nonempty_str(value: object) -> str | None:
@@ -279,7 +320,7 @@ class CentralPayClient:
         # verification service then routes the payment to manual review
         # (money may have moved; never guess).
         field_errors: list[str] = []
-        reference_id = _to_nonempty_str(data.get("referenceId"))
+        reference_id, reference_id_invalid = _parse_reference_id(data.get("referenceId"))
         if reference_id is None:
             field_errors.append(GATEWAY_INVALID_REFERENCE_ID)
         amount = _to_int(data.get("amount"))
@@ -305,4 +346,5 @@ class CentralPayClient:
             card_number=_to_nonempty_str(data.get("cardNumber")),
             failure_reason=None,
             field_errors=tuple(field_errors),
+            reference_id_invalid=reference_id_invalid,
         )
