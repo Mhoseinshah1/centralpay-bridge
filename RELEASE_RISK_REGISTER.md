@@ -380,8 +380,13 @@ Full evidence, per-invariant verdicts, false-positive appendix, and the
 recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
 
 **Remediation status (fix/b4-confirmed-release-blockers):** CANON-1
-(topic 33), CANON-2 (topic 34), CANON-3 (topic 35), and CANON-5 (topic
-38) are now **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED**. The
+(topic 33), CANON-2 (topic 34), and CANON-5 (topic 38) are **FIXED IN
+CODE — INDEPENDENT B4 RECHECK REQUIRED**. CANON-3 (topic 35) is **CORE
+COMMIT BINDING FIXED — MANIFEST EXACTNESS FOLLOW-UP PENDING B4 RECHECK**:
+the core commit-binding landed in fix/b4-confirmed-release-blockers, and
+the residual `SHA256SUMS`/`SOURCE_COMMIT` parsing-exactness defects were
+tightened in `fix/release-manifest-exactness`; the combined result awaits
+the independent B4 recheck before it may be marked fully fixed. The
 historical `ADVERSARIAL_REVIEW_0.6.0_RC1.md` verdict for its audited SHA
 (`4e62a552…`) stands unchanged as an honest record that B4 failed on that
 commit. **B4 remains OPEN**: it can be closed only by a subsequent
@@ -435,13 +440,27 @@ their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
   `re.ASCII`) at both sites, routing to the existing safe paths; add
   tests for `"²"`, `"--5"`, and a `\xb2` Retry-After.
 
-### 35. Update integrity control decoupled from the deployed bytes — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED DEFECT; MEDIUM; weakened control + doc mismatch)
-- **Resolution (CANON-3):** the release workflow now emits a checksummed
+### 35. Update integrity control decoupled from the deployed bytes — **CORE COMMIT BINDING FIXED — MANIFEST EXACTNESS FOLLOW-UP PENDING B4 RECHECK** (was: CONFIRMED DEFECT; MEDIUM; weakened control + doc mismatch)
+- **Resolution (CANON-3):** the release workflow emits a checksummed
   `SOURCE_COMMIT` asset, and `centralpay update` requires the fetched
   tag's commit to equal the verified `SOURCE_COMMIT` before any
   checkout/build/migration/restart (see topic 19 for the full new
-  guarantee). A tag moved after the release was built is rejected. The
-  original finding is kept below for history.
+  guarantee). A tag moved after the release was built is rejected.
+- **Manifest-exactness follow-up (`fix/release-manifest-exactness`):** the
+  first implementation selected `SOURCE_COMMIT` / `centralpay-bridge-.*.tar.gz`
+  loosely (a wildcard artifact match, only "two lines present"), and used
+  `tr -d '\n'` to normalize `SOURCE_COMMIT`. Both were tightened to a strict
+  fail-closed helper: `SHA256SUMS` must contain EXACTLY one entry each for
+  the exact runtime artifact filename and the exact filename `SOURCE_COMMIT`,
+  each formatted precisely as `[0-9a-f]{64}  <name>` (rejecting duplicates,
+  `./SOURCE_COMMIT`, `path/SOURCE_COMMIT`, `SOURCE_COMMIT.old`, similarly
+  named artifacts, binary `*` markers, uppercase/malformed hashes, and
+  leading/trailing junk); and the `SOURCE_COMMIT` file bytes must full-match
+  `[0-9a-f]{40}` or `[0-9a-f]{40}\n` read as RAW BYTES (rejecting embedded
+  newlines, a second trailing newline, CRLF, spaces, tabs, NUL/control bytes,
+  uppercase hex, and any other length — no normalization into validity).
+  This combined result awaits the independent B4 recheck before being marked
+  fully fixed. The original finding is kept below for history.
 - `verify_release_artifact` (`scripts/centralpay:239-263`) checksums the
   release tarball then `rm -rf`s it; `cmd_update` deploys the tag via an
   independent `git fetch --tags` + `git checkout FETCH_HEAD`
