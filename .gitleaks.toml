@@ -1,0 +1,21 @@
+# Gitleaks configuration.
+#
+# Default rules stay fully enabled. The single allowlist entry exists for
+# the FIRST tag-triggered release run finding: a full-history scan (unlike
+# CI's push-diff scans) flags the deliberate dummy credentials the test
+# suite defines to PROVE redaction works. Those values are self-evidently
+# placeholders (TEST_* constants whose values start with "test-"); a real
+# credential would never match this shape. Nothing else is allowlisted —
+# in particular, no application, deployment, or documentation path.
+
+title = "centralpay-bridge"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Dummy TEST_* fixture constants in the test suite (values prefixed test-/TEST-); used by the redaction tests themselves"
+regexTarget = "line"
+regexes = [
+  '''TEST_[A-Z0-9_]+ = "(test-[a-z0-9-]+|1234567890:TEST-[A-Za-z0-9-]+)"''',
+]
