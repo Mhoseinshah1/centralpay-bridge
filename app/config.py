@@ -48,7 +48,9 @@ def normalize_public_base_url(value: object) -> str:
     the label grammar). Percent signs anywhere in the authority are
     rejected: percent-encoded host syntax is parser-dependent ambiguity,
     never decoded-and-accepted. An explicit ":" port delimiter must be
-    followed by digits — a dangling colon is rejected, not repaired.
+    followed by digits in canonical decimal spelling — dangling colons
+    and zero-padded ports are rejected, not repaired. Raw "?" and "#"
+    delimiters are rejected even when empty.
     Nothing is silently repaired; the ONLY normalization applied is
     scheme/host lowercasing and dropping a lone trailing slash.
 
@@ -62,6 +64,12 @@ def normalize_public_base_url(value: object) -> str:
     if not value or not value.isascii():
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
     if any(ord(ch) <= 32 or ord(ch) == 127 for ch in value) or "\\" in value:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    # No query or fragment is permitted, INCLUDING empty ones: urlsplit
+    # cannot distinguish "https://host?" from "https://host" (parts.query
+    # is "" for both), so the raw delimiters are rejected outright rather
+    # than silently dropped in canonicalization.
+    if "?" in value or "#" in value:
         raise ValueError(_PUBLIC_BASE_URL_ERROR)
     try:
         parts = urlsplit(value)
@@ -93,6 +101,12 @@ def normalize_public_base_url(value: object) -> str:
             raise ValueError(_PUBLIC_BASE_URL_ERROR)
         port = int(port_text)
         if not 1 <= port <= 65535:
+            raise ValueError(_PUBLIC_BASE_URL_ERROR)
+        # The raw decimal spelling must already be canonical: a
+        # zero-padded port (":0443") would be silently rewritten by the
+        # int() round-trip, and the documented normalizations are case
+        # folding and one trailing slash ONLY.
+        if port_text != str(port):
             raise ValueError(_PUBLIC_BASE_URL_ERROR)
     return f"https://{host_canonical}:{port}" if port is not None else f"https://{host_canonical}"
 
