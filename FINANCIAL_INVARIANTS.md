@@ -165,7 +165,21 @@ indexes, CHECK constraints. [T] the full PG race suite: identical-create
 race, replay storms, 2- and 4-worker claims/drain, create-vs-callback,
 callback-vs-worker, review-vs-callback.
 
-**F20 — Every unresolved ambiguity is visible.** Enforced: every
+**F20 — Every unresolved ambiguity is visible.** *Alert-side-effect
+isolation (fix/admin-alert-savepoint-isolation):* administrator alert
+creation is attempted inside a database SAVEPOINT
+(``Session.begin_nested``) within the caller's financial transaction. A
+failed alert side effect — including a genuine PostgreSQL statement
+failure that aborts the nested transaction — rolls back ONLY the
+savepoint and cannot abort the outer payment transaction: the payment
+state transition and its original PaymentEvent still commit, and no
+partial AdminAlert row or ``admin_alert_created`` event remains. When
+alert creation succeeds, the alert row stays part of the same financial
+transaction (outer commit commits it, outer rollback discards it — no
+separate session or independent commit). Telegram DELIVERY is not
+transactional and never was — only alert-ROW creation participates in
+the financial transaction, and only when it succeeds. Proven on real
+PostgreSQL in ``tests/integration/test_alert_savepoint.py``. Enforced: every
 non-success path lands in `manual_review` with a reason code, or raises
 an explicit coded error, or (deployment-level) leaves services stopped
 with instructions; critical events map to never-deduplicated admin
