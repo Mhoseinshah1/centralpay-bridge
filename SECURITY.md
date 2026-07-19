@@ -69,6 +69,14 @@ CentralPay confirmation, or lost silently is always critical.
   errors, or API responses. Gateway logs carry only the endpoint name, the
   order id, the HTTP status, the internal reason code, and a fixed-value
   marker naming which failure signal was present.
+- **Reference-ID storage boundary (fix/centralpay-reference-id-validation):**
+  gateway-reported reference IDs are validated against the exact database
+  storage contract (max 128 characters, no NUL/control characters) before
+  any query, assignment, audit event, or log use. Invalid values are never
+  truncated and route the payment to manual review without bot
+  notification; the raw invalid value never leaves the CentralPay client
+  module. (No claim is made that real CentralPay has returned such a
+  value — this is defense at the trust boundary.)
 - **Redirect URL validation policy (audit):** the `redirectUrl` returned by
   getLink is parsed with `urllib.parse.urlsplit` (never substring checks)
   and accepted only when it is HTTPS with a non-empty hostname, carries no
