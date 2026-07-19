@@ -18,6 +18,7 @@ from app.db import create_session_factory
 from app.exceptions import BridgeError
 from app.logging_setup import configure_logging
 from app.middleware import RequestContextMiddleware
+from app.version import APP_VERSION
 
 logger = logging.getLogger("app.main")
 
@@ -65,7 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="CentralPay Bridge",
-        version="0.1.0",
+        version=APP_VERSION,
         # API docs are disabled: this service exposes a payment API, not a
         # browsable surface.
         docs_url=None,
