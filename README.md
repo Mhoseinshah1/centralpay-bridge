@@ -252,14 +252,47 @@ The request schema rejects anything outside this contract with a generic
 
 - `api_key` — string. Compared in constant time; never logged, never
   included in errors.
-- `amount` — JSON **integer**, TOMAN. Booleans, floats, and numeric
-  strings are rejected, never coerced. Policy bounds are
+- `amount` — a JSON **integer**, TOMAN. For legacy-client compatibility a
+  plain ASCII-decimal **string** matching exactly `[0-9]+` (e.g. `"50000"`)
+  is also accepted and converted to that integer before validation.
+  Everything else is rejected, never coerced: floats, booleans, and any
+  other string shape — a sign (`+50000`, `-100`), separators (`50,000`,
+  `50_000`), surrounding whitespace, exponents (`1e4`), non-ASCII digits
+  (Persian/Arabic `۵۰۰۰۰`), or empty. Policy bounds are
   `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` (checked after
   authentication, error `amount_out_of_range`); the schema additionally
   enforces an absolute backstop of 10¹² TOMAN.
 - `order_id` — opaque non-empty string, at most 128 characters, no
   control characters, no NUL. Passed through unchanged: never trimmed,
   case-folded, or Unicode-normalized.
+
+### Legacy request-body compatibility
+
+The canonical request is an `application/json` object, and that is what new
+clients should send. To accommodate an older selling bot that could not be
+changed, the endpoint additionally normalizes a small, explicitly allowed
+set of body encodings into that same strict contract before validating —
+nothing about authentication, idempotency, fees, or gateway handling is
+relaxed. Accepted representations:
+
+- **`application/json`** — a JSON object, **or** a JSON *string* whose
+  content is exactly one JSON object (at most one extra decode layer; a
+  string-in-a-string is **not** unwrapped recursively).
+- **`application/x-www-form-urlencoded`** — exactly the three fields
+  `api_key`, `amount`, `order_id`, each present **once**; a duplicated,
+  missing, or extra field is rejected.
+- **`text/plain`** — one JSON object, or one JSON string containing one
+  JSON object (same one-layer rule).
+- A missing `Content-Type` is treated as JSON (the historical default).
+
+Every other content type — including `multipart/form-data` — and every
+malformed body is rejected with the same generic `422 validation_error`;
+oversized bodies (beyond the 64 KB edge limit) are refused before any
+parsing. Rejections never echo field contents, and no field value (in
+particular `order_id`) is logged for an unauthenticated request. The body
+size is bounded before decoding, and a sanitized
+`custom_payment_body_normalized` log event (representation, content type,
+and byte length only) records each accepted request.
 
 ### Idempotency contract
 
