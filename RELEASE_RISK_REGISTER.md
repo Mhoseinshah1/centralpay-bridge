@@ -264,13 +264,15 @@ unaccounted for — the top priority of AGENTS.md.
 | B1 | Installer never executed on a real Ubuntu host (no VM access from this environment) | `REAL_HOST_VALIDATION.md` |
 | B2 | CentralPay contract never observed for real: staging run against the real/sandbox gateway (verify schema, verify-after-verify idempotency, real Caddy TLS) | `STAGING_VALIDATION.md` |
 | B3 | Live Telegram validation of the admin bot (blocker for enabling the admin bot; the payment path does not depend on it) | `ADMIN_BOT_VALIDATION.md` |
-| B4 | Multi-agent adversarial review (started for Phase 1, stopped, never completed; not run for Phases 2–5) | `DEFERRED_REVIEW.md` |
+| B4 | Multi-agent adversarial review **RUN** (2026-07-19, six agents, real PostgreSQL 16) → **`B4_FAILED_CONFIRMED_CODE_BLOCKERS`**: three confirmed defects (topics 33–35) must be fixed in a separate PR before B4 can close | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` |
 | B5 | Release workflow (`.github/workflows/release.yml`) has not yet run green: Docker builds, Trivy scan, SBOM, and artifact packaging are CI-delegated and unverified locally | GitHub Actions |
 
 **Release decision:** 0.6.0-rc1 is a code-complete release candidate.
 It must not be tagged, published, or used for real payments until B1,
 B2, B4, and B5 are closed (and B3 if the admin bot is to be enabled),
-and a human approval is recorded.
+and a human approval is recorded. **B4 was run on 2026-07-19 and
+FAILED with confirmed code blockers** (topics 33–35); it stays open
+until those are fixed and re-reviewed.
 
 **Final-audit classification (audit/final-financial-correctness):**
 after six focused audits plus the final end-to-end audit, **no code
@@ -353,3 +355,111 @@ existing configurations and is deliberately NOT bundled into the
 PUBLIC_BASE_URL fix — recorded here for an explicit follow-up decision
 (options: require https, or add an explicit
 `ALLOW_INSECURE_*_URL=true` escape hatch for private-network bots).
+
+## Topics 33–41 (audit/adversarial-review-0.6.0-rc1 — B4)
+
+The B4 independent adversarial review (2026-07-19, six agents, real
+PostgreSQL 16) verdict is **`B4_FAILED_CONFIRMED_CODE_BLOCKERS`**. All
+eighteen financial invariants HOLD and every runtime failure mode fails
+closed/safe (no path moves money incorrectly), but three confirmed
+defects (33–35) must be fixed in a separate focused PR before B4 closes.
+Full evidence, per-invariant verdicts, false-positive appendix, and the
+recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
+
+### 33. Installer rerun silently applies a 0% fee — **CONFIRMED DEFECT (release blocker B4); MEDIUM; financial correctness**
+- `PAYMENT_FEE_PERCENT` is never persisted (`install.sh:330/331/593`
+  only; absent from `deploy/centralpay.env.template` and
+  `write_configuration`). If the first-run `fee set … --ensure-initial`
+  step fails transiently (no policy row committed) and the operator
+  reruns and accepts the default "Keep existing configuration?" → `Y`,
+  `gather_input` is skipped, `${PAYMENT_FEE_PERCENT:-0}` = 0, and
+  `fee set 0 --ensure-initial` creates a **0% policy** while reporting
+  success. The intended non-zero rate is lost (revenue-correctness
+  error). Operator-only, narrow precondition, but the default rerun path
+  is the buggy one.
+- Fix direction: persist the chosen fee and re-read it on the
+  keep-existing path, or refuse to create a policy when the rate was
+  never supplied on a rerun. Add a rerun regression test.
+
+### 34. `isdigit()`-gated `int()` crashes on gateway/bot digit-like strings — **CONFIRMED CODE DEFECT (release blocker B4); LOW; fails closed/safe**
+- Two sites, one root cause (`str.isdigit()` ⊋ `int()`-parseable):
+  `_to_int` (`app/centralpay.py:85-95`, gate `lstrip("-").isdigit()`)
+  crashes on `"²"`/`"⁵"`/`"--5"` on the verify path → uncaught
+  `ValueError` (not a `CentralPayError`) → HTTP 500 → the payment is
+  **not** routed to manual review as designed (stays `link_created`,
+  re-500s). `_parse_retry_after` (`app/bot.py:71-81`, gate
+  `stripped.isdigit()`) crashes on a `Retry-After: \xb2` 429 → the
+  worker pass fails and the row self-heals to manual review via
+  stale-claim recovery. Reproduced with the real modules; gateway/bot
+  trust boundary, never the public payer; no money moves incorrectly.
+- Fix direction: `try/except ValueError` (or `isdecimal()` under
+  `re.ASCII`) at both sites, routing to the existing safe paths; add
+  tests for `"²"`, `"--5"`, and a `\xb2` Retry-After.
+
+### 35. Update integrity control decoupled from the deployed bytes — **CONFIRMED DEFECT (release blocker B4); MEDIUM; weakened control + doc mismatch (supersedes the topic 19 "verifies checksum before deploying" claim)**
+- `verify_release_artifact` (`scripts/centralpay:239-263`) checksums the
+  release tarball then `rm -rf`s it; `cmd_update` deploys the tag via an
+  independent `git fetch --tags` + `git checkout FETCH_HEAD`
+  (`:298-299`) with no `git verify-tag`/SHA pin. The checksum never
+  gates the deployed tree. Fails closed on a missing checksum; under the
+  honest threat model (GitHub+TLS trusted) the trees are identical, so
+  no practical exploit today, but the control gives false assurance and
+  topic 19 overstates it. High impact / low likelihood (needs tag/GitHub
+  compromise).
+- Fix direction: deploy from the verified tarball, or `git verify-tag` /
+  pin `FETCH_HEAD` to the manifest commit; correct topic 19's wording.
+
+### 36. GitHub Actions are not SHA-pinned — **SUPPLY-CHAIN GAP; MEDIUM; register blind spot (topic 18 covers base images only)**
+- Every `uses:` in `ci.yml`/`release.yml` is a mutable tag
+  (`actions/checkout@v4`, `docker/*@v3/v6`, `anchore/sbom-action@v0`,
+  `gitleaks/gitleaks-action@v2`, `lycheeverse/lychee-action@v2`, …).
+  Third-party actions run with repo access; the release `package` job
+  holds `contents: write`. Fix: pin to full commit SHAs (Dependabot).
+
+### 37. No dependency lockfile / hash pinning — **POST-RELEASE BACKLOG; LOW-MEDIUM; supply chain**
+- Runtime deps are ranges only; no lock/hash file → non-reproducible
+  builds and a non-deterministic pip-audit set. Fix: `pip-compile`/`uv
+  lock` + `pip install --require-hashes`.
+
+### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **DOCUMENTATION MISMATCH; LOW**
+- `Dockerfile:26` `org.opencontainers.image.version="0.5.0-rc1"` vs
+  `APP_VERSION="0.6.0-rc1"`; syft can propagate it into the shipped SBOM.
+  Unguarded by tests. Fix: source from a build ARG or drop the label;
+  add a test asserting it tracks `APP_VERSION`.
+
+### 39. Concurrent `reference_id` collision → HTTP 500 — **CONFIRMED DEFECT; LOW; fails safe (not a B4 blocker)**
+- The non-locking collision `SELECT` (`app/services/verification.py:150`)
+  can be raced by two callbacks reporting the same `reference_id` for
+  different payments; the loser's commit hits `uq_payments_reference_id`
+  → `IntegrityError` → 500, then self-heals to manual review on retry.
+  The UNIQUE constraint is the real backstop — no double credit (proven
+  on real PostgreSQL). Optional fix: catch `IntegrityError` → manual
+  review.
+
+### 40. No reconciliation for a crash in the verify→commit window — **EXTERNAL VALIDATION GAP / POST-RELEASE; LOW-MEDIUM; fails closed**
+- A crash after `client.verify()` succeeds but before `db.commit()`
+  leaves the payment `link_created`; there is no background sweep to
+  re-verify aged `link_created` payments, so recovery relies on the payer
+  re-hitting the callback URL. No money moves incorrectly. Ties to B2
+  (verify-after-verify idempotency). Optional fix: a reconciliation job.
+
+### 41. `_to_int` accepts non-ASCII decimal digits — **POST-RELEASE BACKLOG; LOW; no financial impact**
+- Diverges from `services/fees.py` (`re.ASCII`); parses to the correct
+  integer and must still match the stored ASCII value, so no wrong value
+  and no crash. Consistency nit; align with `re.ASCII`.
+
+**Accepted risks confirmed by the B4 review (not defects):** the
+intentional serialization of the gateway HTTP call across the row lock
+(capacity concern only; makes invariant 10 hold), the bounded
+unauthenticated signature-storm alert write (~1/600s window), the
+`CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` root-only escape hatch, and the
+interrupted-restore + manual-`start` operator override.
+
+**Rejected candidate findings (false positives):** SSRF via config (the
+gateway `redirectUrl` is validated and only returned to the payer, never
+fetched server-side); IPv4-mapped IPv6 host misclassification (correct
+classification); any double-credit / false-verification path (blocked by
+the `FOR UPDATE` lock, verified-status short-circuit, the
+`reference_id` UNIQUE constraint, and the financial CHECK constraints —
+proven on real PostgreSQL); aborted-transaction continuation and
+deadlock/lock-ordering cycles (none found).
