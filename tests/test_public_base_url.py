@@ -82,6 +82,26 @@ def test_accepts_and_canonicalizes(value, canonical):
         f"https://пример-{SENTINEL}.example",  # internationalized hostname: rejected
         12345,  # not a string
         None,
+        # --- authority strictness (follow-up to PR #23) ---
+        f"https://{SENTINEL}.example.com:",  # dangling port colon: rejected, not repaired
+        "https://[2001:db8::1]:",  # dangling colon after bracketed IPv6
+        f"https://%65xample-{SENTINEL}.com",  # percent-encoded hostname byte
+        f"https://pay.%65xample-{SENTINEL}.com",  # percent inside a label
+        f"https://{SENTINEL}.example.com%40evil.example",  # encoded @
+        f"https://{SENTINEL}.example.com%2fevil.example",  # encoded slash
+        f"https://{SENTINEL}.example.com%5cevil.example",  # encoded backslash
+        f"https://{SENTINEL}.example.com%3a443",  # encoded colon-port
+        f"https://pay..{SENTINEL}.com",  # empty label
+        f"https://-{SENTINEL}.example.com",  # leading hyphen in label
+        f"https://{SENTINEL}-.example.com",  # trailing hyphen in label
+        f"https://_{SENTINEL}.example.com",  # underscore label
+        "https://999.999.999.999",  # all-numeric host must be valid IPv4
+        "https://1.2.3.4.5",  # numeric but not an IPv4 address
+        "https://[not-ipv6]",  # brackets around a non-IPv6 value
+        "https://[2001:db8::1]extra",  # junk after the closing bracket
+        f"https://{SENTINEL}.example.com:+443",  # signed port
+        f"https://{SENTINEL}.example.com:-443",  # negative port
+        f"https://{SENTINEL}.example.com: 443",  # spaced port
     ],
 )
 def test_rejects_invalid_values_without_echoing_them(value, caplog):
@@ -91,6 +111,40 @@ def test_rejects_invalid_values_without_echoing_them(value, caplog):
     assert "PUBLIC_BASE_URL" in str(excinfo.value)
     assert SENTINEL not in str(excinfo.value)
     assert SENTINEL not in caplog.text
+
+
+ACCEPTED_FORMS = [
+    "https://pay.example.com",
+    "HTTPS://PAY.EXAMPLE.COM",
+    "https://pay.example.com/",
+    "https://pay.example.com:443",
+    "https://pay.example.com:8443",
+    "https://127.0.0.1",
+    "https://[2001:db8::1]",
+    "https://[2001:db8::1]:8443",
+    "https://pay.test.local",
+]
+
+
+@pytest.mark.parametrize("value", ACCEPTED_FORMS)
+def test_canonical_output_round_trips_and_is_structurally_clean(value):
+    """normalize(normalize(x)) == normalize(x), and the canonical output
+    is itself a clean HTTPS origin — no userinfo/path/query/fragment, a
+    grammar-valid host, an in-range numeric port or none, and no percent
+    or backslash anywhere in the authority."""
+    canonical = normalize_public_base_url(value)
+    assert normalize_public_base_url(canonical) == canonical  # idempotent
+
+    parts = urlsplit(canonical)
+    assert parts.scheme == "https"
+    assert parts.username is None and parts.password is None
+    assert parts.path == "" and parts.query == "" and parts.fragment == ""
+    assert parts.hostname
+    assert "%" not in parts.netloc and "\\" not in parts.netloc
+    if ":" in parts.netloc.rsplit("]", 1)[-1]:  # explicit port present
+        assert parts.port is not None and 1 <= parts.port <= 65535
+    else:
+        assert parts.port is None
 
 
 def test_settings_construction_rejects_invalid_url_without_echo(settings):
