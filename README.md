@@ -83,7 +83,15 @@ the adversarial review, and a green release workflow. Original topics:
   failed alert INSERT rolls back only the savepoint and can never abort
   the financial transaction; the admin-bot service delivers them
   best-effort with bounded retries, dedup windows, and stale-claim
-  recovery — a Telegram outage can never block payment processing
+  recovery — a Telegram outage can never block payment processing.
+  Delivery results carry claim ownership: a result is persisted only
+  while the alert row still holds the same worker ID and attempt number
+  (checked under the row lock), so late results from released or
+  superseded claims are discarded and audited
+  (`admin_alert_result_discarded`) without modifying the successor's
+  claim. Telegram delivery itself stays at-least-once: a stale worker
+  may already have sent a duplicate operational message — ownership
+  prevents stale database-result overwrites, not duplicate sends
 - Health monitor with consecutive-failure thresholds and recovery alerts;
   optional daily report (Asia/Tehran default, restart-safe dedup);
   worker heartbeats recorded in the database
