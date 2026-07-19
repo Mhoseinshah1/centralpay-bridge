@@ -201,9 +201,8 @@ def settings_for(compose: dict, service: str) -> Settings:
     """Construct Settings exactly as the service's container would: the
     simulated env file overridden by the service's Compose environment."""
     env = dict(_ENV_FILE_SIMULATION)
-    env.update(
-        {key: str(value) for key, value in compose["services"][service].get("environment", {}).items()}
-    )
+    overrides = compose["services"][service].get("environment", {})
+    env.update({key: str(value) for key, value in overrides.items()})
     return Settings(**{key.lower(): value for key, value in env.items()})
 
 
