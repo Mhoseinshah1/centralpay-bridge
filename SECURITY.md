@@ -69,6 +69,20 @@ CentralPay confirmation, or lost silently is always critical.
   errors, or API responses. Gateway logs carry only the endpoint name, the
   order id, the HTTP status, the internal reason code, and a fixed-value
   marker naming which failure signal was present.
+- **PUBLIC_BASE_URL contract (fix/public-base-url-security-validation):**
+  the callback base URL is an HTTPS origin only — scheme, host, and
+  optional port (`https://host[:port]`). Paths, queries, fragments,
+  userinfo, whitespace, control characters, backslashes, and cleartext
+  HTTP are rejected at startup by the shared Settings model (API, worker,
+  admin bot, and CLI alike), with a fixed error that never echoes the
+  submitted value. Accepted values are canonicalized (lower-cased
+  scheme/host, lone trailing slash dropped) — never silently repaired —
+  so the generated CentralPay return URL (which carries the one-time
+  callback token and HMAC signature) is always
+  `https://host[:port]/api/centralpay/callback` with exactly the
+  application-generated `orderId`, `ct`, and `sig` parameters. (No claim
+  is made about DNS, TLS issuance, or real callback delivery — those
+  remain real-host validation gates.)
 - **Reference-ID storage boundary (fix/centralpay-reference-id-validation):**
   gateway-reported reference IDs are validated against the exact database
   storage contract (max 128 characters, no NUL/control characters) before

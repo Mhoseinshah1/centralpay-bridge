@@ -320,3 +320,28 @@ scan of the runtime dependency set is clean. Migrating the test suite
 to pytest 9 is deliberately NOT done inside a release-candidate branch
 (major-version test-framework bump ≠ release hardening); it is recorded
 here as post-release backlog.
+
+## Topic 32 (fix/public-base-url-security-validation)
+
+### 32. Adjacent URL configuration can still be cleartext HTTP — **DOCUMENTED; not changed in this PR**
+
+While enforcing the PUBLIC_BASE_URL HTTPS-origin contract, the adjacent
+outbound URLs were audited:
+
+- `CENTRALPAY_BASE_URL` (default `https://centralapi.org/webservice/basic`)
+  has **no application-side validation**: an operator could configure a
+  cleartext `http://` value, sending the CentralPay API key in POST
+  bodies over plaintext.
+- `BOT_PAYMENT_NOTIFY_URL` is validated against `^https?://` — cleartext
+  `http://` is **explicitly permitted**, sending the bot `Token` header
+  over plaintext. The installer defaults to `https://` but passes a
+  user-typed `http://` prefix through unchanged.
+
+Deployment implications: both are outbound URLs under operator control;
+the installer's defaults are HTTPS, so exposure requires an explicit
+misconfiguration, and some bot deployments legitimately use plain HTTP
+inside a private network. Tightening either is a behavioral change for
+existing configurations and is deliberately NOT bundled into the
+PUBLIC_BASE_URL fix — recorded here for an explicit follow-up decision
+(options: require https, or add an explicit
+`ALLOW_INSECURE_*_URL=true` escape hatch for private-network bots).
