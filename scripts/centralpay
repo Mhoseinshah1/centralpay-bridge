@@ -236,30 +236,79 @@ record_version_history() {
     chmod 600 "$VERSION_HISTORY_FILE"
 }
 
-verify_release_artifact() {
-    # $1 = release tag. Downloads the release artifact and SHA256SUMS and
-    # verifies the checksum as an integrity gate before deploying the tag.
-    local tag="$1" tmp
-    tmp=$(mktemp -d)
-    local base="https://github.com/${REPO_SLUG}/releases/download/${tag}"
-    local artifact="centralpay-bridge-${tag#v}.tar.gz"
-    log "Verifying release artifact checksum for ${tag}..."
-    if ! curl -fsSL -o "${tmp}/${artifact}" "${base}/${artifact}" \
-        || ! curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"; then
-        rm -rf "$tmp"
-        if grep -qE '^CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true$' "$ENV_FILE" 2>/dev/null; then
-            warn "Release artifact/SHA256SUMS not downloadable; continuing UNVERIFIED (CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true)."
-            return 0
-        fi
-        fail "Cannot download the release artifact and SHA256SUMS for ${tag}. Publish the GitHub release first, or set CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true (not recommended)."
-    fi
-    if (cd "$tmp" && grep " ${artifact}\$" SHA256SUMS | sha256sum -c --quiet); then
-        log "Checksum verified: ${artifact}"
-        rm -rf "$tmp"
+is_release_tag() {
+    # Strict release-tag grammar: vX.Y.Z or vX.Y.Z-rcN, nothing else.
+    # Rejects v1.2.3evil, v1.2.3/other, v1.2.3-rc (no number), main, etc.
+    [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]
+}
+
+resolve_verified_update_commit() {
+    # $1 = update ref. Prints (stdout) the exact Git commit SHA to deploy and
+    # returns 0; prints NOTHING to stdout and returns non-zero on any failure.
+    #
+    # For a release tag this BINDS the deployed commit to a separately
+    # checksummed SOURCE_COMMIT release asset: the fetched tag commit must
+    # equal the verified SOURCE_COMMIT, so a tag moved after the release
+    # assets were produced is rejected BEFORE any checkout/build/migration/
+    # restart. A checksum alone (over the discarded tarball) never proved
+    # what git actually deploys.
+    local ref="$1" tmp base artifact fetched source_commit allow_unverified=false
+    grep -qE '^CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true$' "$ENV_FILE" 2>/dev/null \
+        && allow_unverified=true
+
+    git -C "$INSTALL_DIR" fetch --tags --force origin "$ref" >/dev/null 2>&1 \
+        || fail "Cannot fetch ${ref} from origin."
+    # ^{commit} dereferences annotated tags to the underlying commit object.
+    fetched=$(git -C "$INSTALL_DIR" rev-parse --verify --quiet "FETCH_HEAD^{commit}") \
+        || fail "Cannot resolve fetched ref ${ref} to a commit."
+
+    if ! is_release_tag "$ref"; then
+        warn "Update ref '${ref}' is not a release tag (DEVELOPMENT MODE): NO checksum and NO SOURCE_COMMIT binding. Pin CENTRALPAY_UPDATE_REF to a release tag (vX.Y.Z or vX.Y.Z-rcN) for production."
+        printf '%s\n' "$fetched"
         return 0
     fi
+
+    tmp=$(mktemp -d)
+    base="${CENTRALPAY_RELEASE_BASE_URL:-https://github.com/${REPO_SLUG}/releases/download}/${ref}"
+    artifact="centralpay-bridge-${ref#v}.tar.gz"
+    log "Verifying release assets and SOURCE_COMMIT binding for ${ref}..." >&2
+    if ! curl -fsSL -o "${tmp}/${artifact}" "${base}/${artifact}" \
+        || ! curl -fsSL -o "${tmp}/SOURCE_COMMIT" "${base}/SOURCE_COMMIT" \
+        || ! curl -fsSL -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"; then
+        rm -rf "$tmp"
+        if [[ "$allow_unverified" == "true" ]]; then
+            warn "Release assets not downloadable; continuing UNVERIFIED (CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true): NO checksum verification and NO SOURCE_COMMIT commit binding are performed. Deploying the fetched tag commit as-is."
+            printf '%s\n' "$fetched"
+            return 0
+        fi
+        fail "Cannot download the release assets (artifact, SOURCE_COMMIT, SHA256SUMS) for ${ref}. Publish the GitHub release first, or set CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true (not recommended)."
+    fi
+    # Verify checksums for BOTH the artifact and SOURCE_COMMIT. The SBOM line
+    # in SHA256SUMS references a file we intentionally do not download here,
+    # so filter to exactly the two entries and require both to be present.
+    if ! (
+        cd "$tmp" || exit 3
+        grep -E ' (SOURCE_COMMIT|centralpay-bridge-.*\.tar\.gz)$' SHA256SUMS > check.sums
+        [ "$(wc -l < check.sums)" -eq 2 ] || exit 4
+        sha256sum -c --quiet check.sums
+    ) >/dev/null 2>&1; then
+        rm -rf "$tmp"
+        fail "Release asset verification FAILED for ${ref} (missing entry or checksum mismatch for the artifact or SOURCE_COMMIT). Aborting update."
+    fi
+    # Validate SOURCE_COMMIT grammar: exactly 40 lowercase hex, one optional
+    # trailing newline, nothing else.
+    source_commit=$(tr -d '\n' < "${tmp}/SOURCE_COMMIT")
     rm -rf "$tmp"
-    fail "CHECKSUM MISMATCH for ${artifact}. Aborting update."
+    if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+        fail "SOURCE_COMMIT is malformed for ${ref} (expected one 40-character lowercase hex commit). Aborting update."
+    fi
+    # Require the fetched tag commit to equal the verified SOURCE_COMMIT.
+    if [[ "$fetched" != "$source_commit" ]]; then
+        fail "Deployed-commit mismatch for ${ref}: the tag resolves to ${fetched:0:12} but the verified SOURCE_COMMIT is ${source_commit:0:12}. The tag may have been moved after the release was built. Aborting update BEFORE any change."
+    fi
+    log "SOURCE_COMMIT binding verified: ${source_commit:0:12}" >&2
+    printf '%s\n' "$source_commit"
+    return 0
 }
 
 cmd_update_check() {
@@ -269,7 +318,7 @@ cmd_update_check() {
     current=$(git -C "$INSTALL_DIR" rev-parse HEAD)
     git -C "$INSTALL_DIR" fetch --tags origin "$ref" >/dev/null 2>&1 \
         || fail "Cannot fetch ${ref} from origin."
-    remote=$(git -C "$INSTALL_DIR" rev-parse FETCH_HEAD)
+    remote=$(git -C "$INSTALL_DIR" rev-parse "FETCH_HEAD^{commit}")
     echo "configured ref:  ${ref}"
     echo "installed:       ${current}"
     echo "available:       ${remote}"
@@ -283,20 +332,19 @@ cmd_update_check() {
 cmd_update() {
     require_root update
     require_install
-    local ref previous
+    local ref previous target_commit
     ref=$(env_value CENTRALPAY_UPDATE_REF)
     ref="${ref:-main}"
     previous=$(git -C "$INSTALL_DIR" rev-parse HEAD)
-    if [[ "$ref" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-        verify_release_artifact "$ref"
-    else
-        warn "Update ref '${ref}' is not a release tag (DEVELOPMENT MODE, no artifact checksum). Pin CENTRALPAY_UPDATE_REF to a release tag for production."
-    fi
+    # Resolve the exact commit to deploy, binding it to a verified
+    # SOURCE_COMMIT release asset for release tags. Any verification failure
+    # aborts HERE — before the backup, checkout, build, migration, restart,
+    # or version-history mutation below.
+    target_commit=$(resolve_verified_update_commit "$ref") || exit 1
     log "Creating pre-update backup..."
     "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-update backup failed; update aborted."
-    log "Fetching ${ref}..."
-    git -C "$INSTALL_DIR" fetch --tags origin "$ref"
-    git -C "$INSTALL_DIR" checkout -q FETCH_HEAD
+    log "Deploying verified commit ${target_commit:0:12} (ref ${ref})..."
+    git -C "$INSTALL_DIR" checkout -q "$target_commit"
     record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)"
     log "Building images..."
     compose build --quiet
@@ -795,4 +843,7 @@ main() {
     esac
 }
 
-main "$@"
+# Allow tests to source the functions without executing a command.
+if [[ "${CENTRALPAY_CLI_SOURCE_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi

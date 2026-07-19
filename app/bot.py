@@ -12,6 +12,7 @@ header are inspected.
 """
 
 import enum
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -67,15 +68,29 @@ _REFUSED_MARKERS = ("connection refused", "[errno 111]", "econnrefused")
 
 _MAX_RETRY_AFTER_SECONDS = 3600
 
+# ASCII unsigned decimal only. str.isdigit() accepts Unicode digits — e.g. a
+# latin-1 Retry-After byte 0xB2 decodes to "²", which int() then rejects with
+# ValueError. The grammar here is strictly [0-9]+.
+_ASCII_UINT_PATTERN = re.compile(r"[0-9]+", re.ASCII)
+
 
 def _parse_retry_after(value: str | None) -> int | None:
-    """Integer-seconds Retry-After only; anything else is ignored."""
+    """Integer-seconds Retry-After only; anything else is ignored.
+
+    Never raises: only an ASCII unsigned decimal string (surrounding
+    whitespace stripped) is parsed. Unicode/superscript digits, signs,
+    HTTP-date values, and anything int() cannot parse return None so the
+    caller falls back to the normal backoff schedule.
+    """
     if value is None:
         return None
     stripped = value.strip()
-    if not stripped.isdigit():
+    if not _ASCII_UINT_PATTERN.fullmatch(stripped):
         return None
-    seconds = int(stripped)
+    try:
+        seconds = int(stripped)
+    except (ValueError, OverflowError):
+        return None
     if seconds <= 0:
         return None
     return min(seconds, _MAX_RETRY_AFTER_SECONDS)
