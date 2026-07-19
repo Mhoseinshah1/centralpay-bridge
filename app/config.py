@@ -2,15 +2,80 @@
 
 import re
 from typing import Literal, Self
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _HTTP_URL_PATTERN = re.compile(r"^https?://[^\s]+$")
 
+# Fixed error text for an invalid PUBLIC_BASE_URL. The submitted value is
+# deliberately never echoed anywhere (a malformed URL may embed userinfo,
+# tokens, or other secrets); the message names only the variable.
+_PUBLIC_BASE_URL_ERROR = (
+    "PUBLIC_BASE_URL must be an HTTPS origin only: https://host[:port] with "
+    "no path, query, fragment, userinfo, whitespace, or control characters"
+)
+
 
 class ConfigurationError(RuntimeError):
     """Invalid configuration. Messages must never contain secret values."""
+
+
+def normalize_public_base_url(value: object) -> str:
+    """Validate and canonicalize PUBLIC_BASE_URL to ``https://host[:port]``.
+
+    This URL is the base of the CentralPay return URL, which carries the
+    gateway order id, the one-time callback token, and the callback HMAC
+    signature — an http:// value would expose both secrets in cleartext,
+    and any path/query/fragment/userinfo would corrupt or redirect the
+    generated callback. The application enforces the contract itself;
+    installer correctness is not a sufficient security control.
+
+    Accepted: absolute HTTPS URL with a non-empty ASCII hostname
+    (IPv4 / registered name / bracketed IPv6), an optional numeric port
+    (1-65535), and at most a bare "/" path. Internationalized hostnames
+    are explicitly rejected — operators must supply the punycode form.
+    Nothing is silently repaired; the ONLY normalization applied is
+    scheme/host lowercasing and dropping a lone trailing slash.
+
+    Raises ValueError with a fixed message that never includes the value.
+    """
+    if not isinstance(value, str):
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    # Whitespace, ASCII control characters (incl. NUL/TAB/CR/LF/DEL),
+    # backslashes, and non-ASCII are rejected before any URL parsing —
+    # they are the raw material of URL-confusion attacks.
+    if not value or not value.isascii():
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    if any(ord(ch) <= 32 or ord(ch) == 127 for ch in value) or "\\" in value:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+    # HTTPS only; a missing scheme also rejects protocol-relative values.
+    if parts.scheme.lower() != "https":
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    if parts.query or parts.fragment:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    if parts.path not in ("", "/"):
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    try:
+        hostname = parts.hostname
+        port = parts.port  # raises ValueError for non-numeric/out-of-range
+    except ValueError:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR) from None
+    if not hostname:
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    if port is not None and not (1 <= port <= 65535):
+        raise ValueError(_PUBLIC_BASE_URL_ERROR)
+    # Reconstruct the canonical origin from parsed components only —
+    # never from the raw string.
+    host_out = f"[{hostname}]" if ":" in hostname else hostname
+    return f"https://{host_out}:{port}" if port is not None else f"https://{host_out}"
 
 
 class Settings(BaseSettings):
@@ -19,6 +84,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
+        # Validation errors must never echo submitted values: a malformed
+        # PUBLIC_BASE_URL may embed userinfo, and other fields hold secrets.
+        hide_input_in_errors=True,
     )
 
     environment: str = "development"
@@ -119,6 +187,14 @@ class Settings(BaseSettings):
     admin_bot_api_url: str = "http://api:8000"
     # Admin bot container liveness heartbeat file.
     admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, value: object) -> str:
+        # Runs wherever Settings is constructed — API startup, worker,
+        # admin bot, CLI/ops — so an invalid callback base can never exist
+        # silently in any service.
+        return normalize_public_base_url(value)
 
     @model_validator(mode="after")
     def _validate_bot_settings(self) -> Self:

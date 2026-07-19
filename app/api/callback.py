@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
 from app.api.pages import payment_status_page
 from app.exceptions import InvalidCallbackSignatureError, RateLimitedError
-from app.security import verify_callback_signature
+from app.security import CALLBACK_PATH, verify_callback_signature
 from app.services.verification import process_callback
 
 logger = logging.getLogger("app.api.callback")
@@ -85,7 +85,7 @@ class SignatureFailureTracker:
 signature_failure_tracker = SignatureFailureTracker()
 
 
-@router.get("/api/centralpay/callback", response_class=HTMLResponse)
+@router.get(CALLBACK_PATH, response_class=HTMLResponse)
 def centralpay_callback(
     request: Request,
     db: DbDep,
