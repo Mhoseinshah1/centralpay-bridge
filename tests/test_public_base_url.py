@@ -102,6 +102,16 @@ def test_accepts_and_canonicalizes(value, canonical):
         f"https://{SENTINEL}.example.com:+443",  # signed port
         f"https://{SENTINEL}.example.com:-443",  # negative port
         f"https://{SENTINEL}.example.com: 443",  # spaced port
+        # --- empty delimiters and port canonicality (follow-up to PR #24) ---
+        f"https://{SENTINEL}.example.com?",  # empty query delimiter
+        f"https://{SENTINEL}.example.com#",  # empty fragment delimiter
+        f"https://{SENTINEL}.example.com/?",  # slash + empty query
+        f"https://{SENTINEL}.example.com/#",  # slash + empty fragment
+        f"https://{SENTINEL}.example.com?#",  # both delimiters, both empty
+        f"https://{SENTINEL}.example.com:0443",  # zero-padded port
+        f"https://{SENTINEL}.example.com:008443",  # multi-zero-padded port
+        "https://[2001:db8::1]:08443",  # zero-padded port after IPv6
+        f"https://{SENTINEL}.example.com:00001",  # zero-padded port 1
     ],
 )
 def test_rejects_invalid_values_without_echoing_them(value, caplog):
