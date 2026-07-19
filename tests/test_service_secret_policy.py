@@ -18,6 +18,7 @@ Role allowlist:
 
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -84,12 +85,12 @@ _PLACEHOLDER = re.compile(r"\A(|not-used-by-[a-z-]+)\Z")
 
 
 @pytest.fixture(scope="module")
-def compose() -> dict[str, object]:
-    loaded: dict[str, object] = yaml.safe_load(COMPOSE_FILE.read_text())
+def compose() -> dict[str, Any]:
+    loaded: dict[str, Any] = yaml.safe_load(COMPOSE_FILE.read_text())
     return loaded
 
 
-def effective_environment(service: dict) -> dict[str, str]:
+def effective_environment(service: dict[str, Any]) -> dict[str, str]:
     """The environment a container sees: sentinel values standing in for
     the shared env file, overridden by the service's environment: block."""
     env = {var: f"SENTINEL-{var}" for var in CREDENTIAL_VARS}
@@ -197,13 +198,14 @@ _ENV_FILE_SIMULATION = {
 }
 
 
-def settings_for(compose: dict, service: str) -> Settings:
+def settings_for(compose: dict[str, Any], service: str) -> Settings:
     """Construct Settings exactly as the service's container would: the
     simulated env file overridden by the service's Compose environment."""
     env = dict(_ENV_FILE_SIMULATION)
     overrides = compose["services"][service].get("environment", {})
     env.update({key: str(value) for key, value in overrides.items()})
-    return Settings(**{key.lower(): value for key, value in env.items()})
+    kwargs: dict[str, Any] = {key.lower(): value for key, value in env.items()}
+    return Settings(**kwargs)
 
 
 def test_api_startup_with_admin_alerts_enabled_under_masking(compose):
