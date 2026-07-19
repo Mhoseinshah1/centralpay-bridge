@@ -137,6 +137,9 @@ jobs:
           docker compose --profile admin-bot config --quiet
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
+      - name: Resolve APP_VERSION
+        id: appver
+        run: echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
       - name: Build image (amd64, loaded for testing)
         uses: docker/build-push-action@v6
         with:
@@ -145,6 +148,7 @@ jobs:
           load: true
           tags: centralpay-bridge:release
           build-args: |
+            APP_VERSION=${{ steps.appver.outputs.value }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -156,9 +160,10 @@ jobs:
           platforms: linux/arm64
           tags: centralpay-bridge:release-arm64
           build-args: |
+            APP_VERSION=${{ steps.appver.outputs.value }}
             BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
-      - name: Image smoke test (non-root, version, imports)
+      - name: Image smoke test (non-root, version, label, imports)
         run: |
           docker run --rm --entrypoint python centralpay-bridge:release - <<'EOF'
           import os
@@ -167,6 +172,10 @@ jobs:
           assert os.getuid() != 0, "container must not run as root"
           print("version:", APP_VERSION)
           EOF
+          label=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' centralpay-bridge:release)
+          expected='${{ steps.appver.outputs.value }}'
+          echo "image version label: '${label}' (expected '${expected}')"
+          test "$label" = "$expected"
       - name: Validate Caddyfile template
         run: |
           sed -e 's/{{PAYMENT_DOMAIN}}/pay.example.com/' -e 's/{{TLS_EMAIL}}/ops@example.com/' \
@@ -271,6 +280,13 @@ jobs:
           git archive --format=tar.gz \
             --prefix="centralpay-bridge-${version}/" \
             -o "centralpay-bridge-${version}.tar.gz" HEAD
+      - name: Record SOURCE_COMMIT (binds the deployed commit to this release)
+        run: |
+          # The exact commit this release's source artifact was built from.
+          # The updater fetches the configured tag, resolves it to a commit,
+          # and requires it to equal this checksummed value before deploying.
+          git rev-parse HEAD > SOURCE_COMMIT
+          cat SOURCE_COMMIT
       - name: Verify artifact contains no secrets or dumps
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -286,6 +302,7 @@ jobs:
         run: |
           version="${{ steps.version.outputs.version }}"
           sha256sum "centralpay-bridge-${version}.tar.gz" \
+            SOURCE_COMMIT \
             sbom-centralpay-bridge.spdx.json > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/upload-artifact@v4
@@ -293,6 +310,7 @@ jobs:
           name: release-artifacts
           path: |
             centralpay-bridge-*.tar.gz
+            SOURCE_COMMIT
             sbom-centralpay-bridge.spdx.json
             SHA256SUMS
           if-no-files-found: error
@@ -307,6 +325,7 @@ jobs:
             --title "centralpay-bridge ${version}" \
             --notes-file "RELEASE_NOTES_0.6.0_RC1.md" \
             "centralpay-bridge-${version}.tar.gz" \
+            SOURCE_COMMIT \
             sbom-centralpay-bridge.spdx.json \
             SHA256SUMS
           echo "Draft release created. Publishing requires an explicit human decision."

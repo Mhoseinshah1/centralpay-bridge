@@ -473,6 +473,29 @@ def test_dockerfile_properties():
     assert ".env" in dockerignore
 
 
+def test_dockerfile_oci_version_label_is_not_a_stale_literal():
+    """CANON-5: the OCI version label must never carry a hardcoded version
+    literal (it was pinned at 0.5.0-rc1 while APP_VERSION advanced). It is
+    driven by a build ARG supplied from app.version.APP_VERSION, so it can
+    never drift; a local build with no --build-arg gets an empty label."""
+    from app.version import APP_VERSION
+
+    text = DOCKERFILE.read_text()
+    # The label is ARG-driven, never a literal.
+    assert 'org.opencontainers.image.version="${APP_VERSION}"' in text
+    assert 'ARG APP_VERSION=""' in text
+    # No hardcoded version literal appears anywhere in the Dockerfile — not
+    # the old 0.5.0-rc1, nor even the current APP_VERSION (which would drift
+    # on the next bump).
+    version_line = next(
+        line for line in text.splitlines() if "image.version" in line
+    )
+    assert re.search(r"\d+\.\d+\.\d+", version_line) is None, version_line
+    for stale in ("0.5.0-rc1", "0.1.0"):
+        assert stale not in text, stale
+    assert APP_VERSION not in text  # the version literal lives only in app/version.py
+
+
 # --- ShellCheck (skipped when the binary is unavailable) --------------------
 
 
@@ -726,10 +749,11 @@ def test_installer_asks_fee_percentage_with_strict_pattern():
 
 def test_installer_creates_initial_fee_policy_after_migrations():
     text = INSTALLER.read_text()
-    # Typed Python ops delegation with --ensure-initial: a rerun can never
-    # reset or replace an operator's existing fee configuration.
-    assert "--ensure-initial" in text
-    assert "python -m app.ops fee set" in text
+    # Typed Python ops delegation with the dedicated 'fee ensure-initial'
+    # operation: a rerun can never reset or replace an operator's existing
+    # fee configuration, and a missing rate on an empty table fails instead
+    # of silently creating a 0% policy (CANON-1).
+    assert "python -m app.ops fee ensure-initial" in text
     # Ordering: the policy is ensured only after the stack (and therefore
     # the migrations that create fee_policies) has been deployed.
     main_body = text[text.index("\nmain() {"):]
@@ -737,6 +761,25 @@ def test_installer_creates_initial_fee_policy_after_migrations():
     assert (
         main_body.index("ensure_initial_fee_policy") < main_body.index("verify_deployment")
     )
+
+
+def test_installer_persists_and_recovers_the_initial_fee():
+    """CANON-1: the operator's initial fee is persisted as recovery metadata
+    and re-read on a keep-existing rerun, so a failed-then-rerun install can
+    never silently fall back to 0%."""
+    text = INSTALLER.read_text()
+    template = ENV_TEMPLATE.read_text()
+    # Persisted (recovery metadata only) in the generated env file...
+    assert "INSTALLER_INITIAL_FEE_PERCENT={{INSTALLER_INITIAL_FEE_PERCENT}}" in template
+    assert "s|{{INSTALLER_INITIAL_FEE_PERCENT}}|${PAYMENT_FEE_PERCENT}|g" in text
+    # ...re-read on the keep-existing path...
+    assert "grep -E '^INSTALLER_INITIAL_FEE_PERCENT=' \"$ENV_FILE\"" in text
+    # ...and the ensure step prefers the recovered/gathered value, never a
+    # hardcoded 0 default.
+    body = text[text.index("ensure_initial_fee_policy() {"):]
+    body = body[: body.index("\n}")]
+    assert "INSTALLER_INITIAL_FEE_PERCENT:-${PAYMENT_FEE_PERCENT:-}" in body
+    assert ':-0}' not in body  # no silent 0% default anywhere in the ensure step
 
 
 def test_installer_sets_explicit_script_modes():

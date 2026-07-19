@@ -513,6 +513,7 @@ render_template() {
         -e "s|{{CENTRALPAY_USER_ID}}|${CENTRALPAY_USER_ID:-1}|g" \
         -e "s|{{MIN_PAYMENT_AMOUNT_TOMAN}}|${MIN_PAYMENT_AMOUNT_TOMAN}|g" \
         -e "s|{{MAX_PAYMENT_AMOUNT_TOMAN}}|${MAX_PAYMENT_AMOUNT_TOMAN}|g" \
+        -e "s|{{INSTALLER_INITIAL_FEE_PERCENT}}|${PAYMENT_FEE_PERCENT}|g" \
         -e "s|{{TELEGRAM_BOT_USERNAME}}|${TELEGRAM_BOT_USERNAME}|g" \
         -e "s|{{BOT_PAYMENT_NOTIFY_URL}}|${BOT_PAYMENT_NOTIFY_URL}|g" \
         -e "s|{{BOT_NOTIFY_TOKEN}}|${BOT_NOTIFY_TOKEN}|g" \
@@ -584,26 +585,35 @@ install_management_command() {
 }
 
 ensure_initial_fee_policy() {
-    # Runs AFTER migrations. Creates the initial fee policy through the
-    # typed Python operations command (never shell SQL). --ensure-initial
-    # makes this a no-op when any policy already exists, so a rerun can
-    # never reset or silently replace an operator's fee configuration —
-    # changing an existing fee always requires the explicit
-    # 'centralpay fee set' command.
-    local percent="${PAYMENT_FEE_PERCENT:-0}"
-    # Belt and braces: the prompt already validated this, but the value may
-    # come from a rerun environment — never hand an unvalidated rate to the
-    # typed parser only to fail late.
-    validate_fee_percent "$percent" \
-        || fail "Invalid payment fee percentage '${percent}' (allowed: 0-100 with up to 2 decimals)."
+    # Runs AFTER migrations. Creates the initial fee policy through the typed
+    # Python operations command (never shell SQL). 'fee ensure-initial' is a
+    # no-op when any policy already exists (a rerun never resets or replaces
+    # an operator's fee) and, when the table is empty, REQUIRES an explicit
+    # validated rate — a missing value never means 0% (CANON-1). Concurrent
+    # reruns are serialized by a PostgreSQL advisory lock inside app.ops.
+    #
+    # The rate comes from the operator's recorded selection: PAYMENT_FEE_PERCENT
+    # on a fresh install, or INSTALLER_INITIAL_FEE_PERCENT recovered from the
+    # env file on a rerun. When neither is available (a legacy install with no
+    # recorded metadata), no rate is passed: app.ops then no-ops if history
+    # exists, or fails safely (creating nothing) if the table is empty.
+    local percent="${INSTALLER_INITIAL_FEE_PERCENT:-${PAYMENT_FEE_PERCENT:-}}"
+    local -a percent_args=()
+    if [[ -n "$percent" ]]; then
+        # Belt and braces: re-validate before handing the rate to app.ops.
+        validate_fee_percent "$percent" \
+            || fail "The recorded installer fee percentage is invalid (allowed: 0-100 with up to 2 decimals). Re-run the installer and choose to reconfigure to re-enter it, or set it with: centralpay fee set <rate>"
+        percent_args=(--percent "$percent")
+    fi
     cd "$INSTALL_DIR"
-    if docker compose run --rm migrate python -m app.ops fee set "$percent" \
-        --note "Initial installation fee" --actor installer --ensure-initial; then
-        log "Fee policy ensured (${percent}%; existing policy history is never overwritten)."
+    if docker compose run --rm migrate python -m app.ops fee ensure-initial \
+        "${percent_args[@]}" --note "Initial installation fee" --actor installer; then
+        log "Initial fee policy ensured (existing policy history is never overwritten)."
     else
         # The installation must NEVER report success while the operator's
-        # requested fee configuration was silently not applied.
-        fail "Could not ensure the initial fee policy (${percent}%). Fix the error above and re-run the installer, or apply it manually with: centralpay fee set ${percent} --note 'Initial installation fee'"
+        # requested fee configuration was silently not applied, and must
+        # never silently create a 0% policy.
+        fail "Could not ensure the initial fee policy. If this is a rerun after a previously failed install, re-run the installer and choose to reconfigure to re-enter the fee, or set it explicitly with: centralpay fee set <rate>"
     fi
 }
 
@@ -735,6 +745,8 @@ main() {
         BOT_PAYMENT_NOTIFY_URL=$(grep -E '^BOT_PAYMENT_NOTIFY_URL=' "$ENV_FILE" | cut -d= -f2-)
         BOT_NOTIFY_RETRY_MODE=$(grep -E '^BOT_NOTIFY_RETRY_MODE=' "$ENV_FILE" | cut -d= -f2-)
         BACKUP_RETENTION_DAYS=$(grep -E '^BACKUP_RETENTION_DAYS=' "$ENV_FILE" | cut -d= -f2- || echo 14)
+        # Recovery metadata (absent in legacy env files → empty, handled below).
+        INSTALLER_INITIAL_FEE_PERCENT=$(grep -E '^INSTALLER_INITIAL_FEE_PERCENT=' "$ENV_FILE" | cut -d= -f2- || true)
     else
         gather_input
     fi

@@ -92,6 +92,9 @@ jobs:
           CENTRALPAY_CADDYFILE=/tmp/cfg/Caddyfile \
             docker compose config --quiet
       - uses: docker/setup-buildx-action@v3
+      - name: Resolve APP_VERSION
+        id: appver
+        run: echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
       - name: Build image (amd64)
         uses: docker/build-push-action@v6
         with:
@@ -99,9 +102,11 @@ jobs:
           push: false
           load: true
           tags: centralpay-bridge:ci
+          build-args: |
+            APP_VERSION=${{ steps.appver.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Image smoke test (non-root, version, clean exit)
+      - name: Image smoke test (non-root, version, label, clean exit)
         run: |
           docker run --rm --entrypoint python centralpay-bridge:ci - <<'EOF'
           import os
@@ -109,6 +114,10 @@ jobs:
           assert os.getuid() != 0, "container must not run as root"
           print("version:", APP_VERSION)
           EOF
+          label=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' centralpay-bridge:ci)
+          expected='${{ steps.appver.outputs.value }}'
+          echo "image version label: '${label}' (expected '${expected}')"
+          test "$label" = "$expected"
       - name: Validate Caddyfile template
         run: |
           sed -e 's/{{PAYMENT_DOMAIN}}/pay.example.com/' -e 's/{{TLS_EMAIL}}/ops@example.com/' \

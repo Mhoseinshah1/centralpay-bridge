@@ -194,14 +194,27 @@ unaccounted for — the top priority of AGENTS.md.
   pin `image@sha256:…` in Dockerfile/compose). Mitigation: Trivy image
   scan in the release workflow. Severity: medium (supply chain).
 
-### 19. Update channel integrity — **FIXED (0.5.0-rc1)**
-- `CENTRALPAY_UPDATE_REF` now defaults to a pinned release tag. For
-  release tags, `centralpay update` downloads the published artifact's
-  `SHA256SUMS` and verifies the checksum before deploying; unverifiable
-  updates abort (development-mode escape hatch requires an explicit env
-  var). Version history is recorded; `centralpay rollback` is
-  application-only and never downgrades the DB schema. Signed
-  tags/artifacts remain pre-1.0 backlog.
+### 19. Update channel integrity — **FIXED (0.5.0-rc1; strengthened by CANON-3, fix/b4-confirmed-release-blockers)**
+- `CENTRALPAY_UPDATE_REF` defaults to a pinned release tag. For release
+  tags, `centralpay update` now downloads the artifact, a `SOURCE_COMMIT`
+  release asset, and `SHA256SUMS`, verifies the checksums of BOTH the
+  artifact and `SOURCE_COMMIT`, validates `SOURCE_COMMIT`'s grammar (one
+  40-character lowercase hex commit), resolves the fetched tag to its
+  commit (`FETCH_HEAD^{commit}`, annotated-tag aware), and **requires the
+  deployed commit to equal the verified `SOURCE_COMMIT`** before any
+  checkout, build, migration, restart, or version-history mutation. This
+  closes the earlier gap (topic 35): the checksum previously covered only
+  a discarded tarball while the deploy was an independent
+  `git checkout FETCH_HEAD`, so a moved tag could not be detected. The
+  release-tag grammar is now strict (`vX.Y.Z` / `vX.Y.Z-rcN`); other refs
+  stay explicit development mode. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true`
+  remains a root-only escape hatch that warns unmistakably and never
+  falsely claims verification. The exact guarantee: **the deployed Git
+  commit must match a separately checksummed `SOURCE_COMMIT` release
+  asset.** Signed-tag (GPG) verification remains a separate pre-1.0
+  backlog item — this is commit binding, not signature verification.
+  Version history is recorded; `centralpay rollback` is application-only
+  and never downgrades the DB schema.
 
 ### 20. Installer never executed on a real host — **RELEASE BLOCKER B1**
 - This environment has no VM/root target available; a real
@@ -366,7 +379,25 @@ defects (33–35) must be fixed in a separate focused PR before B4 closes.
 Full evidence, per-invariant verdicts, false-positive appendix, and the
 recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
 
-### 33. Installer rerun silently applies a 0% fee — **CONFIRMED DEFECT (release blocker B4); MEDIUM; financial correctness**
+**Remediation status (fix/b4-confirmed-release-blockers):** CANON-1
+(topic 33), CANON-2 (topic 34), CANON-3 (topic 35), and CANON-5 (topic
+38) are now **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED**. The
+historical `ADVERSARIAL_REVIEW_0.6.0_RC1.md` verdict for its audited SHA
+(`4e62a552…`) stands unchanged as an honest record that B4 failed on that
+commit. **B4 remains OPEN**: it can be closed only by a subsequent
+independent review of the fixed `main`. B1, B2, B3, and B5 remain open on
+their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
+
+### 33. Installer rerun silently applies a 0% fee — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED DEFECT; MEDIUM; financial correctness)
+- **Resolution (CANON-1):** the operator's initial fee is persisted as
+  `INSTALLER_INITIAL_FEE_PERCENT` recovery metadata (never the live fee)
+  and re-read on the keep-existing path. A new typed operation
+  `app.ops fee ensure-initial` replaces `fee set --ensure-initial`: under
+  a transaction-level advisory lock it no-ops when any policy history
+  exists, and when the table is empty it REQUIRES an explicit validated
+  rate — a missing value can never mean 0%. A legacy install with history
+  is preserved; with zero rows it fails closed. Proven on real
+  PostgreSQL (7 scenarios). The original finding is kept below for history.
 - `PAYMENT_FEE_PERCENT` is never persisted (`install.sh:330/331/593`
   only; absent from `deploy/centralpay.env.template` and
   `write_configuration`). If the first-run `fee set … --ensure-initial`
@@ -381,7 +412,15 @@ recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
   keep-existing path, or refuse to create a policy when the rate was
   never supplied on a rerun. Add a rerun regression test.
 
-### 34. `isdigit()`-gated `int()` crashes on gateway/bot digit-like strings — **CONFIRMED CODE DEFECT (release blocker B4); LOW; fails closed/safe**
+### 34. `isdigit()`-gated `int()` crashes on gateway/bot digit-like strings — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED CODE DEFECT; LOW; fails closed/safe)
+- **Resolution (CANON-2):** both parsers now use an explicit ASCII grammar
+  (`-?[0-9]+` for gateway numbers, `[0-9]+` for `Retry-After`) and catch
+  `ValueError`/`OverflowError` defensively, returning `None` so malformed
+  values flow through the existing field-error / normal-backoff paths
+  instead of raising. Malformed gateway numbers now route the payment to
+  manual review (no 500); a malformed `Retry-After` falls back to the
+  normal backoff without a worker crash. Raw malformed values never reach
+  logs, events, alerts, or responses. The original finding is kept below.
 - Two sites, one root cause (`str.isdigit()` ⊋ `int()`-parseable):
   `_to_int` (`app/centralpay.py:85-95`, gate `lstrip("-").isdigit()`)
   crashes on `"²"`/`"⁵"`/`"--5"` on the verify path → uncaught
@@ -396,7 +435,13 @@ recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
   `re.ASCII`) at both sites, routing to the existing safe paths; add
   tests for `"²"`, `"--5"`, and a `\xb2` Retry-After.
 
-### 35. Update integrity control decoupled from the deployed bytes — **CONFIRMED DEFECT (release blocker B4); MEDIUM; weakened control + doc mismatch (supersedes the topic 19 "verifies checksum before deploying" claim)**
+### 35. Update integrity control decoupled from the deployed bytes — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED DEFECT; MEDIUM; weakened control + doc mismatch)
+- **Resolution (CANON-3):** the release workflow now emits a checksummed
+  `SOURCE_COMMIT` asset, and `centralpay update` requires the fetched
+  tag's commit to equal the verified `SOURCE_COMMIT` before any
+  checkout/build/migration/restart (see topic 19 for the full new
+  guarantee). A tag moved after the release was built is rejected. The
+  original finding is kept below for history.
 - `verify_release_artifact` (`scripts/centralpay:239-263`) checksums the
   release tarball then `rm -rf`s it; `cmd_update` deploys the tag via an
   independent `git fetch --tags` + `git checkout FETCH_HEAD`
@@ -421,11 +466,17 @@ recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
   builds and a non-deterministic pip-audit set. Fix: `pip-compile`/`uv
   lock` + `pip install --require-hashes`.
 
-### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **DOCUMENTATION MISMATCH; LOW**
-- `Dockerfile:26` `org.opencontainers.image.version="0.5.0-rc1"` vs
-  `APP_VERSION="0.6.0-rc1"`; syft can propagate it into the shipped SBOM.
-  Unguarded by tests. Fix: source from a build ARG or drop the label;
-  add a test asserting it tracks `APP_VERSION`.
+### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: DOCUMENTATION MISMATCH; LOW)
+- **Resolution (CANON-5):** the label is now `${APP_VERSION}`, supplied by
+  a build ARG that CI and the release workflow set from
+  `app.version.APP_VERSION` (a local build with no `--build-arg` gets an
+  empty, never stale, label). Both image smoke tests inspect the label and
+  assert it equals `APP_VERSION`, and a Dockerfile test forbids any version
+  literal in the version label. `APP_VERSION` and the pyproject version are
+  unchanged. Original finding kept below.
+- `Dockerfile:26` (pre-fix) `org.opencontainers.image.version="0.5.0-rc1"`
+  vs `APP_VERSION="0.6.0-rc1"`; syft could propagate it into the shipped
+  SBOM. Unguarded by tests.
 
 ### 39. Concurrent `reference_id` collision → HTTP 500 — **CONFIRMED DEFECT; LOW; fails safe (not a B4 blocker)**
 - The non-locking collision `SELECT` (`app/services/verification.py:150`)

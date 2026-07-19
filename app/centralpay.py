@@ -12,6 +12,7 @@ module.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -82,16 +83,34 @@ def _explicit_success(body: dict[str, Any]) -> bool:
     )
 
 
+# ASCII signed decimal only. str.isdigit()/int() accept Unicode digits and
+# str.lstrip("-") accepted multiple leading minus signs, so a gateway value
+# like "²" (U+00B2) or "--5" passed the old gate and then raised ValueError
+# inside int(). The grammar here is strictly -?[0-9]+.
+_ASCII_INT_PATTERN = re.compile(r"-?[0-9]+", re.ASCII)
+
+
 def _to_int(value: object) -> int | None:
-    """Coerce gateway numeric fields (int or digit string) to int; None otherwise."""
+    """Coerce a gateway numeric field to int; None on anything unparseable.
+
+    Never raises. A non-boolean int passes through; an ASCII decimal string
+    (optionally signed, surrounding whitespace stripped) is parsed; every
+    other value — bool, float, list/dict, empty, "+", "+5", "--5", Unicode or
+    superscript digits, or an over-long string int() refuses — returns None so
+    the caller routes the payment through the existing field-error /
+    manual-review path.
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value
     if isinstance(value, str):
         stripped = value.strip()
-        if stripped.lstrip("-").isdigit():
-            return int(stripped)
+        if _ASCII_INT_PATTERN.fullmatch(stripped):
+            try:
+                return int(stripped)
+            except (ValueError, OverflowError):
+                return None
     return None
 
 

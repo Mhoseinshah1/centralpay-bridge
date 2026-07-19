@@ -213,6 +213,64 @@ def _cmd_fee(args: argparse.Namespace) -> int:
             db.rollback()
             return 0
 
+        if args.fee_command == "ensure-initial":
+            # Idempotent initial-policy creation for the installer. Atomic
+            # under a transaction-level advisory lock (PostgreSQL): serialize
+            # concurrent installer reruns so at most one initial policy is
+            # ever created. "Initial" means the fee_policies table has ZERO
+            # rows — any scheduled/cancelled history is an operator decision
+            # the installer must never override.
+            if db.get_bind().dialect.name == "postgresql":
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": FEE_ENSURE_INITIAL_LOCK_KEY},
+                )
+            existing = db.execute(select(func.count(FeePolicy.id))).scalar_one()
+            if existing:
+                print(
+                    f"Fee policy history already exists ({existing} row(s), "
+                    "including any scheduled or cancelled policies); no change. "
+                    "Use 'centralpay fee set' to change the fee."
+                )
+                db.rollback()
+                return 0
+            # Zero rows: a validated rate MUST be supplied. A missing value
+            # never means 0% — that is exactly the CANON-1 defect. Fail
+            # closed so the installer cannot silently ship a 0% fee.
+            if args.percent is None:
+                db.rollback()
+                print(
+                    "error: no fee policy exists and no initial rate was "
+                    "supplied. The installer's recorded initial rate "
+                    "(INSTALLER_INITIAL_FEE_PERCENT) is missing, so NO policy "
+                    "was created and NO fee is configured. Re-run the "
+                    "installer and choose to reconfigure, or set the fee "
+                    "explicitly with: centralpay fee set <rate>",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                rate_bps = parse_rate_percent(args.percent)
+            except ValueError as exc:
+                db.rollback()
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            policy = create_policy(
+                db,
+                rate_bps=rate_bps,
+                effective_at=datetime.now(UTC),
+                actor=args.actor,
+                note=args.note,
+                scheduled=False,
+            )
+            db.commit()
+            print(
+                f"Initial fee policy created: {format_rate_percent(rate_bps)} "
+                f"(policy {policy.id})."
+            )
+            print("Applies to: new payment orders only")
+            return 0
+
         actor = args.actor
         try:
             if args.fee_command in ("set", "schedule"):
@@ -608,6 +666,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="create the policy only when none exists (installer; never resets)",
     )
+    # Dedicated installer operation: create the initial policy only when the
+    # table is empty, requiring an explicit validated rate (never defaults to
+    # 0). No-ops when any history exists. Serialized by advisory lock.
+    fee_ensure = fee_sub.add_parser("ensure-initial")
+    fee_ensure.add_argument("--percent", default=None)
+    fee_ensure.add_argument("--note", default="Initial installation fee")
+    fee_ensure.add_argument("--actor", default="installer")
     fee_schedule = fee_sub.add_parser("schedule")
     fee_schedule.add_argument("rate")
     fee_schedule.add_argument("--at", required=True)

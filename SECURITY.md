@@ -170,13 +170,22 @@ CentralPay confirmation, or lost silently is always critical.
   them can touch Docker, the host filesystem, deployment configuration,
   or the backups directory. Access logs redact both the callback
   signature (`sig`) and the one-time token (`ct`).
-- **Update trust model:** production updates pin a release tag; the
-  published artifact checksum (SHA256SUMS) is verified before deployment,
-  which then happens via `git checkout` of the fetched ref over HTTPS —
-  no archive is ever extracted, so archive path-traversal/symlink attacks
-  have no surface. Signed tags remain pre-1.0 backlog. Rollback reuses
-  the previously recorded local version, never touches configuration or
-  secrets, and never downgrades the schema.
+- **Update trust model:** production updates pin a release tag (strict
+  `vX.Y.Z` / `vX.Y.Z-rcN` grammar). The updater downloads the artifact, a
+  `SOURCE_COMMIT` release asset, and `SHA256SUMS`; verifies the checksums
+  of both the artifact and `SOURCE_COMMIT`; validates `SOURCE_COMMIT`'s
+  grammar; resolves the fetched tag to its commit (annotated-tag aware);
+  and **requires the deployed commit to equal the verified
+  `SOURCE_COMMIT`** before any checkout, build, migration, or restart. The
+  deploy is then a `git checkout` of that exact verified commit over
+  HTTPS — no archive is ever extracted, so archive path-traversal/symlink
+  attacks have no surface, and a tag moved after the release was built is
+  rejected (the checksum alone never proved what git deploys). This is
+  commit binding, not GPG signature verification; signed tags remain
+  pre-1.0 backlog. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a root-only
+  escape hatch that warns unmistakably and never claims verification it did
+  not perform. Rollback reuses the previously recorded local version, never
+  touches configuration or secrets, and never downgrades the schema.
 - **Audit:** every financial state transition is recorded in the permanent
   append-only `payment_events` table; migrations refuse to drop it.
 - **Admin Telegram bot (optional, off by default):** read-only; authorizes
