@@ -1059,8 +1059,11 @@ def test_callback_path_consistent_across_app_and_caddy():
     )
     routes = matcher.strip().split()[1:]
     assert CALLBACK_PATH in routes
+    # /static/* exposes ONLY the bundled font assets (FastAPI StaticFiles:
+    # fixed directory, no listing) for the payer success page.
     assert set(routes) == {
         "/api/custom-payment", CALLBACK_PATH, "/health/live", "/health/ready",
+        "/static/*",
     }
 
 

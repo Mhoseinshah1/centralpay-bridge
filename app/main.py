@@ -6,10 +6,12 @@ settings.
 """
 
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api import callback, health, payments
 from app.centralpay import CentralPayClient
@@ -93,4 +95,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(payments.router)
     app.include_router(callback.router)
+    # Repository-local font assets for the payer success page (Vazirmatn,
+    # OFL — see app/static/fonts/). StaticFiles serves only regular files
+    # under this fixed directory: no directory listing, no traversal, and
+    # nothing outside app/static is exposed.
+    app.mount(
+        "/static",
+        StaticFiles(directory=Path(__file__).resolve().parent / "static"),
+        name="static",
+    )
     return app

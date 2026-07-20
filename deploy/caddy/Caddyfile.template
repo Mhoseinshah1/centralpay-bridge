@@ -44,10 +44,11 @@
 	}
 
 	# Only the public application routes are reachable. Everything else —
-	# docs, internals, directory paths — returns 404. There is no static
-	# file serving and therefore no directory listing.
+	# docs, internals, directory paths — returns 404. /static/* proxies ONLY
+	# the application's bundled font assets (FastAPI StaticFiles: fixed
+	# directory, no directory listing, no traversal).
 	@public {
-		path /api/custom-payment /api/centralpay/callback /health/live /health/ready
+		path /api/custom-payment /api/centralpay/callback /health/live /health/ready /static/*
 	}
 
 	handle @public {
