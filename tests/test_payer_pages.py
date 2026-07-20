@@ -67,13 +67,12 @@ def _visible(page: str) -> str:
 
 def test_bot_accepted_states_exactly_the_known_facts():
     page = _page(CallbackStatus.BOT_ACCEPTED)
-    # Fact 1: the payment succeeded (proven by CentralPay verification).
+    # Fact: the payment succeeded (proven by CentralPay verification).
     assert "پرداخت سفارش شما تأیید شد" in page
     assert "پرداخت با موفقیت انجام شد" in page
-    # Fact 2: the bot ACCEPTED the order-processing REQUEST (not more).
-    assert "درخواست سفارش پذیرفته شد" in page
-    # Instruction: the order status lives in the bot.
+    # Instruction: the order status lives in the bot (text + fixed button).
     assert "برای مشاهده وضعیت سفارش به ربات بازگردید" in page
+    assert "بازگشت به ربات" in page
     # The approved page is Persian-only.
     assert "Your payment was verified" not in page
 
@@ -128,10 +127,9 @@ def test_persian_and_english_express_equivalent_semantics():
     # ...and both direct the payer to the bot for the outcome.
     assert "ربات" in pending["body_fa"] and "bot" in pending["body_en"]
     # The success page (Persian-only by approved design) still states
-    # verification, request acceptance, and the return-to-bot instruction.
+    # verification and the return-to-bot instruction.
     success = _page(CallbackStatus.BOT_ACCEPTED)
     assert "تأیید شد" in success
-    assert "پذیرفته شد" in success
     assert "ربات" in success
     # No implementation details (HTTP codes) reach the payer.
     for texts in _PAGE_TEXTS.values():
@@ -194,7 +192,6 @@ def test_accepted_state_and_duplicate_callback_render_accepted_page(
     assert duplicate.status_code == 200
     assert 'data-status="bot_accepted"' in duplicate.text
     assert "پرداخت سفارش شما تأیید شد" in duplicate.text
-    assert "درخواست سفارش پذیرفته شد" in duplicate.text
     for phrase in FORBIDDEN_PHRASES:
         assert phrase not in _visible(duplicate.text), phrase
 

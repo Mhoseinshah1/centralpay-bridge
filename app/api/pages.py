@@ -89,21 +89,20 @@ p {{ color: #444; line-height: 1.9; margin: .5rem 0; }}
 </html>"""
 
 
-# The approved "ZedProxy Color Pop Receipt" design, ported 1:1 from
+# The approved "ZedProxy Color Pop Receipt" design, ported from
 # docs/previews/payment-success-zedproxy-color-pop-fa.html. Plain string
 # template (NOT an f-string, so the CSS braces stay readable); the ONLY
-# substitution points are the two placeholders below, filled exclusively
-# with HTML-escaped values:
-#   __ORDER_ID__  — the payer's bot order id (escaped)
-#   __BOT_LINK__  — "" or the optional escaped t.me return-to-bot anchor
+# substitution point is __ORDER_ID__, filled exclusively with the
+# HTML-escaped payer order id.
 # Production deltas versus the preview, each required for production use:
 #   - data-status="bot_accepted" kept on <main> (monitoring/test contract);
 #   - the real order id replaces the preview example, and the id pill can
 #     scroll internally so a long (up to 128-char) id never overflows;
-#   - the status-strip item «سفارش ثبت شد» became «درخواست سفارش پذیرفته
-#     شد» per the wording contract above (the preview file itself carries
-#     this exact reconciliation note);
-#   - the optional return-to-bot pill link (legacy-page behavior parity).
+#   - the bundled Vazirmatn variable webfont is loaded via a local
+#     @font-face (root-relative /static URL; never a remote request);
+#   - the decorative status strip was removed in favor of ONE primary
+#     action: a FIXED return-to-bot button whose destination is always
+#     https://t.me/zedproxy_bot — no dynamic username can alter it.
 _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -111,6 +110,16 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>پرداخت سفارش شما تأیید شد</title>
 <style>
+  /* Vazirmatn v33.0.3 — repository-local variable webfont (SIL OFL 1.1,
+     app/static/fonts/vazirmatn-v33/OFL.txt). Served by this application
+     from a root-relative URL: never a Google Fonts / CDN / remote request. */
+  @font-face{
+    font-family:"Vazirmatn";
+    src:url("/static/fonts/vazirmatn-v33/vazirmatn-variable.woff2") format("woff2");
+    font-weight:100 900;
+    font-style:normal;
+    font-display:swap;
+  }
   :root{
     --blue:#3977F6; --blue-deep:#2454D8;
     --violet:#7C5CFC; --violet-deep:#5A3FDB;
@@ -119,10 +128,9 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
     --coral:#FF718C; --yellow:#FFD86B;
     --ink:#14213D; --ink-2:#56637A;
     --surface:rgba(255,255,255,.82);
-    /* Persian typography: Vazirmatn renders only where the viewer's
-       system provides it — no font-face declaration, no bundled font
-       binary, and no external font request. */
-    --font:Vazirmatn, Tahoma, "Segoe UI", Arial, sans-serif;
+    /* Persian typography: the bundled Vazirmatn variable font above,
+       falling back to system fonts while it loads (font-display:swap). */
+    --font:"Vazirmatn", Tahoma, "Segoe UI", Arial, sans-serif;
     --mono:ui-monospace, SFMono-Regular, Consolas, monospace;
     /* Hero sticker-scene scale. The composition is authored at 288x298;
        the whole scene scales with this factor (layout height is
@@ -249,25 +257,17 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
     font-weight:600;font-size:.8rem;opacity:0;transition:opacity .2s}
   .copied-note.show{opacity:1}
 
-  /* optional return-to-bot pill (legacy-page behavior parity) */
-  .botlink{display:inline-flex;align-items:center;gap:.45rem;margin-top:clamp(8px,1.6vh,12px);
+  /* primary return-to-bot action */
+  .botlink{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;
+    width:min(100%,260px);min-height:44px;margin-top:clamp(12px,2.4vh,20px);
     background:linear-gradient(135deg,var(--blue),var(--violet-deep));color:#fff;
-    font-weight:700;font-size:.9rem;text-decoration:none;
-    padding:.5rem 1.2rem;border-radius:999px;
-    box-shadow:0 10px 24px rgba(57,119,246,.35),inset 0 1px 0 rgba(255,255,255,.35)}
-  .botlink svg{width:16px;height:16px;display:block}
-
-  /* ==================  STATUS STRIP  ================== */
-  .status{display:flex;flex-wrap:wrap;justify-content:center;gap:.4rem .5rem;
-    margin-top:clamp(8px,1.8vh,14px);padding:0;list-style:none;width:100%}
-  .status li{display:inline-flex;align-items:center;gap:.35rem;
-    font-size:.8rem;font-weight:600;color:var(--ink);
-    background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.85);
-    border-radius:999px;padding:.28rem .6rem;backdrop-filter:blur(6px)}
-  .status li svg{width:13px;height:13px;display:block}
-  .status .i-ok svg{color:var(--emerald-deep)}
-  .status .i-doc svg{color:var(--blue-deep)}
-  .status .i-bot svg{color:var(--violet-deep)}
+    font-weight:700;font-size:1rem;text-decoration:none;
+    padding:.55rem 1.4rem;border-radius:999px;
+    box-shadow:0 10px 24px rgba(57,119,246,.35),inset 0 1px 0 rgba(255,255,255,.35);
+    transition:filter .15s,transform .1s}
+  .botlink:hover{filter:brightness(1.07)}
+  .botlink:active{transform:scale(.98)}
+  .botlink svg{width:17px;height:17px;display:block;flex:0 0 auto}
 
   :focus-visible{outline:3px solid var(--violet);outline-offset:3px;border-radius:12px}
 
@@ -319,9 +319,7 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
     .thanks{font-size:14px}
     .sub{font-size:14px;line-height:1.65}
     .order{margin-top:8px;padding:.55rem .8rem .6rem}
-    .botlink{margin-top:7px;padding:.42rem 1.1rem}
-    .status{margin-top:6px}
-    .status li{padding:.24rem .55rem;font-size:.76rem}
+    .botlink{margin-top:9px}
   }
 </style>
 </head>
@@ -464,13 +462,9 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
       </div>
       <p class="copied-note" id="copiedNote" aria-live="polite"></p>
     </section>
-__BOT_LINK__
-    <!-- ===== STATUS STRIP ===== -->
-    <ul class="status">
-      <li class="i-ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7"/></svg>پرداخت تأیید شد</li>
-      <li class="i-doc"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 3h7l5 5v13a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M14 3v5h5"/></svg>درخواست سفارش پذیرفته شد</li>
-      <li class="i-bot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 4L3 11l6 2 2 6 4-5 6 6z"/></svg>آماده بازگشت به ربات</li>
-    </ul>
+
+    <!-- ===== PRIMARY ACTION: fixed return-to-bot button ===== -->
+    <a class="botlink" href="https://t.me/zedproxy_bot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 4L3 11l6 2 2 6 4-5 6 6z"/></svg>بازگشت به ربات</a>
   </main>
 </div>
 
@@ -501,27 +495,19 @@ __BOT_LINK__
 </html>"""
 
 
-def _success_page(bot_order_id: str, bot_username: str) -> str:
-    """Render the approved success page with the REAL escaped order id."""
-    order = html.escape(bot_order_id)
-    bot_link = ""
-    if bot_username:
-        username = html.escape(bot_username.lstrip("@"))
-        bot_link = (
-            f'\n    <a class="botlink" href="https://t.me/{username}">'
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-            'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
-            'aria-hidden="true"><path d="M21 4L3 11l6 2 2 6 4-5 6 6z"/></svg>'
-            "بازگشت به ربات</a>\n"
-        )
-    return _SUCCESS_PAGE_TEMPLATE.replace("__ORDER_ID__", order).replace(
-        "__BOT_LINK__", bot_link
-    )
+def _success_page(bot_order_id: str) -> str:
+    """Render the approved success page with the REAL escaped order id.
+
+    The return-to-bot destination is intentionally FIXED in the template
+    (https://t.me/zedproxy_bot); the configurable bot username only affects
+    the legacy pending/review pages.
+    """
+    return _SUCCESS_PAGE_TEMPLATE.replace("__ORDER_ID__", html.escape(bot_order_id))
 
 
 def payment_status_page(
     status: CallbackStatus, bot_order_id: str, *, bot_username: str = ""
 ) -> str:
     if status is CallbackStatus.BOT_ACCEPTED:
-        return _success_page(bot_order_id, bot_username)
+        return _success_page(bot_order_id)
     return _legacy_page(status, bot_order_id, bot_username)

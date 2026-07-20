@@ -135,23 +135,79 @@ def test_no_external_assets_or_requests(
     assert "<img" not in page
     assert "<script src" not in page
     assert "@import" not in page
-    assert "@font-face" not in page
     assert "url(http" not in page and "url('http" not in page and 'url("http' not in page
     assert "integrity=" not in page
-    # The ONLY absolute URL allowed is the long-standing optional t.me
-    # return-to-bot NAVIGATION anchor (no telegram_bot_username is set in
-    # the test fixture, so by default there is none at all).
+    # No remote font source of any kind.
+    for marker in ("googleapis", "gstatic", "cdn.", "jsdelivr", "unpkg"):
+        assert marker not in page, marker
+    # The ONLY absolute URL in the page is the FIXED return-to-bot anchor.
     for chunk in page.split("https://")[1:]:
-        assert chunk.startswith("t.me/"), chunk[:40]
+        assert chunk.startswith("t.me/zedproxy_bot"), chunk[:40]
 
 
-def test_bot_link_only_when_username_configured():
-    assert "t.me" not in payment_status_page(CallbackStatus.BOT_ACCEPTED, "o-1")
-    with_link = payment_status_page(
-        CallbackStatus.BOT_ACCEPTED, "o-1", bot_username="@my_bot"
+# --- fixed return-to-bot button ----------------------------------------------
+
+
+def test_status_strip_removed_from_success_page():
+    page = payment_status_page(CallbackStatus.BOT_ACCEPTED, "o-1")
+    assert "پرداخت تأیید شد" not in page  # h1 wording differs; exact item absent
+    assert "درخواست سفارش پذیرفته شد" not in page
+    assert "آماده بازگشت به ربات" not in page
+    assert 'class="status"' not in page
+
+
+def test_exactly_one_fixed_return_to_bot_action():
+    page = payment_status_page(CallbackStatus.BOT_ACCEPTED, "o-1")
+    assert page.count('href="https://t.me/zedproxy_bot"') == 1
+    assert page.count("بازگشت به ربات") == 1
+    assert page.count("https://t.me/") == 1
+    # A real same-context anchor: no target/JS navigation, no tracking params.
+    anchor = page.split('<a class="botlink"', 1)[1].split("</a>", 1)[0]
+    assert "target=" not in anchor
+    assert "onclick" not in anchor
+    assert "?" not in anchor.split('href="', 1)[1].split('"', 1)[0]
+
+
+def test_dynamic_username_cannot_alter_success_destination():
+    """The configurable bot username must not affect the success page; it only
+    feeds the legacy pending/review pages."""
+    page = payment_status_page(
+        CallbackStatus.BOT_ACCEPTED, "o-1", bot_username="@attacker_bot"
     )
-    assert 'href="https://t.me/my_bot"' in with_link
-    assert "بازگشت به ربات" in with_link
+    assert 'href="https://t.me/zedproxy_bot"' in page
+    assert "attacker_bot" not in page
+    # Legacy pages keep their long-standing dynamic link behavior.
+    pending = payment_status_page(
+        CallbackStatus.BOT_PENDING, "o-1", bot_username="@my_bot"
+    )
+    assert "https://t.me/my_bot" in pending
+
+
+# --- bundled Vazirmatn webfont ------------------------------------------------
+
+
+def test_vazirmatn_loaded_via_local_font_face():
+    page = payment_status_page(CallbackStatus.BOT_ACCEPTED, "o-1")
+    assert "@font-face" in page
+    assert 'font-family:"Vazirmatn"' in page
+    assert "font-display:swap" in page
+    assert 'url("/static/fonts/vazirmatn-v33/vazirmatn-variable.woff2")' in page
+    assert "data:" not in page  # no base64/data-URI font embedding
+    assert '"Vazirmatn", Tahoma, "Segoe UI", Arial, sans-serif' in page
+
+
+def test_font_asset_served_with_correct_type(client):
+    response = client.get("/static/fonts/vazirmatn-v33/vazirmatn-variable.woff2")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "font/woff2"
+    assert response.content[:4] == b"wOF2"  # a real WOFF2 payload
+    # The OFL license ships alongside the font.
+    assert client.get("/static/fonts/vazirmatn-v33/OFL.txt").status_code == 200
+
+
+def test_static_mount_serves_no_directory_listing(client):
+    for path in ("/static/", "/static/fonts/", "/static/fonts/vazirmatn-v33/"):
+        assert client.get(path).status_code == 404, path
 
 
 # --- accessibility / RTL / typography markers ---------------------------------
@@ -175,9 +231,8 @@ def test_accessibility_and_rtl_markers(
     # Accessible Persian copy-button label and reduced-motion support.
     assert 'aria-label="کپی شمارهٔ سفارش"' in page
     assert "prefers-reduced-motion" in page
-    # Vazirmatn-first stack with no font download (checked above via
-    # @font-face absence); order id keeps the monospace stack.
-    assert 'Vazirmatn, Tahoma, "Segoe UI", Arial, sans-serif' in page
+    # Bundled-Vazirmatn-first stack; order id keeps the monospace stack.
+    assert '"Vazirmatn", Tahoma, "Segoe UI", Arial, sans-serif' in page
 
 
 # --- unchanged behavior: statuses, sibling pages, notification ----------------
