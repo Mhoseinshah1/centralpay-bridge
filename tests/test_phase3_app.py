@@ -81,16 +81,22 @@ def test_invalid_telegram_bot_username_rejected(settings):
         )
 
 
-def test_payer_page_includes_bot_link_when_configured(settings):
+def test_payer_page_uses_fixed_bot_link(settings):
+    """The unified payer page always links to the FIXED bot destination;
+    the configurable username no longer influences any rendered page (it
+    remains validated in Settings for other consumers)."""
     from app.api.pages import payment_status_page
     from app.services.verification import CallbackStatus
 
     page = payment_status_page(
         CallbackStatus.BOT_PENDING, "order-1", bot_username="@my_bot"
     )
-    assert 'href="https://t.me/my_bot"' in page
-    page = payment_status_page(CallbackStatus.BOT_PENDING, "order-1")
-    assert "t.me" not in page
+    assert 'href="https://t.me/zedproxy_bot"' in page
+    assert "t.me/my_bot" not in page
+    assert (
+        'href="https://t.me/zedproxy_bot"'
+        in payment_status_page(CallbackStatus.BOT_PENDING, "order-1")
+    )
 
 
 def test_worker_heartbeat_is_touched_after_pass(

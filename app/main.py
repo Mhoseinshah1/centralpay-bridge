@@ -6,6 +6,7 @@ settings.
 """
 
 import logging
+import mimetypes
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -98,7 +99,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Repository-local font assets for the payer success page (Vazirmatn,
     # OFL — see app/static/fonts/). StaticFiles serves only regular files
     # under this fixed directory: no directory listing, no traversal, and
-    # nothing outside app/static is exposed.
+    # nothing outside app/static is exposed. The woff2 MIME type is
+    # registered explicitly: python:slim images ship no /etc/mime.types,
+    # where guess_type would otherwise fall back to application/octet-stream.
+    mimetypes.add_type("font/woff2", ".woff2")
     app.mount(
         "/static",
         StaticFiles(directory=Path(__file__).resolve().parent / "static"),

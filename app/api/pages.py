@@ -1,15 +1,16 @@
-"""User-facing payment status pages for the CentralPay callback.
+"""User-facing payment status page for the CentralPay callback.
 
-BOT_ACCEPTED renders the approved Persian-only "ZedProxy Color Pop
-Receipt" success page (ported from
-docs/previews/payment-success-zedproxy-color-pop-fa.html); BOT_PENDING and
-UNDER_REVIEW keep the bilingual legacy template. The only interpolated
-values are the bot order id and the optional bot username, both
-HTML-escaped. The pages are fully self-contained: original inline SVG and
-CSS only — no external image, script, stylesheet, font, analytics, or any
-other network dependency (the single outbound *navigation* link is the
-long-standing optional t.me return-to-bot anchor). Stack traces, secrets,
-bot responses, and raw gateway errors never reach these pages.
+Every callback outcome that follows successful CentralPay verification —
+BOT_ACCEPTED, BOT_PENDING, and UNDER_REVIEW — renders the SAME approved
+Persian-only "ZedProxy Color Pop Receipt" page, so the payer experience
+does not depend on the asynchronous customer-bot delivery state. The only
+interpolated values are the machine-readable status (a fixed enum value on
+``data-status``) and the HTML-escaped bot order id. The page is fully
+self-contained: original inline SVG/CSS and the bundled Vazirmatn webfont
+only — no external image, script, stylesheet, remote font, analytics, or
+any other network dependency (the single outbound *navigation* link is the
+fixed t.me return-to-bot button). Stack traces, secrets, bot responses,
+and raw gateway errors never reach this page.
 """
 
 import html
@@ -20,95 +21,36 @@ from app.services.verification import CallbackStatus
 # (1) CentralPay verification and, for BOT_ACCEPTED, (2) that the bot API
 # accepted the order-processing request (HTTP 2xx = acceptance only —
 # see app/services/notification.py). The final business result inside the
-# customer bot is never known here, so these pages must never claim the
+# customer bot is never known here, so this page must never claim the
 # order was registered/completed or that credit was applied, and must
-# never promise near-term application. The payer is always directed to
-# the bot for the final order status. The success page therefore says the
-# PAYMENT succeeded (provable), labels the bot fact as an accepted
-# REQUEST («درخواست سفارش پذیرفته شد» — never «سفارش ثبت شد»), and sends
-# the payer to the bot for the order status.
-_PAGE_TEXTS: dict[CallbackStatus, dict[str, str]] = {
-    CallbackStatus.BOT_PENDING: {
-        "title_fa": "پرداخت تأیید شد",
-        "body_fa": "پرداخت شما تأیید شد، اما پذیرش درخواست ثبت سفارش توسط ربات "
-        "هنوز تأیید نشده است. لطفاً وضعیت سفارش را در ربات بررسی کنید.",
-        "title_en": "Payment verified",
-        "body_en": "Your payment was verified, but the bot has not yet confirmed "
-        "acceptance of the order-processing request. Please check the order "
-        "status in the bot.",
-    },
-    CallbackStatus.UNDER_REVIEW: {
-        "title_fa": "پرداخت در حال بررسی است",
-        "body_fa": "پرداخت شما دریافت شد و توسط پشتیبانی بررسی می‌شود. "
-        "سفارش شما به‌صورت دستی پیگیری خواهد شد.",
-        "title_en": "Payment under review",
-        "body_en": "Your payment was received and requires administrator review. "
-        "Your order will be handled manually.",
-    },
-}
-
-
-def _legacy_page(status: CallbackStatus, bot_order_id: str, bot_username: str) -> str:
-    """The pre-existing bilingual template (BOT_PENDING / UNDER_REVIEW)."""
-    texts = _PAGE_TEXTS[status]
-    order = html.escape(bot_order_id)
-    bot_link = ""
-    if bot_username:
-        username = html.escape(bot_username.lstrip("@"))
-        bot_link = (
-            f'<p><a href="https://t.me/{username}">'
-            f"بازگشت به ربات / Return to bot @{username}</a></p>"
-        )
-    return f"""<!doctype html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{texts["title_fa"]}</title>
-<style>
-body {{ font-family: system-ui, Tahoma, sans-serif; background: #f5f6f8; margin: 0;
-       display: flex; min-height: 100vh; align-items: center; justify-content: center; }}
-main {{ background: #fff; border-radius: 12px; padding: 2rem 2.5rem; max-width: 28rem;
-        box-shadow: 0 2px 12px rgba(0,0,0,.08); text-align: center; }}
-h1 {{ font-size: 1.25rem; margin: 0 0 .75rem; }}
-p {{ color: #444; line-height: 1.9; margin: .5rem 0; }}
-.order {{ color: #666; font-size: .85rem; margin-top: 1.25rem; direction: ltr; }}
-.en {{ color: #777; font-size: .85rem; direction: ltr; text-align: left;
-       border-top: 1px solid #eee; margin-top: 1.25rem; padding-top: 1rem; }}
-</style>
-</head>
-<body>
-<main data-status="{status.value}">
-<h1>{texts["title_fa"]}</h1>
-<p>{texts["body_fa"]}</p>
-{bot_link}
-<div class="en"><strong>{texts["title_en"]}</strong><br>{texts["body_en"]}</div>
-<div class="order">Order: {order}</div>
-</main>
-</body>
-</html>"""
-
-
+# never promise near-term application. Because ONE page now serves all
+# three verified outcomes, its copy states only what is true in EVERY
+# one of them: the payment succeeded (provable via CentralPay verify),
+# order processing may take some time, and the order status lives in the
+# bot. The visible internal state stays machine-readable on
+# ``data-status`` without changing any stored status.
+#
 # The approved "ZedProxy Color Pop Receipt" design, ported from
 # docs/previews/payment-success-zedproxy-color-pop-fa.html. Plain string
 # template (NOT an f-string, so the CSS braces stay readable); the ONLY
-# substitution point is __ORDER_ID__, filled exclusively with the
-# HTML-escaped payer order id.
+# substitution points are __STATUS__ (a fixed CallbackStatus enum value)
+# and __ORDER_ID__ (the HTML-escaped payer order id).
 # Production deltas versus the preview, each required for production use:
-#   - data-status="bot_accepted" kept on <main> (monitoring/test contract);
+#   - data-status carries the REAL callback status (monitoring/tests);
 #   - the real order id replaces the preview example, and the id pill can
 #     scroll internally so a long (up to 128-char) id never overflows;
 #   - the bundled Vazirmatn variable webfont is loaded via a local
 #     @font-face (root-relative /static URL; never a remote request);
-#   - the decorative status strip was removed in favor of ONE primary
-#     action: a FIXED return-to-bot button whose destination is always
-#     https://t.me/zedproxy_bot — no dynamic username can alter it.
+#   - neutral copy that is true for accepted, pending, AND under-review
+#     outcomes (no order-registered / credited claim anywhere);
+#   - ONE primary action: a FIXED return-to-bot button whose destination
+#     is always https://t.me/zedproxy_bot — no dynamic value alters it.
 _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>پرداخت سفارش شما تأیید شد</title>
+<title>پرداخت با موفقیت انجام شد</title>
 <style>
   /* Vazirmatn v33.0.3 — repository-local variable webfont (SIL OFL 1.1,
      app/static/fonts/vazirmatn-v33/OFL.txt). Served by this application
@@ -332,7 +274,7 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
 </div>
 
 <div class="wrap">
-  <main data-status="bot_accepted">
+  <main data-status="__STATUS__">
 
     <!-- brand pill -->
     <span class="brand">
@@ -443,9 +385,9 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
     </div>
 
     <!-- ===== COPY ===== -->
-    <h1>پرداخت سفارش شما تأیید شد</h1>
+    <h1>پرداخت با موفقیت انجام شد</h1>
     <p class="thanks">از خرید شما از <span class="zx">زدپروکسی</span> سپاسگزاریم <span aria-hidden="true">💙</span></p>
-    <p class="sub">پرداخت با موفقیت انجام شد؛ برای مشاهده وضعیت سفارش به ربات بازگردید.</p>
+    <p class="sub">پرداخت شما تأیید شد. پردازش سفارش ممکن است چند لحظه زمان ببرد. لطفاً برای مشاهده وضعیت سفارش به ربات بازگردید.</p>
 
     <!-- ===== ORDER-ID PANEL ===== -->
     <section class="order" aria-label="شماره سفارش">
@@ -495,19 +437,18 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
 </html>"""
 
 
-def _success_page(bot_order_id: str) -> str:
-    """Render the approved success page with the REAL escaped order id.
-
-    The return-to-bot destination is intentionally FIXED in the template
-    (https://t.me/zedproxy_bot); the configurable bot username only affects
-    the legacy pending/review pages.
-    """
-    return _SUCCESS_PAGE_TEMPLATE.replace("__ORDER_ID__", html.escape(bot_order_id))
-
-
 def payment_status_page(
     status: CallbackStatus, bot_order_id: str, *, bot_username: str = ""
 ) -> str:
-    if status is CallbackStatus.BOT_ACCEPTED:
-        return _success_page(bot_order_id)
-    return _legacy_page(status, bot_order_id, bot_username)
+    """Render the unified verified-payment page.
+
+    ``status`` fills only the machine-readable ``data-status`` attribute —
+    the stored payment/notification state is never altered or promoted by
+    rendering. The return-to-bot destination is intentionally FIXED in the
+    template (https://t.me/zedproxy_bot); ``bot_username`` is retained for
+    call-site compatibility and deliberately unused.
+    """
+    del bot_username  # fixed destination: no dynamic value may alter the page
+    return _SUCCESS_PAGE_TEMPLATE.replace("__STATUS__", status.value).replace(
+        "__ORDER_ID__", html.escape(bot_order_id)
+    )
