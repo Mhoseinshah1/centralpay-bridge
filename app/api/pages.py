@@ -124,6 +124,11 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
        binary, and no external font request. */
     --font:Vazirmatn, Tahoma, "Segoe UI", Arial, sans-serif;
     --mono:ui-monospace, SFMono-Regular, Consolas, monospace;
+    /* Hero sticker-scene scale. The composition is authored at 288x298;
+       the whole scene scales with this factor (layout height is
+       reclaimed via the .hero margin calc) so the page fits ONE viewport
+       with no vertical scrolling at every target size. */
+    --hs:.78;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -149,7 +154,7 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
   /* ---- layout ---- */
   .wrap{position:relative;z-index:1;min-height:100dvh;
     display:flex;flex-direction:column;align-items:center;justify-content:center;
-    padding:clamp(20px,5vw,44px) 16px;
+    padding:clamp(10px,1.8vh,18px) 16px;
     width:100%;max-width:520px;margin-inline:auto}
   @media (min-width:900px){ .wrap{max-width:620px} }
 
@@ -160,16 +165,21 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
     background:rgba(255,255,255,.72);border:1px solid rgba(255,255,255,.9);
     box-shadow:0 8px 22px rgba(57,119,246,.22);backdrop-filter:blur(10px);
     padding:.4rem .85rem .4rem .55rem;border-radius:999px;
-    font-weight:700;color:var(--ink);font-size:.95rem;margin-bottom:clamp(6px,2vw,12px)}
+    font-weight:700;color:var(--ink);font-size:.95rem;margin-bottom:clamp(4px,1vh,8px)}
   .brand .z{width:28px;height:28px;display:block;flex:0 0 auto;
     filter:drop-shadow(0 3px 6px rgba(57,119,246,.45))}
   .brand .tw{width:12px;height:12px;display:block;color:var(--yellow)}
 
   /* ==================  HERO STICKER SCENE  ================== */
-  .hero{position:relative;width:288px;height:298px;margin:clamp(4px,1.6vw,10px) auto clamp(6px,2vw,14px)}
+  /* The scene keeps its authored 288x298 coordinate space and scales as a
+     whole via --hs. transform does not shrink layout height, so the
+     margin-bottom calc reclaims exactly the difference — the page column
+     sees the VISUAL hero height, never the authored one. */
+  .hero{position:relative;width:288px;height:298px;
+    margin:clamp(2px,.8vh,8px) auto calc(clamp(4px,1.2vh,12px) + 298px*(var(--hs) - 1));
+    transform:scale(var(--hs));transform-origin:top center}
   .hero svg{overflow:visible;display:block}
-  @media (min-width:900px){ .hero{transform:scale(1.2);margin-block:26px 34px} }
-  @media (max-width:360px){ .hero{transform:scale(.92)} }
+  @media (min-width:900px){ :root{--hs:.82} }
 
   .hero > *{position:absolute;filter:drop-shadow(0 12px 18px rgba(28,40,88,.20))}
   .h-shield {left:96px; top:-6px;  width:58px; z-index:1}
@@ -194,37 +204,37 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
   .rc-ok svg{width:11px;height:11px;display:block}
 
   /* ==================  TEXT  ================== */
-  h1{margin:.1rem 0 .55rem;color:var(--ink);font-weight:800;
-    font-size:clamp(23px,6.2vw,31px);line-height:1.5;letter-spacing:0;
+  h1{margin:.1rem 0 .4rem;color:var(--ink);font-weight:800;
+    font-size:clamp(22px,5.8vw,28px);line-height:1.4;letter-spacing:0;
     max-width:19rem;text-wrap:balance}
   @media (min-width:900px){ h1{max-width:24rem} }
-  .thanks{margin:0 0 .25rem;color:var(--ink);font-weight:500;
-    font-size:clamp(15px,4vw,17px);line-height:1.8;letter-spacing:0}
+  .thanks{margin:0 0 .2rem;color:var(--ink);font-weight:500;
+    font-size:clamp(14px,3.8vw,15.5px);line-height:1.7;letter-spacing:0}
   .thanks .zx{color:var(--blue);font-weight:700}
-  .sub{margin:.15rem 0 0;color:var(--ink-2);font-weight:400;
-    font-size:clamp(14.5px,3.7vw,16px);line-height:1.8;letter-spacing:0;max-width:24rem}
+  .sub{margin:.1rem 0 0;color:var(--ink-2);font-weight:400;
+    font-size:clamp(14px,3.6vw,15.5px);line-height:1.7;letter-spacing:0;max-width:24rem}
 
   /* ==================  ORDER-ID PANEL  ================== */
-  .order{width:100%;max-width:26rem;margin:clamp(18px,4.5vw,24px) auto 0;
+  .order{width:100%;max-width:26rem;margin:clamp(10px,2vh,16px) auto 0;
     background:var(--surface);backdrop-filter:blur(12px);
     border:1px solid rgba(124,92,252,.28);border-radius:22px;
-    padding:1rem 1.05rem 1.1rem;
+    padding:.7rem .9rem .75rem;
     box-shadow:0 14px 30px rgba(57,119,246,.16),0 0 0 4px rgba(124,92,252,.06),
       inset 0 1px 0 rgba(255,255,255,.7)}
   .order .top{display:flex;align-items:center;justify-content:center;gap:.4rem;
-    color:var(--ink-2);font-weight:600;font-size:.86rem;margin-bottom:.6rem}
+    color:var(--ink-2);font-weight:600;font-size:.86rem;margin-bottom:.45rem}
   .order .top svg{width:17px;height:17px;display:block;color:var(--blue-deep)}
   .id-row{display:flex;align-items:center;justify-content:center;gap:.55rem;max-width:100%}
   /* Real order ids can be up to 128 characters: the pill keeps the id on
      one unwrapped LTR line and scrolls internally instead of overflowing
      the viewport. */
   .id{direction:ltr;unicode-bidi:isolate;font-family:var(--mono);
-    font-size:1.06rem;font-weight:700;letter-spacing:.14em;color:var(--ink);
+    font-size:1rem;font-weight:700;letter-spacing:.14em;color:var(--ink);
     background:#fff;border:1px solid rgba(124,92,252,.22);border-radius:12px;
-    padding:.44rem .85rem;white-space:nowrap;user-select:all;
+    padding:.4rem .8rem;white-space:nowrap;user-select:all;
     display:inline-block;max-width:calc(100% - 3.1rem);overflow-x:auto;
     box-shadow:inset 0 1px 0 rgba(255,255,255,.8),0 2px 6px rgba(57,119,246,.1)}
-  .copy{width:44px;height:44px;flex:0 0 auto;border-radius:13px;cursor:pointer;
+  .copy{width:40px;height:40px;flex:0 0 auto;border-radius:13px;cursor:pointer;
     display:grid;place-items:center;color:var(--blue-deep);
     background:#fff;border:1px solid rgba(124,92,252,.22);
     box-shadow:0 2px 6px rgba(57,119,246,.12);
@@ -235,26 +245,26 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
   .copy .ok{display:none}
   .copy.done{color:var(--emerald-deep);background:rgba(25,200,120,.12);border-color:rgba(25,200,120,.45)}
   .copy.done .clip{display:none}.copy.done .ok{display:block}
-  .copied-note{min-height:1.05rem;margin-top:.5rem;color:var(--emerald-deep);
+  .copied-note{min-height:.9rem;margin-top:.3rem;color:var(--emerald-deep);
     font-weight:600;font-size:.8rem;opacity:0;transition:opacity .2s}
   .copied-note.show{opacity:1}
 
   /* optional return-to-bot pill (legacy-page behavior parity) */
-  .botlink{display:inline-flex;align-items:center;gap:.45rem;margin-top:clamp(14px,3.5vw,18px);
+  .botlink{display:inline-flex;align-items:center;gap:.45rem;margin-top:clamp(8px,1.6vh,12px);
     background:linear-gradient(135deg,var(--blue),var(--violet-deep));color:#fff;
-    font-weight:700;font-size:.95rem;text-decoration:none;
-    padding:.62rem 1.4rem;border-radius:999px;
+    font-weight:700;font-size:.9rem;text-decoration:none;
+    padding:.5rem 1.2rem;border-radius:999px;
     box-shadow:0 10px 24px rgba(57,119,246,.35),inset 0 1px 0 rgba(255,255,255,.35)}
   .botlink svg{width:16px;height:16px;display:block}
 
   /* ==================  STATUS STRIP  ================== */
-  .status{display:flex;flex-wrap:wrap;justify-content:center;gap:.5rem .7rem;
-    margin-top:clamp(16px,4vw,22px);padding:0;list-style:none;width:100%}
-  .status li{display:inline-flex;align-items:center;gap:.4rem;
-    font-size:.83rem;font-weight:600;color:var(--ink);
+  .status{display:flex;flex-wrap:wrap;justify-content:center;gap:.4rem .5rem;
+    margin-top:clamp(8px,1.8vh,14px);padding:0;list-style:none;width:100%}
+  .status li{display:inline-flex;align-items:center;gap:.35rem;
+    font-size:.8rem;font-weight:600;color:var(--ink);
     background:rgba(255,255,255,.6);border:1px solid rgba(255,255,255,.85);
-    border-radius:999px;padding:.34rem .7rem;backdrop-filter:blur(6px)}
-  .status li svg{width:15px;height:15px;display:block}
+    border-radius:999px;padding:.28rem .6rem;backdrop-filter:blur(6px)}
+  .status li svg{width:13px;height:13px;display:block}
   .status .i-ok svg{color:var(--emerald-deep)}
   .status .i-doc svg{color:var(--blue-deep)}
   .status .i-bot svg{color:var(--violet-deep)}
@@ -290,6 +300,28 @@ _SUCCESS_PAGE_TEMPLATE = """<!doctype html>
   @media (max-width:360px){
     .s-coral{display:none}
     .blob.coral{opacity:.24}
+  }
+
+  /* ---- one-viewport fit on shorter screens (kept LAST so the height
+     rules win over the width defaults above). Nothing is hidden: only
+     scale, spacing, and type sizes tighten. ---- */
+  @media (max-height:850px){
+    :root{--hs:.73}
+    .wrap{padding-block:10px}
+    .brand{margin-bottom:4px}
+    h1{font-size:clamp(22px,5.2vw,26px)}
+  }
+  @media (max-height:780px){
+    :root{--hs:.66}
+    .wrap{padding-block:8px}
+    .brand{margin-bottom:2px}
+    h1{font-size:clamp(21px,5vw,25px);margin-bottom:.3rem}
+    .thanks{font-size:14px}
+    .sub{font-size:14px;line-height:1.65}
+    .order{margin-top:8px;padding:.55rem .8rem .6rem}
+    .botlink{margin-top:7px;padding:.42rem 1.1rem}
+    .status{margin-top:6px}
+    .status li{padding:.24rem .55rem;font-size:.76rem}
   }
 </style>
 </head>
