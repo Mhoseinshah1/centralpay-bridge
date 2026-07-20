@@ -220,17 +220,40 @@ cmd_migrate() {
 }
 
 VERSION_HISTORY_FILE="${CONFIG_DIR}/version_history"
+DEPLOY_LOCK_FILE="${CONFIG_DIR}/.deploy.lock"
 REPO_SLUG="Mhoseinshah1/centralpay-bridge"
 
+acquire_deploy_lock() {
+    # Serialize update/rollback so two concurrent deploys cannot interleave
+    # their git checkout, version-history write, and compose build/up (which
+    # would leave the worktree and version_history inconsistent). Uses a
+    # dedicated lock on fd 8, distinct from the backup lock (fd 9), so the
+    # nested pre-deploy backup never self-deadlocks. Non-blocking: a second
+    # deploy fails fast instead of piling up behind the first. The lock
+    # releases automatically when the process exits.
+    exec 8>"$DEPLOY_LOCK_FILE" || fail "Cannot open deploy lock ${DEPLOY_LOCK_FILE}."
+    flock -n 8 \
+        || fail "Another update or rollback is already running (deploy lock held). Wait for it to finish, then retry."
+}
+
 record_version_history() {
-    # $1 = new sha; keeps current and previous for rollback.
-    local new_sha="$1" current_sha=""
-    [[ -f "$VERSION_HISTORY_FILE" ]] \
-        && current_sha=$(grep -E '^current=' "$VERSION_HISTORY_FILE" | cut -d= -f2- || true)
+    # $1 = new sha; $2 = explicit previous sha (optional). Keeps current and
+    # previous for rollback.
+    #
+    # $2 exists because the very first `centralpay update` has no
+    # version_history file yet: the pre-update commit must be passed in
+    # explicitly by the caller, otherwise `previous` is recorded empty and
+    # `centralpay rollback` fails ("No previous version recorded") for exactly
+    # the first upgrade. When $2 is omitted, fall back to the file's current=
+    # line (the behavior used on later updates / rollbacks).
+    local new_sha="$1" previous_sha="${2:-}"
+    if [[ -z "$previous_sha" && -f "$VERSION_HISTORY_FILE" ]]; then
+        previous_sha=$(grep -E '^current=' "$VERSION_HISTORY_FILE" | cut -d= -f2- || true)
+    fi
     umask 077
     {
         echo "current=${new_sha}"
-        echo "previous=${current_sha}"
+        echo "previous=${previous_sha}"
         echo "updated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "$VERSION_HISTORY_FILE"
     chmod 600 "$VERSION_HISTORY_FILE"
@@ -413,6 +436,7 @@ cmd_update_check() {
 cmd_update() {
     require_root update
     require_install
+    acquire_deploy_lock
     local ref previous target_commit
     ref=$(env_value CENTRALPAY_UPDATE_REF)
     ref="${ref:-main}"
@@ -426,7 +450,9 @@ cmd_update() {
     "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-update backup failed; update aborted."
     log "Deploying verified commit ${target_commit:0:12} (ref ${ref})..."
     git -C "$INSTALL_DIR" checkout -q "$target_commit"
-    record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)"
+    # Pass the captured pre-update commit explicitly so the FIRST update (no
+    # version_history file yet) still records a rollback target.
+    record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)" "$previous"
     log "Building images..."
     compose build --quiet
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
@@ -446,6 +472,7 @@ cmd_update() {
 cmd_rollback() {
     require_root rollback
     require_install
+    acquire_deploy_lock
     local previous
     previous=$(grep -E '^previous=' "$VERSION_HISTORY_FILE" 2>/dev/null | cut -d= -f2- || true)
     [[ -n "$previous" ]] || fail "No previous version recorded in ${VERSION_HISTORY_FILE}."
