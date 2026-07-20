@@ -106,13 +106,26 @@ jobs:
             APP_VERSION=${{ steps.appver.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Image smoke test (non-root, version, label, clean exit)
+      - name: Image smoke test (non-root, version, label, static assets, clean exit)
         run: |
           docker run --rm --entrypoint python centralpay-bridge:ci - <<'EOF'
           import os
+          from pathlib import Path
+          import app as app_pkg
           from app.version import APP_VERSION
           assert os.getuid() != 0, "container must not run as root"
+          # The wheel must ship the bundled font (see pyproject
+          # tool.setuptools.package-data): a missing app/static previously
+          # crashed StaticFiles at startup in production.
+          fonts = Path(app_pkg.__file__).parent / "static" / "fonts" / "vazirmatn-v33"
+          woff2 = fonts / "vazirmatn-variable.woff2"
+          assert woff2.is_file(), "vazirmatn-variable.woff2 missing from image"
+          assert (fonts / "OFL.txt").is_file(), "OFL.txt missing from image"
+          assert woff2.read_bytes()[:4] == b"wOF2", "not a real WOFF2 payload"
+          from starlette.staticfiles import StaticFiles
+          StaticFiles(directory=fonts.parent.parent)  # validates the mount dir
           print("version:", APP_VERSION)
+          print("static font assets present; StaticFiles mount directory valid")
           EOF
           label=$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' centralpay-bridge:ci)
           expected='${{ steps.appver.outputs.value }}'

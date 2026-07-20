@@ -34,6 +34,13 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["app*"]
 
+[tool.setuptools.package-data]
+# Non-Python application assets. packages.find collects only Python
+# packages, so without this mapping `pip install .` silently drops
+# app/static from the wheel — the production image then has no
+# site-packages/app/static and StaticFiles fails at startup.
+app = ["static/fonts/vazirmatn-v33/*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

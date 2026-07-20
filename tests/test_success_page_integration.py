@@ -22,7 +22,7 @@ from tests.conftest import (
 )
 
 PREVIEW_EXAMPLE_ID = "1efea273b3"
-NEW_HEADING = "پرداخت سفارش شما تأیید شد"
+NEW_HEADING = "پرداخت با موفقیت انجام شد"
 
 
 def _accepted_response(client, settings, session_factory, stub, bot_stub, notifier, order_id):
@@ -52,7 +52,8 @@ def test_verified_payment_renders_new_persian_page(
     assert NEW_HEADING in page
     assert "زدپروکسی" in page
     assert "از خرید شما از" in page and "سپاسگزاریم" in page
-    assert "پرداخت با موفقیت انجام شد؛ برای مشاهده وضعیت سفارش به ربات بازگردید." in page
+    assert "پرداخت شما تأیید شد. پردازش سفارش ممکن است چند لحظه زمان ببرد." in page
+    assert "لطفاً برای مشاهده وضعیت سفارش به ربات بازگردید." in page
     assert "شماره سفارش" in page
     assert 'data-status="bot_accepted"' in page
 
@@ -168,19 +169,18 @@ def test_exactly_one_fixed_return_to_bot_action():
     assert "?" not in anchor.split('href="', 1)[1].split('"', 1)[0]
 
 
-def test_dynamic_username_cannot_alter_success_destination():
-    """The configurable bot username must not affect the success page; it only
-    feeds the legacy pending/review pages."""
-    page = payment_status_page(
-        CallbackStatus.BOT_ACCEPTED, "o-1", bot_username="@attacker_bot"
-    )
-    assert 'href="https://t.me/zedproxy_bot"' in page
-    assert "attacker_bot" not in page
-    # Legacy pages keep their long-standing dynamic link behavior.
-    pending = payment_status_page(
-        CallbackStatus.BOT_PENDING, "o-1", bot_username="@my_bot"
-    )
-    assert "https://t.me/my_bot" in pending
+def test_dynamic_username_cannot_alter_any_destination():
+    """The configurable bot username affects NO rendered page: every verified
+    outcome uses the fixed destination."""
+    for status in (
+        CallbackStatus.BOT_ACCEPTED,
+        CallbackStatus.BOT_PENDING,
+        CallbackStatus.UNDER_REVIEW,
+    ):
+        page = payment_status_page(status, "o-1", bot_username="@attacker_bot")
+        assert 'href="https://t.me/zedproxy_bot"' in page
+        assert "attacker_bot" not in page
+        assert page.count("https://t.me/") == 1
 
 
 # --- bundled Vazirmatn webfont ------------------------------------------------
@@ -250,21 +250,66 @@ def test_verification_classification_unchanged(
     )
 
 
-def test_pending_page_unchanged(client, settings, session_factory, stub):
+def test_pending_renders_unified_page_and_stays_pending(
+    client, settings, session_factory, stub
+):
     payment = make_verified_pending(
         client, settings, session_factory, stub, order_id="pend-same"
     )
     response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
     page = response.text
+    # The unified design, with the REAL state on data-status.
     assert 'data-status="bot_pending"' in page
-    # Exact legacy wording and the bilingual section are intact.
-    assert "هنوز تأیید نشده است" in page
-    assert "has not yet confirmed acceptance" in page
-    assert 'class="en"' in page
-    # The new design did not leak into the pending page.
-    assert NEW_HEADING not in page
-    assert "زدپروکسی" not in page
+    assert NEW_HEADING in page
+    assert "زدپروکسی" in page
+    # Rendering promoted nothing: the stored status is still pending.
+    assert (
+        get_payment(session_factory, "pend-same").status
+        == PaymentStatus.BOT_NOTIFY_PENDING.value
+    )
+
+
+def test_bot_500_stays_retryable_pending_and_renders_unified_page(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """The observed production case: verification succeeded, the customer bot
+    returned HTTP 500. The worker keeps retrying (5xx is retryable), the
+    stored status stays pending, and the payer sees the SAME unified page."""
+    payment = make_verified_pending(
+        client, settings, session_factory, stub, order_id="bot-500"
+    )
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings)
+    stored = get_payment(session_factory, "bot-500")
+    assert stored.status == PaymentStatus.BOT_NOTIFY_PENDING.value  # not promoted
+    assert stored.bot_notify_attempts == 1
+    assert stored.next_retry_at is not None  # 5xx stays retryable
+    assert stored.bot_last_http_status == 500
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
+    assert response.status_code == 200
+    assert 'data-status="bot_pending"' in response.text
+    assert NEW_HEADING in response.text
+
+
+def test_under_review_renders_unified_page_and_stays_under_review(
+    client, settings, session_factory, stub
+):
+    """A verify-amount mismatch routes to manual review (unchanged) and the
+    payer still sees the unified page with the real state on data-status."""
+    from tests.conftest import create_order, verify_ok_response
+
+    assert create_order(client, settings, order_id="rev-1", amount=10000).status_code == 200
+    payment = get_payment(session_factory, "rev-1")
+    stub.verify_result = verify_ok_response(amount=99999, reference_id="REF-rev-1")
+    response = client.get(valid_callback_path(stub, payment.gateway_order_id))
+    assert response.status_code == 200
+    assert 'data-status="under_review"' in response.text
+    assert NEW_HEADING in response.text
+    assert (
+        get_payment(session_factory, "rev-1").status
+        == PaymentStatus.MANUAL_REVIEW.value
+    )
 
 
 def test_failed_callback_behavior_unchanged(client, settings, session_factory, stub):
@@ -285,6 +330,24 @@ def test_outbound_bot_notification_unchanged(
     )
     [request] = bot_stub.requests
     assert request == {"order_id": "ntf-same", "actions": "custom_payment_verify"}
+
+
+def test_wheel_package_data_covers_the_font_assets():
+    """packages.find collects only Python packages, so app/static ships in
+    the wheel ONLY through tool.setuptools.package-data — a missing mapping
+    previously crashed StaticFiles at startup in the production image."""
+    import tomllib
+    from fnmatch import fnmatch
+
+    root = Path(__file__).resolve().parent.parent
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text())
+    patterns = pyproject["tool"]["setuptools"]["package-data"]["app"]
+    for rel in (
+        "static/fonts/vazirmatn-v33/vazirmatn-variable.woff2",
+        "static/fonts/vazirmatn-v33/OFL.txt",
+    ):
+        assert (root / "app" / rel).is_file(), rel
+        assert any(fnmatch(rel, pattern) for pattern in patterns), rel
 
 
 def test_viewport_fit_css_markers():

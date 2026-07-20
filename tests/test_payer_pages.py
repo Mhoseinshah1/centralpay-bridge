@@ -1,15 +1,18 @@
 """Payer-facing status page accuracy.
 
-The bridge knows only (1) CentralPay verification and, for BOT_ACCEPTED,
-(2) that the bot API accepted the order-processing request — never the
-final business result inside the customer bot. The pages must state
-exactly those facts and nothing stronger.
+Every callback outcome after successful CentralPay verification —
+BOT_ACCEPTED, BOT_PENDING, and UNDER_REVIEW — renders ONE unified page, so
+its copy may state only what is true in EVERY one of those states: the
+payment succeeded (proven by CentralPay verification), order processing
+may take time, and the final order status lives in the customer bot.
+Rendering never alters or promotes the stored payment/notification state;
+the real state stays machine-readable on ``data-status``.
 """
 
 import httpx
 import pytest
 
-from app.api.pages import _PAGE_TEXTS, payment_status_page
+from app.api.pages import payment_status_page
 from app.models import PaymentStatus
 from app.services.verification import CallbackStatus
 from tests.conftest import (
@@ -19,22 +22,21 @@ from tests.conftest import (
     valid_callback_path,
 )
 
-# Claims the bridge cannot prove: final order/credit facts and promises
-# of near-term application, in either language. Scoped to the payer-facing
-# page templates only.
-#
-# NOTE (feat/zedproxy-payment-success-page): «پرداخت با موفقیت انجام شد» was
-# removed from this list because the approved success page asserts that the
-# PAYMENT succeeded — a fact the bridge proves via CentralPay verification.
-# Order-level claims («سفارش ثبت شد» and friends) stay forbidden: the bridge
-# only ever knows the bot ACCEPTED the order-processing request.
+# Claims the bridge cannot prove for a page shared by ALL verified
+# outcomes: order registration/completion, credit application, bot
+# acceptance/confirmation, and promises of near-term application — in
+# either language. Payment-level success wording IS allowed (CentralPay
+# verification proves it in every state that reaches this page).
 FORBIDDEN_PHRASES = [
     "سفارش ثبت شد",
     "سفارش شما ثبت شد",
     "سفارش نهایی شد",
+    "درخواست سفارش پذیرفته شد",
+    "ربات درخواست ثبت سفارش را پذیرفت",
     "اعتبار شما افزایش یافت",
     "مبلغ به حساب شما اضافه شد",
     "خرید تکمیل شد",
+    "سفارش تکمیل شد",
     "به‌زودی",
     "اعمال می‌شود",
     "order has been registered",
@@ -44,7 +46,14 @@ FORBIDDEN_PHRASES = [
     "credited",
     "balance",
     "shortly",
-    "Payment completed",
+    "bot accepted",
+    "bot confirmed",
+]
+
+VERIFIED_STATUSES = [
+    CallbackStatus.BOT_ACCEPTED,
+    CallbackStatus.BOT_PENDING,
+    CallbackStatus.UNDER_REVIEW,
 ]
 
 
@@ -61,106 +70,43 @@ def _visible(page: str) -> str:
     return re.sub(r"<(style|script)>.*?</\1>", "", page, flags=re.S)
 
 
-# --- BOT_ACCEPTED: verified + request accepted + check the bot ---------------
-# BOT_ACCEPTED now renders the approved Persian-only ZedProxy success page.
+# --- one unified page for every verified outcome ------------------------------
 
 
-def test_bot_accepted_states_exactly_the_known_facts():
-    page = _page(CallbackStatus.BOT_ACCEPTED)
-    # Fact: the payment succeeded (proven by CentralPay verification).
-    assert "پرداخت سفارش شما تأیید شد" in page
+@pytest.mark.parametrize("status", VERIFIED_STATUSES)
+def test_every_verified_outcome_renders_the_unified_page(status):
+    page = _page(status)
+    # Neutral copy, true in every state that reaches this page.
     assert "پرداخت با موفقیت انجام شد" in page
-    # Instruction: the order status lives in the bot (text + fixed button).
-    assert "برای مشاهده وضعیت سفارش به ربات بازگردید" in page
+    assert "پرداخت شما تأیید شد." in page
+    assert "پردازش سفارش ممکن است چند لحظه زمان ببرد." in page
+    assert "لطفاً برای مشاهده وضعیت سفارش به ربات بازگردید." in page
     assert "بازگشت به ربات" in page
-    # The approved page is Persian-only.
+    # Persian-only: the bilingual legacy sections are gone.
+    assert 'class="en"' not in page
+    assert "Payment verified" not in page
     assert "Your payment was verified" not in page
 
 
-def test_bot_accepted_makes_no_final_credit_or_order_claim():
-    page = _visible(_page(CallbackStatus.BOT_ACCEPTED))
+@pytest.mark.parametrize("status", VERIFIED_STATUSES)
+def test_no_unprovable_claim_on_any_verified_outcome(status):
+    page = _visible(_page(status))
     for phrase in FORBIDDEN_PHRASES:
-        assert phrase not in page, phrase
+        assert phrase not in page, (status, phrase)
 
 
-# --- BOT_PENDING: verified + acceptance NOT yet confirmed --------------------
+def test_all_outcomes_render_byte_identical_except_status_attribute():
+    """The pages differ ONLY in the machine-readable data-status value."""
+    normalized = {
+        payment_status_page(s, "order-1").replace(
+            f'data-status="{s.value}"', 'data-status="X"'
+        )
+        for s in VERIFIED_STATUSES
+    }
+    assert len(normalized) == 1
 
 
-def test_bot_pending_states_verification_but_unconfirmed_acceptance():
-    page = _page(CallbackStatus.BOT_PENDING)
-    assert "پرداخت شما تأیید شد" in page
-    assert "Your payment was verified" in page
-    # Acceptance is explicitly NOT yet confirmed.
-    assert "هنوز تأیید نشده است" in page
-    assert "has not yet confirmed acceptance" in page
-    # Instruction: check the bot.
-    assert "وضعیت سفارش را در ربات بررسی کنید" in page
-    assert "check the order status in the bot" in page
-
-
-def test_bot_pending_promises_nothing_about_eventual_application():
-    page = _page(CallbackStatus.BOT_PENDING)
-    for phrase in FORBIDDEN_PHRASES:
-        assert phrase not in page, phrase
-
-
-# --- template-wide scan and semantics ----------------------------------------
-
-
-def test_no_payer_template_contains_forbidden_claims():
-    """Regression scan over the page templates AND the rendered success page."""
-    for texts in _PAGE_TEXTS.values():
-        blob = " ".join(texts.values())
-        for phrase in FORBIDDEN_PHRASES:
-            assert phrase not in blob, (phrase, texts)
-    success = _visible(_page(CallbackStatus.BOT_ACCEPTED))
-    for phrase in FORBIDDEN_PHRASES:
-        assert phrase not in success, phrase
-
-
-def test_persian_and_english_express_equivalent_semantics():
-    pending = _PAGE_TEXTS[CallbackStatus.BOT_PENDING]
-    # Both languages assert verification...
-    assert "تأیید شد" in pending["body_fa"] and "verified" in pending["body_en"]
-    # ...unconfirmed acceptance...
-    assert "هنوز" in pending["body_fa"] and "not yet" in pending["body_en"]
-    # ...and both direct the payer to the bot for the outcome.
-    assert "ربات" in pending["body_fa"] and "bot" in pending["body_en"]
-    # The success page (Persian-only by approved design) still states
-    # verification and the return-to-bot instruction.
-    success = _page(CallbackStatus.BOT_ACCEPTED)
-    assert "تأیید شد" in success
-    assert "ربات" in success
-    # No implementation details (HTTP codes) reach the payer.
-    for texts in _PAGE_TEXTS.values():
-        blob = " ".join(texts.values())
-        assert "2xx" not in blob and "HTTP" not in blob
-    assert "2xx" not in success
-
-
-def test_under_review_wording_unchanged():
-    """UNDER_REVIEW made no unproven claim (received + reviewed + manual
-    follow-up are all true) — its wording is pinned as-is."""
-    texts = _PAGE_TEXTS[CallbackStatus.UNDER_REVIEW]
-    assert texts["title_fa"] == "پرداخت در حال بررسی است"
-    assert "بررسی می‌شود" in texts["body_fa"]
-    assert "administrator review" in texts["body_en"]
-
-
-def test_escaping_and_status_attributes_unchanged():
-    page = payment_status_page(
-        CallbackStatus.BOT_ACCEPTED, "<x>&amp", bot_username="@evil<script>"
-    )
-    assert "&lt;x&gt;&amp;amp" in page  # order id HTML-escaped
-    # The hostile username never becomes live markup; the ONLY <script> in
-    # the page is the trusted inline copy-button script.
-    assert "evil<script>" not in page
-    assert page.count("<script>") == 1
-    # The pending/review legacy pages contain no script at all.
-    for status in (CallbackStatus.BOT_PENDING, CallbackStatus.UNDER_REVIEW):
-        assert "<script" not in payment_status_page(
-            status, "<x>&amp", bot_username="@evil<script>"
-        ).replace("&lt;script&gt;", "")
+def test_status_attribute_reflects_the_real_state():
     for status, attr in [
         (CallbackStatus.BOT_ACCEPTED, 'data-status="bot_accepted"'),
         (CallbackStatus.BOT_PENDING, 'data-status="bot_pending"'),
@@ -169,10 +115,25 @@ def test_escaping_and_status_attributes_unchanged():
         assert attr in _page(status)
 
 
-# --- behavior unchanged: only the words moved --------------------------------
+def test_escaping_holds_on_every_outcome():
+    for status in VERIFIED_STATUSES:
+        page = payment_status_page(status, "<x>&amp", bot_username="@evil<script>")
+        assert "&lt;x&gt;&amp;amp" in page  # order id HTML-escaped
+        # The ignored username can never become markup; the ONLY <script>
+        # is the trusted inline copy-button script.
+        assert "evil" not in page
+        assert page.count("<script>") == 1
 
 
-def test_accepted_state_and_duplicate_callback_render_accepted_page(
+def test_every_page_still_renders():
+    for status in CallbackStatus:
+        assert payment_status_page(status, "order-x")
+
+
+# --- behavior unchanged: rendering never promotes state -----------------------
+
+
+def test_accepted_flow_renders_unified_page_with_accepted_status(
     client, settings, session_factory, stub, bot_stub, notifier
 ):
     payment = make_verified_pending(
@@ -185,27 +146,26 @@ def test_accepted_state_and_duplicate_callback_render_accepted_page(
         get_payment(session_factory, "page-acc").status
         == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
     )
-
-    # A duplicate callback renders the ACCEPTED (ZedProxy success) page from
-    # persisted state, with the accurate wording and no forbidden claim.
     duplicate = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert duplicate.status_code == 200
     assert 'data-status="bot_accepted"' in duplicate.text
-    assert "پرداخت سفارش شما تأیید شد" in duplicate.text
+    assert "پرداخت با موفقیت انجام شد" in duplicate.text
     for phrase in FORBIDDEN_PHRASES:
         assert phrase not in _visible(duplicate.text), phrase
 
 
-def test_pending_callback_renders_pending_page(client, settings, session_factory, stub):
+def test_pending_flow_renders_unified_page_without_status_promotion(
+    client, settings, session_factory, stub
+):
     payment = make_verified_pending(
         client, settings, session_factory, stub, order_id="page-pend"
     )
+    # BOT_PENDING remains BOT_PENDING: rendering promotes nothing.
     assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
     duplicate = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert 'data-status="bot_pending"' in duplicate.text
-    assert "هنوز تأیید نشده است" in duplicate.text
-
-
-@pytest.mark.parametrize("status", list(CallbackStatus))
-def test_every_page_still_renders(status):
-    assert payment_status_page(status, "order-x")
+    assert "پرداخت با موفقیت انجام شد" in duplicate.text
+    assert (
+        get_payment(session_factory, "page-pend").status
+        == PaymentStatus.BOT_NOTIFY_PENDING.value
+    )
