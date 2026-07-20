@@ -775,7 +775,11 @@ def test_installer_persists_and_recovers_the_initial_fee():
     template = ENV_TEMPLATE.read_text()
     # Persisted (recovery metadata only) in the generated env file...
     assert "INSTALLER_INITIAL_FEE_PERCENT={{INSTALLER_INITIAL_FEE_PERCENT}}" in template
-    assert "s|{{INSTALLER_INITIAL_FEE_PERCENT}}|${PAYMENT_FEE_PERCENT}|g" in text
+    # ...rendered from the operator's gathered PAYMENT_FEE_PERCENT.
+    # render_template now substitutes via literal bash (audit hardening:
+    # secrets no longer cross a `sed` command line), so the mapping is asserted
+    # in its new form rather than as the old sed expression.
+    assert '[INSTALLER_INITIAL_FEE_PERCENT]="${PAYMENT_FEE_PERCENT}"' in text
     # ...re-read on the keep-existing path...
     assert "grep -E '^INSTALLER_INITIAL_FEE_PERCENT=' \"$ENV_FILE\"" in text
     # ...and the ensure step prefers the recovered/gathered value, never a

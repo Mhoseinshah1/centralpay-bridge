@@ -501,31 +501,54 @@ load_or_generate_secrets() {
 }
 
 render_template() {
-    # $1 template file, $2 destination. Uses only fixed {{PLACEHOLDER}} names.
-    sed \
-        -e "s|{{PAYMENT_DOMAIN}}|${PAYMENT_DOMAIN}|g" \
-        -e "s|{{TLS_EMAIL}}|${TLS_EMAIL}|g" \
-        -e "s|{{POSTGRES_PASSWORD}}|${POSTGRES_PASSWORD}|g" \
-        -e "s|{{INBOUND_API_KEY}}|${INBOUND_API_KEY}|g" \
-        -e "s|{{CALLBACK_HMAC_SECRET}}|${CALLBACK_HMAC_SECRET}|g" \
-        -e "s|{{CENTRALPAY_GETLINK_API_KEY}}|${CENTRALPAY_GETLINK_API_KEY}|g" \
-        -e "s|{{CENTRALPAY_VERIFY_API_KEY}}|${CENTRALPAY_VERIFY_API_KEY}|g" \
-        -e "s|{{CENTRALPAY_USER_ID}}|${CENTRALPAY_USER_ID:-1}|g" \
-        -e "s|{{MIN_PAYMENT_AMOUNT_TOMAN}}|${MIN_PAYMENT_AMOUNT_TOMAN}|g" \
-        -e "s|{{MAX_PAYMENT_AMOUNT_TOMAN}}|${MAX_PAYMENT_AMOUNT_TOMAN}|g" \
-        -e "s|{{INSTALLER_INITIAL_FEE_PERCENT}}|${PAYMENT_FEE_PERCENT}|g" \
-        -e "s|{{TELEGRAM_BOT_USERNAME}}|${TELEGRAM_BOT_USERNAME}|g" \
-        -e "s|{{BOT_PAYMENT_NOTIFY_URL}}|${BOT_PAYMENT_NOTIFY_URL}|g" \
-        -e "s|{{BOT_NOTIFY_TOKEN}}|${BOT_NOTIFY_TOKEN}|g" \
-        -e "s|{{BOT_NOTIFY_RETRY_MODE}}|${BOT_NOTIFY_RETRY_MODE}|g" \
-        -e "s|{{ADMIN_BOT_ENABLED}}|${ADMIN_BOT_ENABLED:-false}|g" \
-        -e "s|{{ADMIN_BOT_TOKEN}}|${ADMIN_BOT_TOKEN:-}|g" \
-        -e "s|{{ADMIN_TELEGRAM_IDS}}|${ADMIN_TELEGRAM_IDS:-}|g" \
-        -e "s|{{ADMIN_BOT_PAYMENT_SUCCESS_ALERTS}}|${ADMIN_BOT_PAYMENT_SUCCESS_ALERTS:-false}|g" \
-        -e "s|{{ADMIN_BOT_DAILY_REPORT_ENABLED}}|${ADMIN_BOT_DAILY_REPORT_ENABLED:-true}|g" \
-        -e "s|{{ADMIN_BOT_DAILY_REPORT_TIME}}|${ADMIN_BOT_DAILY_REPORT_TIME:-09:00}|g" \
-        -e "s|{{ADMIN_BOT_TIMEZONE}}|${ADMIN_BOT_TIMEZONE:-Asia/Tehran}|g" \
-        "$1" > "$2"
+    # $1 template file, $2 destination. Fixed {{PLACEHOLDER}} names only.
+    #
+    # Substitution is done in pure bash rather than `sed`, for two reasons the
+    # old sed pipeline got wrong for a secret-bearing template:
+    #   1. Secrets never touch a command line. The previous version passed
+    #      every value as a `sed -e "s|..|${SECRET}|"` argument, so the DB
+    #      password, callback HMAC secret, CentralPay keys, and bot tokens
+    #      were briefly visible in `ps`/`/proc/<pid>/cmdline` to any local
+    #      user during install. Here values live only in shell variables.
+    #   2. Replacement is LITERAL. In a sed replacement `&` means "the whole
+    #      match" and `|`/`\` are metacharacters, so a secret containing any
+    #      of them was silently corrupted (or aborted the install). bash
+    #      parameter-substitution with a QUOTED replacement treats the value
+    #      as literal text (bash 5 also makes `&` special in ${x/y/z} unless
+    #      the replacement is quoted — it is).
+    local -A _subst=(
+        [PAYMENT_DOMAIN]="${PAYMENT_DOMAIN}"
+        [TLS_EMAIL]="${TLS_EMAIL}"
+        [POSTGRES_PASSWORD]="${POSTGRES_PASSWORD}"
+        [INBOUND_API_KEY]="${INBOUND_API_KEY}"
+        [CALLBACK_HMAC_SECRET]="${CALLBACK_HMAC_SECRET}"
+        [CENTRALPAY_GETLINK_API_KEY]="${CENTRALPAY_GETLINK_API_KEY}"
+        [CENTRALPAY_VERIFY_API_KEY]="${CENTRALPAY_VERIFY_API_KEY}"
+        [CENTRALPAY_USER_ID]="${CENTRALPAY_USER_ID:-1}"
+        [MIN_PAYMENT_AMOUNT_TOMAN]="${MIN_PAYMENT_AMOUNT_TOMAN}"
+        [MAX_PAYMENT_AMOUNT_TOMAN]="${MAX_PAYMENT_AMOUNT_TOMAN}"
+        [INSTALLER_INITIAL_FEE_PERCENT]="${PAYMENT_FEE_PERCENT}"
+        [TELEGRAM_BOT_USERNAME]="${TELEGRAM_BOT_USERNAME}"
+        [BOT_PAYMENT_NOTIFY_URL]="${BOT_PAYMENT_NOTIFY_URL}"
+        [BOT_NOTIFY_TOKEN]="${BOT_NOTIFY_TOKEN}"
+        [BOT_NOTIFY_RETRY_MODE]="${BOT_NOTIFY_RETRY_MODE}"
+        [ADMIN_BOT_ENABLED]="${ADMIN_BOT_ENABLED:-false}"
+        [ADMIN_BOT_TOKEN]="${ADMIN_BOT_TOKEN:-}"
+        [ADMIN_TELEGRAM_IDS]="${ADMIN_TELEGRAM_IDS:-}"
+        [ADMIN_BOT_PAYMENT_SUCCESS_ALERTS]="${ADMIN_BOT_PAYMENT_SUCCESS_ALERTS:-false}"
+        [ADMIN_BOT_DAILY_REPORT_ENABLED]="${ADMIN_BOT_DAILY_REPORT_ENABLED:-true}"
+        [ADMIN_BOT_DAILY_REPORT_TIME]="${ADMIN_BOT_DAILY_REPORT_TIME:-09:00}"
+        [ADMIN_BOT_TIMEZONE]="${ADMIN_BOT_TIMEZONE:-Asia/Tehran}"
+    )
+    local content key
+    # The trailing `printf x` / `%x` guard preserves a template's final
+    # newline, which command substitution would otherwise strip.
+    content=$(cat "$1"; printf x)
+    content=${content%x}
+    for key in "${!_subst[@]}"; do
+        content=${content//"{{${key}}}"/"${_subst[$key]}"}
+    done
+    printf '%s' "$content" > "$2"
 }
 
 write_configuration() {
@@ -742,6 +765,12 @@ main() {
     if [[ "$KEEP_EXISTING" == "true" ]]; then
         log "Reusing configuration from ${ENV_FILE}."
         PAYMENT_DOMAIN=$(grep -E '^PUBLIC_BASE_URL=' "$ENV_FILE" | cut -d= -f2- | sed -E 's#^https?://##')
+        # print_summary reports the inbound API key; on a "keep existing"
+        # rerun load_or_generate_secrets is skipped, so read it from the env
+        # file here. Without this the final summary expands an unset variable
+        # under `set -u` and a fully successful rerun aborts with a spurious
+        # "Installation failed" (breaking the documented safe-to-rerun path).
+        INBOUND_API_KEY=$(grep -E '^INBOUND_API_KEY=' "$ENV_FILE" | cut -d= -f2- || true)
         BOT_PAYMENT_NOTIFY_URL=$(grep -E '^BOT_PAYMENT_NOTIFY_URL=' "$ENV_FILE" | cut -d= -f2-)
         BOT_NOTIFY_RETRY_MODE=$(grep -E '^BOT_NOTIFY_RETRY_MODE=' "$ENV_FILE" | cut -d= -f2-)
         BACKUP_RETENTION_DAYS=$(grep -E '^BACKUP_RETENTION_DAYS=' "$ENV_FILE" | cut -d= -f2- || echo 14)
