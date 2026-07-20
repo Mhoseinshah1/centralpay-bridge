@@ -45,7 +45,10 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
 # Persian user-facing text legitimately contains characters RUF001 flags as
 # "confusable" with ASCII.
 "app/adminbot/*" = ["RUF001"]
-"app/api/pages.py" = ["RUF001"]
+# pages.py additionally embeds the approved payment-success page template,
+# ported verbatim from docs/previews/ — its SVG path/CSS lines exceed the
+# line limit and are intentionally not reflowed (transcription safety).
+"app/api/pages.py" = ["RUF001", "E501"]
 "app/ops.py" = ["RUF001"]
 # Deliberately exercises Persian/Arabic-Indic digit amount strings, which
 # the parser must reject; RUF001 flags those digits as confusable with ASCII.
