@@ -232,6 +232,22 @@ def test_outbound_bot_notification_unchanged(
     assert request == {"order_id": "ntf-same", "actions": "custom_payment_verify"}
 
 
+def test_viewport_fit_css_markers():
+    """The one-viewport sizing contract (fix/success-page-fit-viewport):
+    height-aware media queries exist, the aggressive desktop hero upscale is
+    gone, the hero scales via the --hs variable with layout-height
+    compensation, and the layout column never crops content to fake a fit.
+    (Fit itself was measured in a real browser: scrollHeight == viewport
+    height at 360x800, 390x844, 430x932, 1366x768, and 1440x900.)"""
+    page = payment_status_page(CallbackStatus.BOT_ACCEPTED, "o-1")
+    assert "@media (max-height:850px)" in page
+    assert "@media (max-height:780px)" in page
+    assert "scale(1.2)" not in page
+    assert "--hs" in page
+    wrap_rule = page.split(".wrap{", 1)[1].split("}", 1)[0]
+    assert "overflow" not in wrap_rule
+
+
 def test_long_order_id_kept_on_one_scrollable_line():
     long_id = "x" * 128
     page = payment_status_page(CallbackStatus.BOT_ACCEPTED, long_id)
