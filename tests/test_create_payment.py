@@ -46,7 +46,7 @@ def test_create_payment_success(client, settings, session_factory, stub):
     assert payment.gateway_user_id == DEFAULT_GATEWAY_USER_ID
     assert payment.gateway_user_id != settings.centralpay_user_id
     assert payment.payer_identity_id is not None
-    assert payment.payer_derivation_version == 1
+    assert payment.payer_derivation_version == 2  # raw-Telegram-id scheme
     assert payment.redirect_url == DEFAULT_REDIRECT_URL
     assert 10**11 <= payment.gateway_order_id < 10**12
 

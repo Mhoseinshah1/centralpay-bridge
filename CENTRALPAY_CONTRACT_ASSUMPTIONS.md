@@ -40,6 +40,7 @@ risk, but the bridge is unusable until the allowlist is corrected →
 | Assumption | If wrong | Class |
 |---|---|---|
 | Payload fields: `api_key`, `type:"deposit"`, `amount` (integer TOMAN), `userId`, `orderId` (numeric), `returnUrl` | rejection → `getlink` failure, retry with fresh id | SAFE-FAIL + STAGING |
+| `userId` accepts 64-bit positive integers. The bridge now sends the payer's EXACT Telegram id (Bot API: ≤ 2^52−1, today up to ~1e10 — already beyond int32) or, when no identity is supplied, a reserved per-order id in `[6.0e15, 6.001e15)` chosen strictly above every valid Telegram id so the two namespaces can never collide | rejection of a large `userId` → `getlink` failure (fail-closed, recoverable); ids are NEVER truncated/modulo'd to fit — confirm the accepted range with CentralPay support before go-live | SAFE-FAIL + STAGING (critical) |
 | `data.redirectUrl` holds the payment URL; HTTPS, valid hostname, ≤2048 chars, no credentials/control chars | anything else → `gateway_invalid_redirect_url` | SAFE-FAIL |
 | CentralPay redirects the payer to `returnUrl` **exactly as given** (our `orderId`/`ct`/`sig` params intact, each exactly once) | extra params are ignored by us; duplicated/mangled security params → 403, payment recoverable via re-request | SAFE-FAIL + STAGING |
 | Amount unit is TOMAN (not Rial) | **unit mismatch would make every verify amount comparison fail → 100% manual review** — visible immediately, no silent credit | REVIEW + STAGING (critical) |

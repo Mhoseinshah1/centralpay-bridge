@@ -245,7 +245,7 @@ def test_absent_alias_uses_order_fallback(client, settings, session_factory, stu
 def test_raw_alias_value_not_logged(client, settings, session_factory, stub, caplog):
     """When an identity alias IS present, the raw Telegram id never reaches the
     normalized-body observability log (only a boolean presence flag)."""
-    raw = 8123456789012345
+    raw = 4_400_000_000_000_123  # large, distinctive, VALID (below 2**52)
     fields = _valid_fields(settings, amount=10000, order_id="al-log")
     fields["user_id"] = raw
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):

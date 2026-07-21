@@ -70,28 +70,44 @@ shared id.
   only if it is a valid positive integer within int64 (booleans and non-ASCII
   digits are never coerced); an absent/invalid alias is silently ignored, never
   rejected.
-- **Two identity scopes (never the shared id):**
-  - `telegram_user` — a valid Telegram id was supplied. Identity key
-    `tg:<id>`: the same user maps to the same gateway id across orders, and two
-    different users never share one.
-  - `order_fallback` — no usable identity. Identity key `order:<bot_order_id>`:
-    stable across retries of that one order, isolated from every other order, so
-    at worst an order shares nothing with any other. The two key prefixes cannot
-    collide (`tg:` is digits; `order:` carries the opaque order id).
-- **Derivation.** The identity key is mapped to a stable numeric gateway
-  `userId` via keyed HMAC over a **dedicated** `CENTRALPAY_PAYER_ID_SECRET`
-  (never reused from any other secret). The mapping lives in
-  `centralpay_payer_identities` (`UNIQUE(customer_key_hash)` — the column keeps
-  its historical name but now stores the keyed hash of the *scoped identity
-  key*, `UNIQUE(gateway_user_id)`, `gateway_user_id > 0`). The raw Telegram id is
-  never stored (only the keyed, non-reversible hash) and never logged — only a
-  12-char fingerprint and the identity scope reach logs/events. (`bot_order_id`
-  remains stored/logged as the documented idempotency key.)
-- **Determinism & safety:** the same identity key always resolves to the same
-  gateway id; two different identities never share one (DB uniqueness + a
-  deterministic re-derivation counter on the astronomically rare HMAC collision);
-  stored ids are immutable, so restarts, redeploys, backup/restore, and changing
-  *other* secrets never move them.
+- **Two identity scopes (never the shared id), explicit schemes (revision 2 —
+  matching the reference mirza-cpanel behavior by product requirement):**
+  - `telegram_user` / scheme `telegram_raw_v1` — a valid Telegram id was
+    supplied (positive, ≤ 2^52−1 per the Bot API). The gateway `userId` **is
+    the exact Telegram id** — no hashing, remapping, truncation, modulo, or
+    alternate allocation — so the same user trivially gets the same id across
+    every order and two different users can never share one.
+  - `order_fallback` / scheme `order_hmac_v1` — no usable identity. A keyed-HMAC
+    id (dedicated `CENTRALPAY_PAYER_ID_SECRET`) is derived per `bot_order_id`
+    inside the **reserved range `[6.0e15, 6.001e15)`**, which starts strictly
+    above every valid Telegram id — asserted in code, so the two numeric
+    namespaces cannot collide by construction. Stable across retries of one
+    order, isolated from every other order.
+  - scheme `historical_hmac_v1` — every mapping row created by the retired
+    keyed-HMAC derivations (customer-era and v1 tg/order). Immutable.
+  The scheme is stored per mapping row (`identity_scheme`) and never inferred
+  from the numeric value.
+- **Mapping table & collision policy.** `centralpay_payer_identities` keeps
+  `UNIQUE(customer_key_hash)` (the keyed, non-reversible lookup hash of the
+  scoped identity key) and `UNIQUE(gateway_user_id)`. An `order_hmac_v1`
+  collision re-derives deterministically. A **raw Telegram id is never
+  re-derived**: if its numeric value is already owned by a historical mapping,
+  or equals the legacy shared id, creation **fails closed**
+  (`503 payer_identity_conflict` + an actionable `payer_identity_collision`
+  audit event naming the occupying row id — never the raw id). One user is
+  never handed another identity's mapping and an id is never silently altered.
+- **Privacy (explicit product tradeoff).** `gateway_user_id` now intentionally
+  CONTAINS the raw Telegram id for `telegram_raw_v1` rows and is sent to
+  CentralPay — an explicit product requirement. Everywhere else the id stays
+  restricted: it is never logged, audit events no longer carry
+  `gateway_user_id` values at all (identity-created, adoption, and
+  verify-mismatch events carry scheme/type/fingerprint only), and admin/ops
+  output reports counts and scheme labels. (`bot_order_id` remains
+  stored/logged as the documented idempotency key.)
+- **Determinism & safety:** stored ids are immutable, so restarts, redeploys,
+  backup/restore, and changing *other* secrets never move them; raw Telegram
+  ids are secret-independent by definition, and fallback ids depend only on
+  the dedicated payer secret.
 - **Snapshot & verification unchanged in spirit:** each payment snapshots
   `gateway_user_id` (+ `payer_identity_id`, `payer_identity_type`,
   `payer_derivation_version`). Callback verification still compares CentralPay's
@@ -102,12 +118,17 @@ shared id.
   - a retry that merely *dropped* the optional Telegram id keeps the established
     Telegram identity (never downgraded to per-order);
   - an order first seen without an identity, retried with a Telegram id **before**
-    a link exists → deterministically **adopts** the Telegram identity;
+    a link exists → deterministically **adopts** the exact Telegram id;
   - the same order once a link exists is **never** re-pointed: the (already
     isolated) order-scoped link is returned unchanged;
   - a *different* Telegram user on an existing order is rejected
     (`409 duplicate_order_customer_mismatch`) and never handed the first user's
-    link.
+    link;
+  - **historical HMAC rows: retries reuse stored snapshots.** A retry whose
+    identity matches the stored mapping under the retired v1 hash is recognized
+    (keyed comparison, no guessing) and reuses the stored HMAC snapshot —
+    pre-link or linked — so history is never re-derived to the raw scheme; a
+    different user on such an order is still rejected.
 - **Legacy in-flight rows are healed, not exempt.** A pre-fix row that never
   produced a link (status `created`/`getlink_failed`, `payer_identity_id NULL`)
   would otherwise mint a *new* link under the shared id on the next retry; it now
@@ -165,11 +186,37 @@ identity-scope column on top of the deployed state:
 Proven on PostgreSQL 16 by `tests/integration/test_migration_0008_pg.py`, which
 starts from the EXACT deployed original-0007 schema (and asserts 0007 in this
 tree still is that original), seeds legacy + 0007-era rows via raw SQL, runs
-`alembic upgrade head` in a subprocess, and verifies: 0008 applies, historical
-rows keep `NULL` scope with zero data loss, the CHECK enforces the value set,
-re-upgrade after `stamp 0007` is a no-op, the downgrade preserves the schema,
-and the new application serves existing links and verifies existing callbacks
-against their stored snapshots.
+alembic in a subprocess, and verifies: 0008 applies, historical rows keep
+`NULL` scope with zero data loss, the CHECK enforces the value set, re-upgrade
+after `stamp 0007` is a no-op, the downgrade preserves the schema, and the new
+application serves existing links and verifies existing callbacks against
+their stored snapshots.
+
+**0009 (`alembic/versions/0009_identity_scheme.py`) — new (raw-id revision).**
+Production is at 0008; 0009 is the forward-only follow-up (0007/0008 are
+applied and never edited):
+- adds `centralpay_payer_identities.identity_scheme VARCHAR(32) NOT NULL`
+  with server default `historical_hmac_v1` + CHECK
+  `ck_payer_identities_identity_scheme_valid` (`telegram_raw_v1`,
+  `order_hmac_v1`, `historical_hmac_v1`);
+- the server default is the **non-destructive backfill**: every row that exists
+  when 0009 runs was created by a retired keyed-HMAC derivation, so the
+  collective `historical_hmac_v1` label is accurate — and it stays accurate for
+  any row a not-yet-updated 0008-era application inserts during a rollback
+  window;
+- existing mappings, payment snapshots, and live links are untouched;
+- `upgrade()` no-ops for already-present objects; `downgrade()` is
+  non-destructive by default (pointer-only; dropping requires
+  `CENTRALPAY_DROP_PAYER_IDENTITY=1`).
+
+Proven on PostgreSQL 16 by `tests/integration/test_migration_0009_pg.py`: from
+the exact production-0008 schema with a seeded historical v1 payment,
+`alembic upgrade head` runs exactly 0009; the historical mapping keeps its
+derived id byte-for-byte and is labeled `historical_hmac_v1`; the CHECK rejects
+unknown schemes; `stamp 0008` + re-upgrade no-ops; the downgrade preserves the
+schema; and the new application sends the exact raw id for a fresh payment
+while the historical payment's retry reuses its stored snapshot and its
+callback still verifies.
 
 ## Backward compatibility (no upstream change required)
 
@@ -266,11 +313,27 @@ identities first seen afterward. Treat any rotation as a planned migration.
   above), the order-scoped mapping resolved for that retry is left unused in
   `centralpay_payer_identities`. Harmless: isolated, never attached to a payment,
   no financial or privacy effect.
+- **Raw Telegram ids are disclosed to CentralPay** (explicit product
+  requirement — the gateway `userId` is the user's exact Telegram id). The
+  gateway can therefore correlate payments to Telegram accounts; this is
+  accepted by design and confined to the gateway payload — logs, audit events,
+  and admin output still never carry the raw id.
+- A user whose exact Telegram id is already occupied by a historical HMAC
+  mapping (the old derived range `[1, 2e9]` overlaps real Telegram ids) — or
+  equals the legacy shared id — cannot create payments (fail-closed
+  `503 payer_identity_conflict`) until an operator resolves the
+  `payer_identity_collision` event (e.g. by verifying the historical mapping is
+  orphaned and retiring it manually). Probability per user ≈ number of
+  historical mappings / 2e9; never silent, never cross-user.
 
 ## Remaining unknowns
 
-- CentralPay's exact `userId` semantics and accepted range (the derived range is
-  a documented assumption; if wrong, `getLink` fails closed, never leaks).
+- CentralPay's exact `userId` semantics and accepted numeric range. The bridge
+  now requires 64-bit acceptance: raw Telegram ids (documented < 2^52; today up
+  to ~1e10 — already beyond int32) and the reserved order-fallback range
+  `[6.0e15, 6.001e15)` (see `CENTRALPAY_CONTRACT_ASSUMPTIONS.md`). If a value
+  is rejected, `getLink` fails closed — ids are never truncated or remapped to
+  fit. Confirm with support (question 2 below) before go-live.
 - Whether/what CentralPay retained or exposed for the previously shared id.
 - Whether any other gateway/merchant/session key also influences suggestions.
 

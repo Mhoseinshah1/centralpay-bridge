@@ -334,12 +334,14 @@ class Settings(BaseSettings):
     centralpay_base_url: str = "https://centralapi.org/webservice/basic"
     centralpay_getlink_api_key: str = Field(min_length=1)
     centralpay_verify_api_key: str = Field(min_length=1)
-    # LEGACY: the single shared gateway payer id used before the per-customer
+    # LEGACY: the single shared gateway payer id used before the per-user
     # isolation fix (incident 2026-07). No longer used to create new payments —
-    # each payment now derives a customer-specific gateway_user_id — but kept
-    # for configuration compatibility and to interpret historical payments.
+    # each payment now carries its end user's exact Telegram id or a reserved
+    # per-order fallback id — but kept for configuration compatibility and to
+    # interpret historical payments.
     centralpay_user_id: int = Field(gt=0)
-    # Dedicated secret for deriving the stable per-customer gateway payer id.
+    # Dedicated secret keying the payer-identity lookup hashes and the
+    # order-fallback derivation.
     # MUST NOT be reused from any other secret (callback HMAC, inbound/gateway
     # API keys, bot token, DB password). Required for payment creation; an
     # empty value fails closed at creation time. Callback verification of

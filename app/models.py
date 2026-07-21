@@ -92,10 +92,15 @@ class CentralPayPayerIdentity(Base):
 
     Maps a payer identity — a Telegram end user (``tg:<id>``) or a per-order
     fallback (``order:<bot_order_id>``) — via a keyed, non-reversible
-    ``customer_key_hash`` (the raw Telegram id is never stored) to a stable
-    numeric gateway ``userId``. Uniqueness on both columns guarantees two
-    different identities can never share one gateway payer identity (which
-    would share saved-card suggestions). See app/services/payer_identity.py.
+    ``customer_key_hash`` to a stable numeric gateway ``userId``. The scheme
+    is EXPLICIT (``identity_scheme``), never inferred from the number:
+    ``telegram_raw_v1`` rows store the exact Telegram id as ``gateway_user_id``
+    (product requirement), ``order_hmac_v1`` rows store a derived id inside
+    the reserved fallback range, and ``historical_hmac_v1`` marks immutable
+    rows from the retired keyed-HMAC schemes. Uniqueness on both columns
+    guarantees two different identities can never share one gateway payer
+    identity (which would share saved-card suggestions). See
+    app/services/payer_identity.py.
     """
 
     __tablename__ = "centralpay_payer_identities"
@@ -108,6 +113,14 @@ class CentralPayPayerIdentity(Base):
     derivation_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+    # Always written explicitly by the resolver; the default covers only rows
+    # created by pre-0009 code paths (accurate: those ARE retired-HMAC rows).
+    identity_scheme: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="historical_hmac_v1",
+        server_default="historical_hmac_v1",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -119,6 +132,10 @@ class CentralPayPayerIdentity(Base):
         CheckConstraint("gateway_user_id > 0", name="ck_payer_identities_gateway_user_id_positive"),
         CheckConstraint(
             "derivation_version >= 1", name="ck_payer_identities_derivation_version_positive"
+        ),
+        CheckConstraint(
+            "identity_scheme IN ('telegram_raw_v1', 'order_hmac_v1', 'historical_hmac_v1')",
+            name="ck_payer_identities_identity_scheme_valid",
         ),
     )
 

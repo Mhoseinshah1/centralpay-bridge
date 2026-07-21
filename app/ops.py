@@ -558,6 +558,17 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         mappings = db.execute(
             select(func.count(CentralPayPayerIdentity.id))
         ).scalar_one()
+        # Per-scheme mapping counts (labels only — never a gateway_user_id,
+        # which under telegram_raw_v1 is the raw Telegram id).
+        mappings_by_scheme: dict[str, int] = {
+            row[0]: row[1]
+            for row in db.execute(
+                select(
+                    CentralPayPayerIdentity.identity_scheme,
+                    func.count(CentralPayPayerIdentity.id),
+                ).group_by(CentralPayPayerIdentity.identity_scheme)
+            ).all()
+        }
         # A gateway userId owned by more than one payer identity is the exact
         # failure this fix prevents; DB uniqueness should keep it at zero.
         dup_rows = db.execute(
@@ -586,6 +597,7 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         "isolated_payer_payments": isolated,
         "untyped_isolated_payments": untyped_isolated,
         "payer_identity_mappings": mappings,
+        "payer_identity_mappings_by_scheme": mappings_by_scheme,
         "duplicate_gateway_user_ids": duplicate_count,
         # Post-fix, every new payment is mapped; legacy rows are the only ones
         # without a mapping and are the residual pre-fix exposure surface.

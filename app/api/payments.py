@@ -26,6 +26,7 @@ from app.security import constant_time_equals
 from app.services.payer_identity import (
     IDENTITY_TYPE_ORDER_FALLBACK,
     IDENTITY_TYPE_TELEGRAM_USER,
+    MAX_TELEGRAM_USER_ID,
     identity_fingerprint,
     order_identity_key,
     telegram_identity_key,
@@ -56,7 +57,9 @@ class CreatePaymentRequest(BaseModel):
     The OPTIONAL end-user aliases (user_id/userId/uid/chat_id/telegram_id)
     are intentionally NOT part of this strict model — they are extracted
     separately (see _extract_telegram_user_id) and only ever influence the
-    derived, isolated gateway payer id, never the model or the DB directly.
+    isolated gateway payer identity (the exact Telegram id under
+    telegram_raw_v1, per the product requirement), never the model or the DB
+    directly.
     """
 
     api_key: StrictStr
@@ -100,8 +103,13 @@ _REQUIRED_FIELDS = ("api_key", "amount", "order_id")
 # the precedence order when several are present.
 _ALIAS_FIELDS = ("user_id", "userId", "uid", "chat_id", "telegram_id")
 _ALIAS_FIELD_SET = frozenset(_ALIAS_FIELDS)
-# Telegram ids are positive integers well within int64.
-_MAX_TELEGRAM_ID = 2**63 - 1
+# Telegram ids are positive integers with at most 52 significant bits (Bot
+# API documentation). The bound is load-bearing: the order-fallback id range
+# starts strictly above it, so an accepted "Telegram" id can never collide
+# with a derived fallback id (see app/services/payer_identity.py). Larger
+# values are not rejected — they are simply not a usable identity and the
+# payment falls back to per-order isolation.
+_MAX_TELEGRAM_ID = MAX_TELEGRAM_USER_ID
 # Bound on the number of application/x-www-form-urlencoded pairs accepted from
 # an unauthenticated request. The legitimate body carries the required fields
 # plus at most a handful of unrelated/alias fields. 32 leaves generous headroom
