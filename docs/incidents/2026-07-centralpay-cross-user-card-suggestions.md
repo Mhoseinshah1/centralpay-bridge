@@ -81,6 +81,17 @@ All versions up to and including the deployed `0.6.0-rc1` (commit
   stays idempotent; a *different* customer reusing an order id is rejected
   (`409 duplicate_order_customer_mismatch`) and never handed the first customer's
   link.
+- **Legacy in-flight rows are healed, not exempt.** A pre-fix row that never
+  produced a link (status `created`/`getlink_failed`, `payer_identity_id NULL`)
+  would otherwise mint a *new* link under the shared id on the next retry; it now
+  **adopts** the requesting customer's isolated identity before `getLink`
+  (`legacy_payment_payer_identity_adopted` audit event). Already-`link_created`/
+  verified rows are left untouched (their link already exists; forward-only).
+- **Legacy shared id excluded from the derived range.** Because historical
+  payments used `CENTRALPAY_USER_ID` with no mapping row, `UNIQUE(gateway_user_id)`
+  cannot stop a brand-new customer from HMAC-landing on it; the resolver treats
+  that value as reserved and re-derives, so new customers never share the
+  historical pool's id either.
 - **Legacy marker & audit:** `payer_identity_id IS NULL` marks payments created
   under the legacy shared id. `python -m app.ops privacy-audit` reports counts
   only (legacy vs isolated payments, mapping count, duplicate gateway ids — expected
@@ -158,6 +169,15 @@ Stored mappings and their gateway ids are immutable across a rotation; a
 deliberate scheme change is expressed by bumping `DERIVATION_VERSION` (and the
 domain strings) in `app/services/payer_identity.py`, which affects only
 customers first seen afterward. Treat any rotation as a planned migration.
+
+## Known residuals (low)
+
+- An authenticated caller can create a `centralpay_payer_identities` mapping row
+  (and one `centralpay_payer_identity_created` event) with a request that is
+  ultimately rejected for amount/status reasons on an existing order — the
+  customer-mismatch check legitimately needs the resolved identity first. Bounded:
+  authenticated (valid inbound API key), rate-limited, tiny rows, no financial
+  effect, no card/customer data. Not the leak; noted for completeness.
 
 ## Remaining unknowns
 

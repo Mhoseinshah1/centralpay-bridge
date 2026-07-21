@@ -80,12 +80,13 @@ def _ensure_payment_row(
     Returns the resolved payer identity when THIS call created the row, else
     ``None`` (the row already existed or a concurrent request won the insert).
 
-    The fee snapshot is taken HERE, exactly once, inside the same
-    transaction as the insert: the effective policy is read and the four
-    snapshot fields (fee_policy_id, fee_rate_bps, fee_amount,
-    payable_amount) all derive from that single read — a concurrent fee
-    change yields entirely the old or entirely the new policy, never a
-    mixed calculation. Later policy changes never touch this payment.
+    The fee snapshot is captured HERE, exactly once: the effective policy is
+    read a single time and the four snapshot fields (fee_policy_id,
+    fee_rate_bps, fee_amount, payable_amount) are frozen into immutable locals
+    from that one read BEFORE resolve_payer_identity runs — so a concurrent fee
+    change yields entirely the old or entirely the new policy, never a mixed
+    calculation, and the over-max check and the stored row use identical values.
+    Later policy changes never touch this payment.
 
     Ordering (incident 2026-07): the payable-amount bound is enforced BEFORE
     the payer identity is resolved, so an over-max request creates no payment
@@ -124,7 +125,10 @@ def _ensure_payment_row(
         )
 
     payer = resolve_payer_identity(
-        db, secret=settings.centralpay_payer_id_secret, customer_id=customer_id
+        db,
+        secret=settings.centralpay_payer_id_secret,
+        customer_id=customer_id,
+        reserved_gateway_user_id=settings.centralpay_user_id,
     )
     payment = Payment(
         bot_order_id=bot_order_id,
@@ -203,7 +207,10 @@ def create_payment(
     # Done BEFORE taking the row lock so the resolver's own transaction handling
     # can never release that lock.
     payer = created_payer or resolve_payer_identity(
-        db, secret=settings.centralpay_payer_id_secret, customer_id=customer_id
+        db,
+        secret=settings.centralpay_payer_id_secret,
+        customer_id=customer_id,
+        reserved_gateway_user_id=settings.centralpay_user_id,
     )
 
     payment = _lock_payment_by_bot_order_id(db, bot_order_id)
@@ -262,6 +269,27 @@ def create_payment(
             },
         )
         return payment.redirect_url
+
+    # Legacy pre-fix rows (payer_identity_id NULL) that never produced a live
+    # link carry the OLD SHARED gateway_user_id snapshot. Before issuing a link
+    # for one, adopt the resolved per-customer identity so the link is created
+    # under the isolated id — never the shared one (incident 2026-07). Already
+    # verified / LINK_CREATED legacy rows were returned/refused above and are
+    # left untouched (forward-only history; their link, if any, already exists).
+    if payment.payer_identity_id is None:
+        payment.gateway_user_id = payer.gateway_user_id
+        payment.payer_identity_id = payer.id
+        payment.payer_derivation_version = payer.derivation_version
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="legacy_payment_payer_identity_adopted",
+            data={
+                "payer_identity_id": payer.id,
+                "gateway_user_id": payer.gateway_user_id,
+                "derivation_version": payer.derivation_version,
+            },
+        )
 
     # Status is created or getlink_failed: attempt link creation while holding
     # the row lock. A previously failed attempt gets a fresh gateway order id

@@ -416,6 +416,17 @@ class Settings(BaseSettings):
     # Admin bot container liveness heartbeat file.
     admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
 
+    @field_validator("centralpay_payer_id_secret")
+    @classmethod
+    def _validate_payer_id_secret(cls, value: str) -> str:
+        # Optional (empty fails closed at the route), but a configured value
+        # must be strong enough to be an HMAC key — a hand-edited short secret
+        # would silently weaken payer isolation. Matches the 16-char floor of
+        # the other secrets.
+        if value and len(value) < 16:
+            raise ValueError("CENTRALPAY_PAYER_ID_SECRET must be empty or at least 16 characters")
+        return value
+
     @field_validator("centralpay_base_url")
     @classmethod
     def _validate_centralpay_base_url(cls, value: object) -> str:

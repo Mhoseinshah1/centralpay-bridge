@@ -104,7 +104,11 @@ def _lookup(db: Session, key_hash: str) -> CentralPayPayerIdentity | None:
 
 
 def resolve_payer_identity(
-    db: Session, *, secret: str, customer_id: str
+    db: Session,
+    *,
+    secret: str,
+    customer_id: str,
+    reserved_gateway_user_id: int | None = None,
 ) -> PayerIdentity:
     """Return the stable gateway payer identity for ``customer_id``.
 
@@ -112,6 +116,12 @@ def resolve_payer_identity(
     so the mapping is durable before any payment row or gateway call. Callers
     must have already validated ``customer_id`` and confirmed ``secret`` is
     configured (fail-closed happens in the route).
+
+    ``reserved_gateway_user_id`` (the legacy shared CENTRALPAY_USER_ID) is never
+    assigned to a new customer: historical payments used that id WITHOUT a
+    mapping row, so ``UNIQUE(gateway_user_id)`` cannot catch a fresh customer
+    that HMAC-lands on it — treat it as a collision and re-derive. This keeps
+    new customers isolated from the historical shared-id pool too.
     """
     key_hash = customer_key_hash(secret, customer_id)
     existing = _lookup(db, key_hash)
@@ -123,6 +133,8 @@ def resolve_payer_identity(
 
     for attempt in range(_MAX_DERIVATION_ATTEMPTS):
         candidate = derive_gateway_user_id(secret, customer_id, attempt)
+        if candidate == reserved_gateway_user_id:
+            continue  # never share the legacy shared payer id
         row = CentralPayPayerIdentity(
             customer_key_hash=key_hash,
             gateway_user_id=candidate,

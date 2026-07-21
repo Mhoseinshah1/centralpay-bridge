@@ -26,6 +26,8 @@ from app.services.payer_identity import (
     resolve_payer_identity,
 )
 from tests.conftest import (
+    DEFAULT_GATEWAY_USER_ID,
+    TEST_CALLBACK_HMAC_SECRET,
     TEST_PAYER_ID_SECRET,
     build_app,
     create_order,
@@ -72,6 +74,22 @@ def test_different_customers_get_different_gateway_ids(session_factory):
     assert _identity_count(session_factory) == 2
 
 
+def test_reserved_gateway_user_id_is_never_assigned(session_factory):
+    """The legacy shared id is excluded from the derived range: a new customer
+    whose attempt-0 candidate equals it re-derives instead of sharing it."""
+    victim = "cust-reserved"
+    attempt0 = derive_gateway_user_id(TEST_PAYER_ID_SECRET, victim, 0)
+    with session_factory() as db:
+        resolved = resolve_payer_identity(
+            db,
+            secret=TEST_PAYER_ID_SECRET,
+            customer_id=victim,
+            reserved_gateway_user_id=attempt0,
+        )
+    assert resolved.gateway_user_id != attempt0
+    assert resolved.gateway_user_id == derive_gateway_user_id(TEST_PAYER_ID_SECRET, victim, 1)
+
+
 def test_collision_deterministically_re_derives(session_factory):
     """If a customer's attempt-0 id is already taken by ANOTHER customer, the
     resolver re-derives (attempt 1) — never returns the other's id, never
@@ -93,16 +111,33 @@ def test_collision_deterministically_re_derives(session_factory):
     assert resolved.gateway_user_id == derive_gateway_user_id(TEST_PAYER_ID_SECRET, victim, 1)
 
 
-def test_unrelated_secret_never_changes_a_stored_identity(session_factory):
-    """Only the dedicated payer secret drives derivation; a stored mapping is
-    immutable, so rotating any OTHER secret cannot move a payer id."""
-    with session_factory() as db:
-        original = resolve_payer_identity(db, secret=TEST_PAYER_ID_SECRET, customer_id="cust-x")
-        # Re-resolving (any number of unrelated config changes later) returns
-        # the stored row unchanged; the derivation is never re-run for it.
-        again = resolve_payer_identity(db, secret=TEST_PAYER_ID_SECRET, customer_id="cust-x")
-    assert again.gateway_user_id == original.gateway_user_id
-    assert again.id == original.id
+def test_unrelated_secret_change_does_not_move_a_payer_id(settings, session_factory, stub):
+    """End-to-end: changing an UNRELATED secret (the callback HMAC secret) does
+    not change a customer's gateway userId — derivation uses only the dedicated
+    payer secret, and the stored mapping is immutable."""
+    from fastapi.testclient import TestClient
+
+    app1 = build_app(settings, session_factory, stub)
+    with TestClient(app1, raise_server_exceptions=False) as client:
+        r1 = create_order(client, settings, order_id="u-1", customer_id="cust-x")
+    app1.state.centralpay.close()
+    assert r1.status_code == 200
+    first_user_id = stub.getlink_requests[-1]["userId"]
+
+    # Rotate an unrelated secret; the payer secret and DB are unchanged.
+    rotated = settings.model_copy(
+        update={"callback_hmac_secret": TEST_CALLBACK_HMAC_SECRET + "-rotated"}
+    )
+    stub2 = type(stub)()
+    app2 = build_app(rotated, session_factory, stub2)
+    with TestClient(app2, raise_server_exceptions=False) as client:
+        r2 = create_order(client, rotated, order_id="u-2", customer_id="cust-x")
+    app2.state.centralpay.close()
+    assert r2.status_code == 200
+    second_user_id = stub2.getlink_requests[-1]["userId"]
+
+    assert second_user_id == first_user_id  # unchanged by the unrelated rotation
+    assert _identity_count(session_factory) == 1  # still one mapping row
 
 
 def test_fingerprint_is_short_non_reversible_and_not_the_raw_id():
@@ -238,7 +273,12 @@ def test_legacy_payment_verifies_against_its_own_snapshot(
 
     import httpx
 
-    legacy_user_id = settings.centralpay_user_id  # the old shared id
+    # A snapshot value distinct from BOTH the config value and any derived id,
+    # so the test fails if verification ever consulted settings.centralpay_user_id
+    # or the mapping table instead of the payment's own snapshot.
+    legacy_user_id = 987654321
+    assert legacy_user_id != settings.centralpay_user_id
+    assert legacy_user_id != DEFAULT_GATEWAY_USER_ID
     token = generate_callback_token()
     with session_factory() as db:
         payment = Payment(
@@ -276,6 +316,45 @@ def test_legacy_payment_verifies_against_its_own_snapshot(
     )
     assert client.get(path).status_code == 200
     assert get_payment(session_factory, "legacy-1").status == PaymentStatus.BOT_NOTIFY_PENDING.value
+
+
+def test_legacy_prelink_row_adopts_isolated_identity(
+    client, settings, session_factory, stub
+):
+    """A pre-fix legacy row still awaiting its link (payer_identity_id NULL,
+    shared gateway_user_id) must NOT mint a new link under the shared id: on
+    the next create it adopts the requesting customer's isolated identity."""
+    from datetime import UTC, datetime
+
+    shared = settings.centralpay_user_id
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="legacy-prelink",
+                gateway_order_id=910000000077,
+                gateway_user_id=shared,  # the old shared id
+                payer_identity_id=None,  # legacy marker, still pre-link
+                payer_derivation_version=None,
+                amount=10000,
+                fee_rate_bps=0,
+                fee_amount=0,
+                payable_amount=10000,
+                status=PaymentStatus.CREATED.value,
+                callback_token_issued_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+
+    resp = create_order(client, settings, order_id="legacy-prelink", customer_id="newcust")
+    assert resp.status_code == 200
+    # The link was issued under the per-customer id, never the shared one.
+    assert stub.getlink_requests[-1]["userId"] != shared
+    payment = get_payment(session_factory, "legacy-prelink")
+    assert payment.payer_identity_id is not None
+    assert payment.gateway_user_id != shared
+    assert stub.getlink_requests[-1]["userId"] == payment.gateway_user_id
+    types = [e.event_type for e in get_events(session_factory, payment.id)]
+    assert "legacy_payment_payer_identity_adopted" in types
 
 
 # --- no raw customer_id in logs / events / errors ----------------------------
