@@ -25,11 +25,7 @@ from app.main import create_app
 from app.models import Base, Payment, PaymentEvent
 from app.security import callback_signature
 from app.services.notification import run_worker_pass, utcnow
-from app.services.payer_identity import (
-    derive_gateway_user_id,
-    order_identity_key,
-    telegram_identity_key,
-)
+from app.services.payer_identity import derive_order_gateway_user_id, order_identity_key
 
 TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"
 TEST_CALLBACK_HMAC_SECRET = "test-callback-hmac-secret-8d11a52b"
@@ -47,14 +43,10 @@ TEST_USER_ID = 4242
 
 # Default OPTIONAL end-user identity forwarded by create_order/full-flow
 # helpers (a valid positive Telegram numeric id, sent under the ``user_id``
-# alias), and the per-user gateway userId it deterministically derives to
-# (attempt 0, the value a fresh identity receives in an empty test DB). Using
-# one stable default identity keeps every default-flow payment on one gateway
-# userId, exactly as the old shared-customer default did.
+# alias). Under telegram_raw_v1 the gateway userId IS that exact number, so
+# every default-flow payment shares this one gateway userId.
 DEFAULT_TELEGRAM_USER_ID = 55501234
-DEFAULT_GATEWAY_USER_ID = derive_gateway_user_id(
-    TEST_PAYER_ID_SECRET, telegram_identity_key(DEFAULT_TELEGRAM_USER_ID), 0
-)
+DEFAULT_GATEWAY_USER_ID = DEFAULT_TELEGRAM_USER_ID
 
 DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
 
@@ -62,17 +54,19 @@ DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
 def expected_gateway_user_id(
     *, order_id: str | None = None, telegram_user_id: int | None = None
 ) -> int:
-    """The gateway userId a fresh identity derives to at attempt 0.
+    """The gateway userId a fresh identity resolves to.
 
-    Mirrors resolve_payer_identity for a clean DB: reliable in tests because a
-    collision with the reserved legacy id or a stored id is astronomically
-    unlikely across the small, distinct identities the suite uses."""
+    telegram_raw_v1: the exact Telegram id, always. order_hmac_v1: the
+    attempt-0 derivation into the reserved fallback range — reliable in tests
+    because a collision with the reserved legacy id or a stored id is
+    astronomically unlikely across the small, distinct identities the suite
+    uses."""
     if telegram_user_id is not None:
-        key = telegram_identity_key(telegram_user_id)
-    else:
-        assert order_id is not None, "order_id required for the fallback identity"
-        key = order_identity_key(order_id)
-    return derive_gateway_user_id(TEST_PAYER_ID_SECRET, key, 0)
+        return telegram_user_id
+    assert order_id is not None, "order_id required for the fallback identity"
+    return derive_order_gateway_user_id(
+        TEST_PAYER_ID_SECRET, order_identity_key(order_id), 0
+    )
 
 
 def getlink_ok_response(redirect_url: str = DEFAULT_REDIRECT_URL) -> httpx.Response:

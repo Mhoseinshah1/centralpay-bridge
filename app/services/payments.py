@@ -28,13 +28,14 @@ from app.exceptions import (
     OrderUnderReviewError,
     PayableAmountOutOfRangeError,
 )
-from app.models import Payment, PaymentStatus
+from app.models import CentralPayPayerIdentity, Payment, PaymentStatus
 from app.security import build_callback_url, callback_token_hash, generate_callback_token
 from app.services.fees import calculate_fee, select_effective_policy
 from app.services.payer_identity import (
     IDENTITY_TYPE_ORDER_FALLBACK,
     IDENTITY_TYPE_TELEGRAM_USER,
     PayerIdentity,
+    historical_identity_key_hash,
     order_identity_key,
     resolve_payer_identity,
     telegram_identity_key,
@@ -101,6 +102,7 @@ def _ensure_payment_row(
     amount: int,
     identity_key: str,
     identity_type: str,
+    telegram_user_id: int | None,
 ) -> PayerIdentity | None:
     """Create the payment row in its own committed transaction if missing.
 
@@ -155,6 +157,7 @@ def _ensure_payment_row(
         db,
         secret=settings.centralpay_payer_id_secret,
         identity_key=identity_key,
+        telegram_user_id=telegram_user_id,
         reserved_gateway_user_id=settings.centralpay_user_id,
     )
     payment = Payment(
@@ -291,11 +294,13 @@ def create_payment(
     """Create (or idempotently return) a payment link for a bot order.
 
     ``telegram_user_id`` is the OPTIONAL end-user identity forwarded by the
-    upstream bot. When present (a valid positive Telegram numeric id) it scopes
-    a stable per-user gateway payer id, so the same user reuses one payer
-    identity across orders and two different users never share one. When absent
-    the identity is scoped to ``bot_order_id`` instead — stable across retries
-    of that one order, isolated from every other order. The legacy shared
+    upstream bot. When present (a valid positive Telegram numeric id) the
+    gateway ``userId`` IS that exact number (``telegram_raw_v1`` — explicit
+    product requirement), so the same user trivially reuses one payer identity
+    across orders and two different users never share one. When absent the
+    identity is scoped to ``bot_order_id`` instead (``order_hmac_v1``, derived
+    inside the reserved fallback range) — stable across retries of that one
+    order, isolated from every other order. The legacy shared
     CENTRALPAY_USER_ID is NEVER used for a new link. Returns the CentralPay
     redirect URL.
     """
@@ -313,17 +318,35 @@ def create_payment(
         amount=amount,
         identity_key=identity_key,
         identity_type=identity_type,
+        telegram_user_id=telegram_user_id,
     )
-    # For a brand-new row _ensure_payment_row already resolved the payer; for an
-    # existing row resolve it now (deterministic; the mapping already exists).
-    # Done BEFORE taking the row lock so the resolver's own transaction handling
-    # can never release that lock.
-    payer = created_payer or resolve_payer_identity(
-        db,
-        secret=settings.centralpay_payer_id_secret,
-        identity_key=identity_key,
-        reserved_gateway_user_id=settings.centralpay_user_id,
-    )
+    # For a brand-new row _ensure_payment_row already resolved the payer. For an
+    # EXISTING row, first recognize a retired-scheme identity: if the stored
+    # mapping's key hash equals the v1 hash of THIS identity key, the retry
+    # belongs to the same identity under the retired HMAC derivation — its
+    # stored snapshot is reused verbatim, so resolving (which could allocate a
+    # new-scheme mapping or even fail closed on a raw-id collision) is skipped
+    # entirely. Otherwise resolve now. Both happen BEFORE the row lock so the
+    # resolver's own transaction handling can never release that lock.
+    payer: PayerIdentity | None = created_payer
+    if payer is None:
+        stored_key_hash = db.execute(
+            select(CentralPayPayerIdentity.customer_key_hash)
+            .join(Payment, Payment.payer_identity_id == CentralPayPayerIdentity.id)
+            .where(Payment.bot_order_id == bot_order_id)
+        ).scalar_one_or_none()
+        db.rollback()
+        matches_retired_scheme = stored_key_hash is not None and stored_key_hash == (
+            historical_identity_key_hash(settings.centralpay_payer_id_secret, identity_key)
+        )
+        if not matches_retired_scheme:
+            payer = resolve_payer_identity(
+                db,
+                secret=settings.centralpay_payer_id_secret,
+                identity_key=identity_key,
+                telegram_user_id=telegram_user_id,
+                reserved_gateway_user_id=settings.centralpay_user_id,
+            )
 
     payment = _lock_payment_by_bot_order_id(db, bot_order_id)
     if payment is None:
@@ -337,13 +360,23 @@ def create_payment(
         or payment.gateway_verified_at is not None
         or payment.status in _LINKED_STATUSES
     )
-    decision = _reconcile_identity(
-        payment,
-        requested_type=identity_type,
-        payer=payer,
-        has_live_link=has_live_link,
-    )
+    if payer is None:
+        # Retired-scheme identity recognized above: always reuse the stored
+        # snapshot (item: retries reuse stored snapshots; historical rows stay
+        # unchanged). If a concurrent retry re-stamped the identity between the
+        # unlocked read and this lock, reuse is still the safe answer — the
+        # stored identity is whatever the same order's concurrent retry
+        # established, and it is never touched here.
+        decision = "reuse"
+    else:
+        decision = _reconcile_identity(
+            payment,
+            requested_type=identity_type,
+            payer=payer,
+            has_live_link=has_live_link,
+        )
     if decision == "reject":
+        assert payer is not None  # reject only ever comes from _reconcile_identity
         # This order was recreated for a DIFFERENT Telegram user; refuse so one
         # user's link/identity is never handed to another (incident 2026-07).
         # Only internal ids/types are recorded, never the raw identity.
@@ -403,6 +436,7 @@ def create_payment(
     # shared one (incident 2026-07). Verified / LINK_CREATED rows were
     # returned/refused above and are never re-pointed.
     if decision == "adopt":
+        assert payer is not None  # adopt only ever comes from _reconcile_identity
         payment.gateway_user_id = payer.gateway_user_id
         payment.payer_identity_id = payer.id
         payment.payer_identity_type = identity_type
@@ -412,8 +446,10 @@ def create_payment(
             payment_id=payment.id,
             event_type="payment_payer_identity_adopted",
             data={
+                # No gateway_user_id: under telegram_raw_v1 that value IS the
+                # raw Telegram id, which never enters audit events.
                 "payer_identity_id": payer.id,
-                "gateway_user_id": payer.gateway_user_id,
+                "identity_scheme": payer.scheme,
                 "derivation_version": payer.derivation_version,
                 "identity_type": identity_type,
             },

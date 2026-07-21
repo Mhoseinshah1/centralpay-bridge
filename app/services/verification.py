@@ -137,9 +137,12 @@ def _validate_and_apply_verification(
             payment,
             mismatch_event="verify_user_id_mismatch",
             data={
+                # The mismatch FACT only — under telegram_raw_v1 the expected
+                # value IS the raw Telegram id, which never enters audit
+                # events. Operators compare the payment row against the
+                # gateway's report directly during manual review.
                 "gateway_order_id": payment.gateway_order_id,
-                "expected_user_id": payment.gateway_user_id,
-                "reported_user_id": result.user_id,
+                "payer_identity_type": payment.payer_identity_type,
                 "field_errors": field_errors,
             },
         )

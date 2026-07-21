@@ -358,7 +358,7 @@ def test_required_values_absent_from_preauth_logs(client, settings, session_fact
 
 
 def test_raw_alias_value_absent_from_preauth_logs(client, settings, session_factory, stub, caplog):
-    raw = 8123456789012345
+    raw = 4_400_000_000_000_123  # large, distinctive, VALID (below 2**52)
     body = _required(settings, order_id="al-preauth") + f"&user_id={raw}"
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
         response = _post_form(client, body)

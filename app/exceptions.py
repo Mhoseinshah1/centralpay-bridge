@@ -135,6 +135,17 @@ class PayerIdentityAllocationError(BridgeError):
     default_message = "Could not allocate a unique gateway payer identity"
 
 
+class PayerIdentityCollisionError(BridgeError):
+    # A raw Telegram id's numeric value is already owned by a different
+    # identity (historical HMAC mapping or the reserved legacy shared id).
+    # Fail closed: never remap the user to another number, never hand over the
+    # existing mapping. Operators act on the payer_identity_collision audit
+    # event; the caller only learns creation is unavailable.
+    code = "payer_identity_conflict"
+    http_status = 503
+    default_message = "Payment creation is temporarily unavailable"
+
+
 class DuplicateOrderCustomerMismatchError(BridgeError):
     # A previously created order is being recreated for a DIFFERENT customer.
     # Never reuse the existing link (it would cross customer identities).
