@@ -1,11 +1,15 @@
 """application/x-www-form-urlencoded compatibility: tolerate extra fields.
 
 The inaccessible legacy sales bot posts an urlencoded body that carries the
-four required payment fields *plus* unrelated legacy fields. The parser must
-require each required field exactly once while safely **ignoring** every extra
-field: an extra field is never validated, never stored, never logged, and can
-never influence authentication, the amount, the order identity, fees, or the
-gateway.
+three required payment fields (api_key, amount, order_id) *plus* unrelated
+legacy fields, and it may also carry the OPTIONAL end-user identity under one
+of the accepted aliases (user_id/userId/uid/chat_id/telegram_id). The parser
+must require each required field exactly once, capture an identity alias if
+present, and safely **ignore** every other extra field: an unrelated extra is
+never validated, never stored, never logged, and can never influence
+authentication, the amount, the order identity, fees, or the gateway. An
+identity alias only ever influences the derived, isolated gateway payer id —
+never the strict model or the DB directly.
 
 These tests exercise the real route through the strict model and fake both
 CentralPay and the customer bot at the httpx transport layer (shared
@@ -19,9 +23,10 @@ from sqlalchemy import func, select
 
 from app.api.payments import _MAX_FORM_PAIRS, _CompatReject, _decode_urlencoded
 from app.models import Payment
+from app.services.payer_identity import IDENTITY_TYPE_TELEGRAM_USER
 from tests.conftest import (
-    DEFAULT_CUSTOMER_ID,
     DEFAULT_REDIRECT_URL,
+    expected_gateway_user_id,
     get_events,
     get_payment,
     run_pass,
@@ -48,56 +53,60 @@ def _post_form(client, body: str):
     return client.post(CUSTOM_PAYMENT_URL, content=body, headers={"Content-Type": FORM_CT})
 
 
-def _required(
-    settings, *, amount="10000", order_id="urlenc-order", customer_id=DEFAULT_CUSTOMER_ID
-) -> str:
-    return (
-        f"api_key={settings.inbound_api_key}&amount={amount}"
-        f"&order_id={order_id}&customer_id={customer_id}"
+def _required(settings, *, amount="10000", order_id="urlenc-order") -> str:
+    return f"api_key={settings.inbound_api_key}&amount={amount}&order_id={order_id}"
+
+
+# --- unit: the decoder returns the required fields plus any identity alias -----
+
+
+def test_decode_urlencoded_drops_extras_and_keeps_alias():
+    """Unrelated extras (including a non-alias field like customer_id) never
+    leave the decoder; the required fields and a supported identity alias do."""
+    raw = (
+        b"api_key=k&utm_source=telegram&amount=5000&debug=1"
+        b"&order_id=o-1&customer_id=c-1&user_id=42&note=hi"
     )
-
-
-# --- unit: the decoder returns only the four required fields ------------------
-
-
-def test_decode_urlencoded_drops_extra_fields():
-    """Direct proof that extras never leave the decoder: the returned dict has
-    exactly the four required keys regardless of how many extras arrive."""
-    raw = b"api_key=k&utm_source=telegram&amount=5000&debug=1&order_id=o-1&customer_id=c-1&note=hi"
     representation, data = _decode_urlencoded(raw)
     assert representation == "urlencoded"
-    assert data == {"api_key": "k", "amount": "5000", "order_id": "o-1", "customer_id": "c-1"}
+    assert data == {"api_key": "k", "amount": "5000", "order_id": "o-1", "user_id": "42"}
+
+
+def test_decode_urlencoded_without_alias_returns_only_required():
+    raw = b"api_key=k&amount=5000&order_id=o-1&utm_source=telegram"
+    _, data = _decode_urlencoded(raw)
+    assert data == {"api_key": "k", "amount": "5000", "order_id": "o-1"}
 
 
 def test_decode_urlencoded_requires_each_field_exactly_once():
     with pytest.raises(_CompatReject):
-        # duplicate amount (the other three required fields present exactly once)
-        _decode_urlencoded(b"api_key=k&amount=1&amount=2&order_id=o&customer_id=c")
+        # duplicate amount (the other two required fields present exactly once)
+        _decode_urlencoded(b"api_key=k&amount=1&amount=2&order_id=o")
     with pytest.raises(_CompatReject):
-        # missing amount (the other three required fields present)
-        _decode_urlencoded(b"api_key=k&order_id=o&customer_id=c")
+        # missing amount (the other two required fields present)
+        _decode_urlencoded(b"api_key=k&order_id=o")
 
 
-def test_normalize_also_drops_extra_keys():
-    """Second stripping layer: even if a decoder ever leaked extras,
-    _normalize keeps only the four required fields."""
+def test_normalize_drops_extra_keys_and_aliases():
+    """Second stripping layer: even the identity alias is dropped here —
+    _normalize keeps only the three required fields for the strict model."""
     from app.api.payments import _normalize
 
     data = {
         "api_key": "k",
         "amount": "10",
         "order_id": "o",
-        "customer_id": "c",
+        "user_id": "42",  # alias: used for identity, never for the model
         "evil": "x",
         "fee_amount": 1,
     }
-    assert _normalize(data) == {"api_key": "k", "amount": 10, "order_id": "o", "customer_id": "c"}
+    assert _normalize(data) == {"api_key": "k", "amount": 10, "order_id": "o"}
 
 
 def test_only_required_fields_reach_the_strict_model(
     client, settings, session_factory, stub, monkeypatch
 ):
-    """End-to-end, load-bearing proof of 'extras are never passed to
+    """End-to-end, load-bearing proof of 'extras/aliases are never passed to
     CreatePaymentRequest': capture the exact kwargs the parser constructs the
     model with. (The model's default extra-tolerance would otherwise silently
     mask a stripping regression — DB/gateway assertions alone cannot see it.)"""
@@ -112,16 +121,16 @@ def test_only_required_fields_reach_the_strict_model(
             super().__init__(**kwargs)
 
     monkeypatch.setattr(payments_module, "CreatePaymentRequest", SpyModel)
-    body = _required(settings, order_id="model-spy") + "&utm_source=x&debug=1&note=hi"
+    body = _required(settings, order_id="model-spy") + "&utm_source=x&debug=1&user_id=99&note=hi"
     assert _post_form(client, body).status_code == 200
     [kwargs] = captured
-    assert set(kwargs) == {"api_key", "amount", "order_id", "customer_id"}
+    assert set(kwargs) == {"api_key", "amount", "order_id"}
 
 
 # --- accepted: exact fields, and extras ignored ------------------------------
 
 
-def test_exact_four_fields_still_work(client, settings, session_factory, stub):
+def test_exact_required_fields_still_work(client, settings, session_factory, stub):
     response = _post_form(client, _required(settings, order_id="exact"))
     assert response.status_code == 200
     assert response.json() == {"url": DEFAULT_REDIRECT_URL}
@@ -150,6 +159,30 @@ def test_repeated_extra_field_is_allowed(client, settings, session_factory, stub
     response = _post_form(client, body)
     assert response.status_code == 200
     assert get_payment(session_factory, "dup-extra").amount == 10000
+
+
+# --- optional identity alias -------------------------------------------------
+
+
+@pytest.mark.parametrize("alias", ["user_id", "userId", "uid", "chat_id", "telegram_id"])
+def test_urlencoded_identity_alias_drives_gateway_id(
+    client, settings, session_factory, stub, alias
+):
+    body = _required(settings, order_id=f"al-{alias}") + f"&{alias}=909001"
+    response = _post_form(client, body)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, f"al-{alias}")
+    assert payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=909001)
+
+
+def test_urlencoded_alias_last_value_wins(client, settings, session_factory, stub):
+    """A repeated identity alias is not a required-field duplicate; last wins."""
+    body = _required(settings, order_id="al-dup") + "&user_id=101010&user_id=202020"
+    response = _post_form(client, body)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-dup")
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=202020)
 
 
 # --- extras cannot influence the payment -------------------------------------
@@ -187,17 +220,16 @@ def test_extra_fields_do_not_change_gateway_request(client, settings, session_fa
 # --- rejections: duplicate required fields -----------------------------------
 
 
-@pytest.mark.parametrize("field", ["api_key", "amount", "order_id", "customer_id"])
+@pytest.mark.parametrize("field", ["api_key", "amount", "order_id"])
 def test_duplicate_required_field_rejected(client, settings, session_factory, stub, field):
     values = {
         "api_key": settings.inbound_api_key,
         "amount": "10000",
         "order_id": "dup",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
-    # Emit the target field twice; the other three once.
+    # Emit the target field twice; the other two once.
     parts = []
-    for name in ("api_key", "amount", "order_id", "customer_id"):
+    for name in ("api_key", "amount", "order_id"):
         parts.append(f"{name}={values[name]}")
         if name == field:
             parts.append(f"{name}={values[name]}")
@@ -221,10 +253,9 @@ def test_duplicate_required_field_rejected_even_with_extras(
 @pytest.mark.parametrize(
     "body_fields",
     [
-        ("amount", "order_id", "customer_id"),  # missing api_key
-        ("api_key", "order_id", "customer_id"),  # missing amount
-        ("api_key", "amount", "customer_id"),  # missing order_id
-        ("api_key", "amount", "order_id"),  # missing customer_id
+        ("amount", "order_id"),  # missing api_key
+        ("api_key", "order_id"),  # missing amount
+        ("api_key", "amount"),  # missing order_id
     ],
 )
 def test_missing_required_field_rejected(
@@ -234,7 +265,6 @@ def test_missing_required_field_rejected(
         "api_key": settings.inbound_api_key,
         "amount": "10000",
         "order_id": "miss",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
     # Include unrelated extras to prove they cannot substitute for a missing field.
     body = "&".join(f"{name}={values[name]}" for name in body_fields) + "&extra=1&more=2"
@@ -247,9 +277,9 @@ def test_missing_required_field_rejected(
 
 
 def test_pair_count_at_limit_accepted(client, settings, session_factory, stub):
-    extras = "&".join(f"e{i}=v{i}" for i in range(_MAX_FORM_PAIRS - 4))
+    extras = "&".join(f"e{i}=v{i}" for i in range(_MAX_FORM_PAIRS - 3))
     body = _required(settings, order_id="at-limit") + "&" + extras
-    assert body.count("=") == _MAX_FORM_PAIRS  # 4 required + (limit-4) extras
+    assert body.count("=") == _MAX_FORM_PAIRS  # 3 required + (limit-3) extras
     response = _post_form(client, body)
     assert response.status_code == 200
     assert get_payment(session_factory, "at-limit").amount == 10000
@@ -280,8 +310,7 @@ def test_rejection_logs_only_safe_diagnostics(client, settings, session_factory,
     # All required fields present exactly once except the duplicated amount, so
     # the diagnostic isolates the duplicate (missing_required_fields stays empty).
     body = (
-        f"api_key={settings.inbound_api_key}&amount=13579&amount=24680"
-        f"&order_id={order_id}&customer_id={DEFAULT_CUSTOMER_ID}"
+        f"api_key={settings.inbound_api_key}&amount=13579&amount=24680&order_id={order_id}"
     )
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
         response = _post_form(client, body)
@@ -297,7 +326,6 @@ def test_rejection_logs_only_safe_diagnostics(client, settings, session_factory,
     assert "13579" not in blob
     assert "24680" not in blob
     assert order_id not in blob
-    assert DEFAULT_CUSTOMER_ID not in blob
     assert settings.inbound_api_key not in blob
 
 
@@ -320,13 +348,25 @@ def test_required_values_absent_from_preauth_logs(client, settings, session_fact
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
         response = _post_form(client, body)
     assert response.status_code == 200
-    # The pre-auth parser event carries only representation/content_type/body_size.
+    # The pre-auth parser event carries only representation/content_type/body_size
+    # plus a boolean identity-presence flag — never a field value.
     [norm] = [r for r in caplog.records if r.getMessage() == "custom_payment_body_normalized"]
     blob = repr(norm.__dict__)
     assert order_id not in blob
     assert "45678" not in blob
-    assert DEFAULT_CUSTOMER_ID not in blob
     assert settings.inbound_api_key not in blob
+
+
+def test_raw_alias_value_absent_from_preauth_logs(client, settings, session_factory, stub, caplog):
+    raw = 8123456789012345
+    body = _required(settings, order_id="al-preauth") + f"&user_id={raw}"
+    with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
+        response = _post_form(client, body)
+    assert response.status_code == 200
+    [norm] = [r for r in caplog.records if r.getMessage() == "custom_payment_body_normalized"]
+    assert norm.has_end_user_identity is True
+    for record in caplog.records:
+        assert str(raw) not in repr(record.__dict__)
 
 
 def test_api_key_absent_from_logs_and_error_responses(
@@ -361,7 +401,9 @@ def test_outbound_customer_bot_payload_unchanged(
     body = _required(settings, order_id=order_id) + "&utm_source=x&campaign=y"
     assert _post_form(client, body).status_code == 200
     payment = get_payment(session_factory, order_id)
-    stub.verify_result = verify_ok_response(amount=10000, reference_id=f"REF-{order_id}")
+    stub.verify_result = verify_ok_response(
+        amount=10000, user_id=payment.gateway_user_id, reference_id=f"REF-{order_id}"
+    )
     assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
     result = run_pass(session_factory, notifier, settings)
     assert result["processed"] == 1
@@ -377,7 +419,6 @@ def test_json_and_text_plain_paths_unchanged(client, settings, session_factory, 
         "api_key": settings.inbound_api_key,
         "amount": 10000,
         "order_id": "json-still",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
     assert client.post(
         CUSTOM_PAYMENT_URL, content=json.dumps(obj), headers={"Content-Type": "application/json"}
@@ -386,7 +427,6 @@ def test_json_and_text_plain_paths_unchanged(client, settings, session_factory, 
         "api_key": settings.inbound_api_key,
         "amount": "10000",
         "order_id": "text-still",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
     assert client.post(
         CUSTOM_PAYMENT_URL, content=json.dumps(obj2), headers={"Content-Type": "text/plain"}

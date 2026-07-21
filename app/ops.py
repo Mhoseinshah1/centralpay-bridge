@@ -525,7 +525,7 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
 
 def _cmd_privacy_audit(args: argparse.Namespace) -> int:
     """Payer-identity isolation report (incident 2026-07). Counts only — never
-    a raw customer_id or card datum. Exit 1 if any hard invariant is violated
+    a raw Telegram id or card datum. Exit 1 if any hard invariant is violated
     (a gateway userId shared by two payer identities, which would re-share card
     suggestions)."""
     from sqlalchemy import func

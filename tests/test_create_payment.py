@@ -40,9 +40,9 @@ def test_create_payment_success(client, settings, session_factory, stub):
     assert payment.status == PaymentStatus.LINK_CREATED.value
     assert payment.bot_order_id == "order-abc-1"
     assert payment.amount == 10000
-    # Per-customer isolation (incident 2026-07): the payment carries the
-    # customer-specific derived gateway userId and a payer_identity_id, NEVER
-    # the legacy shared CENTRALPAY_USER_ID.
+    # Per-user isolation (incident 2026-07): the payment carries the end-user
+    # derived gateway userId and a payer_identity_id, NEVER the legacy shared
+    # CENTRALPAY_USER_ID.
     assert payment.gateway_user_id == DEFAULT_GATEWAY_USER_ID
     assert payment.gateway_user_id != settings.centralpay_user_id
     assert payment.payer_identity_id is not None
@@ -60,7 +60,7 @@ def test_create_payment_success(client, settings, session_factory, stub):
     assert request["api_key"] == settings.centralpay_getlink_api_key
     assert request["type"] == "deposit"
     assert request["amount"] == 10000
-    # The gateway receives the per-customer isolated userId, not the shared one.
+    # The gateway receives the per-user isolated userId, not the shared one.
     assert request["userId"] == DEFAULT_GATEWAY_USER_ID
     assert request["userId"] != settings.centralpay_user_id
     assert request["orderId"] == payment.gateway_order_id

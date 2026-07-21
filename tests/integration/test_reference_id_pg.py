@@ -77,8 +77,8 @@ def pg_app(settings, pg_session_factory):
 
 
 def _verify_success(reference_id: object, *, amount: int) -> httpx.Response:
-    # create_order uses the default customer, so verify must report that
-    # customer's derived gateway userId (not the legacy shared id).
+    # create_order uses the default end user, so verify must report that
+    # user's derived gateway userId (not the legacy shared id).
     data: dict[str, object] = {"amount": amount, "userId": DEFAULT_GATEWAY_USER_ID}
     if reference_id is not None:
         data["referenceId"] = reference_id

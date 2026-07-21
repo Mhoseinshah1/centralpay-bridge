@@ -1,22 +1,27 @@
 """Legacy-body compatibility for POST /api/custom-payment.
 
 Some legacy customer bots do not POST a plain JSON object: they send the
-same four fields (api_key, amount, order_id, customer_id) as a JSON string,
-as application/x-www-form-urlencoded, or as text/plain containing JSON, and
+same three required fields (api_key, amount, order_id) as a JSON string, as
+application/x-www-form-urlencoded, or as text/plain containing JSON, and
 they sometimes send ``amount`` as a decimal *string*. FastAPI's default
 body binding rejected all of those with a 422 before the route ran.
 
 ``parse_create_payment_request`` normalizes the *allowed* representations
-into a {api_key, amount, order_id, customer_id} dict and validates it with
-the SAME strict ``CreatePaymentRequest`` model. This suite proves:
+into a {api_key, amount, order_id} dict, validates it with the SAME strict
+``CreatePaymentRequest`` model, and separately extracts the OPTIONAL end-user
+Telegram id from any supported alias (user_id/userId/uid/chat_id/telegram_id)
+in the body or query. This suite proves:
 
 - every accepted representation reaches the strict model and creates a
   payment identical to the canonical JSON-object request;
+- the optional identity alias is parsed from every accepted representation
+  and from the query string, and drives the derived per-user gateway id;
 - every disallowed representation, malformed amount, and malformed
   order_id is rejected with the project's sanitized 422 and produces no
   payment row, no audit event, and no gateway traffic;
 - the api_key is never echoed in an error and no field value (in
-  particular order_id) is logged before authentication;
+  particular order_id or the raw Telegram id) is logged before/without
+  authentication;
 - the success response and the outbound customer-bot callback are
   byte-for-byte unchanged.
 
@@ -31,9 +36,13 @@ import pytest
 from sqlalchemy import func, select
 
 from app.models import Payment
+from app.services.payer_identity import (
+    IDENTITY_TYPE_ORDER_FALLBACK,
+    IDENTITY_TYPE_TELEGRAM_USER,
+)
 from tests.conftest import (
-    DEFAULT_CUSTOMER_ID,
     DEFAULT_REDIRECT_URL,
+    expected_gateway_user_id,
     get_events,
     get_payment,
     run_pass,
@@ -61,12 +70,11 @@ def _post_raw(client, body, content_type: str | None):
     return client.post(CUSTOM_PAYMENT_URL, content=body, headers=headers)
 
 
-def _valid_fields(settings, *, amount, order_id="legacy-order-1", customer_id=DEFAULT_CUSTOMER_ID):
+def _valid_fields(settings, *, amount, order_id="legacy-order-1"):
     return {
         "api_key": settings.inbound_api_key,
         "amount": amount,
         "order_id": order_id,
-        "customer_id": customer_id,
     }
 
 
@@ -112,10 +120,7 @@ def test_json_string_object_with_decimal_string_amount(client, settings, session
 
 
 def test_urlencoded_exact_fields(client, settings, session_factory, stub):
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&order_id=urlenc-1"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=urlenc-1"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     payment = get_payment(session_factory, "urlenc-1")
@@ -158,13 +163,99 @@ def test_urlencoded_order_id_passed_through_byte_exact(client, settings, session
     """order_id stays opaque through the urlencoded path — decoded but not
     trimmed, case-folded, or normalized."""
     order_id = "Order ABC-1"  # a space survives percent-decoding unchanged
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&order_id=Order%20ABC-1"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=Order%20ABC-1"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert get_payment(session_factory, order_id).bot_order_id == order_id
+
+
+# --- optional identity alias across every accepted representation ------------
+
+
+def test_json_object_alias_sets_telegram_identity(client, settings, session_factory, stub):
+    fields = _valid_fields(settings, amount=10000, order_id="al-json")
+    fields["user_id"] = 707801
+    response = _post_raw(client, json.dumps(fields), "application/json")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-json")
+    assert payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707801)
+
+
+@pytest.mark.parametrize("alias", ["user_id", "userId", "uid", "chat_id", "telegram_id"])
+def test_json_object_accepts_each_alias(client, settings, session_factory, stub, alias):
+    fields = _valid_fields(settings, amount=10000, order_id=f"al-{alias}")
+    fields[alias] = 707802
+    response = _post_raw(client, json.dumps(fields), "application/json")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, f"al-{alias}")
+    assert payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707802)
+
+
+def test_json_string_object_alias_parsed(client, settings, session_factory, stub):
+    fields = _valid_fields(settings, amount=10000, order_id="al-jsonstr")
+    fields["telegram_id"] = 707803
+    body = json.dumps(json.dumps(fields))  # one extra JSON-string layer
+    response = _post_raw(client, body, "application/json")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-jsonstr")
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707803)
+
+
+def test_urlencoded_alias_parsed(client, settings, session_factory, stub):
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=al-url&uid=707804"
+    response = _post_raw(client, body, "application/x-www-form-urlencoded")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-url")
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707804)
+
+
+def test_text_plain_alias_parsed(client, settings, session_factory, stub):
+    fields = _valid_fields(settings, amount=10000, order_id="al-text")
+    fields["chat_id"] = 707805
+    response = _post_raw(client, json.dumps(fields), "text/plain")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-text")
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707805)
+
+
+def test_alias_from_query_string_parsed(client, settings, session_factory, stub):
+    # Body carries only the required fields; the identity comes from the query.
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=al-query"
+    response = client.post(
+        f"{CUSTOM_PAYMENT_URL}?userId=707806",
+        content=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-query")
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=707806)
+
+
+def test_absent_alias_uses_order_fallback(client, settings, session_factory, stub):
+    body = json.dumps(_valid_fields(settings, amount=10000, order_id="al-none"))
+    response = _post_raw(client, body, "application/json")
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "al-none")
+    assert payment.payer_identity_type == IDENTITY_TYPE_ORDER_FALLBACK
+    assert payment.gateway_user_id == expected_gateway_user_id(order_id="al-none")
+
+
+def test_raw_alias_value_not_logged(client, settings, session_factory, stub, caplog):
+    """When an identity alias IS present, the raw Telegram id never reaches the
+    normalized-body observability log (only a boolean presence flag)."""
+    raw = 8123456789012345
+    fields = _valid_fields(settings, amount=10000, order_id="al-log")
+    fields["user_id"] = raw
+    with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
+        response = _post_raw(client, json.dumps(fields), "application/json")
+    assert response.status_code == 200
+    events = [r for r in caplog.records if r.getMessage() == "custom_payment_body_normalized"]
+    assert len(events) == 1
+    assert events[0].has_end_user_identity is True
+    for record in caplog.records:
+        assert str(raw) not in repr(record.__dict__)
 
 
 # --- disallowed representations ----------------------------------------------
@@ -220,11 +311,8 @@ def test_invalid_json_rejected(client, settings, session_factory, stub):
 
 
 def test_urlencoded_duplicate_field_rejected(client, settings, session_factory, stub):
-    # customer_id is present so the duplicate amount is the sole rejection cause.
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&amount=20000&order_id=dup"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    # A duplicate required field is the rejection cause.
+    body = f"api_key={settings.inbound_api_key}&amount=10000&amount=20000&order_id=dup"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 422
     _assert_no_side_effects(session_factory, stub)
@@ -233,21 +321,15 @@ def test_urlencoded_duplicate_field_rejected(client, settings, session_factory, 
 def test_urlencoded_extra_field_is_ignored(client, settings, session_factory, stub):
     # Legacy senders add unrelated fields; they are ignored, not rejected.
     # (Full extra-field coverage: tests/test_custom_payment_urlencoded_extra_fields.py.)
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&order_id=x&extra=1"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=x&extra=1"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert get_payment(session_factory, "x").amount == 10000
 
 
 def test_urlencoded_missing_field_rejected(client, settings, session_factory, stub):
-    # customer_id present so order_id is the single missing required field.
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"  # no order_id
-    )
+    # order_id is the single missing required field.
+    body = f"api_key={settings.inbound_api_key}&amount=10000"  # no order_id
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 422
     _assert_no_side_effects(session_factory, stub)
@@ -328,7 +410,7 @@ def test_invalid_order_ids_rejected(client, settings, session_factory, stub, ord
     _assert_no_side_effects(session_factory, stub)
 
 
-@pytest.mark.parametrize("missing", ["api_key", "amount", "order_id", "customer_id"])
+@pytest.mark.parametrize("missing", ["api_key", "amount", "order_id"])
 def test_missing_required_field_rejected(client, settings, session_factory, stub, missing):
     fields = _valid_fields(settings, amount=10000, order_id="miss")
     del fields[missing]
@@ -337,7 +419,7 @@ def test_missing_required_field_rejected(client, settings, session_factory, stub
     _assert_no_side_effects(session_factory, stub)
 
 
-@pytest.mark.parametrize("field", ["api_key", "amount", "order_id", "customer_id"])
+@pytest.mark.parametrize("field", ["api_key", "amount", "order_id"])
 def test_null_required_field_rejected(client, settings, session_factory, stub, field):
     fields = _valid_fields(settings, amount=10000, order_id="null-field")
     fields[field] = None
@@ -416,7 +498,6 @@ def test_normalized_log_carries_only_safe_metadata(
     blob = repr(record.__dict__)
     assert order_id not in blob
     assert settings.inbound_api_key not in blob
-    assert DEFAULT_CUSTOMER_ID not in blob
     assert "10000" not in blob
 
 
@@ -424,10 +505,7 @@ def test_normalized_log_carries_only_safe_metadata(
 
 
 def test_success_response_shape_unchanged(client, settings, session_factory, stub):
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&order_id=shape"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=shape"
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert response.json() == {"url": DEFAULT_REDIRECT_URL}
@@ -440,14 +518,14 @@ def test_outbound_customer_bot_callback_unchanged(
     exact, unchanged outbound customer-bot notification payload."""
     order_id = "outbound-1"
     # Create through the legacy urlencoded representation.
-    body = (
-        f"api_key={settings.inbound_api_key}&amount=10000&order_id={order_id}"
-        f"&customer_id={DEFAULT_CUSTOMER_ID}"
-    )
+    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id={order_id}"
     assert _post_raw(client, body, "application/x-www-form-urlencoded").status_code == 200
     payment = get_payment(session_factory, order_id)
-    # Verify it via the signed callback, leaving it pending notification.
-    stub.verify_result = verify_ok_response(amount=10000, reference_id=f"REF-{order_id}")
+    # Verify it via the signed callback, leaving it pending notification. No
+    # alias was sent, so the row is order-scoped: verify its own gateway id.
+    stub.verify_result = verify_ok_response(
+        amount=10000, user_id=payment.gateway_user_id, reference_id=f"REF-{order_id}"
+    )
     assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
     # One worker pass delivers the unchanged outbound payload.
     result = run_pass(session_factory, notifier, settings)

@@ -190,7 +190,6 @@ def test_errors_summary_lists_reason_events(
             "api_key": settings.inbound_api_key,
             "amount": 10000,
             "order_id": "adm-err",
-            "customer_id": "cust-adm-err",
         },
     )
     text = "\n".join(handlers.handle(admin_ctx(), "errors", []))

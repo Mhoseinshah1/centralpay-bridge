@@ -13,6 +13,10 @@ Representation labels: ``urlencoded`` (strict form), ``urlencoded_json_object``
 / ``urlencoded_json_string_object`` (fallback accepted), and
 ``urlencoded_unparseable`` (both parsers failed).
 
+The three required fields are api_key, amount, order_id; the OPTIONAL end-user
+identity alias is carried alongside them and is parsed on the fallback path
+too, driving only the derived gateway payer id.
+
 These tests exercise the real route through the strict model and fake both
 CentralPay and the customer bot at the httpx transport layer (shared
 fixtures) — no real external service is contacted.
@@ -32,9 +36,10 @@ from app.api.payments import (
     _UrlencodedSyntaxError,
 )
 from app.models import Payment
+from app.services.payer_identity import IDENTITY_TYPE_TELEGRAM_USER
 from tests.conftest import (
-    DEFAULT_CUSTOMER_ID,
     DEFAULT_REDIRECT_URL,
+    expected_gateway_user_id,
     get_events,
     get_payment,
     run_pass,
@@ -61,21 +66,15 @@ def _post_form(client, body: str | bytes):
     return client.post(CUSTOM_PAYMENT_URL, content=body, headers={"Content-Type": FORM_CT})
 
 
-def _form_body(
-    settings, *, amount="10000", order_id="fb-order", customer_id=DEFAULT_CUSTOMER_ID
-) -> str:
-    return (
-        f"api_key={settings.inbound_api_key}&amount={amount}"
-        f"&order_id={order_id}&customer_id={customer_id}"
-    )
+def _form_body(settings, *, amount="10000", order_id="fb-order") -> str:
+    return f"api_key={settings.inbound_api_key}&amount={amount}&order_id={order_id}"
 
 
-def _json_fields(settings, *, amount, order_id, customer_id=DEFAULT_CUSTOMER_ID, **extras):
+def _json_fields(settings, *, amount, order_id, **extras):
     fields = {
         "api_key": settings.inbound_api_key,
         "amount": amount,
         "order_id": order_id,
-        "customer_id": customer_id,
     }
     fields.update(extras)
     return fields
@@ -181,6 +180,19 @@ def test_fallback_amount_ascii_decimal_string_converted(
     assert isinstance(payment.amount, int)
 
 
+def test_fallback_identity_alias_parsed(client, settings, session_factory, stub):
+    """The optional identity alias is parsed on the JSON-under-form fallback
+    path too, and drives the derived per-user gateway id."""
+    body = json.dumps(
+        _json_fields(settings, amount=10000, order_id="fb-alias", user_id=767601)
+    )
+    response = _post_form(client, body)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "fb-alias")
+    assert payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=767601)
+
+
 # --- fallback extras: ignored, never reach the model, DB, or gateway ----------
 
 
@@ -205,7 +217,7 @@ def test_fallback_extra_json_keys_never_reach_the_model(
     )
     assert _post_form(client, body).status_code == 200
     [kwargs] = captured
-    assert set(kwargs) == {"api_key", "amount", "order_id", "customer_id"}
+    assert set(kwargs) == {"api_key", "amount", "order_id"}
 
 
 def test_fallback_extra_json_keys_not_stored_and_cannot_alter_payment(
@@ -249,10 +261,9 @@ def test_fallback_extra_json_keys_do_not_change_gateway_request(
 @pytest.mark.parametrize(
     "present",
     [
-        ("amount", "order_id", "customer_id"),  # missing api_key
-        ("api_key", "order_id", "customer_id"),  # missing amount
-        ("api_key", "amount", "customer_id"),  # missing order_id
-        ("api_key", "amount", "order_id"),  # missing customer_id
+        ("amount", "order_id"),  # missing api_key
+        ("api_key", "order_id"),  # missing amount
+        ("api_key", "amount"),  # missing order_id
     ],
 )
 def test_parsed_form_missing_required_field_rejected_without_fallback(
@@ -262,7 +273,6 @@ def test_parsed_form_missing_required_field_rejected_without_fallback(
         "api_key": settings.inbound_api_key,
         "amount": "10000",
         "order_id": "nf-miss",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
     body = "&".join(f"{name}={values[name]}" for name in present)
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
@@ -272,12 +282,12 @@ def test_parsed_form_missing_required_field_rejected_without_fallback(
     # Rejected AS A FORM: the semantic diagnostics prove the fallback never ran.
     assert rec.representation == "urlencoded"
     assert rec.missing_required_fields == [
-        f for f in ("api_key", "amount", "order_id", "customer_id") if f not in present
+        f for f in ("api_key", "amount", "order_id") if f not in present
     ]
     _assert_no_side_effects(session_factory, stub)
 
 
-@pytest.mark.parametrize("field", ["api_key", "amount", "order_id", "customer_id"])
+@pytest.mark.parametrize("field", ["api_key", "amount", "order_id"])
 def test_parsed_form_duplicate_required_field_rejected_without_fallback(
     client, settings, session_factory, stub, caplog, field
 ):
@@ -285,10 +295,9 @@ def test_parsed_form_duplicate_required_field_rejected_without_fallback(
         "api_key": settings.inbound_api_key,
         "amount": "10000",
         "order_id": "nf-dup",
-        "customer_id": DEFAULT_CUSTOMER_ID,
     }
     parts = []
-    for name in ("api_key", "amount", "order_id", "customer_id"):
+    for name in ("api_key", "amount", "order_id"):
         parts.append(f"{name}={values[name]}")
         if name == field:
             parts.append(f"{name}={values[name]}")
@@ -311,8 +320,8 @@ def test_parsed_form_over_pair_limit_rejected_without_fallback(
     assert response.status_code == 422
     rec = _rejection_record(caplog)
     assert rec.representation == "urlencoded"
-    # 4 required pairs + (_MAX_FORM_PAIRS + 5) extras.
-    assert rec.total_pair_count == _MAX_FORM_PAIRS + 9
+    # 3 required pairs + (_MAX_FORM_PAIRS + 5) extras.
+    assert rec.total_pair_count == _MAX_FORM_PAIRS + 8
     _assert_no_side_effects(session_factory, stub)
 
 
@@ -378,13 +387,12 @@ def test_fallback_schema_failures_still_rejected(client, settings, session_facto
 
 
 def test_fallback_never_bypasses_authentication(client, settings, session_factory, stub):
-    # A schema-valid body (customer_id present) that fails only the key check.
+    # A schema-valid body that fails only the key check.
     body = json.dumps(
         {
             "api_key": "wrong-key-value",
             "amount": 10000,
             "order_id": "fb-auth",
-            "customer_id": DEFAULT_CUSTOMER_ID,
         }
     )
     response = _post_form(client, body)
@@ -422,7 +430,6 @@ def test_accepted_fallback_logs_no_field_values(
     assert order_id not in blob
     assert "45678" not in blob
     assert "EXTRA-V" not in blob
-    assert DEFAULT_CUSTOMER_ID not in blob
     assert settings.inbound_api_key not in blob
 
 
@@ -471,7 +478,9 @@ def test_outbound_customer_bot_payload_unchanged(
     body = json.dumps(_json_fields(settings, amount=10000, order_id=order_id, legacy="x"))
     assert _post_form(client, body).status_code == 200
     payment = get_payment(session_factory, order_id)
-    stub.verify_result = verify_ok_response(amount=10000, reference_id=f"REF-{order_id}")
+    stub.verify_result = verify_ok_response(
+        amount=10000, user_id=payment.gateway_user_id, reference_id=f"REF-{order_id}"
+    )
     assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
     result = run_pass(session_factory, notifier, settings)
     assert result["processed"] == 1
