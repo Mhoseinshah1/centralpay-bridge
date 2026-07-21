@@ -5,6 +5,7 @@ from sqlalchemy import func, select
 
 from app.models import Payment, PaymentStatus
 from tests.conftest import (
+    DEFAULT_GATEWAY_USER_ID,
     DEFAULT_REDIRECT_URL,
     create_order,
     event_types,
@@ -39,7 +40,13 @@ def test_create_payment_success(client, settings, session_factory, stub):
     assert payment.status == PaymentStatus.LINK_CREATED.value
     assert payment.bot_order_id == "order-abc-1"
     assert payment.amount == 10000
-    assert payment.gateway_user_id == settings.centralpay_user_id
+    # Per-customer isolation (incident 2026-07): the payment carries the
+    # customer-specific derived gateway userId and a payer_identity_id, NEVER
+    # the legacy shared CENTRALPAY_USER_ID.
+    assert payment.gateway_user_id == DEFAULT_GATEWAY_USER_ID
+    assert payment.gateway_user_id != settings.centralpay_user_id
+    assert payment.payer_identity_id is not None
+    assert payment.payer_derivation_version == 1
     assert payment.redirect_url == DEFAULT_REDIRECT_URL
     assert 10**11 <= payment.gateway_order_id < 10**12
 
@@ -53,7 +60,9 @@ def test_create_payment_success(client, settings, session_factory, stub):
     assert request["api_key"] == settings.centralpay_getlink_api_key
     assert request["type"] == "deposit"
     assert request["amount"] == 10000
-    assert request["userId"] == settings.centralpay_user_id
+    # The gateway receives the per-customer isolated userId, not the shared one.
+    assert request["userId"] == DEFAULT_GATEWAY_USER_ID
+    assert request["userId"] != settings.centralpay_user_id
     assert request["orderId"] == payment.gateway_order_id
     assert request["returnUrl"].startswith(
         f"{settings.public_base_url}/api/centralpay/callback?orderId="

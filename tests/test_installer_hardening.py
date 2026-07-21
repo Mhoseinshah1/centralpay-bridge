@@ -31,6 +31,7 @@ TEST_RENDER_INBOUND_API_KEY = "test-inbound-api-key-abcdef"
 TEST_RENDER_HMAC_SECRET = "test-callback-hmac-secret-abcdef"
 TEST_RENDER_GETLINK_API_KEY = "test-getlink-api-key-abcdef"
 TEST_RENDER_VERIFY_API_KEY = "test-verify-api-key-abcdef"
+TEST_RENDER_PAYER_ID_SECRET = "test-payer-id-secret-abcdef"
 TEST_RENDER_BOT_TOKEN = "test-bot-notify-token-abcdef"
 
 # Every install.sh variable render_template reads that has no in-function
@@ -43,6 +44,7 @@ _RENDER_REQUIRED = {
     "CALLBACK_HMAC_SECRET": TEST_RENDER_HMAC_SECRET,
     "CENTRALPAY_GETLINK_API_KEY": TEST_RENDER_GETLINK_API_KEY,
     "CENTRALPAY_VERIFY_API_KEY": TEST_RENDER_VERIFY_API_KEY,
+    "CENTRALPAY_PAYER_ID_SECRET": TEST_RENDER_PAYER_ID_SECRET,
     "MIN_PAYMENT_AMOUNT_TOMAN": "1000",
     "MAX_PAYMENT_AMOUNT_TOMAN": "100000000",
     "PAYMENT_FEE_PERCENT": "2.5",

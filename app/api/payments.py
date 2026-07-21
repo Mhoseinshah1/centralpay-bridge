@@ -4,18 +4,39 @@ import contextlib
 import json
 import logging
 import re
+import unicodedata
 from typing import Annotated, Any, NoReturn
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, StrictInt, StrictStr
+from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
-from app.exceptions import AmountOutOfRangeError, InvalidApiKeyError, RateLimitedError
+from app.exceptions import (
+    AmountOutOfRangeError,
+    InvalidApiKeyError,
+    PayerIdentityMisconfiguredError,
+    PaymentCreationDisabledError,
+    RateLimitedError,
+)
 from app.security import constant_time_equals
+from app.services.payer_identity import customer_fingerprint
 from app.services.payments import create_payment
+
+
+def _customer_id_has_forbidden_char(value: str) -> bool:
+    """Reject control/format/bidi/zero-width and other unsafe Unicode in an
+    opaque customer id. Category ``C*`` covers ASCII controls (Cc), bidi and
+    zero-width format characters (Cf, e.g. RLO/LRE/ZWSP/BOM), surrogates,
+    private-use, and unassigned code points; ``Zl``/``Zp`` are line/paragraph
+    separators."""
+    for ch in value:
+        category = unicodedata.category(ch)
+        if category[0] == "C" or category in ("Zl", "Zp"):
+            return True
+    return False
 
 logger = logging.getLogger("app.api.payments")
 
@@ -37,6 +58,12 @@ class CreatePaymentRequest(BaseModel):
       and produced a 500). It is passed through unchanged — never
       trimmed, case-folded, or Unicode-normalized — because the bot
       contract treats it as an opaque identifier.
+    - customer_id: opaque STABLE upstream customer identity (incident
+      2026-07). Required: it isolates payers on the gateway so saved-card
+      suggestions can never be shared across customers. At most 128
+      characters, no control/format/bidi/zero-width characters, no
+      whitespace-only or whitespace-padded value. Never logged raw; only a
+      short non-reversible fingerprint appears in logs/events.
     """
 
     api_key: StrictStr
@@ -44,6 +71,16 @@ class CreatePaymentRequest(BaseModel):
     order_id: StrictStr = Field(
         min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$"
     )
+    customer_id: StrictStr = Field(min_length=1, max_length=128)
+
+    @field_validator("customer_id")
+    @classmethod
+    def _validate_customer_id(cls, value: str) -> str:
+        if value != value.strip() or not value.strip():
+            raise ValueError("customer_id must not be blank or padded with whitespace")
+        if _customer_id_has_forbidden_char(value):
+            raise ValueError("customer_id contains forbidden characters")
+        return value
 
 
 class CreatePaymentResponse(BaseModel):
@@ -64,7 +101,7 @@ class CreatePaymentResponse(BaseModel):
 # Bounded before any decode/parse; aligns with the Caddy edge limit
 # (request_body max_size 64KB). The legitimate body is ~150 bytes.
 _MAX_BODY_BYTES = 64 * 1024
-_REQUIRED_FIELDS = ("api_key", "amount", "order_id")
+_REQUIRED_FIELDS = ("api_key", "amount", "order_id", "customer_id")
 # Bound on the number of application/x-www-form-urlencoded pairs accepted from
 # an unauthenticated request. The legitimate body carries exactly the three
 # required fields; a legacy sender adds at most a handful of unrelated fields.
@@ -332,11 +369,30 @@ def create_custom_payment(
         raise InvalidApiKeyError()
     if not limiters.check(limiters.create, "create_payment"):
         raise RateLimitedError()
+    # Emergency privacy containment and fail-closed payer isolation, checked
+    # AFTER authentication (never expose guard state to unauthenticated
+    # callers) and BEFORE any gateway work. Neither error names the missing
+    # configuration to the caller.
+    if not settings.payment_creation_enabled:
+        logger.error("payment_creation_disabled", extra={"bot_order_id": body.order_id})
+        raise PaymentCreationDisabledError()
+    if not settings.centralpay_payer_id_secret:
+        # Without the dedicated payer-id secret we cannot isolate customers on
+        # the gateway; refuse rather than fall back to a shared identity.
+        logger.error("payer_identity_secret_missing", extra={"bot_order_id": body.order_id})
+        raise PayerIdentityMisconfiguredError()
     # Logged only AFTER authentication so unauthenticated probes cannot
-    # write attacker-chosen order ids into this event stream.
+    # write attacker-chosen order ids into this event stream. The raw
+    # customer_id is NEVER logged — only a short non-reversible fingerprint.
     logger.info(
         "payment_create_requested",
-        extra={"bot_order_id": body.order_id, "amount": body.amount},
+        extra={
+            "bot_order_id": body.order_id,
+            "amount": body.amount,
+            "customer_fingerprint": customer_fingerprint(
+                settings.centralpay_payer_id_secret, body.customer_id
+            ),
+        },
     )
     # The MINIMUM applies to the ORIGINAL bot amount. The MAXIMUM applies to
     # the final payable amount (original + service fee) and is enforced in
@@ -355,6 +411,11 @@ def create_custom_payment(
             f"Amount must be at least {settings.min_payment_amount_toman} TOMAN"
         )
     url = create_payment(
-        db, client, settings, bot_order_id=body.order_id, amount=body.amount
+        db,
+        client,
+        settings,
+        bot_order_id=body.order_id,
+        amount=body.amount,
+        customer_id=body.customer_id,
     )
     return CreatePaymentResponse(url=url)

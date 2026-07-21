@@ -523,6 +523,72 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
     return 0 if not failures else 1
 
 
+def _cmd_privacy_audit(args: argparse.Namespace) -> int:
+    """Payer-identity isolation report (incident 2026-07). Counts only — never
+    a raw customer_id or card datum. Exit 1 if any hard invariant is violated
+    (a gateway userId shared by two payer identities, which would re-share card
+    suggestions)."""
+    from sqlalchemy import func
+
+    from app.models import CentralPayPayerIdentity
+
+    settings = Settings()
+    configure_logging(settings)
+    session_factory = create_session_factory(settings.database_url)
+    failures: list[str] = []
+    report: dict[str, object] = {}
+
+    with session_factory() as db:
+        payments_total = db.execute(select(func.count(Payment.id))).scalar_one()
+        legacy = db.execute(
+            select(func.count(Payment.id)).where(Payment.payer_identity_id.is_(None))
+        ).scalar_one()
+        isolated = db.execute(
+            select(func.count(Payment.id)).where(Payment.payer_identity_id.is_not(None))
+        ).scalar_one()
+        mappings = db.execute(
+            select(func.count(CentralPayPayerIdentity.id))
+        ).scalar_one()
+        # A gateway userId owned by more than one payer identity is the exact
+        # failure this fix prevents; DB uniqueness should keep it at zero.
+        dup_rows = db.execute(
+            select(CentralPayPayerIdentity.gateway_user_id)
+            .group_by(CentralPayPayerIdentity.gateway_user_id)
+            .having(func.count(CentralPayPayerIdentity.id) > 1)
+        ).all()
+        newest_legacy = db.execute(
+            select(func.max(Payment.created_at)).where(Payment.payer_identity_id.is_(None))
+        ).scalar_one_or_none()
+
+    guard = "active"
+    if not settings.payment_creation_enabled:
+        guard = "disabled"
+    elif not settings.centralpay_payer_id_secret:
+        guard = "misconfigured"
+        failures.append("payer_id_secret_missing")
+
+    duplicate_count = len(dup_rows)
+    if duplicate_count:
+        failures.append("duplicate_gateway_user_ids")
+
+    report = {
+        "payments_total": payments_total,
+        "legacy_shared_payer_payments": legacy,
+        "isolated_payer_payments": isolated,
+        "payer_identity_mappings": mappings,
+        "duplicate_gateway_user_ids": duplicate_count,
+        # Post-fix, every new payment is mapped; legacy rows are the only ones
+        # without a mapping and are the residual pre-fix exposure surface.
+        "payments_missing_payer_mapping": legacy,
+        "newest_legacy_payment_at": newest_legacy.isoformat() if newest_legacy else None,
+        "payment_creation_guard": guard,
+        "status": "ok" if not failures else "attention",
+        "failures": failures,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    return 0 if not failures else 1
+
+
 def _cmd_review(args: argparse.Namespace) -> int:
     settings = Settings()
     configure_logging(settings)
@@ -645,6 +711,10 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--retention-days", type=int, default=0)
     backup.add_argument("--detail", default="")
     sub.add_parser("test-alert", help="queue a clearly marked test alert")
+    sub.add_parser(
+        "privacy-audit",
+        help="payer-identity isolation report (counts only; no customer/card data)",
+    )
 
     db_check = sub.add_parser("db-check", help="database integrity checks (restore verification)")
     db_check.add_argument(
@@ -709,6 +779,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_backup_event(args)
     if args.command == "db-check":
         return _cmd_db_check(args)
+    if args.command == "privacy-audit":
+        return _cmd_privacy_audit(args)
     if args.command == "fee":
         if args.fee_command in ("set", "schedule", "cancel") and not args.note.strip():
             print("a non-empty --note is required", file=sys.stderr)

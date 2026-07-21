@@ -40,6 +40,16 @@ def health_details(request: Request, response: Response) -> dict[str, object]:
             "build_sha": settings.git_commit_sha or None,
             "environment": settings.environment,
             "database": "ok" if db_ok else "error",
+            # Payer-identity isolation guard (incident 2026-07): payment
+            # creation fails closed unless it is "active". Callback verification
+            # is unaffected in every state.
+            "payment_creation": (
+                "disabled"
+                if not settings.payment_creation_enabled
+                else "misconfigured"
+                if not settings.centralpay_payer_id_secret
+                else "active"
+            ),
             "migration_revision": queries.migration_revision(session) if db_ok else None,
             "worker_heartbeat_age_seconds": (
                 int(heartbeat_age) if heartbeat_age is not None else None

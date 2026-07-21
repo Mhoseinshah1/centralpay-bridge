@@ -60,6 +60,9 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
 # Deliberately exercises Persian/Arabic-Indic digit amount strings, which
 # the parser must reject; RUF001 flags those digits as confusable with ASCII.
 "tests/test_custom_payment_legacy_body.py" = ["RUF001"]
+# Deliberately exercises Persian text and bidi/zero-width customer_id values,
+# which RUF001 flags as confusable/ambiguous.
+"tests/test_payer_identity.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.12"

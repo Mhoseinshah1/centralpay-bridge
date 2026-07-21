@@ -1,6 +1,7 @@
 """Audit trail: every financial state transition is recorded with a request id."""
 
 from tests.conftest import (
+    DEFAULT_CUSTOMER_ID,
     create_order,
     event_types,
     get_events,
@@ -54,6 +55,7 @@ def test_incoming_request_id_is_propagated(client, settings, session_factory):
             "api_key": settings.inbound_api_key,
             "amount": 10000,
             "order_id": "audit-2",
+            "customer_id": DEFAULT_CUSTOMER_ID,
         },
         headers={"x-request-id": inbound_id},
     )
