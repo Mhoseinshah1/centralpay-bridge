@@ -129,33 +129,47 @@ shared id.
   zero, newest legacy payment time, guard state). `/health/details` reports the
   `payment_creation` guard state.
 
-## Database migration
+## Database migrations
 
-`alembic/versions/0007_payer_identity.py`:
-- creates `centralpay_payer_identities` with the two unique constraints and the
-  positive-id CHECK;
-- adds nullable `payments.payer_identity_id` (FK, `ON DELETE RESTRICT`, indexed),
-  `payments.payer_identity_type` (`telegram_user`/`order_fallback`), and
-  `payments.payer_derivation_version`.
+**0007 (`alembic/versions/0007_payer_identity.py`) — already deployed; kept
+byte-exact.** Production executed the original 0007 (mapping table +
+`payments.payer_identity_id`/`payer_derivation_version`) and `alembic_version`
+is `0007`. Alembic never re-runs an applied revision, so 0007 is **never edited**
+to deliver new schema — it stays exactly as merged in PR #44.
 
-Non-destructive: existing payment rows are untouched (their shared-id snapshot is
-preserved, `payer_identity_id` stays NULL, active links stay valid).
+**0008 (`alembic/versions/0008_hybrid_payer_identity.py`) — new.** Adds the
+identity-scope column on top of the deployed state:
+- `payments.payer_identity_type VARCHAR(16) NULL` + CHECK
+  `ck_payments_payer_identity_type_valid` (NULL, `telegram_user`, or
+  `order_fallback`);
+- **no backfill, by design**: 0007-era rows (payer_identity_id set under the
+  retired `customer_id` scheme) have no determinable scope — the raw identity is
+  intentionally not stored — so they keep `NULL` as the explicit
+  historical/untyped marker (same as pre-0007 legacy rows) and are never guessed
+  to be Telegram identities. The application handles both historical shapes
+  explicitly (`_reconcile_identity`); `privacy-audit` reports them as
+  `untyped_isolated_payments`.
 
-**Rollback-safe / re-entrant.** An application rollback can leave the database at
-revision 0007 while the code expects 0006. Rolling the code forward again must
-not fail, so:
-- `upgrade()` is **idempotent** — every object is created behind an
-  `IF NOT EXISTS` inspection, so re-running it against a DB that already has the
-  table/columns is a no-op, never a "already exists" error;
-- `downgrade()` is **non-destructive by default** — it only moves the Alembic
-  pointer back to 0006 and *preserves* the mapping table and columns, so no payer
-  identity is lost and no active link is invalidated. To actually drop the schema
-  an operator opts in explicitly with `CENTRALPAY_DROP_PAYER_IDENTITY=1`.
+**Rollback-safe / recovery-safe.**
+- 0008 `upgrade()` no-ops for objects that already exist (a DB that briefly
+  carried the column still upgrades cleanly), so a rollback that leaves the DB
+  ahead of the pointer never blocks rolling the code forward again.
+- 0008 `downgrade()` is **non-destructive by default** — it only moves the
+  Alembic pointer back to 0007 and preserves the column + CHECK; dropping is an
+  explicit opt-in (`CENTRALPAY_DROP_PAYER_IDENTITY=1`).
+- The current production state (DB at 0007, app possibly rolled back to the
+  pre-0007 code at `b897e69` — a code rollback never moves schema) recovers by
+  deploying this build and running `alembic upgrade head`: exactly 0008 runs, no
+  schema downgrade, no data loss.
 
-Tested on PostgreSQL 16: upgrade → (stamp 0006) idempotent re-upgrade →
-non-destructive downgrade (schema retained) → upgrade, and against a DB
-containing historical (legacy shared-id) payments. Forward-only in production as
-usual; the recovery path above exists only for the rollback edge case.
+Proven on PostgreSQL 16 by `tests/integration/test_migration_0008_pg.py`, which
+starts from the EXACT deployed original-0007 schema (and asserts 0007 in this
+tree still is that original), seeds legacy + 0007-era rows via raw SQL, runs
+`alembic upgrade head` in a subprocess, and verifies: 0008 applies, historical
+rows keep `NULL` scope with zero data loss, the CHECK enforces the value set,
+re-upgrade after `stamp 0007` is a no-op, the downgrade preserves the schema,
+and the new application serves existing links and verifies existing callbacks
+against their stored snapshots.
 
 ## Backward compatibility (no upstream change required)
 
@@ -195,8 +209,14 @@ made safe.
   (`tests/test_payer_identity.py`, parser suites).
 - Fail-closed: missing/short payer secret and `PAYMENT_CREATION_ENABLED=false`
   both refuse without creating a row or mapping (`tests/test_payer_identity.py`).
-- Migration up → idempotent re-upgrade → non-destructive downgrade → up, plus
-  historical rows, on PostgreSQL 16.
+- Production upgrade/recovery path on PostgreSQL 16
+  (`tests/integration/test_migration_0008_pg.py`): exact deployed original-0007
+  schema (+ seeded legacy and 0007-era rows) → `alembic upgrade head` runs 0008
+  → no data loss, NULL scopes preserved, CHECK enforced, re-upgrade after
+  `stamp 0007` no-ops, downgrade preserves schema, and the new app serves the
+  existing links and callbacks.
+- 0007-era untyped rows handled explicitly, never guessed or rejected
+  (`tests/test_payer_identity.py`).
 - Full suite (1100+ tests, unit + PostgreSQL), ruff, strict mypy — see the PR.
 
 ## Staging black-box validation (before reopening payments)
@@ -235,11 +255,13 @@ identities first seen afterward. Treat any rotation as a planned migration.
   identity reconciliation legitimately needs the resolved identity first. Bounded:
   authenticated (valid inbound API key), rate-limited, tiny rows, no financial
   effect, no card/identity data. Not the leak; noted for completeness.
-- A legacy pre-fix row (`payer_identity_id NULL`) that *already* has a live link
-  is returned as-is on retry regardless of who retries the same `bot_order_id`;
-  its link uses the old shared id. This is the documented forward-only behavior
-  for historical links (bot order ids are unique per order upstream, so this is
-  not a new cross-user path); new rows never behave this way.
+- A historical row that *already* has a live link — legacy
+  (`payer_identity_id NULL`, shared id) or 0007-era untyped
+  (`payer_identity_id` set, `payer_identity_type NULL`, customer-scoped id) — is
+  returned as-is on retry regardless of who retries the same `bot_order_id`.
+  This is the documented forward-only behavior for historical links (bot order
+  ids are unique per order upstream, so this is not a new cross-user path); new
+  rows never behave this way.
 - When a Telegram-scoped order is retried without the id (kept, per the rules
   above), the order-scoped mapping resolved for that retry is left unused in
   `centralpay_payer_identities`. Harmless: isolated, never attached to a payment,

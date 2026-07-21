@@ -576,6 +576,94 @@ def test_legacy_prelink_row_adopts_isolated_identity(
     assert "payment_payer_identity_adopted" in types
 
 
+# --- 0007-era untyped rows (payer_identity_id set, scope never stored) --------
+#
+# Rows written while the merged-and-deployed PR #44 code was live carry a
+# non-NULL payer_identity_id whose mapping was keyed by the retired customer_id
+# scheme; migration 0008 leaves their payer_identity_type NULL (the scope is
+# NOT determinable and is never guessed). The app must handle them explicitly:
+# a live link is returned unchanged (frozen), a pre-link row adopts the current
+# requester's identity — and is NEVER rejected, or every in-flight 0007-era
+# order would 409 forever.
+
+
+def _seed_untyped_era7_row(session_factory, order_id, gateway_order_id, *, linked):
+    """A 0007-era-shaped row: mapped to an identity the new tg:/order: resolver
+    can never re-resolve (customer-scoped hash), with scope NULL."""
+    with session_factory() as db:
+        mapping = CentralPayPayerIdentity(
+            customer_key_hash=f"{gateway_order_id:064x}"[-64:],
+            gateway_user_id=1_900_000_000 + gateway_order_id % 1000,
+            derivation_version=1,
+        )
+        db.add(mapping)
+        db.flush()
+        db.add(
+            Payment(
+                bot_order_id=order_id,
+                gateway_order_id=gateway_order_id,
+                gateway_user_id=mapping.gateway_user_id,
+                payer_identity_id=mapping.id,
+                payer_identity_type=None,  # scope tracking arrived in 0008
+                payer_derivation_version=1,
+                amount=10000,
+                fee_rate_bps=0,
+                fee_amount=0,
+                payable_amount=10000,
+                status=(
+                    PaymentStatus.LINK_CREATED.value if linked else PaymentStatus.CREATED.value
+                ),
+                redirect_url="https://gateway.test/pay/era7" if linked else None,
+                callback_token_issued_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+        return mapping.gateway_user_id
+
+
+def test_untyped_era7_linked_row_returns_its_link_unchanged(
+    client, settings, session_factory, stub
+):
+    era7_uid = _seed_untyped_era7_row(
+        session_factory, "era7-live", 910000000088, linked=True
+    )
+    resp = create_order(client, settings, order_id="era7-live", telegram_user_id=616161)
+    assert resp.status_code == 200
+    assert resp.json() == {"url": "https://gateway.test/pay/era7"}
+    assert stub.getlink_requests == []  # no new gateway call, no re-point
+    payment = get_payment(session_factory, "era7-live")
+    assert payment.payer_identity_type is None  # immutable historical scope
+    assert payment.gateway_user_id == era7_uid
+
+
+def test_untyped_era7_prelink_row_adopts_current_identity(
+    client, settings, session_factory, stub
+):
+    era7_uid = _seed_untyped_era7_row(
+        session_factory, "era7-pre", 910000000089, linked=False
+    )
+    resp = create_order(client, settings, order_id="era7-pre", telegram_user_id=717171)
+    assert resp.status_code == 200
+    payment = get_payment(session_factory, "era7-pre")
+    assert payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+    assert payment.gateway_user_id == expected_gateway_user_id(telegram_user_id=717171)
+    assert payment.gateway_user_id != era7_uid
+    assert stub.getlink_requests[-1]["userId"] == payment.gateway_user_id
+    types = [e.event_type for e in get_events(session_factory, payment.id)]
+    assert "payment_payer_identity_adopted" in types
+
+
+def test_untyped_era7_prelink_row_without_identity_adopts_order_scope(
+    client, settings, session_factory, stub
+):
+    _seed_untyped_era7_row(session_factory, "era7-noid", 910000000090, linked=False)
+    resp = create_order(client, settings, order_id="era7-noid", telegram_user_id=None)
+    assert resp.status_code == 200
+    payment = get_payment(session_factory, "era7-noid")
+    assert payment.payer_identity_type == IDENTITY_TYPE_ORDER_FALLBACK
+    assert payment.gateway_user_id == expected_gateway_user_id(order_id="era7-noid")
+
+
 # --- no raw Telegram id in logs / events / errors ----------------------------
 
 

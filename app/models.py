@@ -145,8 +145,12 @@ class Payment(Base):
         ForeignKey("centralpay_payer_identities.id", ondelete="RESTRICT"), index=True
     )
     # Identity scope: "telegram_user" (upstream supplied a Telegram id) or
-    # "order_fallback" (no identity supplied; isolated per order). NULL for
-    # legacy shared-id payments.
+    # "order_fallback" (no identity supplied; isolated per order). NULL is the
+    # explicit HISTORICAL marker for rows created before scope tracking
+    # (migration 0008): both pre-0007 legacy shared-id rows and 0007-era rows
+    # whose payer_identity_id was mapped under the retired customer_id scheme —
+    # for the latter the scope is not determinable from stored data and is
+    # never guessed (see _reconcile_identity in app/services/payments.py).
     payer_identity_type: Mapped[str | None] = mapped_column(String(16))
     payer_derivation_version: Mapped[int | None] = mapped_column(Integer)
     # ORIGINAL bot invoice amount in TOMAN — exactly what the bot requested.
@@ -243,6 +247,13 @@ class Payment(Base):
             "status NOT IN ('bot_notify_pending', 'bot_notify_accepted')"
             " OR gateway_verified_at IS NOT NULL",
             name="ck_payments_delivery_requires_verification",
+        ),
+        # Identity scope is one of the known values or NULL (historical rows
+        # created before scope tracking — migration 0008).
+        CheckConstraint(
+            "payer_identity_type IS NULL"
+            " OR payer_identity_type IN ('telegram_user', 'order_fallback')",
+            name="ck_payments_payer_identity_type_valid",
         ),
     )
 

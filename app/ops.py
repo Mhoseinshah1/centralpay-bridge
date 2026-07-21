@@ -546,6 +546,15 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         isolated = db.execute(
             select(func.count(Payment.id)).where(Payment.payer_identity_id.is_not(None))
         ).scalar_one()
+        # 0007-era rows: isolated (mapped) but created before scope tracking
+        # (migration 0008), so payer_identity_type stayed NULL — their scope is
+        # historical/untyped by design, never guessed.
+        untyped_isolated = db.execute(
+            select(func.count(Payment.id)).where(
+                Payment.payer_identity_id.is_not(None),
+                Payment.payer_identity_type.is_(None),
+            )
+        ).scalar_one()
         mappings = db.execute(
             select(func.count(CentralPayPayerIdentity.id))
         ).scalar_one()
@@ -575,6 +584,7 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         "payments_total": payments_total,
         "legacy_shared_payer_payments": legacy,
         "isolated_payer_payments": isolated,
+        "untyped_isolated_payments": untyped_isolated,
         "payer_identity_mappings": mappings,
         "duplicate_gateway_user_ids": duplicate_count,
         # Post-fix, every new payment is mapped; legacy rows are the only ones

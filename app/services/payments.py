@@ -229,8 +229,10 @@ def _reconcile_identity(
     * ``"adopt"``  — stamp the freshly resolved identity onto the payment.
       Only ever returned while NO live link exists, so no issued link is
       re-pointed and no callback verification breaks. Covers legacy pre-fix
-      rows and the deterministic ``order_fallback`` -> ``telegram_user`` upgrade
-      when a real user first appears for an order.
+      rows, 0007-era untyped rows (customer-scoped identity, scope never
+      stored — handled explicitly, never guessed), and the deterministic
+      ``order_fallback`` -> ``telegram_user`` upgrade when a real user first
+      appears for an order.
     * ``"reject"`` — the retry resolved to a DIFFERENT Telegram user; refuse so
       one user's payment link is never returned to another (incident 2026-07).
     """
@@ -244,6 +246,18 @@ def _reconcile_identity(
     if existing_pid == payer.id:
         return "reuse"  # same identity resolved again: idempotent
     existing_type = payment.payer_identity_type
+    if existing_type is None:
+        # 0007-era historical row: payer_identity_id was mapped under the
+        # retired customer_id scheme and no scope was stored, so it can never
+        # equal (or be compared to) a tg:/order:-scoped identity — its scope is
+        # NOT determinable and is never guessed (it stays NULL / immutable).
+        # With a live link: the link is already isolated per its original
+        # identity — return it unchanged (bot order ids are unique per order
+        # upstream, so a retry of this order is the same end customer; same
+        # documented rationale as legacy rows). Without a link: adopt the
+        # current requester's isolated identity, exactly like a legacy row —
+        # never reject, or every in-flight 0007-era order would 409 forever.
+        return "reuse" if has_live_link else "adopt"
     if (
         existing_type == IDENTITY_TYPE_TELEGRAM_USER
         and requested_type == IDENTITY_TYPE_ORDER_FALLBACK
