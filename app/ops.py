@@ -525,7 +525,7 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
 
 def _cmd_privacy_audit(args: argparse.Namespace) -> int:
     """Payer-identity isolation report (incident 2026-07). Counts only — never
-    a raw customer_id or card datum. Exit 1 if any hard invariant is violated
+    a raw Telegram id or card datum. Exit 1 if any hard invariant is violated
     (a gateway userId shared by two payer identities, which would re-share card
     suggestions)."""
     from sqlalchemy import func
@@ -545,6 +545,15 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         ).scalar_one()
         isolated = db.execute(
             select(func.count(Payment.id)).where(Payment.payer_identity_id.is_not(None))
+        ).scalar_one()
+        # 0007-era rows: isolated (mapped) but created before scope tracking
+        # (migration 0008), so payer_identity_type stayed NULL — their scope is
+        # historical/untyped by design, never guessed.
+        untyped_isolated = db.execute(
+            select(func.count(Payment.id)).where(
+                Payment.payer_identity_id.is_not(None),
+                Payment.payer_identity_type.is_(None),
+            )
         ).scalar_one()
         mappings = db.execute(
             select(func.count(CentralPayPayerIdentity.id))
@@ -575,6 +584,7 @@ def _cmd_privacy_audit(args: argparse.Namespace) -> int:
         "payments_total": payments_total,
         "legacy_shared_payer_payments": legacy,
         "isolated_payer_payments": isolated,
+        "untyped_isolated_payments": untyped_isolated,
         "payer_identity_mappings": mappings,
         "duplicate_gateway_user_ids": duplicate_count,
         # Post-fix, every new payment is mapped; legacy rows are the only ones

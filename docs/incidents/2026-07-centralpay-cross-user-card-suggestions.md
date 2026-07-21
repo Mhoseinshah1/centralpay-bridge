@@ -55,107 +55,184 @@ All versions up to and including the deployed `0.6.0-rc1` (commit
 
 ## Permanent remediation
 
-- **New required request field `customer_id`** (opaque, stable upstream customer
-  identity) on `POST /api/custom-payment` — for JSON, JSON-string, and legacy
-  form bodies. Requests without it are rejected (versioned validation error); the
-  bridge never falls back to the shared payer id. Strictly validated: ≤128 chars,
-  no control/format/bidi/zero-width characters, no whitespace-only/padded value.
-- **Per-customer gateway payer id.** `customer_id` is mapped to a stable numeric
-  gateway `userId` via keyed HMAC over a **dedicated** `CENTRALPAY_PAYER_ID_SECRET`
+Isolation must not break the upstream sales bot, whose contract keeps the three
+original required fields (`api_key`, `amount`, `order_id`) and forwards the
+end user's Telegram id only *optionally*. The fix derives an isolated gateway
+payer id from whatever identity is available, and **never** falls back to the
+shared id.
+
+- **Original required fields only.** `POST /api/custom-payment` still requires
+  exactly `api_key`, `amount`, `order_id` (JSON, JSON-string, urlencoded, and
+  text/plain bodies). No new required field, so existing callers keep working.
+- **Optional end-user identity via aliases.** The bot may send a Telegram
+  numeric id under any of `user_id`, `userId`, `uid`, `chat_id`, `telegram_id`,
+  in the body (all supported formats) **or** the query string. A value is used
+  only if it is a valid positive integer within int64 (booleans and non-ASCII
+  digits are never coerced); an absent/invalid alias is silently ignored, never
+  rejected.
+- **Two identity scopes (never the shared id):**
+  - `telegram_user` — a valid Telegram id was supplied. Identity key
+    `tg:<id>`: the same user maps to the same gateway id across orders, and two
+    different users never share one.
+  - `order_fallback` — no usable identity. Identity key `order:<bot_order_id>`:
+    stable across retries of that one order, isolated from every other order, so
+    at worst an order shares nothing with any other. The two key prefixes cannot
+    collide (`tg:` is digits; `order:` carries the opaque order id).
+- **Derivation.** The identity key is mapped to a stable numeric gateway
+  `userId` via keyed HMAC over a **dedicated** `CENTRALPAY_PAYER_ID_SECRET`
   (never reused from any other secret). The mapping lives in
-  `centralpay_payer_identities` (`UNIQUE(customer_key_hash)`,
-  `UNIQUE(gateway_user_id)`, `gateway_user_id > 0`). The raw `customer_id` is
-  never stored — only a keyed, non-reversible `customer_key_hash` — and never
-  logged (only a 12-char fingerprint appears in logs/events).
-- **Determinism & safety:** the same `customer_id` always resolves to the same
-  gateway id; two different customers never share one (DB uniqueness + a
+  `centralpay_payer_identities` (`UNIQUE(customer_key_hash)` — the column keeps
+  its historical name but now stores the keyed hash of the *scoped identity
+  key*, `UNIQUE(gateway_user_id)`, `gateway_user_id > 0`). The raw Telegram id is
+  never stored (only the keyed, non-reversible hash) and never logged — only a
+  12-char fingerprint and the identity scope reach logs/events. (`bot_order_id`
+  remains stored/logged as the documented idempotency key.)
+- **Determinism & safety:** the same identity key always resolves to the same
+  gateway id; two different identities never share one (DB uniqueness + a
   deterministic re-derivation counter on the astronomically rare HMAC collision);
   stored ids are immutable, so restarts, redeploys, backup/restore, and changing
   *other* secrets never move them.
-- **Payment snapshot & verification unchanged in spirit:** each payment snapshots
-  `gateway_user_id` (+ `payer_identity_id`, `payer_derivation_version`). Callback
-  verification still compares CentralPay's reported `userId` to that snapshot
-  (mismatch → manual review). **Historical payments keep their old shared-id
-  snapshot and keep verifying correctly** — history is never rewritten.
-- **Duplicate-order safety:** re-creating an order for the same customer + amount
-  stays idempotent; a *different* customer reusing an order id is rejected
-  (`409 duplicate_order_customer_mismatch`) and never handed the first customer's
-  link.
+- **Snapshot & verification unchanged in spirit:** each payment snapshots
+  `gateway_user_id` (+ `payer_identity_id`, `payer_identity_type`,
+  `payer_derivation_version`). Callback verification still compares CentralPay's
+  reported `userId` to that snapshot (mismatch → manual review). **Historical
+  payments keep their old shared-id snapshot and keep verifying correctly.**
+- **Duplicate-order & reconciliation safety (never cross payer identities):**
+  - same order + same identity → idempotent (existing link returned);
+  - a retry that merely *dropped* the optional Telegram id keeps the established
+    Telegram identity (never downgraded to per-order);
+  - an order first seen without an identity, retried with a Telegram id **before**
+    a link exists → deterministically **adopts** the Telegram identity;
+  - the same order once a link exists is **never** re-pointed: the (already
+    isolated) order-scoped link is returned unchanged;
+  - a *different* Telegram user on an existing order is rejected
+    (`409 duplicate_order_customer_mismatch`) and never handed the first user's
+    link.
 - **Legacy in-flight rows are healed, not exempt.** A pre-fix row that never
   produced a link (status `created`/`getlink_failed`, `payer_identity_id NULL`)
   would otherwise mint a *new* link under the shared id on the next retry; it now
-  **adopts** the requesting customer's isolated identity before `getLink`
-  (`legacy_payment_payer_identity_adopted` audit event). Already-`link_created`/
+  **adopts** the resolved isolated identity before `getLink`
+  (`payment_payer_identity_adopted` audit event). Already-`link_created`/
   verified rows are left untouched (their link already exists; forward-only).
 - **Legacy shared id excluded from the derived range.** Because historical
   payments used `CENTRALPAY_USER_ID` with no mapping row, `UNIQUE(gateway_user_id)`
-  cannot stop a brand-new customer from HMAC-landing on it; the resolver treats
-  that value as reserved and re-derives, so new customers never share the
+  cannot stop a brand-new identity from HMAC-landing on it; the resolver treats
+  that value as reserved and re-derives, so new identities never share the
   historical pool's id either.
+- **Fail-closed guards unchanged.** `PAYMENT_CREATION_ENABLED=false` stops new
+  links (`503 payment_creation_disabled`); an unset `CENTRALPAY_PAYER_ID_SECRET`
+  (or one shorter than 16 chars, rejected at config load) fails closed
+  (`503 payment_creation_unavailable`) rather than falling back to a shared id.
 - **Legacy marker & audit:** `payer_identity_id IS NULL` marks payments created
   under the legacy shared id. `python -m app.ops privacy-audit` reports counts
   only (legacy vs isolated payments, mapping count, duplicate gateway ids — expected
   zero, newest legacy payment time, guard state). `/health/details` reports the
   `payment_creation` guard state.
 
-## Database migration
+## Database migrations
 
-`alembic/versions/0007_payer_identity.py` (reversible):
-- creates `centralpay_payer_identities` with the two unique constraints and the
-  positive-id CHECK;
-- adds nullable `payments.payer_identity_id` (FK, `ON DELETE RESTRICT`, indexed)
-  and `payments.payer_derivation_version`.
+**0007 (`alembic/versions/0007_payer_identity.py`) — already deployed; kept
+byte-exact.** Production executed the original 0007 (mapping table +
+`payments.payer_identity_id`/`payer_derivation_version`) and `alembic_version`
+is `0007`. Alembic never re-runs an applied revision, so 0007 is **never edited**
+to deliver new schema — it stays exactly as merged in PR #44.
 
-Non-destructive: existing payment rows are untouched (their shared-id snapshot is
-preserved, `payer_identity_id` stays NULL, active links stay valid). Tested on
-PostgreSQL 16 upgrade → downgrade → upgrade and against a DB containing
-historical (legacy shared-id) payments. Forward-only in production as usual.
+**0008 (`alembic/versions/0008_hybrid_payer_identity.py`) — new.** Adds the
+identity-scope column on top of the deployed state:
+- `payments.payer_identity_type VARCHAR(16) NULL` + CHECK
+  `ck_payments_payer_identity_type_valid` (NULL, `telegram_user`, or
+  `order_fallback`);
+- **no backfill, by design**: 0007-era rows (payer_identity_id set under the
+  retired `customer_id` scheme) have no determinable scope — the raw identity is
+  intentionally not stored — so they keep `NULL` as the explicit
+  historical/untyped marker (same as pre-0007 legacy rows) and are never guessed
+  to be Telegram identities. The application handles both historical shapes
+  explicitly (`_reconcile_identity`); `privacy-audit` reports them as
+  `untyped_isolated_payments`.
 
-## Backward compatibility & required upstream (sales bot) change
+**Rollback-safe / recovery-safe.**
+- 0008 `upgrade()` no-ops for objects that already exist (a DB that briefly
+  carried the column still upgrades cleanly), so a rollback that leaves the DB
+  ahead of the pointer never blocks rolling the code forward again.
+- 0008 `downgrade()` is **non-destructive by default** — it only moves the
+  Alembic pointer back to 0007 and preserves the column + CHECK; dropping is an
+  explicit opt-in (`CENTRALPAY_DROP_PAYER_IDENTITY=1`).
+- The current production state (DB at 0007, app possibly rolled back to the
+  pre-0007 code at `b897e69` — a code rollback never moves schema) recovers by
+  deploying this build and running `alembic upgrade head`: exactly 0008 runs, no
+  schema downgrade, no data loss.
 
-`customer_id` is **required** — the sales bot must be updated to send a stable,
-opaque per-customer identifier (its internal customer/account id is ideal). It
-must NOT be a raw phone number, email, username, IP, session id, order id, or a
-per-order random value. Rollout:
-1. Deploy this build with `PAYMENT_CREATION_ENABLED=false` (containment).
-2. Update the sales bot to send `customer_id`.
-3. Validate on staging (below), then set `PAYMENT_CREATION_ENABLED=true`.
+Proven on PostgreSQL 16 by `tests/integration/test_migration_0008_pg.py`, which
+starts from the EXACT deployed original-0007 schema (and asserts 0007 in this
+tree still is that original), seeds legacy + 0007-era rows via raw SQL, runs
+`alembic upgrade head` in a subprocess, and verifies: 0008 applies, historical
+rows keep `NULL` scope with zero data loss, the CHECK enforces the value set,
+re-upgrade after `stamp 0007` is a no-op, the downgrade preserves the schema,
+and the new application serves existing links and verifies existing callbacks
+against their stored snapshots.
 
-Compatibility mode that reuses the shared id is intentionally **not** offered:
-it cannot be made safe. (Option A — reject — was chosen over Option B.)
+## Backward compatibility (no upstream change required)
+
+The three original required fields are unchanged, so the existing sales bot keeps
+working **without modification**. The end-user Telegram id is accepted
+*optionally* under any of `user_id`/`userId`/`uid`/`chat_id`/`telegram_id` (body
+or query); when the bot forwards it, payers are isolated per Telegram user, and
+when it does not, they are isolated per order. Either way the shared id is never
+used for a new link.
+
+For the strongest isolation the bot *should* forward the Telegram id (ideally as
+`user_id`), but this is an enhancement, not a hard requirement. A compatibility
+mode that reuses the shared id is intentionally **not** offered — it cannot be
+made safe.
 
 ## Validation evidence
 
 - `app/services/payer_identity.py` derivation: deterministic, in-range, stable,
-  collision-safe (`tests/test_payer_identity.py`).
-- Request contract: `customer_id` required + rejects null/int/bool/empty/
-  whitespace/over-length/NUL/control/bidi/zero-width, no side effects on
-  rejection (`tests/test_payer_identity.py`).
-- Isolation end-to-end: two customers → two distinct gateway `userId`s, never the
-  legacy id; same customer → one id; duplicate-order/customer rules
-  (`tests/test_payer_identity.py`).
-- Concurrency on real PostgreSQL: concurrent same-customer → one mapping;
-  concurrent different customers → all distinct; stable across reconnect
+  collision-safe; `tg:`/`order:` keys cannot collide (`tests/test_payer_identity.py`).
+- Alias contract: `_coerce_telegram_id` accepts a positive int64 / ASCII-decimal
+  string only (rejects bool, 0, negative, non-ASCII digits, over-range);
+  `_extract_telegram_user_id` precedence (body aliases in order, then query); a
+  3-field request and every alias name are accepted; an invalid alias falls back
+  to per-order isolation instead of a 4xx (`tests/test_payer_identity.py`, the
+  legacy-body / urlencoded parser suites).
+- Alias parsing across every body format (JSON object, JSON-string, urlencoded,
+  text/plain) and the query string (parser suites).
+- Isolation end-to-end: two Telegram users → two distinct gateway `userId`s,
+  never the legacy id; same user across orders → one id; no identity → per-order
+  isolation; reconciliation (adopt-before-link, keep-on-drop, no-switch-after-
+  link, reject-different-user) (`tests/test_payer_identity.py`).
+- Concurrency on real PostgreSQL: concurrent same identity → one mapping;
+  concurrent different identities → all distinct; stable across reconnect
   (`tests/integration/test_payer_identity_pg.py`).
-- Historical payment still verifies against its own snapshot; no raw
-  `customer_id` in logs/events/errors (`tests/test_payer_identity.py`).
-- Migration up/down/up + against historical rows on PostgreSQL 16.
-- Full suite, ruff, strict mypy, shellcheck, `docker compose config`, secret &
-  dependency scans — see the PR.
+- Historical payment still verifies against its own snapshot; **no raw Telegram
+  id** in logs/events/errors, only a presence flag + fingerprint
+  (`tests/test_payer_identity.py`, parser suites).
+- Fail-closed: missing/short payer secret and `PAYMENT_CREATION_ENABLED=false`
+  both refuse without creating a row or mapping (`tests/test_payer_identity.py`).
+- Production upgrade/recovery path on PostgreSQL 16
+  (`tests/integration/test_migration_0008_pg.py`): exact deployed original-0007
+  schema (+ seeded legacy and 0007-era rows) → `alembic upgrade head` runs 0008
+  → no data loss, NULL scopes preserved, CHECK enforced, re-upgrade after
+  `stamp 0007` no-ops, downgrade preserves schema, and the new app serves the
+  existing links and callbacks.
+- 0007-era untyped rows handled explicitly, never guessed or rejected
+  (`tests/test_payer_identity.py`).
+- Full suite (1100+ tests, unit + PostgreSQL), ruff, strict mypy — see the PR.
 
 ## Staging black-box validation (before reopening payments)
 
 Separate **code-level** proof (distinct `userId` sent — covered by tests) from
 **gateway-level** proof (no cross-user suggestions in the real UI):
 
-1. Customer A: create a link (customer_id = A), pay/seed a card on the CentralPay
-   page.
-2. Customer B (different customer_id), clean browser profile/device: create a
-   link and open the CentralPay page.
+1. User A: create a link (forward Telegram id A, e.g. `user_id=A`), pay/seed a
+   card on the CentralPay page.
+2. User B (different Telegram id), clean browser profile/device: create a link
+   and open the CentralPay page.
 3. Expected: CentralPay receives different `userId` values (verify in the bridge
    `centralpay_getlink_ok` events / request capture) **and** B sees none of A's
    card suggestions. A and B may each retain their own independent history if the
-   gateway supports it.
+   gateway supports it. (Also spot-check the no-identity path: two orders with no
+   alias must still send two different `userId`s.)
 
 Do not mark the incident resolved until both the code-level and gateway-level
 checks pass.
@@ -163,21 +240,32 @@ checks pass.
 ## Rotation strategy
 
 `CENTRALPAY_PAYER_ID_SECRET` is **not** a routine-rotation secret. Because the
-raw `customer_id` is never stored, an existing mapping cannot be re-keyed, so
-rotating the secret would give returning customers new ids (new histories).
-Stored mappings and their gateway ids are immutable across a rotation; a
-deliberate scheme change is expressed by bumping `DERIVATION_VERSION` (and the
-domain strings) in `app/services/payer_identity.py`, which affects only
-customers first seen afterward. Treat any rotation as a planned migration.
+raw identity (Telegram id / order id) is never stored, an existing mapping cannot
+be re-keyed, so rotating the secret would give returning identities new ids (new
+histories). Stored mappings and their gateway ids are immutable across a
+rotation; a deliberate scheme change is expressed by bumping `DERIVATION_VERSION`
+(and the domain strings) in `app/services/payer_identity.py`, which affects only
+identities first seen afterward. Treat any rotation as a planned migration.
 
 ## Known residuals (low)
 
 - An authenticated caller can create a `centralpay_payer_identities` mapping row
   (and one `centralpay_payer_identity_created` event) with a request that is
   ultimately rejected for amount/status reasons on an existing order — the
-  customer-mismatch check legitimately needs the resolved identity first. Bounded:
+  identity reconciliation legitimately needs the resolved identity first. Bounded:
   authenticated (valid inbound API key), rate-limited, tiny rows, no financial
-  effect, no card/customer data. Not the leak; noted for completeness.
+  effect, no card/identity data. Not the leak; noted for completeness.
+- A historical row that *already* has a live link — legacy
+  (`payer_identity_id NULL`, shared id) or 0007-era untyped
+  (`payer_identity_id` set, `payer_identity_type NULL`, customer-scoped id) — is
+  returned as-is on retry regardless of who retries the same `bot_order_id`.
+  This is the documented forward-only behavior for historical links (bot order
+  ids are unique per order upstream, so this is not a new cross-user path); new
+  rows never behave this way.
+- When a Telegram-scoped order is retried without the id (kept, per the rules
+  above), the order-scoped mapping resolved for that retry is left unused in
+  `centralpay_payer_identities`. Harmless: isolated, never attached to a payment,
+  no financial or privacy effect.
 
 ## Remaining unknowns
 
@@ -234,6 +322,6 @@ Deferred to the owner/legal team; not decided here.
 - `YYYY-MM-DD HH:MM` — root cause identified (shared `userId`).
 - `YYYY-MM-DD HH:MM` — containment (`PAYMENT_CREATION_ENABLED=false`).
 - `YYYY-MM-DD HH:MM` — fix merged / deployed.
-- `YYYY-MM-DD HH:MM` — sales bot updated to send `customer_id`.
+- `YYYY-MM-DD HH:MM` — (optional) sales bot updated to forward the Telegram id.
 - `YYYY-MM-DD HH:MM` — staging validation passed; payments reopened.
 - `YYYY-MM-DD HH:MM` — CentralPay confirmation / purge complete.

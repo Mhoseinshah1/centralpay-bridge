@@ -1,4 +1,4 @@
-"""Per-customer payer identity under real PostgreSQL concurrency (incident
+"""Per-identity payer isolation under real PostgreSQL concurrency (incident
 2026-07). Proves the isolation invariants hold under genuine row locking and
 unique constraints, not just SQLite.
 
@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.models import Base, CentralPayPayerIdentity
-from app.services.payer_identity import resolve_payer_identity
+from app.services.payer_identity import resolve_payer_identity, telegram_identity_key
 from tests.conftest import (
     TEST_PAYER_ID_SECRET,
     CentralPayStub,
@@ -72,9 +72,10 @@ def _identity_count(session_factory) -> int:
         return db.execute(select(func.count(CentralPayPayerIdentity.id))).scalar_one()
 
 
-def test_concurrent_same_customer_resolves_to_one_mapping(pg_session_factory):
-    """Many concurrent first-purchases by ONE customer create exactly one
+def test_concurrent_same_identity_resolves_to_one_mapping(pg_session_factory):
+    """Many concurrent first-purchases by ONE Telegram user create exactly one
     mapping row and one gateway id."""
+    key = telegram_identity_key(990001)
     barrier = threading.Barrier(6)
 
     def resolve() -> int:
@@ -82,7 +83,7 @@ def test_concurrent_same_customer_resolves_to_one_mapping(pg_session_factory):
         try:
             barrier.wait(timeout=30)
             return resolve_payer_identity(
-                session, secret=TEST_PAYER_ID_SECRET, customer_id="racer"
+                session, secret=TEST_PAYER_ID_SECRET, identity_key=key
             ).gateway_user_id
         finally:
             session.close()
@@ -94,47 +95,48 @@ def test_concurrent_same_customer_resolves_to_one_mapping(pg_session_factory):
     assert _identity_count(pg_session_factory) == 1  # exactly one mapping row
 
 
-def test_concurrent_different_customers_never_share_an_id(pg_session_factory):
-    customers = [f"cust-{i}" for i in range(8)]
-    barrier = threading.Barrier(len(customers))
+def test_concurrent_different_identities_never_share_an_id(pg_session_factory):
+    keys = [telegram_identity_key(991000 + i) for i in range(8)]
+    barrier = threading.Barrier(len(keys))
 
-    def resolve(customer: str) -> int:
+    def resolve(key: str) -> int:
         session = pg_session_factory()
         try:
             barrier.wait(timeout=30)
             return resolve_payer_identity(
-                session, secret=TEST_PAYER_ID_SECRET, customer_id=customer
+                session, secret=TEST_PAYER_ID_SECRET, identity_key=key
             ).gateway_user_id
         finally:
             session.close()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(customers)) as pool:
-        ids = [f.result(timeout=30) for f in [pool.submit(resolve, c) for c in customers]]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(keys)) as pool:
+        ids = [f.result(timeout=30) for f in [pool.submit(resolve, k) for k in keys]]
 
-    assert len(set(ids)) == len(customers)  # all distinct: no shared identity
-    assert _identity_count(pg_session_factory) == len(customers)
+    assert len(set(ids)) == len(keys)  # all distinct: no shared identity
+    assert _identity_count(pg_session_factory) == len(keys)
 
 
 def test_mapping_is_stable_across_reconnect(pg_session_factory):
     """Restart/redeploy/backup-restore stability: the stored mapping does not
     change when the process reconnects."""
+    key = telegram_identity_key(880001)
     with pg_session_factory() as db:
         first = resolve_payer_identity(
-            db, secret=TEST_PAYER_ID_SECRET, customer_id="persist"
+            db, secret=TEST_PAYER_ID_SECRET, identity_key=key
         ).gateway_user_id
     # A fresh session factory (as a new process would use) sees the same id.
     fresh = sessionmaker(bind=pg_session_factory.kw["bind"], expire_on_commit=False)
     with fresh() as db:
         again = resolve_payer_identity(
-            db, secret=TEST_PAYER_ID_SECRET, customer_id="persist"
+            db, secret=TEST_PAYER_ID_SECRET, identity_key=key
         ).gateway_user_id
     assert first == again
     assert _identity_count(pg_session_factory) == 1
 
 
-def test_concurrent_create_orders_two_customers_are_isolated(settings, pg_app, pg_session_factory):
-    """End-to-end: two customers creating payments at the same time send two
-    DIFFERENT gateway userIds (and never the legacy shared one)."""
+def test_concurrent_create_orders_two_users_are_isolated(settings, pg_app, pg_session_factory):
+    """End-to-end: two Telegram users creating payments at the same time send
+    two DIFFERENT gateway userIds (and never the legacy shared one)."""
     stub = pg_app.state.centralpay_stub
     with (
         TestClient(pg_app, raise_server_exceptions=False) as client,
@@ -142,9 +144,9 @@ def test_concurrent_create_orders_two_customers_are_isolated(settings, pg_app, p
     ):
         futures = [
             pool.submit(
-                create_order, client, settings, order_id=f"iso-{c}", customer_id=c
+                create_order, client, settings, order_id=f"iso-{tg}", telegram_user_id=tg
             )
-            for c in ("alice", "bob")
+            for tg in (5001, 5002)
         ]
         responses = [f.result(timeout=30) for f in futures]
 

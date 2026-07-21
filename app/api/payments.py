@@ -4,14 +4,15 @@ import contextlib
 import json
 import logging
 import re
-import unicodedata
+from dataclasses import dataclass
 from typing import Annotated, Any, NoReturn
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel, Field, StrictInt, StrictStr
 from pydantic import ValidationError as PydanticValidationError
+from starlette.datastructures import QueryParams
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
 from app.exceptions import (
@@ -22,21 +23,14 @@ from app.exceptions import (
     RateLimitedError,
 )
 from app.security import constant_time_equals
-from app.services.payer_identity import customer_fingerprint
+from app.services.payer_identity import (
+    IDENTITY_TYPE_ORDER_FALLBACK,
+    IDENTITY_TYPE_TELEGRAM_USER,
+    identity_fingerprint,
+    order_identity_key,
+    telegram_identity_key,
+)
 from app.services.payments import create_payment
-
-
-def _customer_id_has_forbidden_char(value: str) -> bool:
-    """Reject control/format/bidi/zero-width and other unsafe Unicode in an
-    opaque customer id. Category ``C*`` covers ASCII controls (Cc), bidi and
-    zero-width format characters (Cf, e.g. RLO/LRE/ZWSP/BOM), surrogates,
-    private-use, and unassigned code points; ``Zl``/``Zp`` are line/paragraph
-    separators."""
-    for ch in value:
-        category = unicodedata.category(ch)
-        if category[0] == "C" or category in ("Zl", "Zp"):
-            return True
-    return False
 
 logger = logging.getLogger("app.api.payments")
 
@@ -58,12 +52,11 @@ class CreatePaymentRequest(BaseModel):
       and produced a 500). It is passed through unchanged — never
       trimmed, case-folded, or Unicode-normalized — because the bot
       contract treats it as an opaque identifier.
-    - customer_id: opaque STABLE upstream customer identity (incident
-      2026-07). Required: it isolates payers on the gateway so saved-card
-      suggestions can never be shared across customers. At most 128
-      characters, no control/format/bidi/zero-width characters, no
-      whitespace-only or whitespace-padded value. Never logged raw; only a
-      short non-reversible fingerprint appears in logs/events.
+
+    The OPTIONAL end-user aliases (user_id/userId/uid/chat_id/telegram_id)
+    are intentionally NOT part of this strict model — they are extracted
+    separately (see _extract_telegram_user_id) and only ever influence the
+    derived, isolated gateway payer id, never the model or the DB directly.
     """
 
     api_key: StrictStr
@@ -71,20 +64,20 @@ class CreatePaymentRequest(BaseModel):
     order_id: StrictStr = Field(
         min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$"
     )
-    customer_id: StrictStr = Field(min_length=1, max_length=128)
-
-    @field_validator("customer_id")
-    @classmethod
-    def _validate_customer_id(cls, value: str) -> str:
-        if value != value.strip() or not value.strip():
-            raise ValueError("customer_id must not be blank or padded with whitespace")
-        if _customer_id_has_forbidden_char(value):
-            raise ValueError("customer_id contains forbidden characters")
-        return value
 
 
 class CreatePaymentResponse(BaseModel):
     url: str
+
+
+@dataclass(frozen=True)
+class ParsedPaymentRequest:
+    """The validated strict body plus the OPTIONAL end-user Telegram id parsed
+    from any supported alias (body or query). ``telegram_user_id`` is None when
+    no usable identity was supplied — the payment then isolates per order."""
+
+    body: CreatePaymentRequest
+    telegram_user_id: int | None
 
 
 # --- legacy-body compatibility (fix/custom-payment-legacy-body-compat) --------
@@ -101,12 +94,19 @@ class CreatePaymentResponse(BaseModel):
 # Bounded before any decode/parse; aligns with the Caddy edge limit
 # (request_body max_size 64KB). The legitimate body is ~150 bytes.
 _MAX_BODY_BYTES = 64 * 1024
-_REQUIRED_FIELDS = ("api_key", "amount", "order_id", "customer_id")
+_REQUIRED_FIELDS = ("api_key", "amount", "order_id")
+# Optional end-user identity aliases (upstream mirza-cpanel compatibility).
+# Accepted from any supported body format and from query parameters. Order is
+# the precedence order when several are present.
+_ALIAS_FIELDS = ("user_id", "userId", "uid", "chat_id", "telegram_id")
+_ALIAS_FIELD_SET = frozenset(_ALIAS_FIELDS)
+# Telegram ids are positive integers well within int64.
+_MAX_TELEGRAM_ID = 2**63 - 1
 # Bound on the number of application/x-www-form-urlencoded pairs accepted from
-# an unauthenticated request. The legitimate body carries exactly the three
-# required fields; a legacy sender adds at most a handful of unrelated fields.
-# 32 leaves generous headroom while capping attacker-controlled fan-out well
-# below what the 64 KB size limit alone would allow (~21k blank pairs).
+# an unauthenticated request. The legitimate body carries the required fields
+# plus at most a handful of unrelated/alias fields. 32 leaves generous headroom
+# while capping attacker-controlled fan-out well below what the 64 KB size limit
+# alone would allow (~21k blank pairs).
 _MAX_FORM_PAIRS = 32
 # ASCII decimal only: `[0-9]` never matches Persian/Arabic digits, and re.ASCII
 # keeps it strict. No sign, separators, whitespace, exponent, or decimal point.
@@ -140,6 +140,41 @@ class _UrlencodedSyntaxError(Exception):
 
 def _media_type(request: Request) -> str:
     return (request.headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+
+
+def _coerce_telegram_id(value: Any) -> int | None:
+    """A valid positive Telegram numeric id, or None. Accepts a JSON integer
+    (never a bool) or an ASCII-decimal string; rejects <= 0 and out-of-range."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and _ASCII_DECIMAL.fullmatch(value.strip()):
+        try:
+            number = int(value.strip())
+        except ValueError:  # absurdly long digit string (int-string limit)
+            return None
+    else:
+        return None
+    return number if 1 <= number <= _MAX_TELEGRAM_ID else None
+
+
+def _extract_telegram_user_id(data: dict[str, Any], query_params: QueryParams) -> int | None:
+    """First valid Telegram id among the aliases — body first (in precedence
+    order), then query parameters. Invalid/absent aliases are skipped, never
+    rejected (a missing identity falls back to per-order isolation)."""
+    for alias in _ALIAS_FIELDS:
+        if alias in data:
+            candidate = _coerce_telegram_id(data[alias])
+            if candidate is not None:
+                return candidate
+    for alias in _ALIAS_FIELDS:
+        raw = query_params.get(alias)
+        if raw is not None:
+            candidate = _coerce_telegram_id(raw)
+            if candidate is not None:
+                return candidate
+    return None
 
 
 async def _read_bounded_body(request: Request) -> bytes:
@@ -186,13 +221,14 @@ def _decode_json_layers(
     raise _CompatReject(object_category)
 
 
-def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
+def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     """Decode a legacy form body, tolerating unrelated extra fields.
 
-    Each of the three required fields must appear **exactly once**; any other
-    field is ignored — never collected, never validated, never logged. The
-    returned dict contains ONLY the three required fields, so nothing else can
-    reach the strict model, the database, or the gateway.
+    Each of the required fields must appear **exactly once**. Optional end-user
+    aliases (user_id/userId/uid/chat_id/telegram_id) are captured (last value
+    wins) so identity extraction can use them, but they never reach the strict
+    model (``_normalize`` keeps only the required fields). Any OTHER field is
+    ignored — never collected, never validated, never logged.
 
     Raises _UrlencodedSyntaxError when the body is not urlencoded data at all
     (the caller may then try the JSON fallback) and _CompatReject for every
@@ -211,14 +247,18 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
     total_pairs = len(pairs)
     if total_pairs > _MAX_FORM_PAIRS:
         raise _CompatReject("urlencoded", {"total_pair_count": total_pairs})
-    # Count occurrences of the REQUIRED fields only; every extra field is
-    # dropped here and its name/value is neither retained nor logged.
+    # Count occurrences of the REQUIRED fields; also capture optional aliases.
+    # Every other extra field is dropped here (name/value neither retained nor
+    # logged).
     counts = dict.fromkeys(_REQUIRED_FIELDS, 0)
     values: dict[str, str] = {}
+    aliases: dict[str, str] = {}
     for key, value in pairs:
         if key in counts:
             counts[key] += 1
             values[key] = value
+        elif key in _ALIAS_FIELD_SET:
+            aliases[key] = value  # optional; last value wins, no count rule
     missing = [field for field in _REQUIRED_FIELDS if counts[field] == 0]
     duplicate = [field for field in _REQUIRED_FIELDS if counts[field] > 1]
     if missing or duplicate:
@@ -231,8 +271,9 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, str]]:
             "duplicate_required_fields": duplicate,
         }
         raise _CompatReject("urlencoded", detail)
-    # A NEW dict with ONLY the three required fields, each present exactly once.
-    return "urlencoded", {field: values[field] for field in _REQUIRED_FIELDS}
+    result: dict[str, Any] = {field: values[field] for field in _REQUIRED_FIELDS}
+    result.update(aliases)
+    return "urlencoded", result
 
 
 def _decode(media_type: str, raw: bytes) -> tuple[str, dict[str, Any]]:
@@ -275,7 +316,8 @@ def _decode(media_type: str, raw: bytes) -> tuple[str, dict[str, Any]]:
 def _normalize(data: dict[str, Any]) -> dict[str, Any]:
     """Keep only the three required fields and convert an ASCII-decimal amount
     STRING to int. Every other type/shape is left untouched for the strict
-    model to reject (floats, bools, nested objects, non-ASCII digits, ...)."""
+    model to reject (floats, bools, nested objects, non-ASCII digits, ...).
+    Optional identity aliases are intentionally NOT kept here."""
     normalized = {field: data[field] for field in _REQUIRED_FIELDS if field in data}
     amount = normalized.get("amount")
     if isinstance(amount, str) and _ASCII_DECIMAL.fullmatch(amount):
@@ -315,8 +357,10 @@ def _reject(
     raise _sanitized_validation_error()
 
 
-async def parse_create_payment_request(request: Request) -> CreatePaymentRequest:
-    """Normalize a legacy request body and validate it with the strict model.
+async def parse_create_payment_request(request: Request) -> ParsedPaymentRequest:
+    """Normalize a legacy request body, validate it with the strict model, and
+    extract the OPTIONAL end-user Telegram id (from any alias in the body or the
+    query string).
 
     Async so it can read the body off the event loop while the route stays a
     normal sync function (blocking DB/gateway work does not move onto the loop).
@@ -334,29 +378,35 @@ async def parse_create_payment_request(request: Request) -> CreatePaymentRequest
         normalized = _normalize(data)
     except _CompatReject as reject:
         _reject(reject.category, media_type, body_size, reject.detail)
-    # Accepted representation — safe pre-auth observability (no field values).
+    telegram_user_id = _extract_telegram_user_id(data, request.query_params)
+    # Accepted representation — safe pre-auth observability (no field values;
+    # only whether an end-user identity alias was present, never its value).
     logger.info(
         "custom_payment_body_normalized",
         extra={
             "representation": representation,
             "content_type": media_type,
             "body_size": body_size,
+            "has_end_user_identity": telegram_user_id is not None,
         },
     )
     try:
-        return CreatePaymentRequest(**normalized)
+        body = CreatePaymentRequest(**normalized)
     except PydanticValidationError:
         _reject("schema_invalid", media_type, body_size)
+    return ParsedPaymentRequest(body=body, telegram_user_id=telegram_user_id)
 
 
 @router.post("/api/custom-payment", response_model=CreatePaymentResponse)
 def create_custom_payment(
     request: Request,
-    body: Annotated[CreatePaymentRequest, Depends(parse_create_payment_request)],
+    parsed: Annotated[ParsedPaymentRequest, Depends(parse_create_payment_request)],
     db: DbDep,
     settings: SettingsDep,
     client: CentralPayDep,
 ) -> CreatePaymentResponse:
+    body = parsed.body
+    telegram_user_id = parsed.telegram_user_id
     limiters = request.app.state.rate_limiters
     if not settings.inbound_api_key or not constant_time_equals(
         body.api_key, settings.inbound_api_key
@@ -377,20 +427,28 @@ def create_custom_payment(
         logger.error("payment_creation_disabled", extra={"bot_order_id": body.order_id})
         raise PaymentCreationDisabledError()
     if not settings.centralpay_payer_id_secret:
-        # Without the dedicated payer-id secret we cannot isolate customers on
-        # the gateway; refuse rather than fall back to a shared identity.
+        # Without the dedicated payer-id secret we cannot isolate payers on the
+        # gateway; refuse rather than fall back to a shared identity.
         logger.error("payer_identity_secret_missing", extra={"bot_order_id": body.order_id})
         raise PayerIdentityMisconfiguredError()
-    # Logged only AFTER authentication so unauthenticated probes cannot
-    # write attacker-chosen order ids into this event stream. The raw
-    # customer_id is NEVER logged — only a short non-reversible fingerprint.
+    # Logged only AFTER authentication so unauthenticated probes cannot write
+    # attacker-chosen order ids into this event stream. The raw Telegram id is
+    # NEVER logged — only the identity scope and a short non-reversible
+    # fingerprint of the scoped identity key.
+    if telegram_user_id is not None:
+        identity_type = IDENTITY_TYPE_TELEGRAM_USER
+        identity_key = telegram_identity_key(telegram_user_id)
+    else:
+        identity_type = IDENTITY_TYPE_ORDER_FALLBACK
+        identity_key = order_identity_key(body.order_id)
     logger.info(
         "payment_create_requested",
         extra={
             "bot_order_id": body.order_id,
             "amount": body.amount,
-            "customer_fingerprint": customer_fingerprint(
-                settings.centralpay_payer_id_secret, body.customer_id
+            "identity_type": identity_type,
+            "identity_fingerprint": identity_fingerprint(
+                settings.centralpay_payer_id_secret, identity_key
             ),
         },
     )
@@ -416,6 +474,6 @@ def create_custom_payment(
         settings,
         bot_order_id=body.order_id,
         amount=body.amount,
-        customer_id=body.customer_id,
+        telegram_user_id=telegram_user_id,
     )
     return CreatePaymentResponse(url=url)

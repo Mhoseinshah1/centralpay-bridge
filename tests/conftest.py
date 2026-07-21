@@ -25,7 +25,11 @@ from app.main import create_app
 from app.models import Base, Payment, PaymentEvent
 from app.security import callback_signature
 from app.services.notification import run_worker_pass, utcnow
-from app.services.payer_identity import derive_gateway_user_id
+from app.services.payer_identity import (
+    derive_gateway_user_id,
+    order_identity_key,
+    telegram_identity_key,
+)
 
 TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"
 TEST_CALLBACK_HMAC_SECRET = "test-callback-hmac-secret-8d11a52b"
@@ -41,13 +45,34 @@ TEST_ADMIN_ID_2 = 222222222
 # create new payments). Present so historical-payment tests can construct it.
 TEST_USER_ID = 4242
 
-# Default upstream customer used by create_order/full-flow helpers, and the
-# per-customer gateway userId it deterministically derives to (attempt 0, the
-# value a fresh customer receives in an empty test DB).
-DEFAULT_CUSTOMER_ID = "cust-default"
-DEFAULT_GATEWAY_USER_ID = derive_gateway_user_id(TEST_PAYER_ID_SECRET, DEFAULT_CUSTOMER_ID, 0)
+# Default OPTIONAL end-user identity forwarded by create_order/full-flow
+# helpers (a valid positive Telegram numeric id, sent under the ``user_id``
+# alias), and the per-user gateway userId it deterministically derives to
+# (attempt 0, the value a fresh identity receives in an empty test DB). Using
+# one stable default identity keeps every default-flow payment on one gateway
+# userId, exactly as the old shared-customer default did.
+DEFAULT_TELEGRAM_USER_ID = 55501234
+DEFAULT_GATEWAY_USER_ID = derive_gateway_user_id(
+    TEST_PAYER_ID_SECRET, telegram_identity_key(DEFAULT_TELEGRAM_USER_ID), 0
+)
 
 DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
+
+
+def expected_gateway_user_id(
+    *, order_id: str | None = None, telegram_user_id: int | None = None
+) -> int:
+    """The gateway userId a fresh identity derives to at attempt 0.
+
+    Mirrors resolve_payer_identity for a clean DB: reliable in tests because a
+    collision with the reserved legacy id or a stored id is astronomically
+    unlikely across the small, distinct identities the suite uses."""
+    if telegram_user_id is not None:
+        key = telegram_identity_key(telegram_user_id)
+    else:
+        assert order_id is not None, "order_id required for the fallback identity"
+        key = order_identity_key(order_id)
+    return derive_gateway_user_id(TEST_PAYER_ID_SECRET, key, 0)
 
 
 def getlink_ok_response(redirect_url: str = DEFAULT_REDIRECT_URL) -> httpx.Response:
@@ -293,17 +318,21 @@ def create_order(
     order_id: str = "order-abc-1",
     amount: int = 10000,
     api_key: str | None = None,
-    customer_id: str = DEFAULT_CUSTOMER_ID,
+    telegram_user_id: int | None = DEFAULT_TELEGRAM_USER_ID,
+    identity_alias: str = "user_id",
 ) -> httpx.Response:
-    return client.post(
-        "/api/custom-payment",
-        json={
-            "api_key": api_key if api_key is not None else settings.inbound_api_key,
-            "amount": amount,
-            "order_id": order_id,
-            "customer_id": customer_id,
-        },
-    )
+    """POST a custom-payment request. By default it forwards the stable default
+    Telegram identity under the ``user_id`` alias; pass ``telegram_user_id=None``
+    for the no-identity (per-order isolation) path, or ``identity_alias`` to
+    exercise a different supported alias."""
+    body: dict[str, object] = {
+        "api_key": api_key if api_key is not None else settings.inbound_api_key,
+        "amount": amount,
+        "order_id": order_id,
+    }
+    if telegram_user_id is not None:
+        body[identity_alias] = telegram_user_id
+    return client.post("/api/custom-payment", json=body)
 
 
 def callback_path(
@@ -403,8 +432,11 @@ def make_verified_pending(
     assert response.status_code == 200
     payment = get_payment(session_factory, order_id)
     # Reference ids are unique per payment (uq_payments_reference_id); reusing
-    # one across payments correctly triggers collision manual-review.
-    stub.verify_result = verify_ok_response(amount=amount, reference_id=f"REF-{order_id}")
+    # one across payments correctly triggers collision manual-review. The verify
+    # userId must equal the payment's derived gateway id (per-identity now).
+    stub.verify_result = verify_ok_response(
+        amount=amount, user_id=payment.gateway_user_id, reference_id=f"REF-{order_id}"
+    )
     callback_response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert callback_response.status_code == 200
     return get_payment(session_factory, order_id)

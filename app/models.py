@@ -88,13 +88,14 @@ class FeePolicy(Base):
 
 
 class CentralPayPayerIdentity(Base):
-    """Stable per-customer CentralPay payer identity (incident 2026-07).
+    """Stable per-identity CentralPay payer mapping (incident 2026-07).
 
-    Maps an upstream customer (by a keyed, non-reversible ``customer_key_hash``
-    — the raw customer_id is never stored) to a stable numeric gateway
-    ``userId``. Uniqueness on both columns guarantees two different customers
-    can never share one gateway payer identity (which would share saved-card
-    suggestions). See app/services/payer_identity.py.
+    Maps a payer identity — a Telegram end user (``tg:<id>``) or a per-order
+    fallback (``order:<bot_order_id>``) — via a keyed, non-reversible
+    ``customer_key_hash`` (the raw Telegram id is never stored) to a stable
+    numeric gateway ``userId``. Uniqueness on both columns guarantees two
+    different identities can never share one gateway payer identity (which
+    would share saved-card suggestions). See app/services/payer_identity.py.
     """
 
     __tablename__ = "centralpay_payer_identities"
@@ -139,10 +140,18 @@ class Payment(Base):
     # gateway's reported userId against THIS snapshot, never a live value.
     gateway_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # NULL == created under the legacy shared payer identity (pre-fix). Set for
-    # every payment created with per-customer isolation.
+    # every payment created with per-identity isolation.
     payer_identity_id: Mapped[int | None] = mapped_column(
         ForeignKey("centralpay_payer_identities.id", ondelete="RESTRICT"), index=True
     )
+    # Identity scope: "telegram_user" (upstream supplied a Telegram id) or
+    # "order_fallback" (no identity supplied; isolated per order). NULL is the
+    # explicit HISTORICAL marker for rows created before scope tracking
+    # (migration 0008): both pre-0007 legacy shared-id rows and 0007-era rows
+    # whose payer_identity_id was mapped under the retired customer_id scheme —
+    # for the latter the scope is not determinable from stored data and is
+    # never guessed (see _reconcile_identity in app/services/payments.py).
+    payer_identity_type: Mapped[str | None] = mapped_column(String(16))
     payer_derivation_version: Mapped[int | None] = mapped_column(Integer)
     # ORIGINAL bot invoice amount in TOMAN — exactly what the bot requested.
     # Never includes the service fee and is never modified after creation.
@@ -238,6 +247,13 @@ class Payment(Base):
             "status NOT IN ('bot_notify_pending', 'bot_notify_accepted')"
             " OR gateway_verified_at IS NOT NULL",
             name="ck_payments_delivery_requires_verification",
+        ),
+        # Identity scope is one of the known values or NULL (historical rows
+        # created before scope tracking — migration 0008).
+        CheckConstraint(
+            "payer_identity_type IS NULL"
+            " OR payer_identity_type IN ('telegram_user', 'order_fallback')",
+            name="ck_payments_payer_identity_type_valid",
         ),
     )
 
