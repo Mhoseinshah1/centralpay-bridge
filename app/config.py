@@ -334,7 +334,21 @@ class Settings(BaseSettings):
     centralpay_base_url: str = "https://centralapi.org/webservice/basic"
     centralpay_getlink_api_key: str = Field(min_length=1)
     centralpay_verify_api_key: str = Field(min_length=1)
+    # LEGACY: the single shared gateway payer id used before the per-customer
+    # isolation fix (incident 2026-07). No longer used to create new payments —
+    # each payment now derives a customer-specific gateway_user_id — but kept
+    # for configuration compatibility and to interpret historical payments.
     centralpay_user_id: int = Field(gt=0)
+    # Dedicated secret for deriving the stable per-customer gateway payer id.
+    # MUST NOT be reused from any other secret (callback HMAC, inbound/gateway
+    # API keys, bot token, DB password). Required for payment creation; an
+    # empty value fails closed at creation time. Callback verification of
+    # already-created payments never depends on it.
+    centralpay_payer_id_secret: str = ""
+    # Emergency privacy-containment switch. When false, POST /api/custom-payment
+    # returns a fixed 503 and creates no payment link. Callback verification for
+    # payments already in flight is never affected.
+    payment_creation_enabled: bool = True
     centralpay_timeout_seconds: float = Field(default=15.0, gt=0)
 
     # Bot notification (Phase 2). Empty values are allowed so the API service
@@ -401,6 +415,17 @@ class Settings(BaseSettings):
     admin_bot_api_url: str = "http://api:8000"
     # Admin bot container liveness heartbeat file.
     admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
+
+    @field_validator("centralpay_payer_id_secret")
+    @classmethod
+    def _validate_payer_id_secret(cls, value: str) -> str:
+        # Optional (empty fails closed at the route), but a configured value
+        # must be strong enough to be an HMAC key — a hand-edited short secret
+        # would silently weaken payer isolation. Matches the 16-char floor of
+        # the other secrets.
+        if value and len(value) < 16:
+            raise ValueError("CENTRALPAY_PAYER_ID_SECRET must be empty or at least 16 characters")
+        return value
 
     @field_validator("centralpay_base_url")
     @classmethod

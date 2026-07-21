@@ -53,6 +53,7 @@ def _drop_all(engine) -> None:
             "worker_heartbeats",
             "payment_events",
             "payments",
+            "centralpay_payer_identities",
             "fee_policies",
             "alembic_version",
         ):

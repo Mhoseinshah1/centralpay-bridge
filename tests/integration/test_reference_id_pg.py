@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.models import AdminAlert, Base, Payment, PaymentStatus
 from tests.conftest import (
+    DEFAULT_GATEWAY_USER_ID,
     CentralPayStub,
     build_app,
     create_order,
@@ -76,7 +77,9 @@ def pg_app(settings, pg_session_factory):
 
 
 def _verify_success(reference_id: object, *, amount: int) -> httpx.Response:
-    data: dict[str, object] = {"amount": amount, "userId": 4242}
+    # create_order uses the default customer, so verify must report that
+    # customer's derived gateway userId (not the legacy shared id).
+    data: dict[str, object] = {"amount": amount, "userId": DEFAULT_GATEWAY_USER_ID}
     if reference_id is not None:
         data["referenceId"] = reference_id
     return httpx.Response(200, json={"status": "success", "data": data})

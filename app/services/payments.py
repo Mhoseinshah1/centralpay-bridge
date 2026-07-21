@@ -22,6 +22,7 @@ from app.config import Settings
 from app.exceptions import (
     CentralPayError,
     DuplicateOrderAmountMismatchError,
+    DuplicateOrderCustomerMismatchError,
     GatewayOrderIdAllocationError,
     OrderAlreadyVerifiedError,
     OrderUnderReviewError,
@@ -30,6 +31,7 @@ from app.exceptions import (
 from app.models import Payment, PaymentStatus
 from app.security import build_callback_url, callback_token_hash, generate_callback_token
 from app.services.fees import calculate_fee, select_effective_policy
+from app.services.payer_identity import PayerIdentity, resolve_payer_identity
 
 logger = logging.getLogger("app.services.payments")
 
@@ -71,28 +73,39 @@ def _lock_payment_by_bot_order_id(db: Session, bot_order_id: str) -> Payment | N
 
 
 def _ensure_payment_row(
-    db: Session, settings: Settings, *, bot_order_id: str, amount: int
-) -> None:
+    db: Session, settings: Settings, *, bot_order_id: str, amount: int, customer_id: str
+) -> PayerIdentity | None:
     """Create the payment row in its own committed transaction if missing.
 
-    The fee snapshot is taken HERE, exactly once, inside the same
-    transaction as the insert: the effective policy is read and the four
-    snapshot fields (fee_policy_id, fee_rate_bps, fee_amount,
-    payable_amount) all derive from that single read — a concurrent fee
-    change yields entirely the old or entirely the new policy, never a
-    mixed calculation. Later policy changes never touch this payment.
+    Returns the resolved payer identity when THIS call created the row, else
+    ``None`` (the row already existed or a concurrent request won the insert).
+
+    The fee snapshot is captured HERE, exactly once: the effective policy is
+    read a single time and the four snapshot fields (fee_policy_id,
+    fee_rate_bps, fee_amount, payable_amount) are frozen into immutable locals
+    from that one read BEFORE resolve_payer_identity runs — so a concurrent fee
+    change yields entirely the old or entirely the new policy, never a mixed
+    calculation, and the over-max check and the stored row use identical values.
+    Later policy changes never touch this payment.
+
+    Ordering (incident 2026-07): the payable-amount bound is enforced BEFORE
+    the payer identity is resolved, so an over-max request creates no payment
+    row, no fee snapshot, no gateway call — and no payer-identity mapping.
     """
     exists = db.execute(select(Payment.id).where(Payment.bot_order_id == bot_order_id)).first()
     db.rollback()
     if exists is not None:
-        return
+        return None
 
     policy = select_effective_policy(db)
     rate_bps = policy.rate_bps if policy is not None else 0
+    # Captured before resolve_payer_identity manages its own transaction
+    # (which expires ORM instances), so `policy` is never touched afterward.
+    fee_policy_id = policy.id if policy is not None else None
     fee_amount, payable_amount = calculate_fee(amount, rate_bps)
     # The configured MAXIMUM bounds the final gateway amount. Rejecting
     # here means: no payment row, no fee snapshot, no gateway call, no
-    # silent clamping, no fee reduction.
+    # payer mapping, no silent clamping, no fee reduction.
     if payable_amount > settings.max_payment_amount_toman:
         db.rollback()
         logger.warning(
@@ -111,12 +124,23 @@ def _ensure_payment_row(
             f"{settings.max_payment_amount_toman} TOMAN"
         )
 
+    payer = resolve_payer_identity(
+        db,
+        secret=settings.centralpay_payer_id_secret,
+        customer_id=customer_id,
+        reserved_gateway_user_id=settings.centralpay_user_id,
+    )
     payment = Payment(
         bot_order_id=bot_order_id,
         gateway_order_id=_generate_gateway_order_id(db),
-        gateway_user_id=settings.centralpay_user_id,
+        # Per-customer isolated gateway payer identity (incident 2026-07):
+        # snapshotted once so verification and retries reuse the exact value,
+        # and NEVER the old shared CENTRALPAY_USER_ID.
+        gateway_user_id=payer.gateway_user_id,
+        payer_identity_id=payer.id,
+        payer_derivation_version=payer.derivation_version,
         amount=amount,
-        fee_policy_id=policy.id if policy is not None else None,
+        fee_policy_id=fee_policy_id,
         fee_rate_bps=rate_bps,
         fee_amount=fee_amount,
         payable_amount=payable_amount,
@@ -127,9 +151,9 @@ def _ensure_payment_row(
         db.flush()
     except IntegrityError:
         # A concurrent request created the row first; fall through to the
-        # locked re-select in create_payment.
+        # locked re-select in create_payment (which re-resolves the payer).
         db.rollback()
-        return
+        return None
     record_event(
         db,
         payment_id=payment.id,
@@ -156,6 +180,7 @@ def _ensure_payment_row(
         },
     )
     db.commit()
+    return payer
 
 
 def create_payment(
@@ -165,17 +190,51 @@ def create_payment(
     *,
     bot_order_id: str,
     amount: int,
+    customer_id: str,
 ) -> str:
     """Create (or idempotently return) a payment link for a bot order.
 
-    Returns the CentralPay redirect URL.
+    ``customer_id`` is the stable upstream customer identity; it is resolved to
+    a per-customer gateway payer id (isolated from every other customer) so two
+    different customers can never share one gateway payer identity. Returns the
+    CentralPay redirect URL.
     """
-    _ensure_payment_row(db, settings, bot_order_id=bot_order_id, amount=amount)
+    created_payer = _ensure_payment_row(
+        db, settings, bot_order_id=bot_order_id, amount=amount, customer_id=customer_id
+    )
+    # For a brand-new row _ensure_payment_row already resolved the payer; for an
+    # existing row resolve it now (deterministic; the mapping already exists).
+    # Done BEFORE taking the row lock so the resolver's own transaction handling
+    # can never release that lock.
+    payer = created_payer or resolve_payer_identity(
+        db,
+        secret=settings.centralpay_payer_id_secret,
+        customer_id=customer_id,
+        reserved_gateway_user_id=settings.centralpay_user_id,
+    )
 
     payment = _lock_payment_by_bot_order_id(db, bot_order_id)
     if payment is None:
         # The row was just ensured; its absence means an unexpected deletion.
         raise GatewayOrderIdAllocationError("payment row disappeared during creation")
+
+    # An existing order recreated for a DIFFERENT customer must never reuse the
+    # first customer's link (that would cross payer identities). Legacy rows
+    # (payer_identity_id NULL, pre-fix) predate customer isolation and are not
+    # matched here. Recording uses only internal ids, never the raw customer_id.
+    if payment.payer_identity_id is not None and payment.payer_identity_id != payer.id:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="duplicate_order_customer_mismatch",
+            level="warning",
+            data={
+                "existing_payer_identity_id": payment.payer_identity_id,
+                "requested_payer_identity_id": payer.id,
+            },
+        )
+        db.commit()
+        raise DuplicateOrderCustomerMismatchError()
 
     if payment.amount != amount:
         record_event(
@@ -210,6 +269,27 @@ def create_payment(
             },
         )
         return payment.redirect_url
+
+    # Legacy pre-fix rows (payer_identity_id NULL) that never produced a live
+    # link carry the OLD SHARED gateway_user_id snapshot. Before issuing a link
+    # for one, adopt the resolved per-customer identity so the link is created
+    # under the isolated id — never the shared one (incident 2026-07). Already
+    # verified / LINK_CREATED legacy rows were returned/refused above and are
+    # left untouched (forward-only history; their link, if any, already exists).
+    if payment.payer_identity_id is None:
+        payment.gateway_user_id = payer.gateway_user_id
+        payment.payer_identity_id = payer.id
+        payment.payer_derivation_version = payer.derivation_version
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="legacy_payment_payer_identity_adopted",
+            data={
+                "payer_identity_id": payer.id,
+                "gateway_user_id": payer.gateway_user_id,
+                "derivation_version": payer.derivation_version,
+            },
+        )
 
     # Status is created or getlink_failed: attempt link creation while holding
     # the row lock. A previously failed attempt gets a fresh gateway order id

@@ -87,6 +87,41 @@ class FeePolicy(Base):
     )
 
 
+class CentralPayPayerIdentity(Base):
+    """Stable per-customer CentralPay payer identity (incident 2026-07).
+
+    Maps an upstream customer (by a keyed, non-reversible ``customer_key_hash``
+    — the raw customer_id is never stored) to a stable numeric gateway
+    ``userId``. Uniqueness on both columns guarantees two different customers
+    can never share one gateway payer identity (which would share saved-card
+    suggestions). See app/services/payer_identity.py.
+    """
+
+    __tablename__ = "centralpay_payer_identities"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    customer_key_hash: Mapped[str] = mapped_column(
+        String(64), unique=True, nullable=False, index=True
+    )
+    gateway_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    derivation_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("gateway_user_id > 0", name="ck_payer_identities_gateway_user_id_positive"),
+        CheckConstraint(
+            "derivation_version >= 1", name="ck_payer_identities_derivation_version_positive"
+        ),
+    )
+
+
 class Payment(Base):
     __tablename__ = "payments"
 
@@ -97,7 +132,18 @@ class Payment(Base):
     gateway_order_id: Mapped[int] = mapped_column(
         BigInteger, unique=True, nullable=False, index=True
     )
+    # Gateway payer identity snapshot. For payments created since the
+    # per-customer isolation fix this is the customer-specific derived userId;
+    # legacy payments carry the old shared CENTRALPAY_USER_ID and a NULL
+    # payer_identity_id (their marker). Verification always compares the
+    # gateway's reported userId against THIS snapshot, never a live value.
     gateway_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # NULL == created under the legacy shared payer identity (pre-fix). Set for
+    # every payment created with per-customer isolation.
+    payer_identity_id: Mapped[int | None] = mapped_column(
+        ForeignKey("centralpay_payer_identities.id", ondelete="RESTRICT"), index=True
+    )
+    payer_derivation_version: Mapped[int | None] = mapped_column(Integer)
     # ORIGINAL bot invoice amount in TOMAN — exactly what the bot requested.
     # Never includes the service fee and is never modified after creation.
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False)

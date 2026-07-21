@@ -494,10 +494,15 @@ load_or_generate_secrets() {
         INBOUND_API_KEY=$(grep -E '^INBOUND_API_KEY=' "$ENV_FILE" | cut -d= -f2- || true)
         CALLBACK_HMAC_SECRET=$(grep -E '^CALLBACK_HMAC_SECRET=' "$ENV_FILE" | cut -d= -f2- || true)
         POSTGRES_PASSWORD=$(grep -E '^POSTGRES_PASSWORD=' "$ENV_FILE" | cut -d= -f2- || true)
+        # Dedicated payer-identity secret (incident 2026-07). Reuse it if
+        # present so existing customer->gateway-id mappings stay stable; only
+        # generate it on a first install.
+        CENTRALPAY_PAYER_ID_SECRET=$(grep -E '^CENTRALPAY_PAYER_ID_SECRET=' "$ENV_FILE" | cut -d= -f2- || true)
     fi
     [[ -n "${INBOUND_API_KEY:-}" ]] || INBOUND_API_KEY=$(generate_secret)
     [[ -n "${CALLBACK_HMAC_SECRET:-}" ]] || CALLBACK_HMAC_SECRET=$(generate_secret)
     [[ -n "${POSTGRES_PASSWORD:-}" ]] || POSTGRES_PASSWORD=$(openssl rand -hex 24)
+    [[ -n "${CENTRALPAY_PAYER_ID_SECRET:-}" ]] || CENTRALPAY_PAYER_ID_SECRET=$(generate_secret)
 }
 
 render_template() {
@@ -525,6 +530,7 @@ render_template() {
         [CENTRALPAY_GETLINK_API_KEY]="${CENTRALPAY_GETLINK_API_KEY}"
         [CENTRALPAY_VERIFY_API_KEY]="${CENTRALPAY_VERIFY_API_KEY}"
         [CENTRALPAY_USER_ID]="${CENTRALPAY_USER_ID:-1}"
+        [CENTRALPAY_PAYER_ID_SECRET]="${CENTRALPAY_PAYER_ID_SECRET}"
         [MIN_PAYMENT_AMOUNT_TOMAN]="${MIN_PAYMENT_AMOUNT_TOMAN}"
         [MAX_PAYMENT_AMOUNT_TOMAN]="${MAX_PAYMENT_AMOUNT_TOMAN}"
         [INSTALLER_INITIAL_FEE_PERCENT]="${PAYMENT_FEE_PERCENT}"

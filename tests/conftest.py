@@ -25,6 +25,7 @@ from app.main import create_app
 from app.models import Base, Payment, PaymentEvent
 from app.security import callback_signature
 from app.services.notification import run_worker_pass, utcnow
+from app.services.payer_identity import derive_gateway_user_id
 
 TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"
 TEST_CALLBACK_HMAC_SECRET = "test-callback-hmac-secret-8d11a52b"
@@ -33,9 +34,18 @@ TEST_VERIFY_API_KEY = "test-verify-api-key-9c23aa41"
 TEST_DB_PASSWORD = "test-db-password-77aa88bb"
 TEST_BOT_TOKEN = "test-bot-notify-token-3f9d1c7a"
 TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6"
+TEST_PAYER_ID_SECRET = "test-payer-id-secret-2b7c9d1e0f3a"
 TEST_ADMIN_ID = 111111111
 TEST_ADMIN_ID_2 = 222222222
+# LEGACY shared gateway id (still a valid config value; no longer used to
+# create new payments). Present so historical-payment tests can construct it.
 TEST_USER_ID = 4242
+
+# Default upstream customer used by create_order/full-flow helpers, and the
+# per-customer gateway userId it deterministically derives to (attempt 0, the
+# value a fresh customer receives in an empty test DB).
+DEFAULT_CUSTOMER_ID = "cust-default"
+DEFAULT_GATEWAY_USER_ID = derive_gateway_user_id(TEST_PAYER_ID_SECRET, DEFAULT_CUSTOMER_ID, 0)
 
 DEFAULT_REDIRECT_URL = "https://gateway.test/pay/tok123"
 
@@ -49,7 +59,7 @@ def getlink_ok_response(redirect_url: str = DEFAULT_REDIRECT_URL) -> httpx.Respo
 def verify_ok_response(
     *,
     amount: int,
-    user_id: int = TEST_USER_ID,
+    user_id: int = DEFAULT_GATEWAY_USER_ID,
     reference_id: str | None = "REF-12345",
     card_number: str | None = "6037991234567890",
 ) -> httpx.Response:
@@ -108,6 +118,7 @@ def settings() -> Settings:
         centralpay_getlink_api_key=TEST_GETLINK_API_KEY,
         centralpay_verify_api_key=TEST_VERIFY_API_KEY,
         centralpay_user_id=TEST_USER_ID,
+        centralpay_payer_id_secret=TEST_PAYER_ID_SECRET,
         centralpay_timeout_seconds=5.0,
         bot_payment_notify_url="https://bot.test.local/api/payment",
         bot_notify_token=TEST_BOT_TOKEN,
@@ -282,6 +293,7 @@ def create_order(
     order_id: str = "order-abc-1",
     amount: int = 10000,
     api_key: str | None = None,
+    customer_id: str = DEFAULT_CUSTOMER_ID,
 ) -> httpx.Response:
     return client.post(
         "/api/custom-payment",
@@ -289,6 +301,7 @@ def create_order(
             "api_key": api_key if api_key is not None else settings.inbound_api_key,
             "amount": amount,
             "order_id": order_id,
+            "customer_id": customer_id,
         },
     )
 

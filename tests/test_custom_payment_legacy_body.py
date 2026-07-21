@@ -1,14 +1,14 @@
 """Legacy-body compatibility for POST /api/custom-payment.
 
 Some legacy customer bots do not POST a plain JSON object: they send the
-same three fields (api_key, amount, order_id) as a JSON string, as
-application/x-www-form-urlencoded, or as text/plain containing JSON, and
+same four fields (api_key, amount, order_id, customer_id) as a JSON string,
+as application/x-www-form-urlencoded, or as text/plain containing JSON, and
 they sometimes send ``amount`` as a decimal *string*. FastAPI's default
 body binding rejected all of those with a 422 before the route ran.
 
 ``parse_create_payment_request`` normalizes the *allowed* representations
-into a {api_key, amount, order_id} dict and validates it with the SAME
-strict ``CreatePaymentRequest`` model. This suite proves:
+into a {api_key, amount, order_id, customer_id} dict and validates it with
+the SAME strict ``CreatePaymentRequest`` model. This suite proves:
 
 - every accepted representation reaches the strict model and creates a
   payment identical to the canonical JSON-object request;
@@ -32,6 +32,7 @@ from sqlalchemy import func, select
 
 from app.models import Payment
 from tests.conftest import (
+    DEFAULT_CUSTOMER_ID,
     DEFAULT_REDIRECT_URL,
     get_events,
     get_payment,
@@ -60,8 +61,13 @@ def _post_raw(client, body, content_type: str | None):
     return client.post(CUSTOM_PAYMENT_URL, content=body, headers=headers)
 
 
-def _valid_fields(settings, *, amount, order_id="legacy-order-1"):
-    return {"api_key": settings.inbound_api_key, "amount": amount, "order_id": order_id}
+def _valid_fields(settings, *, amount, order_id="legacy-order-1", customer_id=DEFAULT_CUSTOMER_ID):
+    return {
+        "api_key": settings.inbound_api_key,
+        "amount": amount,
+        "order_id": order_id,
+        "customer_id": customer_id,
+    }
 
 
 # --- accepted representations ------------------------------------------------
@@ -106,7 +112,10 @@ def test_json_string_object_with_decimal_string_amount(client, settings, session
 
 
 def test_urlencoded_exact_fields(client, settings, session_factory, stub):
-    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=urlenc-1"
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&order_id=urlenc-1"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     payment = get_payment(session_factory, "urlenc-1")
@@ -149,7 +158,10 @@ def test_urlencoded_order_id_passed_through_byte_exact(client, settings, session
     """order_id stays opaque through the urlencoded path — decoded but not
     trimmed, case-folded, or normalized."""
     order_id = "Order ABC-1"  # a space survives percent-decoding unchanged
-    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=Order%20ABC-1"
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&order_id=Order%20ABC-1"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert get_payment(session_factory, order_id).bot_order_id == order_id
@@ -208,7 +220,11 @@ def test_invalid_json_rejected(client, settings, session_factory, stub):
 
 
 def test_urlencoded_duplicate_field_rejected(client, settings, session_factory, stub):
-    body = f"api_key={settings.inbound_api_key}&amount=10000&amount=20000&order_id=dup"
+    # customer_id is present so the duplicate amount is the sole rejection cause.
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&amount=20000&order_id=dup"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 422
     _assert_no_side_effects(session_factory, stub)
@@ -217,14 +233,21 @@ def test_urlencoded_duplicate_field_rejected(client, settings, session_factory, 
 def test_urlencoded_extra_field_is_ignored(client, settings, session_factory, stub):
     # Legacy senders add unrelated fields; they are ignored, not rejected.
     # (Full extra-field coverage: tests/test_custom_payment_urlencoded_extra_fields.py.)
-    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=x&extra=1"
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&order_id=x&extra=1"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert get_payment(session_factory, "x").amount == 10000
 
 
 def test_urlencoded_missing_field_rejected(client, settings, session_factory, stub):
-    body = f"api_key={settings.inbound_api_key}&amount=10000"  # no order_id
+    # customer_id present so order_id is the single missing required field.
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"  # no order_id
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 422
     _assert_no_side_effects(session_factory, stub)
@@ -305,7 +328,7 @@ def test_invalid_order_ids_rejected(client, settings, session_factory, stub, ord
     _assert_no_side_effects(session_factory, stub)
 
 
-@pytest.mark.parametrize("missing", ["api_key", "amount", "order_id"])
+@pytest.mark.parametrize("missing", ["api_key", "amount", "order_id", "customer_id"])
 def test_missing_required_field_rejected(client, settings, session_factory, stub, missing):
     fields = _valid_fields(settings, amount=10000, order_id="miss")
     del fields[missing]
@@ -314,7 +337,7 @@ def test_missing_required_field_rejected(client, settings, session_factory, stub
     _assert_no_side_effects(session_factory, stub)
 
 
-@pytest.mark.parametrize("field", ["api_key", "amount", "order_id"])
+@pytest.mark.parametrize("field", ["api_key", "amount", "order_id", "customer_id"])
 def test_null_required_field_rejected(client, settings, session_factory, stub, field):
     fields = _valid_fields(settings, amount=10000, order_id="null-field")
     fields[field] = None
@@ -393,6 +416,7 @@ def test_normalized_log_carries_only_safe_metadata(
     blob = repr(record.__dict__)
     assert order_id not in blob
     assert settings.inbound_api_key not in blob
+    assert DEFAULT_CUSTOMER_ID not in blob
     assert "10000" not in blob
 
 
@@ -400,7 +424,10 @@ def test_normalized_log_carries_only_safe_metadata(
 
 
 def test_success_response_shape_unchanged(client, settings, session_factory, stub):
-    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id=shape"
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&order_id=shape"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     response = _post_raw(client, body, "application/x-www-form-urlencoded")
     assert response.status_code == 200
     assert response.json() == {"url": DEFAULT_REDIRECT_URL}
@@ -413,7 +440,10 @@ def test_outbound_customer_bot_callback_unchanged(
     exact, unchanged outbound customer-bot notification payload."""
     order_id = "outbound-1"
     # Create through the legacy urlencoded representation.
-    body = f"api_key={settings.inbound_api_key}&amount=10000&order_id={order_id}"
+    body = (
+        f"api_key={settings.inbound_api_key}&amount=10000&order_id={order_id}"
+        f"&customer_id={DEFAULT_CUSTOMER_ID}"
+    )
     assert _post_raw(client, body, "application/x-www-form-urlencoded").status_code == 200
     payment = get_payment(session_factory, order_id)
     # Verify it via the signed callback, leaving it pending notification.

@@ -49,7 +49,14 @@ pytestmark = [
     ),
 ]
 
-_TABLES = ("admin_alerts", "worker_heartbeats", "payment_events", "payments", "fee_policies")
+_TABLES = (
+    "admin_alerts",
+    "worker_heartbeats",
+    "payment_events",
+    "payments",
+    "centralpay_payer_identities",
+    "fee_policies",
+)
 
 
 def _pg_env_and_args():

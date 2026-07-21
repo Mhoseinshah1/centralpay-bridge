@@ -111,3 +111,33 @@ class GatewayOrderIdAllocationError(BridgeError):
     code = "gateway_order_id_allocation_failed"
     http_status = 500
     default_message = "Could not allocate a unique gateway order id"
+
+
+class PaymentCreationDisabledError(BridgeError):
+    # Emergency privacy containment: new payment links are disabled. Callback
+    # verification for already-created payments is unaffected.
+    code = "payment_creation_disabled"
+    http_status = 503
+    default_message = "Payment creation is temporarily disabled"
+
+
+class PayerIdentityMisconfiguredError(BridgeError):
+    # Fail-closed: the dedicated payer-identity secret is required to isolate
+    # customers on the gateway. Never reveal which setting is missing.
+    code = "payment_creation_unavailable"
+    http_status = 503
+    default_message = "Payment creation is temporarily unavailable"
+
+
+class PayerIdentityAllocationError(BridgeError):
+    code = "payer_identity_allocation_failed"
+    http_status = 500
+    default_message = "Could not allocate a unique gateway payer identity"
+
+
+class DuplicateOrderCustomerMismatchError(BridgeError):
+    # A previously created order is being recreated for a DIFFERENT customer.
+    # Never reuse the existing link (it would cross customer identities).
+    code = "duplicate_order_customer_mismatch"
+    http_status = 409
+    default_message = "Order already exists for a different customer"

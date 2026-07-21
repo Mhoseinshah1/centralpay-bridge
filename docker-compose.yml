@@ -77,6 +77,7 @@ services:
     environment:
       CENTRALPAY_GETLINK_API_KEY: not-used-by-migrate
       CENTRALPAY_VERIFY_API_KEY: not-used-by-migrate
+      CENTRALPAY_PAYER_ID_SECRET: not-used-by-migrate
       INBOUND_API_KEY: not-used-by-migrate-x
       CALLBACK_HMAC_SECRET: not-used-by-migrate-x
       BOT_NOTIFY_TOKEN: ""
@@ -138,6 +139,7 @@ services:
     environment:
       CENTRALPAY_GETLINK_API_KEY: not-used-by-worker
       CENTRALPAY_VERIFY_API_KEY: not-used-by-worker
+      CENTRALPAY_PAYER_ID_SECRET: not-used-by-worker
       INBOUND_API_KEY: not-used-by-worker-x
       CALLBACK_HMAC_SECRET: not-used-by-worker-x
       ADMIN_BOT_TOKEN: ""
@@ -177,6 +179,7 @@ services:
     environment:
       CENTRALPAY_GETLINK_API_KEY: not-used-by-admin-bot
       CENTRALPAY_VERIFY_API_KEY: not-used-by-admin-bot
+      CENTRALPAY_PAYER_ID_SECRET: not-used-by-admin-bot
       BOT_NOTIFY_TOKEN: ""
       INBOUND_API_KEY: not-used-by-admin-bot-x
       CALLBACK_HMAC_SECRET: not-used-by-admin-bot-x
