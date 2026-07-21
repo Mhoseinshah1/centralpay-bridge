@@ -334,7 +334,21 @@ class Settings(BaseSettings):
     centralpay_base_url: str = "https://centralapi.org/webservice/basic"
     centralpay_getlink_api_key: str = Field(min_length=1)
     centralpay_verify_api_key: str = Field(min_length=1)
+    # LEGACY: the single shared gateway payer id used before the per-customer
+    # isolation fix (incident 2026-07). No longer used to create new payments —
+    # each payment now derives a customer-specific gateway_user_id — but kept
+    # for configuration compatibility and to interpret historical payments.
     centralpay_user_id: int = Field(gt=0)
+    # Dedicated secret for deriving the stable per-customer gateway payer id.
+    # MUST NOT be reused from any other secret (callback HMAC, inbound/gateway
+    # API keys, bot token, DB password). Required for payment creation; an
+    # empty value fails closed at creation time. Callback verification of
+    # already-created payments never depends on it.
+    centralpay_payer_id_secret: str = ""
+    # Emergency privacy-containment switch. When false, POST /api/custom-payment
+    # returns a fixed 503 and creates no payment link. Callback verification for
+    # payments already in flight is never affected.
+    payment_creation_enabled: bool = True
     centralpay_timeout_seconds: float = Field(default=15.0, gt=0)
 
     # Bot notification (Phase 2). Empty values are allowed so the API service
