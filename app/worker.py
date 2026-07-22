@@ -51,6 +51,20 @@ def build_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
+def heartbeat_instance_id(worker_id: str, loop: str) -> str:
+    """Distinct, stable heartbeat instance id for one loop of this process.
+
+    ``worker_heartbeats.instance_id`` is unique and ``record_worker_heartbeat``
+    upserts by it alone, so the two loops of one worker process MUST heartbeat
+    under different instance ids — sharing the base ``worker_id`` would let
+    whichever loop wins the startup race own the row and permanently label it
+    with its own ``worker_name``, making admin health report the other worker
+    type as missing/stale. Logs and payment claims keep using the shared base
+    ``worker_id`` for correlation; only heartbeat identity is per-loop.
+    """
+    return f"{worker_id}-{loop}"
+
+
 def reconciliation_loop(
     settings: Settings,
     session_factory: Callable[[], Session],
@@ -104,18 +118,14 @@ def reconciliation_loop(
                 logger.exception("reconciliation_pass_failed")
             # Operational visibility heartbeat, mirroring the notification
             # worker's; best-effort — heartbeat problems never stop the loop.
-            # The instance id is DISTINCT from the notification loop's:
-            # record_worker_heartbeat upserts by instance_id alone and never
-            # rewrites worker_name, so sharing the id would let whichever
-            # loop wins the startup race own the row and make /health report
-            # the other worker as missing.
+            # Per-loop instance id: see heartbeat_instance_id.
             try:
                 hb_session = session_factory()
                 try:
                     record_worker_heartbeat(
                         hb_session,
                         worker_name="reconciliation-worker",
-                        instance_id=f"{worker_id}-recon",
+                        instance_id=heartbeat_instance_id(worker_id, "reconciliation"),
                         now=utcnow(),
                         cycle_completed=cycle_completed,
                         error_code=error_code,
@@ -206,13 +216,14 @@ def main() -> int:
         finally:
             session.close()
         # Database heartbeat for operational visibility (admin bot /health).
-        # Best-effort: heartbeat problems never stop delivery.
+        # Best-effort: heartbeat problems never stop delivery. Per-loop
+        # instance id: see heartbeat_instance_id.
         try:
             with session_factory() as hb_session:
                 record_worker_heartbeat(
                     hb_session,
                     worker_name="notification-worker",
-                    instance_id=worker_id,
+                    instance_id=heartbeat_instance_id(worker_id, "notification"),
                     now=utcnow(),
                     cycle_completed=cycle_completed,
                     error_code=error_code,

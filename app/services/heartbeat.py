@@ -21,10 +21,29 @@ def record_worker_heartbeat(
     cycle_completed: bool,
     error_code: str | None = None,
 ) -> None:
-    """Upsert this instance's heartbeat row and commit. Best-effort caller."""
+    """Upsert this instance's heartbeat row and commit. Best-effort caller.
+
+    ``instance_id`` is the unique upsert key, so every loop that heartbeats
+    must use its OWN instance id (see ``app.worker.heartbeat_instance_id``).
+    A row is never silently re-labeled: if the existing row belongs to a
+    DIFFERENT worker type, the call refuses to touch it — updating it would
+    refresh the wrong worker's liveness and mask that worker's staleness —
+    and logs the mismatch instead.
+    """
     heartbeat = db.execute(
         select(WorkerHeartbeat).where(WorkerHeartbeat.instance_id == instance_id)
     ).scalar_one_or_none()
+    if heartbeat is not None and heartbeat.worker_name != worker_name:
+        db.rollback()
+        logger.warning(
+            "worker_heartbeat_name_mismatch",
+            extra={
+                "instance_id": instance_id,
+                "existing_worker_name": heartbeat.worker_name,
+                "requested_worker_name": worker_name,
+            },
+        )
+        return
     if heartbeat is None:
         heartbeat = WorkerHeartbeat(
             worker_name=worker_name,

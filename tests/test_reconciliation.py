@@ -535,7 +535,7 @@ def test_reconciliation_thread_loop_starts_and_stops_cleanly(settings, session_f
     with session_factory() as db:
         [row] = db.execute(select(WorkerHeartbeat)).scalars().all()
     assert row.worker_name == "reconciliation-worker"
-    assert row.instance_id == "loop-test-recon"
+    assert row.instance_id == "loop-test-reconciliation"
 
 
 def test_reconciliation_thread_survives_pass_exceptions(settings):
@@ -569,3 +569,135 @@ def test_reconciliation_thread_survives_pass_exceptions(settings):
     stop.set()
     thread.join(timeout=10)
     assert not thread.is_alive()
+
+
+# --- heartbeat identity (one process, two loops, two rows) --------------------
+
+
+def test_one_process_keeps_two_heartbeat_rows_with_correct_names(session_factory):
+    """Regression: both loops of ONE worker process heartbeat under their own
+    stable instance ids, so one process creates and refreshes TWO rows — the
+    startup race can no longer let one loop own (and permanently label) the
+    other's row."""
+    from datetime import timedelta as _td
+
+    from sqlalchemy import select as _select
+
+    from app.models import WorkerHeartbeat
+    from app.services.heartbeat import record_worker_heartbeat
+    from app.worker import heartbeat_instance_id
+
+    base = "host-1234-abc123"  # the shared base worker id (logs/claims)
+    t0 = datetime.now(UTC)
+
+    def beat(name, loop, now):
+        with session_factory() as db:
+            record_worker_heartbeat(
+                db,
+                worker_name=name,
+                instance_id=heartbeat_instance_id(base, loop),
+                now=now,
+                cycle_completed=True,
+            )
+
+    # Worst-case startup order (the old bug): reconciliation wins the race.
+    beat("reconciliation-worker", "reconciliation", t0)
+    beat("notification-worker", "notification", t0)
+    # Both loops refresh later.
+    t1 = t0 + _td(seconds=30)
+    beat("reconciliation-worker", "reconciliation", t1)
+    beat("notification-worker", "notification", t1)
+
+    with session_factory() as db:
+        rows = db.execute(
+            _select(WorkerHeartbeat).order_by(WorkerHeartbeat.instance_id)
+        ).scalars().all()
+        by_instance = {row.instance_id: row for row in rows}
+    assert len(rows) == 2  # exactly two rows — refreshes never created more
+    notification = by_instance[f"{base}-notification"]
+    reconciliation = by_instance[f"{base}-reconciliation"]
+    assert notification.worker_name == "notification-worker"
+    assert reconciliation.worker_name == "reconciliation-worker"
+    # Both were refreshed, not recreated or cross-relabeled.
+    assert as_utc(notification.last_heartbeat_at) == t1
+    assert as_utc(reconciliation.last_heartbeat_at) == t1
+
+
+def test_admin_health_sees_fresh_notification_worker_with_both_loops_active(
+    session_factory,
+):
+    """Regression: with both loops heartbeating (reconciliation first — the
+    order that used to poison the shared row), admin health still finds a
+    FRESH notification-worker heartbeat and never reports it missing/stale."""
+    from app.adminbot.queries import latest_worker_heartbeat, worker_heartbeat_age_seconds
+    from app.services.heartbeat import record_worker_heartbeat
+    from app.worker import heartbeat_instance_id
+
+    base = "host-5678-def456"
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="reconciliation-worker",
+            instance_id=heartbeat_instance_id(base, "reconciliation"),
+            now=now,
+            cycle_completed=True,
+        )
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="notification-worker",
+            instance_id=heartbeat_instance_id(base, "notification"),
+            now=now,
+            cycle_completed=True,
+        )
+
+    with session_factory() as db:
+        found = latest_worker_heartbeat(db)  # admin default: notification-worker
+        assert found is not None
+        assert found.worker_name == "notification-worker"
+        assert found.instance_id == f"{base}-notification"
+        age = worker_heartbeat_age_seconds(db)
+    assert age is not None
+    assert age < 60  # fresh — never reported stale/missing
+
+
+def test_record_worker_heartbeat_never_silently_relabels(session_factory, caplog):
+    """A heartbeat targeting an instance row owned by a DIFFERENT worker type
+    is refused loudly: the row keeps its name AND its timestamp (refreshing it
+    would fake the other worker's liveness), and a warning is logged."""
+    import logging as _logging
+
+    from sqlalchemy import select as _select
+
+    from app.models import WorkerHeartbeat
+    from app.services.heartbeat import record_worker_heartbeat
+
+    t0 = datetime.now(UTC)
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="notification-worker",
+            instance_id="collide-1",
+            now=t0,
+            cycle_completed=True,
+        )
+    with (
+        caplog.at_level(_logging.WARNING, logger="app.services.heartbeat"),
+        session_factory() as db,
+    ):
+        record_worker_heartbeat(
+            db,
+            worker_name="reconciliation-worker",  # wrong type, same instance
+            instance_id="collide-1",
+            now=t0 + timedelta(seconds=120),
+            cycle_completed=True,
+        )
+    assert any(
+        record.getMessage() == "worker_heartbeat_name_mismatch"
+        for record in caplog.records
+    )
+    with session_factory() as db:
+        [row] = db.execute(_select(WorkerHeartbeat)).scalars().all()
+    assert row.worker_name == "notification-worker"  # never renamed
+    assert as_utc(row.last_heartbeat_at) == t0  # never falsely refreshed

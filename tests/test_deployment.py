@@ -633,7 +633,9 @@ def test_caddy_cannot_reach_database(compose):
 def test_worker_masks_unneeded_secrets(compose):
     env = compose["services"]["worker"]["environment"]
     assert env["CENTRALPAY_GETLINK_API_KEY"] == "not-used-by-worker"
-    assert env["CENTRALPAY_VERIFY_API_KEY"] == "not-used-by-worker"
+    # Reconciliation calls CentralPay verify.php from the worker, so the
+    # REAL verify key must flow through from the env file — never masked.
+    assert "CENTRALPAY_VERIFY_API_KEY" not in env
     assert env["INBOUND_API_KEY"] == "not-used-by-worker-x"
     assert env["CALLBACK_HMAC_SECRET"] == "not-used-by-worker-x"
 

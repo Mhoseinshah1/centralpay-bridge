@@ -130,15 +130,16 @@ services:
   worker:
     <<: [*app-image, *app-env, *app-hardening]
     command: ["python", "-m", "app.worker"]
-    # Least privilege: the worker delivers bot notifications and reads the
-    # database; it never talks to CentralPay, never validates inbound
-    # requests, and never talks to Telegram (it only creates admin-alert
-    # rows), so those secrets are masked with placeholders (environment:
-    # entries override env_file values). It keeps DATABASE_URL and the
-    # BOT_NOTIFY_* configuration.
+    # Least privilege: the worker delivers bot notifications, reconciles
+    # stuck payments against CentralPay verify.php, and reads the database.
+    # It KEEPS CENTRALPAY_VERIFY_API_KEY (reconciliation calls verify) plus
+    # DATABASE_URL and the BOT_NOTIFY_*/RECONCILIATION_* configuration. It
+    # never creates payment links, never validates inbound requests, never
+    # resolves payer identities, and never talks to Telegram (it only creates
+    # admin-alert rows), so those secrets stay masked with placeholders
+    # (environment: entries override env_file values).
     environment:
       CENTRALPAY_GETLINK_API_KEY: not-used-by-worker
-      CENTRALPAY_VERIFY_API_KEY: not-used-by-worker
       CENTRALPAY_PAYER_ID_SECRET: not-used-by-worker
       INBOUND_API_KEY: not-used-by-worker-x
       CALLBACK_HMAC_SECRET: not-used-by-worker-x
