@@ -104,13 +104,18 @@ def reconciliation_loop(
                 logger.exception("reconciliation_pass_failed")
             # Operational visibility heartbeat, mirroring the notification
             # worker's; best-effort — heartbeat problems never stop the loop.
+            # The instance id is DISTINCT from the notification loop's:
+            # record_worker_heartbeat upserts by instance_id alone and never
+            # rewrites worker_name, so sharing the id would let whichever
+            # loop wins the startup race own the row and make /health report
+            # the other worker as missing.
             try:
                 hb_session = session_factory()
                 try:
                     record_worker_heartbeat(
                         hb_session,
                         worker_name="reconciliation-worker",
-                        instance_id=worker_id,
+                        instance_id=f"{worker_id}-recon",
                         now=utcnow(),
                         cycle_completed=cycle_completed,
                         error_code=error_code,

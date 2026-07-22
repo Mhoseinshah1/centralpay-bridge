@@ -191,6 +191,10 @@ def test_unpaid_result_schedules_bounded_retry(client, settings, session_factory
     types = event_types(get_events(session_factory, payment.id))
     assert "reconciliation_gateway_not_paid" in types
     assert "reconciliation_retry_scheduled" in types
+    # Routine polling of an unpaid link is the EXPECTED state: it records the
+    # distinct non-alerting event, never the alert-mapped callback one.
+    assert "centralpay_verify_not_paid" in types
+    assert "centralpay_verify_failed" not in types
     assert "manual_review_required" not in types
     assert _notification_queued_count(session_factory, payment.id) == 0
 
@@ -273,6 +277,52 @@ def test_max_attempts_exhausts_without_state_change(
     stub.verify_requests.clear()
     assert _run_pass(session_factory, settings, stub)["processed"] == 0
     assert stub.verify_requests == []
+
+
+def test_unpaid_reconciliation_never_creates_admin_alerts(
+    app, client, settings, session_factory, stub, alert_policy
+):
+    """Review finding: with admin error alerts enabled (production default),
+    routine "not paid yet" reconciliation checks must NOT create admin alert
+    rows - otherwise every in-progress payment floods the admin outbox. Only
+    the distinct centralpay_verify_not_paid event is recorded, which the
+    alert mapper ignores. (A CALLBACK reporting unpaid keeps alerting - that
+    path is unchanged.)"""
+    from tests.conftest import get_alerts
+
+    _make_stale_link(client, settings, session_factory, order_id="rec-alert")
+    stats = _run_pass(session_factory, alert_policy, stub)  # default stub: unpaid
+    assert stats["retry_scheduled"] == 1
+    assert get_alerts(session_factory) == []  # no alert rows at all
+
+
+def test_claim_gap_is_closed_by_provisional_schedule(
+    client, settings, session_factory, stub, monkeypatch
+):
+    """Review finding: the shared settlement path commits (releasing the row
+    lock) BEFORE retry scheduling is finalized. The claim transaction must
+    therefore already carry a provisional future next_at, so the committed
+    gap-state is never due and a second worker cannot fire an immediate
+    duplicate verify."""
+    from app.services.verification import verify_and_settle as real_settle
+
+    seen: list[object] = []
+
+    def capturing(db, gateway, payment, *, settings=None, source="callback"):
+        # State at the moment the shared path will commit: the provisional
+        # schedule must already be on the row, inside the claim transaction.
+        seen.append(payment.reconciliation_next_at)
+        return real_settle(db, gateway, payment, settings=settings, source=source)
+
+    monkeypatch.setattr("app.services.reconciliation.verify_and_settle", capturing)
+    _make_stale_link(client, settings, session_factory, order_id="rec-gap")
+    assert _run_pass(session_factory, settings, stub)["processed"] == 1  # unpaid path
+    [provisional] = seen
+    assert provisional is not None
+    assert as_utc(provisional) > datetime.now(UTC) - timedelta(seconds=2)
+    # And the finalized schedule still stands after the pass.
+    payment = get_payment(session_factory, "rec-gap")
+    assert payment.reconciliation_next_at is not None
 
 
 # --- financial mismatches keep the existing manual_review behavior ------------
@@ -397,10 +447,10 @@ def test_one_payment_exception_does_not_stop_the_pass(
 
     boom_gateway_order_id = first.gateway_order_id
 
-    def exploding(db, gateway, payment, *, settings=None):
+    def exploding(db, gateway, payment, *, settings=None, source="callback"):
         if payment.gateway_order_id == boom_gateway_order_id:
             raise RuntimeError("unexpected bug")
-        return real_settle(db, gateway, payment, settings=settings)
+        return real_settle(db, gateway, payment, settings=settings, source=source)
 
     monkeypatch.setattr("app.services.reconciliation.verify_and_settle", exploding)
     stub.verify_result = verify_ok_response(
@@ -476,6 +526,16 @@ def test_reconciliation_thread_loop_starts_and_stops_cleanly(settings, session_f
     stop.set()
     thread.join(timeout=10)
     assert not thread.is_alive()
+
+    # Review finding: the heartbeat row must be its OWN instance (the upsert
+    # keys on instance_id alone), so it can never shadow the notification
+    # worker's row and make /health report that worker missing.
+    from app.models import WorkerHeartbeat
+
+    with session_factory() as db:
+        [row] = db.execute(select(WorkerHeartbeat)).scalars().all()
+    assert row.worker_name == "reconciliation-worker"
+    assert row.instance_id == "loop-test-recon"
 
 
 def test_reconciliation_thread_survives_pass_exceptions(settings):

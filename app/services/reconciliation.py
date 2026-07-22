@@ -117,6 +117,18 @@ def _claim_next_due(
     payment.reconciliation_last_at = now
     payment.reconciliation_claimed_at = now
     payment.reconciliation_claimed_by = worker_id
+    # PROVISIONAL pessimistic schedule, closing the multi-worker gap between
+    # the shared settlement path's commit (which releases this row lock) and
+    # _finalize's bookkeeping transaction: the not-paid/transport paths commit
+    # with the row still link_created, and without this the row would sit with
+    # a NULL (= due) next_at in that gap, so another worker could claim it and
+    # fire an immediate extra verify, defeating the bounded backoff. Committed
+    # atomically WITH the outcome; _finalize then replaces it (None when
+    # verified/exhausted, recomputed on retry). A crash before any commit
+    # rolls all of this back — no schedule is ever lost or invented.
+    payment.reconciliation_next_at = now + timedelta(
+        seconds=reconciliation_backoff_seconds(settings, payment.reconciliation_attempts)
+    )
     # Not committed here: the claim rides in the same transaction as the
     # settlement outcome (verify is read-only on the gateway side, so a crash
     # mid-verify loses only this bookkeeping, never financial state).
@@ -309,7 +321,9 @@ def run_reconciliation_pass(
             gateway_order_id = payment.gateway_order_id
             stats["processed"] += 1
             try:
-                settled = verify_and_settle(db, client, payment, settings=settings)
+                settled = verify_and_settle(
+                    db, client, payment, settings=settings, source="reconciliation"
+                )
             except CentralPayError as exc:
                 # The shared path recorded centralpay_verify_failed
                 # (stage=transport, internal code only) and committed.
