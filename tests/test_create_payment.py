@@ -1,12 +1,16 @@
 """Tests for POST /api/custom-payment."""
 
+from datetime import UTC, datetime
+
 import httpx
 from sqlalchemy import func, select
 
+from app.centralpay import CentralPayClient
 from app.models import Payment, PaymentStatus
 from tests.conftest import (
     DEFAULT_GATEWAY_USER_ID,
     DEFAULT_REDIRECT_URL,
+    as_utc,
     create_order,
     event_types,
     get_events,
@@ -167,3 +171,41 @@ def test_create_for_already_verified_order_rejected(client, settings, session_fa
     payment = get_payment(session_factory, "order-paid")
     assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
     assert payment.gateway_verified_at is not None
+
+
+def test_grace_anchor_stamped_after_getlink_returns(
+    client, settings, session_factory, stub, monkeypatch
+):
+    """A slow getLink must not consume the reconciliation grace period.
+
+    ``callback_token_issued_at`` anchors the two-stage reconciliation
+    schedule's minimum-age window, so it must be recorded when the gateway
+    call RETURNS (the earliest moment the payer can see the link), not before
+    the blocking HTTP request starts.
+    """
+    real_get_link = CentralPayClient.get_link
+    returned_at: dict[str, datetime] = {}
+
+    def tracking_get_link(self, *args, **kwargs):
+        result = real_get_link(self, *args, **kwargs)
+        returned_at["value"] = datetime.now(UTC)
+        return result
+
+    monkeypatch.setattr(CentralPayClient, "get_link", tracking_get_link)
+
+    response = create_order(client, settings, order_id="order-late-stamp", amount=10000)
+    assert response.status_code == 200
+
+    payment = get_payment(session_factory, "order-late-stamp")
+    issued_at = as_utc(payment.callback_token_issued_at)
+    assert issued_at is not None
+    assert issued_at >= returned_at["value"]
+
+
+def test_failed_getlink_does_not_start_grace_window(client, settings, session_factory, stub):
+    """Only a successfully issued link starts the reconciliation age clock."""
+    stub.getlink_result = httpx.ConnectError("connection refused")
+    assert create_order(client, settings, order_id="order-no-stamp").status_code == 502
+    payment = get_payment(session_factory, "order-no-stamp")
+    assert payment.status == PaymentStatus.GETLINK_FAILED.value
+    assert payment.callback_token_issued_at is None

@@ -466,7 +466,6 @@ def create_payment(
     # before any CentralPay verify call.
     callback_token = generate_callback_token()
     payment.callback_token_hash = callback_token_hash(callback_token)
-    payment.callback_token_issued_at = datetime.now(UTC)
 
     return_url = build_callback_url(settings, payment.gateway_order_id, callback_token)
     logger.info(
@@ -501,6 +500,10 @@ def create_payment(
 
     payment.status = PaymentStatus.LINK_CREATED.value
     payment.redirect_url = redirect_url
+    # Stamped AFTER getLink returns: this timestamp anchors the reconciliation
+    # grace period, which must start when the payer can first see the link — a
+    # slow getLink response must not consume the pre-check grace window.
+    payment.callback_token_issued_at = datetime.now(UTC)
     payment.last_error = None
     record_event(
         db,
