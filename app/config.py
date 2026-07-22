@@ -372,16 +372,33 @@ class Settings(BaseSettings):
     # Server-side payment reconciliation: the worker verifies link_created
     # payments whose browser callback never arrived, through the SAME shared
     # verification path the callback uses. The browser callback stays the
-    # fast primary path — reconciliation waits reconciliation_min_age_seconds
-    # before the first server-side check and then retries with bounded
-    # exponential backoff (initial * 2^(attempt-1), capped at max_backoff)
-    # until reconciliation_max_attempts. Disabling it only stops the polling;
-    # callbacks are unaffected.
+    # primary immediate path. Two-stage, AGE-based retry schedule (the stage
+    # is derived from the real link age — issued-at timestamp — never from
+    # the attempt count, so worker restarts/downtime can never restart the
+    # fast window):
+    #   * first server-side check ~reconciliation_min_age_seconds after the
+    #     link was issued (default 10 s; plus up to one worker scan interval);
+    #   * link age <  fast_window (default 600 s): retry every
+    #     fast_interval seconds (default 10 s);
+    #   * link age >= fast_window: retry every slow_interval seconds
+    #     (default 300 s) until reconciliation_max_attempts (default 1000 —
+    #     ~60 fast checks in the first 10 minutes, then every 5 minutes for
+    #     roughly 3 days of fallback monitoring).
+    # Reconciliation stops immediately once the payment is verified, leaves
+    # link_created, or moves to manual_review. Disabling it only stops the
+    # polling; callbacks are unaffected.
     reconciliation_enabled: bool = True
-    reconciliation_min_age_seconds: int = Field(default=30, ge=0)
-    reconciliation_interval_seconds: float = Field(default=10.0, gt=0)
+    reconciliation_min_age_seconds: int = Field(default=10, ge=0)
+    reconciliation_interval_seconds: float = Field(default=5.0, gt=0)
     reconciliation_batch_size: int = Field(default=10, gt=0, le=100)
-    reconciliation_max_attempts: int = Field(default=60, gt=0, le=1000)
+    reconciliation_max_attempts: int = Field(default=1000, gt=0, le=1000)
+    reconciliation_fast_window_seconds: int = Field(default=600, ge=0)
+    reconciliation_fast_interval_seconds: int = Field(default=10, gt=0)
+    reconciliation_slow_interval_seconds: int = Field(default=300, gt=0)
+    # DEPRECATED (accepted for compatibility with existing environment files;
+    # no longer control the retry schedule): the exponential-backoff tuning of
+    # the original reconciliation release. The active schedule is the
+    # two-stage age-based one above.
     reconciliation_initial_backoff_seconds: int = Field(default=20, gt=0)
     reconciliation_max_backoff_seconds: int = Field(default=900, gt=0)
 

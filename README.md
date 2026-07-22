@@ -497,33 +497,44 @@ server-side:
   exception-isolated and shuts down with the worker; an in-flight verify
   cannot be interrupted, so shutdown waits at most one gateway timeout for
   it.
-- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` the thread picks up
-  to `RECONCILIATION_BATCH_SIZE` payments in `link_created` that are at least
-  `RECONCILIATION_MIN_AGE_SECONDS` old (measured from link issuance, so the
-  normal callback gets the first chance) and due for a check, oldest first.
-  Verified, notification, `manual_review`, and pre-link states are never
-  selected.
+- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` (default 5 s) the
+  thread picks up to `RECONCILIATION_BATCH_SIZE` payments in `link_created`
+  that are at least `RECONCILIATION_MIN_AGE_SECONDS` old (default 10 s,
+  measured from link issuance, so the normal callback gets the first chance)
+  and due for a check, oldest first. Verified, notification, `manual_review`,
+  and pre-link states are never selected.
+- **Two-stage age-based schedule.** The retry stage comes from the REAL age
+  of the payment link (`callback_token_issued_at`, falling back to
+  `created_at`) — never from the attempt count, so stopping or restarting the
+  worker cannot restart the fast window:
+  - first server-side check ≈ 10 seconds after the link is issued (plus up to
+    one scan interval of alignment delay);
+  - link age < `RECONCILIATION_FAST_WINDOW_SECONDS` (default 600): one verify
+    every `RECONCILIATION_FAST_INTERVAL_SECONDS` (default 10);
+  - link age ≥ the window: one verify every
+    `RECONCILIATION_SLOW_INTERVAL_SECONDS` (default 300);
+  - reconciliation stops immediately once the payment is verified, leaves
+    `link_created`, or moves to `manual_review`.
 - **Outcomes.** Gateway success settles and queues the bot notification
   exactly once (`reconciliation_verified` event). "Not paid yet" and
-  transport errors schedule a retry with bounded exponential backoff —
-  `RECONCILIATION_INITIAL_BACKOFF_SECONDS * 2^(attempt-1)` capped at
-  `RECONCILIATION_MAX_BACKOFF_SECONDS` (`reconciliation_gateway_not_paid` /
-  `reconciliation_transport_failed` + `reconciliation_retry_scheduled`).
-  After `RECONCILIATION_MAX_ATTEMPTS` the payment is left in `link_created`
-  for operators (`reconciliation_exhausted`) — never auto-failed, never
-  auto-paid. Financial mismatches keep the existing `manual_review` behavior
-  and never notify the bot.
+  transport errors schedule the next check on the two-stage schedule above
+  (`reconciliation_gateway_not_paid` / `reconciliation_transport_failed` +
+  `reconciliation_retry_scheduled`). After `RECONCILIATION_MAX_ATTEMPTS`
+  (default 1000 ≈ 60 fast checks in the first 10 minutes, then one every
+  5 minutes — roughly 3 days of fallback monitoring) the payment is left in
+  `link_created` for operators (`reconciliation_exhausted`) — never
+  auto-failed, never auto-paid. Financial mismatches keep the existing
+  `manual_review` behavior and never notify the bot.
 - **Concurrency.** Payments are claimed with `FOR UPDATE SKIP LOCKED` and the
   row lock is held across the verify call — exactly how the callback
   serializes — so two workers can never settle one payment twice, a
   callback racing reconciliation waits and takes the duplicate path, and a
   callback arriving after reconciliation is answered as a duplicate.
-- **Gateway load.** `BATCH_SIZE / INTERVAL` (defaults: 1 verify/second) is an
-  **average** upper bound, not a burst bound — one pass may issue its whole
-  batch of up to `RECONCILIATION_BATCH_SIZE` verify calls back-to-back before
-  waiting out the interval. In practice retries back off to 15-minute
-  intervals, so a single stuck payment costs ~60 verify calls over roughly
-  12 hours.
+- **Gateway load.** `BATCH_SIZE / INTERVAL` (defaults: 2 verifies/second) is
+  an **average** upper bound, not a burst bound — one pass may issue its
+  whole batch of up to `RECONCILIATION_BATCH_SIZE` verify calls back-to-back
+  before waiting out the scan interval. Per stuck payment the schedule costs
+  ~6 verifies/minute for its first 10 minutes, then one every 5 minutes.
 - **Disable.** Set `RECONCILIATION_ENABLED=false` and restart the worker.
   Only the polling stops; callbacks, verification, and notification delivery
   are unaffected.
@@ -689,10 +700,12 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `BOT_NOTIFY_WORKER_INTERVAL_SECONDS` | Worker poll interval (default 10) |
 | `BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` | Stale-claim threshold; must exceed connect+read timeouts (default 120) |
 | `RECONCILIATION_ENABLED` | Server-side stuck-payment reconciliation in the worker (default `true`); disabling only stops the polling — callbacks are unaffected |
-| `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 30) |
-| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Pass cadence and per-pass payment cap (defaults 10 / 10 — average ≤ 1 verify/second; a pass may burst its whole batch) |
-| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 60; payment stays `link_created` for operators) |
-| `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | Bounded exponential backoff `initial * 2^(attempt-1)`, capped (defaults 20 / 900) |
+| `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 10) |
+| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Scan cadence and per-pass payment cap (defaults 5 / 10 — average ≤ 2 verifies/second; a pass may burst its whole batch) |
+| `RECONCILIATION_FAST_WINDOW_SECONDS` | Age boundary between the fast and slow retry stages (default 600) |
+| `RECONCILIATION_FAST_INTERVAL_SECONDS` / `RECONCILIATION_SLOW_INTERVAL_SECONDS` | Retry cadence below / at-or-above the boundary (defaults 10 / 300) |
+| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 1000 ≈ 3 days of coverage; payment stays `link_created` for operators) |
+| `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | **Deprecated** — accepted for compatibility, no longer control the schedule |
 | `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |
 | `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |
 | `LOG_FORMAT` | `json` (default) or `text`; both redact secrets |

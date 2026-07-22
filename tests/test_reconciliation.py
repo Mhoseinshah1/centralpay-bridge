@@ -2,11 +2,13 @@
 
 Covers the full contract: selection (staleness, feature flag, status
 exclusivity), settlement through the SAME shared verification path as the
-callback (all financial checks and manual_review behavior preserved), bounded
-exponential backoff, attempt exhaustion, callback/reconciliation idempotency
-in both orders, per-payment crash isolation, and single bot-notification
-queueing. CentralPay is faked at the httpx transport layer via the shared
-stub — the real client code runs.
+callback (all financial checks and manual_review behavior preserved), the
+two-stage AGE-based retry schedule (fast every 10 s while the link is under
+10 minutes old, then every 5 minutes — anchored on the real link age so
+worker downtime never restarts the fast window), attempt exhaustion,
+callback/reconciliation idempotency in both orders, per-payment crash
+isolation, and single bot-notification queueing. CentralPay is faked at
+the httpx transport layer via the shared stub — the real client code runs.
 """
 
 from datetime import UTC, datetime, timedelta
@@ -21,6 +23,7 @@ from app.services.reconciliation import (
     ERROR_GATEWAY_NOT_PAID,
     ERROR_INTERNAL,
     reconciliation_backoff_seconds,
+    reconciliation_retry_delay_seconds,
     run_reconciliation_pass,
 )
 from tests.conftest import (
@@ -184,7 +187,8 @@ def test_unpaid_result_schedules_bounded_retry(client, settings, session_factory
     assert payment.gateway_verified_at is None
     assert payment.reconciliation_attempts == 1
     assert payment.reconciliation_last_error_code == ERROR_GATEWAY_NOT_PAID
-    expected_delay = settings.reconciliation_initial_backoff_seconds
+    # Young link (age < fast window): the next check is one FAST interval out.
+    expected_delay = settings.reconciliation_fast_interval_seconds
     assert payment.reconciliation_next_at is not None
     remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
     assert 0 < remaining <= expected_delay + 1
@@ -218,18 +222,97 @@ def test_transport_failure_schedules_retry_and_never_crashes(
     assert "reconciliation_retry_scheduled" in types
 
 
-def test_backoff_is_exponential_and_bounded(settings):
+def _aged_payment(age_seconds, *, use_created_at=False):
+    """An in-memory Payment whose link is ``age_seconds`` old (negative =
+    issued in the future, i.e. clock skew)."""
+    now = datetime.now(UTC)
+    issued = now - timedelta(seconds=age_seconds)
+    payment = Payment(
+        bot_order_id="delay-x",
+        gateway_order_id=1,
+        gateway_user_id=1,
+        amount=1,
+        payable_amount=1,
+        status=PaymentStatus.LINK_CREATED.value,
+    )
+    if use_created_at:
+        payment.callback_token_issued_at = None
+        payment.created_at = issued
+    else:
+        payment.callback_token_issued_at = issued
+    return payment, now
+
+
+def test_two_stage_delay_fast_before_the_window(settings):
+    """Link age below the 10-minute window: retry in 10 seconds."""
+    for age in (0, 15, 300, 599):
+        payment, now = _aged_payment(age)
+        assert (
+            reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
+            == settings.reconciliation_fast_interval_seconds
+            == 10
+        )
+
+
+def test_two_stage_delay_slow_at_and_after_the_boundary(settings):
+    """At EXACTLY the window boundary — and any age beyond it — the slow
+    300-second interval applies."""
+    for age in (600, 601, 1200, 86_400):
+        payment, now = _aged_payment(age)
+        assert (
+            reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
+            == settings.reconciliation_slow_interval_seconds
+            == 300
+        )
+
+
+def test_two_stage_delay_is_age_based_not_attempt_based(settings):
+    """Worker downtime: an old payment with a LOW attempt count still uses
+    the slow interval — the fast window never restarts."""
+    payment, now = _aged_payment(20 * 60)  # 20 minutes old
+    payment.reconciliation_attempts = 1  # the worker was offline
+    assert (
+        reconciliation_retry_delay_seconds(settings, payment=payment, now=now) == 300
+    )
+
+
+def test_two_stage_delay_clamps_future_timestamps_to_fast(settings):
+    """Clock skew making the link look issued in the future clamps the age
+    to zero: fast interval, never a negative-age artifact."""
+    payment, now = _aged_payment(-120)  # "issued" 2 minutes in the future
+    assert reconciliation_retry_delay_seconds(settings, payment=payment, now=now) == 10
+
+
+def test_two_stage_delay_falls_back_to_created_at(settings):
+    """Without a callback_token_issued_at, created_at anchors the age."""
+    young, now = _aged_payment(5, use_created_at=True)
+    assert reconciliation_retry_delay_seconds(settings, payment=young, now=now) == 10
+    old, now = _aged_payment(700, use_created_at=True)
+    assert reconciliation_retry_delay_seconds(settings, payment=old, now=now) == 300
+
+
+def test_two_stage_delay_handles_naive_timestamps(settings):
+    """SQLite hands back naive UTC datetimes; both anchors are normalized."""
+    payment, now = _aged_payment(700)
+    assert payment.callback_token_issued_at is not None
+    payment.callback_token_issued_at = payment.callback_token_issued_at.replace(
+        tzinfo=None
+    )
+    assert (
+        reconciliation_retry_delay_seconds(
+            settings, payment=payment, now=now.replace(tzinfo=None)
+        )
+        == 300
+    )
+
+
+def test_deprecated_exponential_helper_remains_bounded(settings):
+    """The RETIRED exponential helper is kept only as a deprecated utility
+    (its settings stay accepted for env compatibility); production
+    reconciliation never calls it. Its bound still holds."""
     initial = settings.reconciliation_initial_backoff_seconds
     maximum = settings.reconciliation_max_backoff_seconds
     assert reconciliation_backoff_seconds(settings, 1) == initial
-    assert reconciliation_backoff_seconds(settings, 2) == initial * 2
-    assert reconciliation_backoff_seconds(settings, 3) == initial * 4
-    previous = 0
-    for attempt in range(1, 80):  # far past the exhaustion limit
-        delay = reconciliation_backoff_seconds(settings, attempt)
-        assert delay <= maximum  # never exceeds the cap
-        assert delay >= previous or delay == maximum  # monotone until capped
-        previous = delay
     assert reconciliation_backoff_seconds(settings, 80) == maximum
 
 
@@ -316,13 +399,67 @@ def test_claim_gap_is_closed_by_provisional_schedule(
 
     monkeypatch.setattr("app.services.reconciliation.verify_and_settle", capturing)
     _make_stale_link(client, settings, session_factory, order_id="rec-gap")
+    before = datetime.now(UTC)
     assert _run_pass(session_factory, settings, stub)["processed"] == 1  # unpaid path
     [provisional] = seen
     assert provisional is not None
-    assert as_utc(provisional) > datetime.now(UTC) - timedelta(seconds=2)
+    assert as_utc(provisional) > before - timedelta(seconds=2)
+    # The provisional schedule uses the SAME two-stage helper: this link is
+    # young (age < fast window), so it sits one FAST interval out — never an
+    # exponential value, never "due now".
+    assert as_utc(provisional) <= before + timedelta(
+        seconds=settings.reconciliation_fast_interval_seconds + 3
+    )
     # And the finalized schedule still stands after the pass.
     payment = get_payment(session_factory, "rec-gap")
     assert payment.reconciliation_next_at is not None
+
+
+def test_old_payment_after_worker_downtime_uses_slow_interval(
+    client, settings, session_factory, stub
+):
+    """End-to-end downtime scenario: a 20-minute-old link with ONE recorded
+    attempt (the worker was offline) schedules its next check ~300 s out —
+    the fast stage never restarts."""
+    _make_stale_link(client, settings, session_factory, order_id="rec-down")
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "rec-down")
+        ).scalar_one()
+        payment.callback_token_issued_at = datetime.now(UTC) - timedelta(minutes=20)
+        payment.reconciliation_attempts = 1  # low attempt count
+        db.commit()
+
+    stats = _run_pass(session_factory, settings, stub)  # default stub: unpaid
+    assert stats["retry_scheduled"] == 1
+    payment = get_payment(session_factory, "rec-down")
+    assert payment.reconciliation_attempts == 2
+    assert payment.reconciliation_next_at is not None
+    remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
+    slow = settings.reconciliation_slow_interval_seconds
+    assert slow - 10 < remaining <= slow + 1  # ~300 s, NOT the 10 s fast stage
+
+
+def test_verified_payment_is_never_verified_again(
+    client, settings, session_factory, stub
+):
+    """After reconciliation settles a payment, reconciliation_next_at is NULL
+    and a later pass sends NO verify request for it."""
+    payment = _make_stale_link(client, settings, session_factory, order_id="rec-done")
+    stub.verify_result = verify_ok_response(
+        amount=10000, user_id=payment.gateway_user_id, reference_id="REF-rec-done"
+    )
+    assert _run_pass(session_factory, settings, stub)["verified"] == 1
+    settled = get_payment(session_factory, "rec-done")
+    assert settled.gateway_verified_at is not None
+    assert settled.reconciliation_next_at is None
+
+    stub.verify_requests.clear()
+    later = datetime.now(UTC) + timedelta(hours=1)
+    stats = _run_pass(session_factory, settings, stub, now_fn=lambda: later)
+    assert stats["processed"] == 0
+    assert stub.verify_requests == []  # never verified again
+    assert _notification_queued_count(session_factory, settled.id) == 1
 
 
 # --- financial mismatches keep the existing manual_review behavior ------------

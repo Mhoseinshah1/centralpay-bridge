@@ -29,11 +29,15 @@ Design:
   duplicate path. The claim columns are operational visibility, not the
   correctness mechanism.
 * Outcomes: gateway success settles and queues the bot notification (once);
-  "not paid" and transport failures schedule a bounded-exponential-backoff
-  retry (initial * 2^(attempt-1), capped) and NEVER move the payment to a
-  failed or manual state; financial mismatches keep the existing
-  manual_review behavior; attempt exhaustion stops the polling while leaving
-  the payment in ``link_created`` for operators.
+  "not paid" and transport failures schedule a retry on the two-stage
+  AGE-based schedule (see reconciliation_retry_delay_seconds — every 10 s
+  while the link is under 10 minutes old, every 5 minutes afterwards, by
+  default) and NEVER move the payment to a failed or manual state; financial
+  mismatches keep the existing manual_review behavior; attempt exhaustion
+  (default 1000 attempts ≈ 3 days of coverage) stops the polling while
+  leaving the payment in ``link_created`` for operators. Reconciliation
+  stops immediately once the payment is verified, leaves link_created, or
+  moves to manual_review.
 * Privacy: events and logs carry only payment_id, gateway_order_id, attempt,
   worker_id, and fixed internal reason codes — never tokens, signatures, API
   keys, card numbers, raw gateway responses, or raw Telegram ids.
@@ -71,14 +75,51 @@ def utcnow() -> datetime:
 
 
 def reconciliation_backoff_seconds(settings: Settings, attempt: int) -> int:
-    """Bounded exponential backoff for the NEXT retry after ``attempt``
-    (1-based) attempts: initial * 2^(attempt-1), capped at the maximum."""
+    """DEPRECATED utility — the exponential backoff of the original
+    reconciliation release (initial * 2^(attempt-1), capped). NOT called by
+    the reconciliation scheduler anymore: the active schedule is the
+    two-stage age-based :func:`reconciliation_retry_delay_seconds`. Retained
+    only because the corresponding settings remain accepted for environment
+    compatibility."""
     exponent = max(attempt - 1, 0)
     # Cap the exponent first so huge attempt numbers cannot overflow.
     if exponent > 30:
         return settings.reconciliation_max_backoff_seconds
     delay = settings.reconciliation_initial_backoff_seconds * (1 << exponent)
     return min(delay, settings.reconciliation_max_backoff_seconds)
+
+
+def reconciliation_retry_delay_seconds(
+    settings: Settings,
+    *,
+    payment: Payment,
+    now: datetime,
+) -> int:
+    """Two-stage, AGE-based retry delay — the ACTIVE default schedule.
+
+    The stage is derived from the REAL age of the payment link (anchored on
+    ``callback_token_issued_at``, falling back to ``created_at``), never from
+    the attempt counter, so stopping or restarting the worker can never
+    restart the fast window: a 20-minute-old payment with one recorded
+    attempt goes straight to the slow interval.
+
+    * age <  ``reconciliation_fast_window_seconds`` (default 600 s): retry in
+      ``reconciliation_fast_interval_seconds`` (default 10 s);
+    * age >= the window (including exactly at the boundary): retry in
+      ``reconciliation_slow_interval_seconds`` (default 300 s).
+
+    A clock skew that makes the link look issued in the future clamps the
+    age to zero (fast interval) instead of producing a negative age.
+    """
+    issued_at = payment.callback_token_issued_at or payment.created_at
+    if issued_at.tzinfo is None:  # SQLite returns naive UTC datetimes
+        issued_at = issued_at.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    age_seconds = max((now - issued_at).total_seconds(), 0)
+    if age_seconds < settings.reconciliation_fast_window_seconds:
+        return settings.reconciliation_fast_interval_seconds
+    return settings.reconciliation_slow_interval_seconds
 
 
 def _claim_next_due(
@@ -127,7 +168,7 @@ def _claim_next_due(
     # verified/exhausted, recomputed on retry). A crash before any commit
     # rolls all of this back — no schedule is ever lost or invented.
     payment.reconciliation_next_at = now + timedelta(
-        seconds=reconciliation_backoff_seconds(settings, payment.reconciliation_attempts)
+        seconds=reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
     )
     # Not committed here: the claim rides in the same transaction as the
     # settlement outcome (verify is read-only on the gateway side, so a crash
@@ -244,7 +285,7 @@ def _finalize(
         logger.error("reconciliation_exhausted", extra=safe_extra)
         return "exhausted"
 
-    delay = reconciliation_backoff_seconds(settings, attempt)
+    delay = reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
     next_at = now + timedelta(seconds=delay)
     payment.reconciliation_next_at = next_at
     record_event(
