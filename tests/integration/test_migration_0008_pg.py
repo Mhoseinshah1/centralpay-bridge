@@ -253,10 +253,10 @@ def test_deployed_0007_then_upgrade_head_runs_0008_and_app_survives(
     assert kept == 3
 
     # --- bring the schema to the full head for the application section ------
-    # (0009 adds centralpay_payer_identities.identity_scheme, which the
+    # (0009/0010 add the identity-scheme and reconciliation columns the
     # current ORM model selects)
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0009"
+    assert _alembic_version(pg_engine) == "0010"
 
     # --- the NEW application against the migrated database ------------------
     session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
@@ -337,7 +337,7 @@ def test_upgrade_head_is_idempotent_on_partially_applied_0008(pg_engine):
             text("ALTER TABLE payments ADD COLUMN payer_identity_type VARCHAR(16)")
         )
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0009"
+    assert _alembic_version(pg_engine) == "0010"
     assert "ck_payments_payer_identity_type_valid" in _check_names(pg_engine, "payments")
 
 
@@ -352,4 +352,4 @@ def test_0008_downgrade_is_non_destructive_by_default(pg_engine):
     assert "ck_payments_payer_identity_type_valid" in _check_names(pg_engine, "payments")
     # And forward again from that state.
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0009"
+    assert _alembic_version(pg_engine) == "0010"

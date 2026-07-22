@@ -369,6 +369,22 @@ class Settings(BaseSettings):
     bot_notify_worker_interval_seconds: float = Field(default=10.0, gt=0)
     bot_notify_claim_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # Server-side payment reconciliation: the worker verifies link_created
+    # payments whose browser callback never arrived, through the SAME shared
+    # verification path the callback uses. The browser callback stays the
+    # fast primary path — reconciliation waits reconciliation_min_age_seconds
+    # before the first server-side check and then retries with bounded
+    # exponential backoff (initial * 2^(attempt-1), capped at max_backoff)
+    # until reconciliation_max_attempts. Disabling it only stops the polling;
+    # callbacks are unaffected.
+    reconciliation_enabled: bool = True
+    reconciliation_min_age_seconds: int = Field(default=30, ge=0)
+    reconciliation_interval_seconds: float = Field(default=10.0, gt=0)
+    reconciliation_batch_size: int = Field(default=10, gt=0, le=100)
+    reconciliation_max_attempts: int = Field(default=60, gt=0, le=1000)
+    reconciliation_initial_backoff_seconds: int = Field(default=20, gt=0)
+    reconciliation_max_backoff_seconds: int = Field(default=900, gt=0)
+
     # Worker liveness heartbeat file, touched after every pass.
     worker_heartbeat_file: str = "/tmp/centralpay-worker-heartbeat"
 
@@ -464,6 +480,11 @@ class Settings(BaseSettings):
         if self.bot_notify_claim_timeout_seconds <= request_budget:
             raise ValueError(
                 "BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS must exceed connect + read timeouts"
+            )
+        if self.reconciliation_max_backoff_seconds < self.reconciliation_initial_backoff_seconds:
+            raise ValueError(
+                "RECONCILIATION_MAX_BACKOFF_SECONDS must be >= "
+                "RECONCILIATION_INITIAL_BACKOFF_SECONDS"
             )
         return self
 

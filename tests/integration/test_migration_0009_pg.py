@@ -171,8 +171,8 @@ def test_production_0008_then_upgrade_head_runs_0009_and_app_survives(
 
     token = _seed_production_0008_state(pg_engine)
 
-    # --- the production upgrade step ----------------------------------------
-    _alembic("upgrade", "head")
+    # --- the production upgrade step (pinned to the 0009 slice) -------------
+    _alembic("upgrade", "0009")
     assert _alembic_version(pg_engine) == "0009"
     assert "identity_scheme" in _column_names(pg_engine, "centralpay_payer_identities")
     assert "ck_payer_identities_identity_scheme_valid" in _check_names(
@@ -205,8 +205,13 @@ def test_production_0008_then_upgrade_head_runs_0009_and_app_survives(
 
     # --- recovery-safety ----------------------------------------------------
     _alembic("stamp", "0008")
-    _alembic("upgrade", "head")  # re-upgrade over existing schema: clean no-op
+    _alembic("upgrade", "0009")  # re-upgrade over existing schema: clean no-op
     assert _alembic_version(pg_engine) == "0009"
+
+    # Bring the schema to the full head for the application section (0010
+    # adds the reconciliation columns the current ORM model selects).
+    _alembic("upgrade", "head")
+    assert _alembic_version(pg_engine) == "0010"
 
     # --- the NEW application against the migrated database ------------------
     session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
@@ -285,7 +290,7 @@ def test_upgrade_head_is_idempotent_on_partially_applied_0009(pg_engine):
             )
         )
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0009"
+    assert _alembic_version(pg_engine) == "0010"
     assert "ck_payer_identities_identity_scheme_valid" in _check_names(
         pg_engine, "centralpay_payer_identities"
     )
@@ -296,11 +301,11 @@ def test_0009_downgrade_is_non_destructive_by_default(pg_engine):
     CHECK survive (dropping is an explicit CENTRALPAY_DROP_PAYER_IDENTITY=1
     opt-in), and the schema upgrades forward again cleanly."""
     _alembic("upgrade", "head")
-    _alembic("downgrade", "0008")
+    _alembic("downgrade", "0008")  # 0010 + 0009 downgrades are pointer-only
     assert _alembic_version(pg_engine) == "0008"
     assert "identity_scheme" in _column_names(pg_engine, "centralpay_payer_identities")
     assert "ck_payer_identities_identity_scheme_valid" in _check_names(
         pg_engine, "centralpay_payer_identities"
     )
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0009"
+    assert _alembic_version(pg_engine) == "0010"

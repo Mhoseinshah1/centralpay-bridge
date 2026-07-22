@@ -470,6 +470,88 @@ All commands are read-only and print one JSON object per line with order
 IDs, verification status, delivery status, reason code, attempt count, last
 HTTP status, next retry time, reference ID, and timestamps.
 
+### Server-side payment reconciliation
+
+Some payers complete payment on CentralPay but never return to the browser
+callback (closed tab, network drop, in-app browser). Without intervention the
+payment stays in `link_created` forever and the customer is never credited —
+this happened in production. The worker therefore reconciles stuck payments
+server-side:
+
+- **The browser callback stays the fast primary path.** Its URL format, HMAC
+  signature, and one-time callback token validation are completely unchanged;
+  reconciliation never fakes or reconstructs any of them — it is pure
+  server-to-server verification.
+- **One settlement path.** Reconciliation calls the exact same internal
+  verify-and-settle function the callback uses (`verify_and_settle` in
+  `app/services/verification.py`): explicit gateway success, referenceId
+  validity and uniqueness, amount == `payable_amount`, userId == the stored
+  `gateway_user_id` snapshot, mismatches → `manual_review`, and atomic
+  bot-notification queueing. There is no parallel payment path to audit.
+- **Dedicated thread — notifications never wait.** Reconciliation runs in its
+  own thread inside the worker process, with its own CentralPay HTTP client
+  and its own short-lived database sessions (nothing is shared across
+  threads). Bot-notification delivery keeps its exact cadence even while a
+  reconciliation verify call is slow or timing out: the two loops only meet
+  at the database, where row locks (below) keep them correct. The thread is
+  exception-isolated and shuts down with the worker; an in-flight verify
+  cannot be interrupted, so shutdown waits at most one gateway timeout for
+  it.
+- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` the thread picks up
+  to `RECONCILIATION_BATCH_SIZE` payments in `link_created` that are at least
+  `RECONCILIATION_MIN_AGE_SECONDS` old (measured from link issuance, so the
+  normal callback gets the first chance) and due for a check, oldest first.
+  Verified, notification, `manual_review`, and pre-link states are never
+  selected.
+- **Outcomes.** Gateway success settles and queues the bot notification
+  exactly once (`reconciliation_verified` event). "Not paid yet" and
+  transport errors schedule a retry with bounded exponential backoff —
+  `RECONCILIATION_INITIAL_BACKOFF_SECONDS * 2^(attempt-1)` capped at
+  `RECONCILIATION_MAX_BACKOFF_SECONDS` (`reconciliation_gateway_not_paid` /
+  `reconciliation_transport_failed` + `reconciliation_retry_scheduled`).
+  After `RECONCILIATION_MAX_ATTEMPTS` the payment is left in `link_created`
+  for operators (`reconciliation_exhausted`) — never auto-failed, never
+  auto-paid. Financial mismatches keep the existing `manual_review` behavior
+  and never notify the bot.
+- **Concurrency.** Payments are claimed with `FOR UPDATE SKIP LOCKED` and the
+  row lock is held across the verify call — exactly how the callback
+  serializes — so two workers can never settle one payment twice, a
+  callback racing reconciliation waits and takes the duplicate path, and a
+  callback arriving after reconciliation is answered as a duplicate.
+- **Gateway load.** `BATCH_SIZE / INTERVAL` (defaults: 1 verify/second) is an
+  **average** upper bound, not a burst bound — one pass may issue its whole
+  batch of up to `RECONCILIATION_BATCH_SIZE` verify calls back-to-back before
+  waiting out the interval. In practice retries back off to 15-minute
+  intervals, so a single stuck payment costs ~60 verify calls over roughly
+  12 hours.
+- **Disable.** Set `RECONCILIATION_ENABLED=false` and restart the worker.
+  Only the polling stops; callbacks, verification, and notification delivery
+  are unaffected.
+
+Inspecting reconciliation:
+
+```bash
+python -m app.cli payment ORDER_ID    # includes reconciliation_* events
+python -m app.cli manual-review       # financial mismatches land here
+# stuck payments the poller gave up on (operator follow-up):
+docker compose exec db psql -U centralpay -c \
+  "SELECT bot_order_id, gateway_order_id, reconciliation_attempts, \
+          reconciliation_last_error_code, reconciliation_last_at \
+     FROM payments \
+    WHERE status = 'link_created' \
+      AND reconciliation_attempts >= 60 \
+      AND reconciliation_next_at IS NULL;"
+```
+
+**Rollout:** deploy the build, run `alembic upgrade head` (migration 0010 —
+adds nullable bookkeeping columns and an index; no data migration, existing
+stuck payments become due automatically), restart the worker, then watch for
+`reconciliation_*` events. **Rollback:** either set
+`RECONCILIATION_ENABLED=false` (worker restart, schema untouched) or roll the
+application back — migration 0010's downgrade is non-destructive (pointer
+only) and the previous application ignores the extra columns, so no schema
+downgrade is required.
+
 ## Dynamic service fee (percentage)
 
 The bridge can add a percentage service fee on top of the bot's invoice.
@@ -606,6 +688,11 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `BOT_NOTIFY_CONNECT_TIMEOUT_SECONDS` / `BOT_NOTIFY_READ_TIMEOUT_SECONDS` | Bot HTTP timeouts (5 / 15) |
 | `BOT_NOTIFY_WORKER_INTERVAL_SECONDS` | Worker poll interval (default 10) |
 | `BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` | Stale-claim threshold; must exceed connect+read timeouts (default 120) |
+| `RECONCILIATION_ENABLED` | Server-side stuck-payment reconciliation in the worker (default `true`); disabling only stops the polling — callbacks are unaffected |
+| `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 30) |
+| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Pass cadence and per-pass payment cap (defaults 10 / 10 — average ≤ 1 verify/second; a pass may burst its whole batch) |
+| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 60; payment stays `link_created` for operators) |
+| `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | Bounded exponential backoff `initial * 2^(attempt-1)`, capped (defaults 20 / 900) |
 | `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |
 | `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |
 | `LOG_FORMAT` | `json` (default) or `text`; both redact secrets |

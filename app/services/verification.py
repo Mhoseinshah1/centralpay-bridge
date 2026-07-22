@@ -51,6 +51,15 @@ class CallbackStatus(enum.StrEnum):
     UNDER_REVIEW = "under_review"  # administrator review required
 
 
+class SettlementOutcome(enum.StrEnum):
+    """Outcome of one verify-and-settle attempt (shared by the callback and
+    the reconciliation worker)."""
+
+    VERIFIED = "verified"  # settled; bot notification queued atomically
+    GATEWAY_NOT_PAID = "gateway_not_paid"  # gateway says not successful (yet)
+    UNDER_REVIEW = "under_review"  # financial mismatch -> manual_review
+
+
 @dataclass(frozen=True)
 class CallbackResult:
     status: CallbackStatus
@@ -297,6 +306,47 @@ def process_callback(
         db.commit()
         return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
 
+    outcome = verify_and_settle(db, client, payment, settings=settings)
+    if outcome is SettlementOutcome.GATEWAY_NOT_PAID:
+        raise VerificationFailedError()
+    if outcome is SettlementOutcome.UNDER_REVIEW:
+        return CallbackResult(CallbackStatus.UNDER_REVIEW, payment.bot_order_id)
+    return CallbackResult(CallbackStatus.BOT_PENDING, payment.bot_order_id)
+
+
+def verify_and_settle(
+    db: Session,
+    client: CentralPayClient,
+    payment: Payment,
+    *,
+    settings: "Settings | None" = None,
+) -> SettlementOutcome:
+    """Verify one payment with CentralPay and settle it — the SINGLE
+    settlement path, shared by the browser callback and the reconciliation
+    worker.
+
+    Contract (both callers already satisfy it):
+    * the caller holds the payment ROW LOCK for the whole call, so two
+      settlements of one payment can never run concurrently;
+    * the caller has already confirmed the payment is still unverified and
+      not in manual_review (the callback additionally validated its one-time
+      token and HMAC signature first — reconciliation never touches those).
+
+    All financial checks live below this point and are therefore identical
+    for both paths: explicit gateway success, valid referenceId, amount ==
+    payable_amount, userId == the stored gateway_user_id snapshot,
+    referenceId uniqueness; any mismatch moves the payment to manual_review;
+    success records gateway_verified_at and queues the bot notification in
+    the SAME transaction (queued exactly once, because this only ever runs
+    under the row lock on a still-unverified payment).
+
+    Transport/protocol errors raise CentralPayError after recording a
+    ``centralpay_verify_failed`` event (stage=transport) — each caller maps
+    that to its own retry semantics. A gateway "not successful" answer
+    returns GATEWAY_NOT_PAID after recording stage=gateway; it is NOT a
+    failure state — the payer may simply not have paid yet.
+    """
+    gateway_order_id = payment.gateway_order_id
     try:
         result = client.verify(order_id=gateway_order_id)
     except CentralPayError as exc:
@@ -327,6 +377,9 @@ def process_callback(
             data={"gateway_order_id": gateway_order_id, "stage": "gateway", "reason": reason},
         )
         db.commit()
-        raise VerificationFailedError()
+        return SettlementOutcome.GATEWAY_NOT_PAID
 
-    return _validate_and_apply_verification(db, payment, result, settings)
+    applied = _validate_and_apply_verification(db, payment, result, settings)
+    if applied.status is CallbackStatus.UNDER_REVIEW:
+        return SettlementOutcome.UNDER_REVIEW
+    return SettlementOutcome.VERIFIED
