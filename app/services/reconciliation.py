@@ -268,10 +268,16 @@ def run_reconciliation_pass(
     """One reconciliation pass: claim due payments one at a time and settle
     or reschedule each in its own transaction.
 
-    A per-payment failure never terminates the pass, and the optional wall
-    clock budget stops the pass from starting new claims once exceeded — so
-    reconciliation can never starve bot notification delivery, which always
-    runs first in the worker loop.
+    A per-payment failure never terminates the pass. The wall-clock budget
+    bounds the pass LENGTH by refusing to START another claim once exceeded;
+    it cannot interrupt an in-flight verify call, so a pass may overrun by up
+    to one gateway timeout. Bot-notification latency does not depend on this
+    budget at all: the worker runs reconciliation in a DEDICATED THREAD (see
+    app/worker.py), never inline in the notification loop.
+
+    Load note: ``batch_size / interval`` is an AVERAGE upper bound on verify
+    calls, not a burst bound — a single pass may issue its whole batch
+    back-to-back.
     """
     stats = {
         "processed": 0,

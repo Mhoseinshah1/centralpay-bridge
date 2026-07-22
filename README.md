@@ -488,9 +488,17 @@ server-side:
   validity and uniqueness, amount == `payable_amount`, userId == the stored
   `gateway_user_id` snapshot, mismatches → `manual_review`, and atomic
   bot-notification queueing. There is no parallel payment path to audit.
-- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` (after — never
-  instead of — the notification pass) the worker picks up to
-  `RECONCILIATION_BATCH_SIZE` payments in `link_created` that are at least
+- **Dedicated thread — notifications never wait.** Reconciliation runs in its
+  own thread inside the worker process, with its own CentralPay HTTP client
+  and its own short-lived database sessions (nothing is shared across
+  threads). Bot-notification delivery keeps its exact cadence even while a
+  reconciliation verify call is slow or timing out: the two loops only meet
+  at the database, where row locks (below) keep them correct. The thread is
+  exception-isolated and shuts down with the worker; an in-flight verify
+  cannot be interrupted, so shutdown waits at most one gateway timeout for
+  it.
+- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` the thread picks up
+  to `RECONCILIATION_BATCH_SIZE` payments in `link_created` that are at least
   `RECONCILIATION_MIN_AGE_SECONDS` old (measured from link issuance, so the
   normal callback gets the first chance) and due for a check, oldest first.
   Verified, notification, `manual_review`, and pre-link states are never
@@ -510,10 +518,12 @@ server-side:
   serializes — so two workers can never settle one payment twice, a
   callback racing reconciliation waits and takes the duplicate path, and a
   callback arriving after reconciliation is answered as a duplicate.
-- **Gateway load.** At the defaults the absolute worst case is
-  `BATCH_SIZE / INTERVAL` = 1 verify/second; in practice retries back off to
-  15-minute intervals, so a single stuck payment costs ~60 verify calls over
-  roughly 12 hours.
+- **Gateway load.** `BATCH_SIZE / INTERVAL` (defaults: 1 verify/second) is an
+  **average** upper bound, not a burst bound — one pass may issue its whole
+  batch of up to `RECONCILIATION_BATCH_SIZE` verify calls back-to-back before
+  waiting out the interval. In practice retries back off to 15-minute
+  intervals, so a single stuck payment costs ~60 verify calls over roughly
+  12 hours.
 - **Disable.** Set `RECONCILIATION_ENABLED=false` and restart the worker.
   Only the polling stops; callbacks, verification, and notification delivery
   are unaffected.
@@ -680,7 +690,7 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` | Stale-claim threshold; must exceed connect+read timeouts (default 120) |
 | `RECONCILIATION_ENABLED` | Server-side stuck-payment reconciliation in the worker (default `true`); disabling only stops the polling — callbacks are unaffected |
 | `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 30) |
-| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Pass cadence and per-pass payment cap (defaults 10 / 10 — worst-case 1 verify/second) |
+| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Pass cadence and per-pass payment cap (defaults 10 / 10 — average ≤ 1 verify/second; a pass may burst its whole batch) |
 | `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 60; payment stays `link_created` for operators) |
 | `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | Bounded exponential backoff `initial * 2^(attempt-1)`, capped (defaults 20 / 900) |
 | `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |

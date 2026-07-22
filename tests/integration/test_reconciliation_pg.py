@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -223,6 +224,103 @@ def test_callback_and_reconciliation_race_settles_once(
     # settlement.
     assert events.count("gateway_payment_verified") == 1
     assert recon_stats["processed"] in (0, 1)
+
+
+def test_notification_delivery_never_waits_for_reconciliation(
+    settings, pg_app, pg_session_factory, bot_stub, notifier
+):
+    """Regression for the worker-latency review finding: a reconciliation
+    verify call blocked IN FLIGHT (which no time budget can interrupt) must
+    not delay bot notification delivery. Reconciliation runs on its own
+    thread with its own session and CentralPay client — mirroring the
+    production worker layout — while the notification pass runs concurrently
+    and completes BEFORE the blocked verify is released."""
+    from app.services.notification import run_worker_pass
+
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        # Payment A: stale link_created — reconciliation will pick it up.
+        stale = _make_stale_link(
+            client, settings, pg_session_factory, order_id="latency-stale"
+        )
+        # Payment B: settled via the normal callback -> bot_notify_pending.
+        assert create_order(client, settings, order_id="latency-notify").status_code == 200
+        with pg_session_factory() as db:
+            pending = db.execute(
+                select(Payment).where(Payment.bot_order_id == "latency-notify")
+            ).scalar_one()
+        stub.verify_result = verify_ok_response(
+            amount=10000, user_id=pending.gateway_user_id, reference_id="REF-lat-b"
+        )
+        assert client.get(valid_callback_path(stub, pending.gateway_order_id)).status_code == 200
+
+    # The reconciliation thread gets its OWN gateway client whose verify
+    # blocks until released — an in-flight call nothing can interrupt.
+    verify_started = threading.Event()
+    release_verify = threading.Event()
+
+    def blocking_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("verify.php"):
+            verify_started.set()
+            assert release_verify.wait(timeout=60), "test released the verify"
+            return verify_ok_response(
+                amount=10000, user_id=stale.gateway_user_id, reference_id="REF-lat-a"
+            )
+        return httpx.Response(404)
+
+    blocking_gateway = CentralPayClient(
+        base_url=settings.centralpay_base_url,
+        getlink_api_key=settings.centralpay_getlink_api_key,
+        verify_api_key=settings.centralpay_verify_api_key,
+        timeout_seconds=120.0,  # the block must outlive the client timeout
+        transport=httpx.MockTransport(blocking_handler),
+    )
+
+    def reconcile():
+        try:
+            with pg_session_factory() as db:
+                run_reconciliation_pass(
+                    db, blocking_gateway, settings, worker_id="latency-recon"
+                )
+        finally:
+            blocking_gateway.close()
+
+    recon_thread = threading.Thread(target=reconcile, name="recon-blocked")
+    recon_thread.start()
+    try:
+        assert verify_started.wait(timeout=30)  # reconciliation is mid-verify
+
+        # While the verify is blocked: deliver the bot notification on this
+        # thread with its own session, exactly like the production worker.
+        started = time.monotonic()
+        with pg_session_factory() as db:
+            result = run_worker_pass(
+                db, notifier, settings, worker_id="latency-notify-worker"
+            )
+        elapsed = time.monotonic() - started
+
+        assert result["processed"] == 1  # delivery completed...
+        assert recon_thread.is_alive() and not release_verify.is_set()
+        # ...while reconciliation was STILL blocked in its verify call.
+        [request] = bot_stub.requests
+        assert request == {"order_id": "latency-notify", "actions": "custom_payment_verify"}
+        assert elapsed < 10  # sanity: nowhere near the blocked verify's wait
+    finally:
+        release_verify.set()
+        recon_thread.join(timeout=60)
+    assert not recon_thread.is_alive()
+
+    # The released reconciliation then settled its own payment normally.
+    with pg_session_factory() as db:
+        stale_after = db.execute(
+            select(Payment).where(Payment.bot_order_id == "latency-stale")
+        ).scalar_one()
+        pending_after = db.execute(
+            select(Payment).where(Payment.bot_order_id == "latency-notify")
+        ).scalar_one()
+    assert stale_after.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert pending_after.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    assert _queued_count(pg_session_factory, stale_after.id) == 1
 
 
 # --- migration 0010 from the deployed production revision ---------------------

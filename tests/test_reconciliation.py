@@ -449,3 +449,63 @@ def test_reconciled_payment_delivers_notification_once(
     assert get_payment(session_factory, "rec-e2e").status == (
         PaymentStatus.BOT_NOTIFY_ACCEPTED.value
     )
+
+
+# --- dedicated worker thread lifecycle ----------------------------------------
+
+
+def test_reconciliation_thread_loop_starts_and_stops_cleanly(settings, session_factory):
+    """The dedicated thread body runs passes on its interval with its own
+    client/sessions and exits promptly when the stop event is set."""
+    import threading
+    import time as _time
+
+    from app.worker import reconciliation_loop
+
+    fast = settings.model_copy(update={"reconciliation_interval_seconds": 0.05})
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=reconciliation_loop,
+        args=(fast, session_factory),
+        kwargs={"worker_id": "loop-test", "stop": stop},
+        daemon=True,
+    )
+    thread.start()
+    _time.sleep(0.3)  # several empty passes (no due payments, no gateway I/O)
+    assert thread.is_alive()
+    stop.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+
+def test_reconciliation_thread_survives_pass_exceptions(settings):
+    """A failing pass (here: the database is down) only logs and waits for the
+    next interval — the thread never dies."""
+    import threading
+    import time as _time
+
+    from sqlalchemy.orm import Session
+
+    from app.worker import reconciliation_loop
+
+    calls: list[int] = []
+
+    def bad_factory() -> Session:
+        calls.append(1)
+        raise RuntimeError("database unavailable")
+
+    fast = settings.model_copy(update={"reconciliation_interval_seconds": 0.02})
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=reconciliation_loop,
+        args=(fast, bad_factory),
+        kwargs={"worker_id": "loop-crash-test", "stop": stop},
+        daemon=True,
+    )
+    thread.start()
+    _time.sleep(0.3)
+    assert thread.is_alive()  # still looping despite every pass failing
+    assert len(calls) >= 2  # it kept retrying
+    stop.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
