@@ -69,8 +69,11 @@ SERVICE_ALLOWLIST: dict[str, set[str]] = {
         "CENTRALPAY_GETLINK_API_KEY",
         "CENTRALPAY_VERIFY_API_KEY",
     },
-    # The worker delivers customer-bot notifications only.
-    "worker": {"DATABASE_URL", "BOT_NOTIFY_TOKEN"},
+    # The worker delivers customer-bot notifications and reconciles stuck
+    # payments against CentralPay verify.php (server-side verify of
+    # link_created payments whose browser callback never arrived) — so it
+    # legitimately holds the verify key. It still never creates links.
+    "worker": {"DATABASE_URL", "BOT_NOTIFY_TOKEN", "CENTRALPAY_VERIFY_API_KEY"},
     # The admin bot talks to Telegram only.
     "admin-bot": {"DATABASE_URL", "ADMIN_BOT_TOKEN", "ADMIN_TELEGRAM_IDS"},
     # Migrations need the database and nothing else (alembic/env.py reads
@@ -235,6 +238,8 @@ def test_worker_startup_under_masking(compose):
     assert settings.inbound_api_key == "not-used-by-worker-x"
     assert settings.callback_hmac_secret == "not-used-by-worker-x"
     assert settings.centralpay_getlink_api_key == "not-used-by-worker"
+    # Reconciliation needs the REAL verify key in the worker.
+    assert settings.centralpay_verify_api_key == TEST_VERIFY_API_KEY
     assert settings.admin_bot_token == ""
     assert settings.admin_telegram_ids == ""
 

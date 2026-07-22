@@ -191,6 +191,10 @@ def test_unpaid_result_schedules_bounded_retry(client, settings, session_factory
     types = event_types(get_events(session_factory, payment.id))
     assert "reconciliation_gateway_not_paid" in types
     assert "reconciliation_retry_scheduled" in types
+    # Routine polling of an unpaid link is the EXPECTED state: it records the
+    # distinct non-alerting event, never the alert-mapped callback one.
+    assert "centralpay_verify_not_paid" in types
+    assert "centralpay_verify_failed" not in types
     assert "manual_review_required" not in types
     assert _notification_queued_count(session_factory, payment.id) == 0
 
@@ -273,6 +277,52 @@ def test_max_attempts_exhausts_without_state_change(
     stub.verify_requests.clear()
     assert _run_pass(session_factory, settings, stub)["processed"] == 0
     assert stub.verify_requests == []
+
+
+def test_unpaid_reconciliation_never_creates_admin_alerts(
+    app, client, settings, session_factory, stub, alert_policy
+):
+    """Review finding: with admin error alerts enabled (production default),
+    routine "not paid yet" reconciliation checks must NOT create admin alert
+    rows - otherwise every in-progress payment floods the admin outbox. Only
+    the distinct centralpay_verify_not_paid event is recorded, which the
+    alert mapper ignores. (A CALLBACK reporting unpaid keeps alerting - that
+    path is unchanged.)"""
+    from tests.conftest import get_alerts
+
+    _make_stale_link(client, settings, session_factory, order_id="rec-alert")
+    stats = _run_pass(session_factory, alert_policy, stub)  # default stub: unpaid
+    assert stats["retry_scheduled"] == 1
+    assert get_alerts(session_factory) == []  # no alert rows at all
+
+
+def test_claim_gap_is_closed_by_provisional_schedule(
+    client, settings, session_factory, stub, monkeypatch
+):
+    """Review finding: the shared settlement path commits (releasing the row
+    lock) BEFORE retry scheduling is finalized. The claim transaction must
+    therefore already carry a provisional future next_at, so the committed
+    gap-state is never due and a second worker cannot fire an immediate
+    duplicate verify."""
+    from app.services.verification import verify_and_settle as real_settle
+
+    seen: list[object] = []
+
+    def capturing(db, gateway, payment, *, settings=None, source="callback"):
+        # State at the moment the shared path will commit: the provisional
+        # schedule must already be on the row, inside the claim transaction.
+        seen.append(payment.reconciliation_next_at)
+        return real_settle(db, gateway, payment, settings=settings, source=source)
+
+    monkeypatch.setattr("app.services.reconciliation.verify_and_settle", capturing)
+    _make_stale_link(client, settings, session_factory, order_id="rec-gap")
+    assert _run_pass(session_factory, settings, stub)["processed"] == 1  # unpaid path
+    [provisional] = seen
+    assert provisional is not None
+    assert as_utc(provisional) > datetime.now(UTC) - timedelta(seconds=2)
+    # And the finalized schedule still stands after the pass.
+    payment = get_payment(session_factory, "rec-gap")
+    assert payment.reconciliation_next_at is not None
 
 
 # --- financial mismatches keep the existing manual_review behavior ------------
@@ -397,10 +447,10 @@ def test_one_payment_exception_does_not_stop_the_pass(
 
     boom_gateway_order_id = first.gateway_order_id
 
-    def exploding(db, gateway, payment, *, settings=None):
+    def exploding(db, gateway, payment, *, settings=None, source="callback"):
         if payment.gateway_order_id == boom_gateway_order_id:
             raise RuntimeError("unexpected bug")
-        return real_settle(db, gateway, payment, settings=settings)
+        return real_settle(db, gateway, payment, settings=settings, source=source)
 
     monkeypatch.setattr("app.services.reconciliation.verify_and_settle", exploding)
     stub.verify_result = verify_ok_response(
@@ -477,6 +527,16 @@ def test_reconciliation_thread_loop_starts_and_stops_cleanly(settings, session_f
     thread.join(timeout=10)
     assert not thread.is_alive()
 
+    # Review finding: the heartbeat row must be its OWN instance (the upsert
+    # keys on instance_id alone), so it can never shadow the notification
+    # worker's row and make /health report that worker missing.
+    from app.models import WorkerHeartbeat
+
+    with session_factory() as db:
+        [row] = db.execute(select(WorkerHeartbeat)).scalars().all()
+    assert row.worker_name == "reconciliation-worker"
+    assert row.instance_id == "loop-test-reconciliation"
+
 
 def test_reconciliation_thread_survives_pass_exceptions(settings):
     """A failing pass (here: the database is down) only logs and waits for the
@@ -509,3 +569,135 @@ def test_reconciliation_thread_survives_pass_exceptions(settings):
     stop.set()
     thread.join(timeout=10)
     assert not thread.is_alive()
+
+
+# --- heartbeat identity (one process, two loops, two rows) --------------------
+
+
+def test_one_process_keeps_two_heartbeat_rows_with_correct_names(session_factory):
+    """Regression: both loops of ONE worker process heartbeat under their own
+    stable instance ids, so one process creates and refreshes TWO rows — the
+    startup race can no longer let one loop own (and permanently label) the
+    other's row."""
+    from datetime import timedelta as _td
+
+    from sqlalchemy import select as _select
+
+    from app.models import WorkerHeartbeat
+    from app.services.heartbeat import record_worker_heartbeat
+    from app.worker import heartbeat_instance_id
+
+    base = "host-1234-abc123"  # the shared base worker id (logs/claims)
+    t0 = datetime.now(UTC)
+
+    def beat(name, loop, now):
+        with session_factory() as db:
+            record_worker_heartbeat(
+                db,
+                worker_name=name,
+                instance_id=heartbeat_instance_id(base, loop),
+                now=now,
+                cycle_completed=True,
+            )
+
+    # Worst-case startup order (the old bug): reconciliation wins the race.
+    beat("reconciliation-worker", "reconciliation", t0)
+    beat("notification-worker", "notification", t0)
+    # Both loops refresh later.
+    t1 = t0 + _td(seconds=30)
+    beat("reconciliation-worker", "reconciliation", t1)
+    beat("notification-worker", "notification", t1)
+
+    with session_factory() as db:
+        rows = db.execute(
+            _select(WorkerHeartbeat).order_by(WorkerHeartbeat.instance_id)
+        ).scalars().all()
+        by_instance = {row.instance_id: row for row in rows}
+    assert len(rows) == 2  # exactly two rows — refreshes never created more
+    notification = by_instance[f"{base}-notification"]
+    reconciliation = by_instance[f"{base}-reconciliation"]
+    assert notification.worker_name == "notification-worker"
+    assert reconciliation.worker_name == "reconciliation-worker"
+    # Both were refreshed, not recreated or cross-relabeled.
+    assert as_utc(notification.last_heartbeat_at) == t1
+    assert as_utc(reconciliation.last_heartbeat_at) == t1
+
+
+def test_admin_health_sees_fresh_notification_worker_with_both_loops_active(
+    session_factory,
+):
+    """Regression: with both loops heartbeating (reconciliation first — the
+    order that used to poison the shared row), admin health still finds a
+    FRESH notification-worker heartbeat and never reports it missing/stale."""
+    from app.adminbot.queries import latest_worker_heartbeat, worker_heartbeat_age_seconds
+    from app.services.heartbeat import record_worker_heartbeat
+    from app.worker import heartbeat_instance_id
+
+    base = "host-5678-def456"
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="reconciliation-worker",
+            instance_id=heartbeat_instance_id(base, "reconciliation"),
+            now=now,
+            cycle_completed=True,
+        )
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="notification-worker",
+            instance_id=heartbeat_instance_id(base, "notification"),
+            now=now,
+            cycle_completed=True,
+        )
+
+    with session_factory() as db:
+        found = latest_worker_heartbeat(db)  # admin default: notification-worker
+        assert found is not None
+        assert found.worker_name == "notification-worker"
+        assert found.instance_id == f"{base}-notification"
+        age = worker_heartbeat_age_seconds(db)
+    assert age is not None
+    assert age < 60  # fresh — never reported stale/missing
+
+
+def test_record_worker_heartbeat_never_silently_relabels(session_factory, caplog):
+    """A heartbeat targeting an instance row owned by a DIFFERENT worker type
+    is refused loudly: the row keeps its name AND its timestamp (refreshing it
+    would fake the other worker's liveness), and a warning is logged."""
+    import logging as _logging
+
+    from sqlalchemy import select as _select
+
+    from app.models import WorkerHeartbeat
+    from app.services.heartbeat import record_worker_heartbeat
+
+    t0 = datetime.now(UTC)
+    with session_factory() as db:
+        record_worker_heartbeat(
+            db,
+            worker_name="notification-worker",
+            instance_id="collide-1",
+            now=t0,
+            cycle_completed=True,
+        )
+    with (
+        caplog.at_level(_logging.WARNING, logger="app.services.heartbeat"),
+        session_factory() as db,
+    ):
+        record_worker_heartbeat(
+            db,
+            worker_name="reconciliation-worker",  # wrong type, same instance
+            instance_id="collide-1",
+            now=t0 + timedelta(seconds=120),
+            cycle_completed=True,
+        )
+    assert any(
+        record.getMessage() == "worker_heartbeat_name_mismatch"
+        for record in caplog.records
+    )
+    with session_factory() as db:
+        [row] = db.execute(_select(WorkerHeartbeat)).scalars().all()
+    assert row.worker_name == "notification-worker"  # never renamed
+    assert as_utc(row.last_heartbeat_at) == t0  # never falsely refreshed

@@ -320,6 +320,7 @@ def verify_and_settle(
     payment: Payment,
     *,
     settings: "Settings | None" = None,
+    source: str = "callback",
 ) -> SettlementOutcome:
     """Verify one payment with CentralPay and settle it — the SINGLE
     settlement path, shared by the browser callback and the reconciliation
@@ -369,13 +370,33 @@ def verify_and_settle(
     if not result.gateway_success:
         reason = (result.failure_reason or "verify not successful")[:_ERROR_MAX_LENGTH]
         payment.last_error = reason
-        record_event(
-            db,
-            payment_id=payment.id,
-            event_type="centralpay_verify_failed",
-            level="warning",
-            data={"gateway_order_id": gateway_order_id, "stage": "gateway", "reason": reason},
-        )
+        if source == "callback":
+            # Callback semantics unchanged: the payer actively returned with
+            # an unpaid order — a warning-worthy anomaly (alert-mapped).
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                level="warning",
+                data={"gateway_order_id": gateway_order_id, "stage": "gateway", "reason": reason},
+            )
+        else:
+            # Reconciliation polls unpaid links ROUTINELY (grace period +
+            # backoff), so "not paid yet" is the expected steady state, not an
+            # error: a distinct event type the admin alert mapper ignores —
+            # otherwise every in-progress/abandoned payment would flood the
+            # admin outbox and bury real gateway failures.
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_not_paid",
+                data={
+                    "gateway_order_id": gateway_order_id,
+                    "stage": "gateway",
+                    "reason": reason,
+                    "source": source,
+                },
+            )
         db.commit()
         return SettlementOutcome.GATEWAY_NOT_PAID
 
