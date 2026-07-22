@@ -498,12 +498,13 @@ def create_payment(
         db.commit()
         raise
 
+    # Stamped only after getLink SUCCEEDS, fresh on every successful attempt:
+    # this timestamp anchors the reconciliation grace period, which must start
+    # when the payer can first see the link — a slow getLink response must not
+    # consume the pre-check grace window.
+    payment.callback_token_issued_at = datetime.now(UTC)
     payment.status = PaymentStatus.LINK_CREATED.value
     payment.redirect_url = redirect_url
-    # Stamped AFTER getLink returns: this timestamp anchors the reconciliation
-    # grace period, which must start when the payer can first see the link — a
-    # slow getLink response must not consume the pre-check grace window.
-    payment.callback_token_issued_at = datetime.now(UTC)
     payment.last_error = None
     record_event(
         db,

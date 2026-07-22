@@ -209,3 +209,13 @@ def test_failed_getlink_does_not_start_grace_window(client, settings, session_fa
     payment = get_payment(session_factory, "order-no-stamp")
     assert payment.status == PaymentStatus.GETLINK_FAILED.value
     assert payment.callback_token_issued_at is None
+
+    # A later successful attempt receives its own fresh post-success stamp.
+    stub.getlink_result = getlink_ok_response()
+    before_retry = datetime.now(UTC)
+    assert create_order(client, settings, order_id="order-no-stamp").status_code == 200
+    payment = get_payment(session_factory, "order-no-stamp")
+    assert payment.status == PaymentStatus.LINK_CREATED.value
+    issued_at = as_utc(payment.callback_token_issued_at)
+    assert issued_at is not None
+    assert issued_at >= before_retry

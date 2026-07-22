@@ -126,6 +126,79 @@ def test_fresh_link_created_is_skipped(client, settings, session_factory, stub):
     assert get_payment(session_factory, "rec-fresh").status == PaymentStatus.LINK_CREATED.value
 
 
+def test_slow_getlink_does_not_consume_the_grace_period(
+    client, settings, session_factory, stub, monkeypatch
+):
+    """A getLink call slower than the minimum age must not make the freshly
+    returned link immediately eligible for reconciliation.
+
+    The gateway "takes" min_age + 2 virtual seconds to answer getLink: the
+    issuance timestamp must be stamped when getLink RETURNS, so the payment
+    becomes due exactly min_age seconds after that moment — never earlier.
+    Simulated with a virtual clock (no real sleeping): the payment module's
+    clock and the reconciliation pass share one offset that the wrapped
+    getLink call advances, exactly as wall time would during a slow request.
+    """
+    delay = settings.reconciliation_min_age_seconds + 2
+    clock = {"offset": timedelta(0)}
+
+    class _ShiftedDateTime:
+        """datetime shim for app.services.payments: real time + virtual offset."""
+
+        @staticmethod
+        def now(tz=None):
+            return datetime.now(tz) + clock["offset"]
+
+    monkeypatch.setattr("app.services.payments.datetime", _ShiftedDateTime)
+
+    real_get_link = CentralPayClient.get_link
+
+    def slow_get_link(self, *args, **kwargs):
+        result = real_get_link(self, *args, **kwargs)
+        clock["offset"] += timedelta(seconds=delay)  # the gateway "took" this long
+        return result
+
+    monkeypatch.setattr(CentralPayClient, "get_link", slow_get_link)
+
+    assert create_order(client, settings, order_id="rec-slow", amount=10000).status_code == 200
+    link_returned_at = _ShiftedDateTime.now(UTC)
+    payment = get_payment(session_factory, "rec-slow")
+    issued_at = as_utc(payment.callback_token_issued_at)
+    # The grace anchor starts when getLink succeeded, not when it was sent.
+    assert issued_at >= link_returned_at - timedelta(seconds=1)
+
+    stub.verify_result = verify_ok_response(
+        amount=10000, user_id=payment.gateway_user_id, reference_id="REF-rec-slow"
+    )
+    stub.verify_requests.clear()
+
+    # Immediately after the URL is returned the payment must NOT be selected,
+    # even though the creation request started min_age + 2 seconds ago.
+    stats = _run_pass(session_factory, settings, stub, now_fn=lambda: link_returned_at)
+    assert stats["processed"] == 0
+    assert stub.verify_requests == []
+    assert get_payment(session_factory, "rec-slow").status == PaymentStatus.LINK_CREATED.value
+
+    # Still not selected one second before the grace period ends...
+    almost_due = issued_at + timedelta(
+        seconds=settings.reconciliation_min_age_seconds - 1
+    )
+    stats = _run_pass(session_factory, settings, stub, now_fn=lambda: almost_due)
+    assert stats["processed"] == 0
+    assert stub.verify_requests == []
+
+    # ...and eligible exactly min_age seconds after the post-getLink stamp.
+    due = issued_at + timedelta(seconds=settings.reconciliation_min_age_seconds)
+    stats = _run_pass(session_factory, settings, stub, now_fn=lambda: due)
+    assert stats["processed"] == 1
+    assert stats["verified"] == 1
+    assert len(stub.verify_requests) == 1
+    assert (
+        get_payment(session_factory, "rec-slow").status
+        == PaymentStatus.BOT_NOTIFY_PENDING.value
+    )
+
+
 def test_disabled_feature_is_a_noop(client, settings, session_factory, stub):
     disabled = settings.model_copy(update={"reconciliation_enabled": False})
     _make_stale_link(client, settings, session_factory, order_id="rec-off")
