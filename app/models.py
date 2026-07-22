@@ -227,6 +227,19 @@ class Payment(Base):
     manual_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notification_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notification_claimed_by: Mapped[str | None] = mapped_column(String(128))
+    # Server-side reconciliation state (migration 0010): worker-driven verify
+    # for link_created payments whose browser callback never arrived. Purely
+    # operational bookkeeping — settlement itself always goes through the same
+    # shared verification path as the callback. NULL reconciliation_next_at on
+    # a link_created row means "not yet attempted" (due once old enough).
+    reconciliation_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    reconciliation_next_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconciliation_last_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconciliation_last_error_code: Mapped[str | None] = mapped_column(String(64))
+    reconciliation_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconciliation_claimed_by: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -237,6 +250,9 @@ class Payment(Base):
     __table_args__ = (
         # Worker due-scan: status + next_retry_at.
         Index("ix_payments_notify_due", "status", "next_retry_at"),
+        # Reconciliation due-scan: status + reconciliation_next_at
+        # (migration 0010).
+        Index("ix_payments_reconciliation_due", "status", "reconciliation_next_at"),
         # Financial invariants enforced at the database level (final audit;
         # migration 0005 adds them to existing PostgreSQL databases):
         # F2-adjacent: amounts are always positive integers.
