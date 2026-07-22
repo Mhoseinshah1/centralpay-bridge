@@ -141,6 +141,12 @@ jobs:
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-24.04
+    # gitleaks-action lists the PR's commits through the API on pull_request
+    # events; on a private repository that needs pull-requests: read, which
+    # the workflow-level token (contents: read only) does not carry.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
