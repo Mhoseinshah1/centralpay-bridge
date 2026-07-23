@@ -150,6 +150,7 @@ class CommandHandlers:
             "recent": self.cmd_recent,
             "stuck": self.cmd_stuck,
             "manual_review": self.cmd_manual_review,
+            "resolved_reviews": self.cmd_resolved_reviews,
             "errors": self.cmd_errors,
             "payment": self.cmd_payment,
             "retry_queue": self.cmd_retry_queue,
@@ -180,7 +181,8 @@ class CommandHandlers:
                 f"نسخه: {esc(APP_VERSION)}",
                 "",
                 "دستورها: /status /health /recent /stuck /manual_review",
-                "/errors /payment /retry_queue /resend_failed /backup_status /version /fee /help",
+                "/resolved_reviews /errors /payment /retry_queue /resend_failed",
+                "/backup_status /version /fee /help",
                 "",
                 f"{WARN} این ربات فقط برای دیدبانی عملیاتی است. "
                 "پاسخ 2xx ربات فروش به معنی واریز قطعی اعتبار مشتری نیست.",
@@ -197,7 +199,8 @@ class CommandHandlers:
                 "/health — جزئیات سلامت اجزا",
                 "/recent [n] — آخرین پرداخت‌ها (حداکثر ۵۰)",
                 "/stuck — پرداخت‌های نیازمند توجه با دلیل دقیق",
-                "/manual_review — پرداخت‌های در بررسی دستی",
+                "/manual_review — بررسی‌های دستی باز (تعیین‌تکلیف‌نشده)",
+                "/resolved_reviews [n] — بررسی‌های تعیین‌تکلیف‌شده (حداکثر ۵۰)",
                 "/errors — خلاصهٔ خطاهای ۲۴ ساعت اخیر",
                 "/payment ORDER_ID — جزئیات یک پرداخت",
                 "/retry_queue — صف ارسال به ربات فروش",
@@ -245,7 +248,9 @@ class CommandHandlers:
         heartbeat_age = queries.worker_heartbeat_age_seconds(db)
         worker_ok = heartbeat_age is not None and heartbeat_age < 120
         pending = queries.count_by_status(db, "bot_notify_pending")
-        review = queries.count_by_status(db, "manual_review")
+        # Open (unresolved) reviews only: rows resolved via the host CLI stay
+        # in manual_review as history but no longer need operator attention.
+        review = queries.count_open_manual_reviews(db)
         getlink_failures = queries.event_count_since(db, "centralpay_getlink_failed")
         verify_failures = queries.event_count_since(db, "centralpay_verify_failed")
         backup = queries.latest_backup_alert(db, "backup_succeeded")
@@ -377,6 +382,32 @@ class CommandHandlers:
             )
         return self._split("\n".join(blocks))
 
+    def cmd_resolved_reviews(self, db: Session, args: list[str]) -> list[str]:
+        """Read-only history of manual reviews resolved via the host CLI
+        (``centralpay review resolve``). Newest resolution first."""
+        limit = RECENT_DEFAULT
+        if args and args[0].isdigit():
+            limit = min(int(args[0]), RECENT_MAX)
+        payments = queries.resolved_review_payments(db, limit)
+        if not payments:
+            return ["هنوز هیچ بررسی دستی تعیین‌تکلیف‌شده‌ای ثبت نشده است."]
+        tz = self._settings.admin_bot_timezone
+        blocks = [f"<b>{OK} بررسی‌های تعیین‌تکلیف‌شده ({len(payments)})</b>"]
+        for payment in payments:
+            reason = payment.bot_notify_reason or "—"
+            blocks.append(
+                "\n".join(
+                    [
+                        f"• <b>{esc(payment.bot_order_id)}</b> ({payment.gateway_order_id})",
+                        f"  مبلغ: {fmt_amount(payment.amount)} تومان",
+                        f"  دلیل ارجاع: <code>{esc(reason)}</code>",
+                        f"  نتیجه: <code>{esc(payment.review_resolution or '—')}</code>",
+                        f"  زمان تعیین‌تکلیف: {fmt_time(payment.review_resolved_at, tz)}",
+                    ]
+                )
+            )
+        return self._split("\n".join(blocks))
+
     def cmd_errors(self, db: Session, args: list[str]) -> list[str]:
         summary = queries.errors_summary(db)
         if not summary:
@@ -424,6 +455,11 @@ class CommandHandlers:
             lines.append(f"تلاش بعدی:\n{fmt_time(payment.next_retry_at, tz)}")
         if payment.manual_review_at:
             lines.append(f"زمان ارجاع به بررسی:\n{fmt_time(payment.manual_review_at, tz)}")
+        if payment.review_resolved_at:
+            lines.append(
+                f"تعیین‌تکلیف بررسی:\n{fmt_time(payment.review_resolved_at, tz)}"
+                f"\nنتیجه: <code>{esc(payment.review_resolution or '—')}</code>"
+            )
         lines.append(f"به‌روزرسانی:\n{fmt_time(payment.updated_at, tz)}")
         events = queries.payment_events(db, payment.id)
         if events:

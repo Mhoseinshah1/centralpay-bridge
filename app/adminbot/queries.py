@@ -25,6 +25,24 @@ def count_by_status(db: Session, status: str) -> int:
     ).scalar_one()
 
 
+def _open_manual_review_conditions() -> tuple[Any, ...]:
+    """An OPEN manual review still needs operator attention: the payment is in
+    manual_review AND has not been resolved via ``centralpay review resolve``
+    (which stamps review_resolved_at but keeps the status as history)."""
+    return (
+        Payment.status == "manual_review",
+        Payment.review_resolved_at.is_(None),
+    )
+
+
+def count_open_manual_reviews(db: Session) -> int:
+    """count_by_status("manual_review") counts ALL rows ever left in that
+    status; this counts only the unresolved ones operators must act on."""
+    return db.execute(
+        select(func.count(Payment.id)).where(*_open_manual_review_conditions())
+    ).scalar_one()
+
+
 def event_count_since(db: Session, event_type: str, *, hours: int = 24) -> int:
     cutoff = _utcnow() - timedelta(hours=hours)
     return db.execute(
@@ -59,11 +77,25 @@ def recent_payments(db: Session, limit: int) -> list[Payment]:
 
 
 def manual_review_payments(db: Session, limit: int = 20) -> list[Payment]:
+    """OPEN manual reviews only — resolved rows keep status manual_review as
+    historical state but leave the operator's default worklist."""
     return list(
         db.execute(
             select(Payment)
-            .where(Payment.status == "manual_review")
+            .where(*_open_manual_review_conditions())
             .order_by(Payment.manual_review_at.asc().nulls_first())
+            .limit(limit)
+        ).scalars()
+    )
+
+
+def resolved_review_payments(db: Session, limit: int = 10) -> list[Payment]:
+    """Reviews an operator has resolved (any status), newest resolution first."""
+    return list(
+        db.execute(
+            select(Payment)
+            .where(Payment.review_resolved_at.is_not(None))
+            .order_by(Payment.review_resolved_at.desc())
             .limit(limit)
         ).scalars()
     )
@@ -138,7 +170,7 @@ def retry_queue_snapshot(db: Session, *, limit: int = 30) -> dict[str, list[Paym
         db.execute(
             select(Payment)
             .where(
-                Payment.status == "manual_review",
+                *_open_manual_review_conditions(),
                 Payment.bot_notify_reason == "retry_limit_reached",
             )
             .order_by(Payment.manual_review_at.desc())

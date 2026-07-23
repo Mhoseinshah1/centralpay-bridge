@@ -63,6 +63,8 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
 # Deliberately exercises Persian text and bidi/zero-width customer_id values,
 # which RUF001 flags as confusable/ambiguous.
 "tests/test_payer_identity.py" = ["RUF001"]
+# Asserts Persian admin-bot output that mixes Persian words with ASCII counts.
+"tests/test_admin_resolved_reviews.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.12"
