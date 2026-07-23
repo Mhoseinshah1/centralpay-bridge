@@ -320,7 +320,9 @@ def daily_report_payload(db: Session, *, report_date: str, hours: int = 24) -> d
         "total_original_invoices_toman": int(verified_amount),
         "total_fees_toman": int(verified_fees),
         "total_collected_via_gateway_toman": int(verified_payable),
-        "manual_review": count_by_status(db, "manual_review"),
+        # Open reviews only, consistent with /status: resolved rows keep the
+        # manual_review status as history but need no operator attention.
+        "manual_review": count_open_manual_reviews(db),
         "pending_retry": count_by_status(db, "bot_notify_pending"),
         "getlink_failures": event_count_since(db, "centralpay_getlink_failed", hours=hours),
         "verify_failures": event_count_since(db, "centralpay_verify_failed", hours=hours),

@@ -200,6 +200,44 @@ def test_payment_shows_resolution_metadata(
     assert "confirmed_by_bot_operator" in text  # resolution type
 
 
+def test_daily_report_counts_only_open_reviews(
+    client, settings, session_factory, stub
+):
+    from app.adminbot.queries import daily_report_payload
+
+    open_payment = make_review(client, settings, session_factory, stub, order_id="rev-dr-o")
+    resolved = make_review(client, settings, session_factory, stub, order_id="rev-dr-d")
+    resolve_review(session_factory, resolved.id)
+
+    def snapshot():
+        with session_factory() as db:
+            return db.execute(
+                select(
+                    Payment.id,
+                    Payment.status,
+                    Payment.amount,
+                    Payment.fee_amount,
+                    Payment.payable_amount,
+                    Payment.reference_id,
+                    Payment.gateway_verified_at,
+                    Payment.review_resolved_at,
+                    Payment.review_resolution,
+                    Payment.updated_at,
+                ).order_by(Payment.id)
+            ).all()
+
+    before = snapshot()
+    with session_factory() as db:
+        payload = daily_report_payload(db, report_date="2026-07-23")
+    # The unresolved review is counted; the resolved one is excluded.
+    assert payload["manual_review"] == 1
+    # Both rows keep manual_review as historical status; nothing was mutated.
+    assert snapshot() == before
+    with session_factory() as db:
+        assert db.get(Payment, open_payment.id).status == "manual_review"
+        assert db.get(Payment, resolved.id).status == "manual_review"
+
+
 def test_review_read_paths_do_not_mutate_financial_fields(
     handlers, client, settings, session_factory, stub
 ):
