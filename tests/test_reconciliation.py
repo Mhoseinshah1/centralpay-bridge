@@ -572,6 +572,42 @@ def test_expiring_tier_gets_reserved_capacity_under_continuous_fresh_traffic(
     assert checked.reconciliation_attempts == 1  # got its reserved slot this pass
 
 
+def test_expiring_tier_reserved_slot_survives_pass_time_budget_exhaustion(
+    client, settings, session_factory, stub
+):
+    """The reserved expiring-tier slot(s) must be attempted at the HEAD of
+    the pass, not the tail: ``run_reconciliation_pass`` only checks its
+    wall-clock time budget before STARTING a new claim, never mid-verify, so
+    a tail-positioned reservation is reachable only if every earlier slot's
+    verify call finishes inside the shrinking remaining budget. Under
+    sustained, slow active-tier traffic that budget can be exhausted long
+    before the pass ever reaches a tail slot, permanently starving the
+    expiring tier despite the documented guarantee. Reproduce that
+    precondition here — enough due active-tier rows to fill the whole batch,
+    each verify call artificially slow, and a time budget tight enough that
+    the pass is cut off well before batch_size claims complete — and assert
+    the expiring payment still gets its attempt because its reserved slot
+    runs FIRST, unaffected by how much budget later active-tier claims burn."""
+    batch_size = settings.reconciliation_batch_size
+    assert settings.reconciliation_slow_tier_reserved_slots >= 1
+    for i in range(batch_size):  # enough active-tier rows to fill the batch alone
+        _make_stale_link(client, settings, session_factory, order_id=f"rec-slow-active-{i}")
+    _make_old_link(
+        client, settings, session_factory,
+        order_id="rec-slow-expiring",
+        age_seconds=settings.reconciliation_fast_window_seconds + 60,
+    )
+    stub.verify_delay_seconds = 0.15
+    stats = _run_pass(
+        session_factory, settings, stub, batch_size=batch_size, time_budget_seconds=0.4
+    )
+    # The tight budget really did cut the pass short before batch_size claims
+    # completed — otherwise this test would not exercise the starvation bug.
+    assert stats["processed"] < batch_size
+    checked = get_payment(session_factory, "rec-slow-expiring")
+    assert checked.reconciliation_attempts == 1
+
+
 def test_spillover_from_active_tier_to_expiring_tier(client, settings, session_factory, stub):
     """When the active tier has fewer due rows than the batch, the unused
     capacity spills to the expiring tier instead of going idle."""

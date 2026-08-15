@@ -17,10 +17,12 @@ Design:
   deleted or mutated, preserved for audit/operator inspection). Split into two
   age tiers — ACTIVE (age < fast window) and EXPIRING (fast window <= age <
   max age) — each ordered oldest-due-first; every pass reserves a small
-  number of slots for the expiring tier first, with unused capacity from
-  either tier spilling to the other, so a historical backlog can never delay
-  a newly-created payment by more than a few seconds, and sustained fresh
-  traffic can never permanently starve the expiring tier (see
+  number of slots at the HEAD of the pass for the expiring tier, with unused
+  capacity from either tier spilling to the other, so a historical backlog
+  can never delay a newly-created payment by more than a few seconds, and
+  sustained fresh traffic can never permanently starve the expiring tier —
+  the reserved slots run before any budget-consuming verify call in the pass,
+  so they are unaffected by the pass's wall-clock time budget (see
   ``run_reconciliation_pass``). NOTHING else is ever selected — verified,
   notification, and ``manual_review`` states are excluded by the status
   predicate alone.
@@ -237,23 +239,31 @@ def _claim_next_due(
     *,
     worker_id: str,
     now: datetime,
-    remaining_slots: int,
+    slot_index: int,
 ) -> Payment | None:
     """Claim ONE due payment for this pass, using reserved-quota-with-
     spillover fairness between the two age tiers.
 
-    The LAST ``reconciliation_slow_tier_reserved_slots`` slots of every pass
-    (judged by how many claims are still available, not a fixed position —
-    so it holds regardless of how many earlier slots actually found a row)
-    try the EXPIRING tier first; every other slot tries the ACTIVE tier
-    first. Either way, a slot whose preferred tier has nothing due
-    immediately falls back to the other tier before giving up. This
-    guarantees the expiring tier makes progress every pass it has due rows —
-    even when the active tier alone could fill the whole batch — without
-    ever taking capacity away from the active tier when the expiring tier is
-    empty.
+    The FIRST ``reconciliation_slow_tier_reserved_slots`` slots of every pass
+    (by processing order — ``slot_index`` 0, 1, ...) try the EXPIRING tier
+    first; every other slot tries the ACTIVE tier first. Either way, a slot
+    whose preferred tier has nothing due immediately falls back to the other
+    tier before giving up.
+
+    The reservation MUST sit at the head of the pass, not the tail: the pass
+    loop only checks its wall-clock time budget before starting a new claim,
+    never mid-verify, so the head slot(s) run before any budget-consuming
+    verify call in this pass has happened — ``time.monotonic() - started`` is
+    still ~0 the moment the loop body first executes. A tail reservation is
+    reachable only if every earlier slot both claims a row and completes its
+    verify call within the remaining budget, which sustained, slow active-tier
+    traffic can defeat indefinitely. A head reservation therefore guarantees
+    the expiring tier makes real progress every pass it has due rows —
+    regardless of gateway latency — while every other slot still strongly
+    prefers the active tier and capacity still spills freely in both
+    directions when a tier is empty.
     """
-    prefer_expiring = remaining_slots <= settings.reconciliation_slow_tier_reserved_slots
+    prefer_expiring = slot_index < settings.reconciliation_slow_tier_reserved_slots
     if prefer_expiring:
         return _claim_expiring_tier(
             db, settings, worker_id=worker_id, now=now
@@ -415,10 +425,14 @@ def run_reconciliation_pass(
     budget at all: the worker runs reconciliation in a DEDICATED THREAD (see
     app/worker.py), never inline in the notification loop.
 
-    Fairness: each claim reserves the tail of the batch for the expiring age
+    Fairness: each claim reserves the HEAD of the batch for the expiring age
     tier (see ``_claim_next_due``) so a historical backlog can never starve
     fresh payments and sustained fresh traffic can never starve the expiring
-    tier — total claims this pass never exceed ``limit`` either way.
+    tier — total claims this pass never exceed ``limit`` either way. The
+    reservation sits at the head, not the tail, specifically so it is
+    attempted before the wall-clock budget check below can ever skip it: that
+    check only runs before starting a new claim, so the very first iteration
+    of the loop always runs regardless of how slow later verify calls are.
 
     Load note: ``batch_size / interval`` is an AVERAGE upper bound on verify
     calls, not a burst bound — a single pass may issue its whole batch
@@ -446,9 +460,8 @@ def run_reconciliation_pass(
         token = request_id_var.set(f"rec-{uuid.uuid4().hex[:16]}")
         try:
             now = now_fn()
-            remaining_slots = limit - stats["processed"]
             payment = _claim_next_due(
-                db, settings, worker_id=worker_id, now=now, remaining_slots=remaining_slots
+                db, settings, worker_id=worker_id, now=now, slot_index=stats["processed"]
             )
             if payment is None:
                 break

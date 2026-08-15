@@ -383,8 +383,10 @@ class Settings(BaseSettings):
     #     propagation/dropped callbacks, retried every slow_interval seconds
     #     (default 300 s). Every pass reserves
     #     slow_tier_reserved_slots (default 1) of its batch for this tier
-    #     FIRST so sustained active-tier traffic can never starve it; any
-    #     slot whose preferred tier has nothing due spills to the other tier.
+    #     FIRST (the head of the pass, before the wall-clock budget can be
+    #     exhausted by earlier claims) so sustained active-tier traffic can
+    #     never starve it; any slot whose preferred tier has nothing due
+    #     spills to the other tier.
     #   * age >= max_age: EXCLUDED from selection entirely — not deleted, not
     #     marked failed or paid, left in link_created for operators. This is
     #     the PRIMARY lifetime limit; reconciliation_max_attempts (default
