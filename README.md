@@ -500,17 +500,33 @@ server-side:
 - **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` (default 5 s) the
   thread picks up to `RECONCILIATION_BATCH_SIZE` payments in `link_created`
   that are at least `RECONCILIATION_MIN_AGE_SECONDS` old (default 10 s,
-  measured from link issuance, so the normal callback gets the first chance)
-  and due for a check, oldest first. Verified, notification, `manual_review`,
-  and pre-link states are never selected.
-- **Two-stage age-based schedule.** The retry stage comes from the REAL age
-  of the payment link (`callback_token_issued_at`, falling back to
+  measured from link issuance, so the normal callback gets the first chance),
+  younger than `RECONCILIATION_MAX_AGE_SECONDS` (default 7200 s = 2 h — the
+  hard reconciliation lifetime; older payments are excluded from selection
+  entirely, never deleted or mutated, left in `link_created` for
+  audit/operator inspection), and due for a check. Verified, notification,
+  `manual_review`, and pre-link states are never selected.
+- **Two-tier fairness.** Due payments split into an ACTIVE tier (age <
+  `RECONCILIATION_FAST_WINDOW_SECONDS`, the still-payable link) and an
+  EXPIRING tier (fast window ≤ age < max age, a safety window for late
+  payment/delayed gateway propagation/dropped callbacks), each ordered
+  oldest-due-first. A naive single priority ordering would let sustained
+  active-tier traffic starve the expiring tier completely, so every pass
+  reserves `RECONCILIATION_SLOW_TIER_RESERVED_SLOTS` (default 1) of its
+  batch for the expiring tier first; any slot whose preferred tier has
+  nothing due spills to the other tier, and total claims per pass never
+  exceed `RECONCILIATION_BATCH_SIZE`. This guarantees a historical backlog
+  can never delay a newly-created payment by more than a scan interval or
+  two, while the expiring tier still makes steady progress.
+- **Two-stage age-based retry schedule.** The retry stage comes from the REAL
+  age of the payment link (`callback_token_issued_at`, falling back to
   `created_at`) — never from the attempt count, so stopping or restarting the
   worker cannot restart the fast window:
   - first server-side check ≈ 10 seconds after the link is issued (plus up to
     one scan interval of alignment delay);
-  - link age < `RECONCILIATION_FAST_WINDOW_SECONDS` (default 600): one verify
-    every `RECONCILIATION_FAST_INTERVAL_SECONDS` (default 10);
+  - link age < `RECONCILIATION_FAST_WINDOW_SECONDS` (default 900 = the
+    15-minute CentralPay link lifetime): one verify every
+    `RECONCILIATION_FAST_INTERVAL_SECONDS` (default 10);
   - link age ≥ the window: one verify every
     `RECONCILIATION_SLOW_INTERVAL_SECONDS` (default 300);
   - reconciliation stops immediately once the payment is verified, leaves
@@ -520,11 +536,11 @@ server-side:
   transport errors schedule the next check on the two-stage schedule above
   (`reconciliation_gateway_not_paid` / `reconciliation_transport_failed` +
   `reconciliation_retry_scheduled`). After `RECONCILIATION_MAX_ATTEMPTS`
-  (default 1000 ≈ 60 fast checks in the first 10 minutes, then one every
-  5 minutes — roughly 3 days of fallback monitoring) the payment is left in
-  `link_created` for operators (`reconciliation_exhausted`) — never
-  auto-failed, never auto-paid. Financial mismatches keep the existing
-  `manual_review` behavior and never notify the bot.
+  (default 1000 — a SECONDARY safety guard; `RECONCILIATION_MAX_AGE_SECONDS`
+  is the primary lifetime limit) the payment is left in `link_created` for
+  operators (`reconciliation_exhausted`) — never auto-failed, never
+  auto-paid. Financial mismatches keep the existing `manual_review` behavior
+  and never notify the bot.
 - **Concurrency.** Payments are claimed with `FOR UPDATE SKIP LOCKED` and the
   row lock is held across the verify call — exactly how the callback
   serializes — so two workers can never settle one payment twice, a
@@ -702,9 +718,11 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `RECONCILIATION_ENABLED` | Server-side stuck-payment reconciliation in the worker (default `true`); disabling only stops the polling — callbacks are unaffected |
 | `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 10) |
 | `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Scan cadence and per-pass payment cap (defaults 5 / 10 — average ≤ 2 verifies/second; a pass may burst its whole batch) |
-| `RECONCILIATION_FAST_WINDOW_SECONDS` | Age boundary between the fast and slow retry stages (default 600) |
+| `RECONCILIATION_SLOW_TIER_RESERVED_SLOTS` | Per-pass batch slots reserved for the expiring (15 min-2 h) tier so it can't be starved by active-tier traffic (default 1; must stay below `RECONCILIATION_BATCH_SIZE`) |
+| `RECONCILIATION_FAST_WINDOW_SECONDS` | Age boundary between the active and expiring tiers / the fast and slow retry stages (default 900 = the 15-minute CentralPay link lifetime) |
 | `RECONCILIATION_FAST_INTERVAL_SECONDS` / `RECONCILIATION_SLOW_INTERVAL_SECONDS` | Retry cadence below / at-or-above the boundary (defaults 10 / 300) |
-| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 1000 ≈ 3 days of coverage; payment stays `link_created` for operators) |
+| `RECONCILIATION_MAX_AGE_SECONDS` | Hard reconciliation lifetime (default 7200 = 2 h): payments this old or older are excluded from selection entirely — never deleted, never marked paid/failed, kept `link_created` for operators. The PRIMARY lifetime limit; must stay greater than `RECONCILIATION_FAST_WINDOW_SECONDS` |
+| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 1000); a SECONDARY safety guard behind `RECONCILIATION_MAX_AGE_SECONDS` |
 | `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | **Deprecated** — accepted for compatibility, no longer control the schedule |
 | `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |
 | `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |

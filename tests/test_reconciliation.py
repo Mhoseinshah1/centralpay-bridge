@@ -4,10 +4,14 @@ Covers the full contract: selection (staleness, feature flag, status
 exclusivity), settlement through the SAME shared verification path as the
 callback (all financial checks and manual_review behavior preserved), the
 two-stage AGE-based retry schedule (fast every 10 s while the link is under
-10 minutes old, then every 5 minutes — anchored on the real link age so
-worker downtime never restarts the fast window), attempt exhaustion,
-callback/reconciliation idempotency in both orders, per-payment crash
-isolation, and single bot-notification queueing. CentralPay is faked at
+the fast window old — default 900 s, the 15-minute CentralPay link lifetime —
+then every 5 minutes, anchored on the real link age so worker downtime never
+restarts the fast window), the two-tier reserved-quota-with-spillover
+selection fairness between the active (<fast window) and expiring (fast
+window-max age) tiers, the hard reconciliation-lifetime cutoff at max age
+(payments past it are excluded from selection but never mutated), attempt
+exhaustion, callback/reconciliation idempotency in both orders, per-payment
+crash isolation, and single bot-notification queueing. CentralPay is faked at
 the httpx transport layer via the shared stub — the real client code runs.
 """
 
@@ -63,6 +67,14 @@ def _age_payment(session_factory, bot_order_id: str, *, seconds: int) -> None:
 def _make_stale_link(client, settings, session_factory, *, order_id, amount=10000):
     assert create_order(client, settings, order_id=order_id, amount=amount).status_code == 200
     _age_payment(session_factory, order_id, seconds=settings.reconciliation_min_age_seconds + 5)
+    return get_payment(session_factory, order_id)
+
+
+def _make_old_link(client, settings, session_factory, *, order_id, age_seconds, amount=10000):
+    """A link_created payment whose link age is exactly ``age_seconds`` —
+    for exercising the active/expiring tier split and the hard age cutoff."""
+    assert create_order(client, settings, order_id=order_id, amount=amount).status_code == 200
+    _age_payment(session_factory, order_id, seconds=age_seconds)
     return get_payment(session_factory, order_id)
 
 
@@ -317,8 +329,10 @@ def _aged_payment(age_seconds, *, use_created_at=False):
 
 
 def test_two_stage_delay_fast_before_the_window(settings):
-    """Link age below the 10-minute window: retry in 10 seconds."""
-    for age in (0, 15, 300, 599):
+    """Link age below the fast window (default 900 s = the 15-minute
+    CentralPay link lifetime): retry in 10 seconds."""
+    window = settings.reconciliation_fast_window_seconds
+    for age in (0, 15, 300, window - 1):
         payment, now = _aged_payment(age)
         assert (
             reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
@@ -330,7 +344,8 @@ def test_two_stage_delay_fast_before_the_window(settings):
 def test_two_stage_delay_slow_at_and_after_the_boundary(settings):
     """At EXACTLY the window boundary — and any age beyond it — the slow
     300-second interval applies."""
-    for age in (600, 601, 1200, 86_400):
+    window = settings.reconciliation_fast_window_seconds
+    for age in (window, window + 1, window * 2, 86_400):
         payment, now = _aged_payment(age)
         assert (
             reconciliation_retry_delay_seconds(settings, payment=payment, now=now)
@@ -360,13 +375,15 @@ def test_two_stage_delay_falls_back_to_created_at(settings):
     """Without a callback_token_issued_at, created_at anchors the age."""
     young, now = _aged_payment(5, use_created_at=True)
     assert reconciliation_retry_delay_seconds(settings, payment=young, now=now) == 10
-    old, now = _aged_payment(700, use_created_at=True)
+    old, now = _aged_payment(
+        settings.reconciliation_fast_window_seconds + 100, use_created_at=True
+    )
     assert reconciliation_retry_delay_seconds(settings, payment=old, now=now) == 300
 
 
 def test_two_stage_delay_handles_naive_timestamps(settings):
     """SQLite hands back naive UTC datetimes; both anchors are normalized."""
-    payment, now = _aged_payment(700)
+    payment, now = _aged_payment(settings.reconciliation_fast_window_seconds + 100)
     assert payment.callback_token_issued_at is not None
     payment.callback_token_issued_at = payment.callback_token_issued_at.replace(
         tzinfo=None
@@ -511,6 +528,256 @@ def test_old_payment_after_worker_downtime_uses_slow_interval(
     remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
     slow = settings.reconciliation_slow_interval_seconds
     assert slow - 10 < remaining <= slow + 1  # ~300 s, NOT the 10 s fast stage
+
+
+# --- two-tier fairness (active vs. expiring) and the hard age cutoff --------
+
+
+def test_fresh_payment_not_delayed_by_backlog(client, settings, session_factory, stub):
+    """A newly-due (<15 min) payment must be checked in this very pass even
+    with a historical backlog far exceeding the batch size — the production
+    starvation bug ("young first" ORDER BY sorting new rows LAST) that this
+    scheduling fix corrects."""
+    batch_size = settings.reconciliation_batch_size
+    for i in range(batch_size * 2):
+        _make_old_link(
+            client, settings, session_factory,
+            order_id=f"rec-backlog-{i}",
+            age_seconds=settings.reconciliation_fast_window_seconds + 60,
+        )
+    _make_stale_link(client, settings, session_factory, order_id="rec-fresh-priority")
+    _run_pass(session_factory, settings, stub, batch_size=batch_size)
+    checked = get_payment(session_factory, "rec-fresh-priority")
+    assert checked.reconciliation_attempts == 1
+    assert checked.reconciliation_last_at is not None
+
+
+def test_expiring_tier_gets_reserved_capacity_under_continuous_fresh_traffic(
+    client, settings, session_factory, stub
+):
+    """Even when the active tier alone can fill the whole batch every pass,
+    the expiring (15 min-2 h) tier must still get its reserved slot(s) —
+    it must never be permanently starved."""
+    batch_size = settings.reconciliation_batch_size
+    assert settings.reconciliation_slow_tier_reserved_slots >= 1
+    for i in range(batch_size * 2):  # far more active-tier due rows than one batch
+        _make_stale_link(client, settings, session_factory, order_id=f"rec-active-{i}")
+    _make_old_link(
+        client, settings, session_factory,
+        order_id="rec-expiring-1",
+        age_seconds=settings.reconciliation_fast_window_seconds + 60,
+    )
+    _run_pass(session_factory, settings, stub, batch_size=batch_size)
+    checked = get_payment(session_factory, "rec-expiring-1")
+    assert checked.reconciliation_attempts == 1  # got its reserved slot this pass
+
+
+def test_spillover_from_active_tier_to_expiring_tier(client, settings, session_factory, stub):
+    """When the active tier has fewer due rows than the batch, the unused
+    capacity spills to the expiring tier instead of going idle."""
+    batch_size = settings.reconciliation_batch_size
+    _make_stale_link(client, settings, session_factory, order_id="rec-active-only")
+    old_ids = [f"rec-old-spill-{i}" for i in range(batch_size - 1)]
+    for order_id in old_ids:
+        _make_old_link(
+            client, settings, session_factory, order_id=order_id,
+            age_seconds=settings.reconciliation_fast_window_seconds + 60,
+        )
+    stats = _run_pass(session_factory, settings, stub, batch_size=batch_size)
+    assert stats["processed"] == batch_size  # 1 active + (batch_size - 1) expiring
+    for order_id in old_ids:
+        assert get_payment(session_factory, order_id).reconciliation_attempts == 1
+
+
+def test_spillover_from_expiring_tier_to_active_tier(client, settings, session_factory, stub):
+    """When the expiring tier is empty, its reserved capacity goes entirely
+    to the active tier instead of going unused."""
+    batch_size = settings.reconciliation_batch_size
+    active_ids = [f"rec-active-spill-{i}" for i in range(batch_size)]
+    for order_id in active_ids:
+        _make_stale_link(client, settings, session_factory, order_id=order_id)
+    stats = _run_pass(session_factory, settings, stub, batch_size=batch_size)
+    assert stats["processed"] == batch_size  # no expiring rows due: all slots go active
+    for order_id in active_ids:
+        assert get_payment(session_factory, order_id).reconciliation_attempts == 1
+
+
+def test_processed_never_exceeds_batch_size_across_tiers(client, settings, session_factory, stub):
+    """With more than batch_size due rows in BOTH tiers combined, total
+    processed for the pass is still bounded by batch_size exactly."""
+    batch_size = settings.reconciliation_batch_size
+    for i in range(batch_size):
+        _make_stale_link(client, settings, session_factory, order_id=f"rec-cap-active-{i}")
+    for i in range(batch_size):
+        _make_old_link(
+            client, settings, session_factory, order_id=f"rec-cap-old-{i}",
+            age_seconds=settings.reconciliation_fast_window_seconds + 60,
+        )
+    stats = _run_pass(session_factory, settings, stub, batch_size=batch_size)
+    assert stats["processed"] == batch_size
+
+
+def test_selection_boundary_just_below_fast_window(client, settings, session_factory, stub):
+    """Age = fast_window - 1: still the ACTIVE tier — selected, fast retry."""
+    window = settings.reconciliation_fast_window_seconds
+    _make_old_link(
+        client, settings, session_factory, order_id="rec-b-below", age_seconds=window - 1
+    )
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 1
+    payment = get_payment(session_factory, "rec-b-below")
+    remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
+    assert 0 < remaining <= settings.reconciliation_fast_interval_seconds + 2
+
+
+def test_selection_boundary_exactly_at_fast_window(client, settings, session_factory, stub):
+    """Age == fast_window exactly: the active tier is a strict less-than, so
+    this is EXPIRING-tier — still selected, slow retry."""
+    window = settings.reconciliation_fast_window_seconds
+    _make_old_link(client, settings, session_factory, order_id="rec-b-at", age_seconds=window)
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 1
+    payment = get_payment(session_factory, "rec-b-at")
+    remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
+    slow = settings.reconciliation_slow_interval_seconds
+    assert slow - 5 < remaining <= slow + 2
+
+
+def test_selection_boundary_just_above_fast_window(client, settings, session_factory, stub):
+    """Age = fast_window + 1: EXPIRING tier — still selected, slow retry."""
+    window = settings.reconciliation_fast_window_seconds
+    _make_old_link(
+        client, settings, session_factory, order_id="rec-b-above", age_seconds=window + 1
+    )
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 1
+    payment = get_payment(session_factory, "rec-b-above")
+    remaining = (as_utc(payment.reconciliation_next_at) - datetime.now(UTC)).total_seconds()
+    slow = settings.reconciliation_slow_interval_seconds
+    assert slow - 5 < remaining <= slow + 2
+
+
+def test_selection_boundary_just_below_max_age(client, settings, session_factory, stub):
+    """Age = max_age - 1: still inside the expiring tier — selected."""
+    max_age = settings.reconciliation_max_age_seconds
+    _make_old_link(
+        client, settings, session_factory, order_id="rec-hb-below", age_seconds=max_age - 1
+    )
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 1
+    assert get_payment(session_factory, "rec-hb-below").reconciliation_attempts == 1
+
+
+def test_selection_boundary_exactly_at_max_age_excluded(client, settings, session_factory, stub):
+    """Age == max_age exactly: the hard cutoff excludes it — never selected,
+    never mutated."""
+    max_age = settings.reconciliation_max_age_seconds
+    _make_old_link(client, settings, session_factory, order_id="rec-hb-at", age_seconds=max_age)
+    before = get_payment(session_factory, "rec-hb-at")
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 0
+    after = get_payment(session_factory, "rec-hb-at")
+    assert after.reconciliation_attempts == before.reconciliation_attempts == 0
+    assert after.status == PaymentStatus.LINK_CREATED.value
+
+
+def test_selection_boundary_just_above_max_age_excluded(client, settings, session_factory, stub):
+    """Age = max_age + 1: excluded — never selected."""
+    max_age = settings.reconciliation_max_age_seconds
+    _make_old_link(
+        client, settings, session_factory, order_id="rec-hb-above", age_seconds=max_age + 1
+    )
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 0
+
+
+def test_payment_older_than_max_age_is_never_mutated(client, settings, session_factory, stub):
+    """A payment well past the 2-hour hard cutoff is preserved byte-for-byte
+    across multiple passes — never deleted, never marked paid or failed,
+    never touched at all. It stays link_created for audit/operator
+    inspection, exactly as the automatic-reconciliation-stops policy
+    requires."""
+    ancient = _make_old_link(
+        client, settings, session_factory, order_id="rec-ancient",
+        age_seconds=settings.reconciliation_max_age_seconds * 5,
+    )
+
+    def snapshot():
+        with session_factory() as db:
+            return db.execute(
+                select(
+                    Payment.id,
+                    Payment.status,
+                    Payment.amount,
+                    Payment.fee_amount,
+                    Payment.payable_amount,
+                    Payment.reference_id,
+                    Payment.gateway_verified_at,
+                    Payment.reconciliation_attempts,
+                    Payment.reconciliation_next_at,
+                    Payment.reconciliation_last_at,
+                    Payment.reconciliation_last_error_code,
+                    Payment.reconciliation_claimed_at,
+                    Payment.reconciliation_claimed_by,
+                    Payment.updated_at,
+                ).where(Payment.id == ancient.id)
+            ).one()
+
+    before = snapshot()
+    for _ in range(3):
+        stats = _run_pass(session_factory, settings, stub)
+        assert stats["processed"] == 0
+    assert snapshot() == before
+    assert get_payment(session_factory, "rec-ancient").status == PaymentStatus.LINK_CREATED.value
+
+
+def test_max_attempts_respected_in_expiring_tier(client, settings, session_factory, stub):
+    """reconciliation_max_attempts remains a secondary safety guard inside
+    the expiring tier too, not just the active tier."""
+    _make_old_link(
+        client, settings, session_factory, order_id="rec-old-exh",
+        age_seconds=settings.reconciliation_fast_window_seconds + 60,
+    )
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "rec-old-exh")
+        ).scalar_one()
+        payment.reconciliation_attempts = settings.reconciliation_max_attempts - 1
+        db.commit()
+
+    stats = _run_pass(session_factory, settings, stub)
+    assert stats["processed"] == 1
+    assert stats["exhausted"] == 1
+    payment = get_payment(session_factory, "rec-old-exh")
+    assert payment.reconciliation_attempts == settings.reconciliation_max_attempts
+    assert payment.reconciliation_next_at is None
+    assert payment.status == PaymentStatus.LINK_CREATED.value
+
+    stub.verify_requests.clear()
+    assert _run_pass(session_factory, settings, stub)["processed"] == 0
+    assert stub.verify_requests == []
+
+
+def test_reconciliation_max_age_must_exceed_fast_window(settings):
+    # model_copy() does not re-run validators, so the invariant is checked
+    # via a fresh construction from the full field set instead.
+    with pytest.raises(ValueError, match="RECONCILIATION_MAX_AGE_SECONDS"):
+        type(settings)(
+            **{
+                **settings.model_dump(),
+                "reconciliation_max_age_seconds": settings.reconciliation_fast_window_seconds,
+            }
+        )
+
+
+def test_reconciliation_slow_tier_reserved_slots_must_be_below_batch_size(settings):
+    with pytest.raises(ValueError, match="RECONCILIATION_SLOW_TIER_RESERVED_SLOTS"):
+        type(settings)(
+            **{
+                **settings.model_dump(),
+                "reconciliation_slow_tier_reserved_slots": settings.reconciliation_batch_size,
+            }
+        )
 
 
 def test_verified_payment_is_never_verified_again(
