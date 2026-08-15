@@ -11,9 +11,24 @@ Design:
 * Selection: ``link_created`` payments at least
   ``RECONCILIATION_MIN_AGE_SECONDS`` old (age measured from the moment the
   payment link was issued), whose ``reconciliation_next_at`` is NULL (never
-  attempted) or due, with fewer than ``RECONCILIATION_MAX_ATTEMPTS`` attempts.
-  Oldest due first. NOTHING else is ever selected — verified, notification,
-  and ``manual_review`` states are excluded by the status predicate alone.
+  attempted) or due, with fewer than ``RECONCILIATION_MAX_ATTEMPTS`` attempts,
+  and younger than ``RECONCILIATION_MAX_AGE_SECONDS`` (the hard reconciliation
+  lifetime — older payments are excluded from selection entirely, never
+  deleted or mutated, preserved for audit/operator inspection). Split into two
+  age tiers — ACTIVE (age < fast window) and EXPIRING (fast window <= age <
+  max age) — each ordered oldest-due-first; every pass has a small MANDATORY
+  fairness prefix at its HEAD — slot 0 prefers the active tier, the next
+  ``RECONCILIATION_SLOW_TIER_RESERVED_SLOTS`` slot(s) prefer the expiring
+  tier — with unused capacity from either tier spilling to the other, so a
+  historical backlog can never delay a newly-created payment by more than a
+  few seconds, and sustained fresh traffic can never permanently starve the
+  expiring tier. The prefix runs before the pass's wall-clock time budget can
+  stop it — even a single verify call slow enough to exhaust the whole
+  budget cannot skip the rest of the prefix — so BOTH tiers get a real
+  opportunity every pass regardless of gateway latency (see
+  ``run_reconciliation_pass``). NOTHING else is ever selected — verified,
+  notification, and ``manual_review`` states are excluded by the status
+  predicate alone.
 * Settlement: the SAME shared :func:`app.services.verification.verify_and_settle`
   the callback uses — one settlement path, all financial checks identical
   (explicit success, referenceId validity/uniqueness, payable-amount and
@@ -30,14 +45,14 @@ Design:
   correctness mechanism.
 * Outcomes: gateway success settles and queues the bot notification (once);
   "not paid" and transport failures schedule a retry on the two-stage
-  AGE-based schedule (see reconciliation_retry_delay_seconds — every 10 s
-  while the link is under 10 minutes old, every 5 minutes afterwards, by
-  default) and NEVER move the payment to a failed or manual state; financial
-  mismatches keep the existing manual_review behavior; attempt exhaustion
-  (default 1000 attempts ≈ 3 days of coverage) stops the polling while
-  leaving the payment in ``link_created`` for operators. Reconciliation
-  stops immediately once the payment is verified, leaves link_created, or
-  moves to manual_review.
+  AGE-based schedule (see reconciliation_retry_delay_seconds — fast while the
+  link is under the fast window old, slow afterwards, by default) and NEVER
+  move the payment to a failed or manual state; financial mismatches keep the
+  existing manual_review behavior; attempt exhaustion (default 1000 attempts)
+  or reaching the max-age hard limit stops the polling while leaving the
+  payment in ``link_created`` for operators. Reconciliation stops immediately
+  once the payment is verified, leaves link_created, or moves to
+  manual_review.
 * Privacy: events and logs carry only payment_id, gateway_order_id, attempt,
   worker_id, and fixed internal reason codes — never tokens, signatures, API
   keys, card numbers, raw gateway responses, or raw Telegram ids.
@@ -103,7 +118,7 @@ def reconciliation_retry_delay_seconds(
     restart the fast window: a 20-minute-old payment with one recorded
     attempt goes straight to the slow interval.
 
-    * age <  ``reconciliation_fast_window_seconds`` (default 600 s): retry in
+    * age <  ``reconciliation_fast_window_seconds`` (default 900 s): retry in
       ``reconciliation_fast_interval_seconds`` (default 10 s);
     * age >= the window (including exactly at the boundary): retry in
       ``reconciliation_slow_interval_seconds`` (default 300 s).
@@ -122,16 +137,29 @@ def reconciliation_retry_delay_seconds(
     return settings.reconciliation_slow_interval_seconds
 
 
-def _claim_next_due(
-    db: Session, settings: Settings, *, worker_id: str, now: datetime
+def _claim_in_age_range(
+    db: Session,
+    settings: Settings,
+    *,
+    worker_id: str,
+    now: datetime,
+    age_floor: timedelta,
+    age_ceiling: timedelta,
 ) -> Payment | None:
-    """Select and claim ONE due payment, keeping its row lock.
+    """Select and claim ONE due payment whose link age falls in
+    ``[age_floor, age_ceiling)``, keeping its row lock.
+
+    Shared by both reconciliation tiers (see ``run_reconciliation_pass``):
+    the active tier bounds age to ``[min_age, fast_window)``, the expiring
+    tier to ``[fast_window, max_age)``. A payment aged ``max_age`` or older
+    therefore matches NEITHER tier and is never claimed by anything — that
+    IS the enforcement of the hard reconciliation lifetime; no separate
+    exclusion flag exists, and nothing about the row is ever written.
 
     The lock is intentionally held across the verify call (like the callback
     path) — that lock IS the double-settlement guard. SKIP LOCKED makes a
     second worker pick a different row instead of waiting.
     """
-    min_age_cutoff = now - timedelta(seconds=settings.reconciliation_min_age_seconds)
     link_age_anchor = func.coalesce(Payment.callback_token_issued_at, Payment.created_at)
     payment = db.execute(
         select(Payment)
@@ -140,7 +168,8 @@ def _claim_next_due(
             # manual_review / created / getlink_failed states never match.
             Payment.status == PaymentStatus.LINK_CREATED.value,
             Payment.gateway_verified_at.is_(None),  # belt-and-braces
-            link_age_anchor <= min_age_cutoff,  # give the browser callback time
+            link_age_anchor <= now - age_floor,  # age >= age_floor
+            link_age_anchor > now - age_ceiling,  # age < age_ceiling
             or_(
                 Payment.reconciliation_next_at.is_(None),
                 Payment.reconciliation_next_at <= now,
@@ -174,6 +203,80 @@ def _claim_next_due(
     # settlement outcome (verify is read-only on the gateway side, so a crash
     # mid-verify loses only this bookkeeping, never financial state).
     return payment
+
+
+def _claim_active_tier(
+    db: Session, settings: Settings, *, worker_id: str, now: datetime
+) -> Payment | None:
+    """The <fast-window (default 15 min) tier: highest reconciliation
+    priority, the payment link is still payable."""
+    return _claim_in_age_range(
+        db,
+        settings,
+        worker_id=worker_id,
+        now=now,
+        age_floor=timedelta(seconds=settings.reconciliation_min_age_seconds),
+        age_ceiling=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+    )
+
+
+def _claim_expiring_tier(
+    db: Session, settings: Settings, *, worker_id: str, now: datetime
+) -> Payment | None:
+    """The fast-window-to-max-age (default 15 min-2 h) safety tier: link has
+    expired, but the payer may have paid near expiry or the gateway/callback
+    may be lagging."""
+    return _claim_in_age_range(
+        db,
+        settings,
+        worker_id=worker_id,
+        now=now,
+        age_floor=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+        age_ceiling=timedelta(seconds=settings.reconciliation_max_age_seconds),
+    )
+
+
+def _claim_next_due(
+    db: Session,
+    settings: Settings,
+    *,
+    worker_id: str,
+    now: datetime,
+    slot_index: int,
+) -> Payment | None:
+    """Claim ONE due payment for this pass, using reserved-quota-with-
+    spillover fairness between the two age tiers.
+
+    Slot 0 of every pass (by processing order) tries the ACTIVE tier first;
+    the next ``reconciliation_slow_tier_reserved_slots`` slot(s) — indices 1
+    through ``reconciliation_slow_tier_reserved_slots`` inclusive — try the
+    EXPIRING tier first; every remaining slot tries the ACTIVE tier first
+    again. Either way, a slot whose preferred tier has nothing due
+    immediately falls back to the other tier before giving up.
+
+    Slots 0 through ``reconciliation_slow_tier_reserved_slots`` form the
+    pass's MANDATORY fairness prefix (see ``run_reconciliation_pass``, which
+    lets this prefix run even once the wall-clock budget is exhausted). Both
+    tiers therefore get a real opportunity every pass that has due rows,
+    regardless of how slow gateway verify calls are:
+    * slot 0 guarantees the ACTIVE tier is tried BEFORE any verify call in
+      the pass has consumed any budget, so a slow EXPIRING verify can never
+      push active-tier payments — the ones still payable — out of a pass;
+    * the following reserved slot(s) guarantee the EXPIRING tier is tried
+      immediately after, before a slow ACTIVE verify can exhaust the budget
+      first.
+    Everything past the mandatory prefix stays budget-gated and strongly
+    prefers the active tier, with capacity still spilling freely in both
+    directions whenever a tier is empty.
+    """
+    prefer_expiring = 1 <= slot_index <= settings.reconciliation_slow_tier_reserved_slots
+    if prefer_expiring:
+        return _claim_expiring_tier(
+            db, settings, worker_id=worker_id, now=now
+        ) or _claim_active_tier(db, settings, worker_id=worker_id, now=now)
+    return _claim_active_tier(
+        db, settings, worker_id=worker_id, now=now
+    ) or _claim_expiring_tier(db, settings, worker_id=worker_id, now=now)
 
 
 def _finalize(
@@ -321,12 +424,30 @@ def run_reconciliation_pass(
     """One reconciliation pass: claim due payments one at a time and settle
     or reschedule each in its own transaction.
 
-    A per-payment failure never terminates the pass. The wall-clock budget
-    bounds the pass LENGTH by refusing to START another claim once exceeded;
-    it cannot interrupt an in-flight verify call, so a pass may overrun by up
-    to one gateway timeout. Bot-notification latency does not depend on this
-    budget at all: the worker runs reconciliation in a DEDICATED THREAD (see
-    app/worker.py), never inline in the notification loop.
+    A per-payment failure never terminates the pass. Past the mandatory
+    fairness prefix (below), the wall-clock budget bounds the pass LENGTH by
+    refusing to START another claim once exceeded; it cannot interrupt an
+    in-flight verify call, so a pass may overrun by up to one gateway
+    timeout (or, during the mandatory prefix, by up to
+    ``1 + reconciliation_slow_tier_reserved_slots`` gateway timeouts — see
+    below). Bot-notification latency does not depend on this budget at all:
+    the worker runs reconciliation in a DEDICATED THREAD (see app/worker.py),
+    never inline in the notification loop.
+
+    Fairness: slot 0 of every pass prefers the ACTIVE tier and the next
+    ``reconciliation_slow_tier_reserved_slots`` slot(s) prefer the EXPIRING
+    tier (see ``_claim_next_due``), each falling back to the other tier when
+    its preference has nothing due — so a historical backlog can never delay
+    fresh payments and sustained fresh traffic can never starve the expiring
+    tier. These ``1 + reconciliation_slow_tier_reserved_slots`` slots are the
+    pass's MANDATORY prefix and are allowed to run even once the wall-clock
+    budget is exhausted, because the budget is only ever checked before
+    STARTING a new claim, never mid-verify: without that carve-out, a single
+    slow verify call in an early mandatory slot could exhaust the budget and
+    silently skip a later one, defeating the guarantee for whichever tier
+    lost the race. Only once the mandatory prefix is complete does the normal
+    budget apply to further claims. Total claims this pass never exceed
+    ``limit`` either way.
 
     Load note: ``batch_size / interval`` is an AVERAGE upper bound on verify
     calls, not a burst bound — a single pass may issue its whole batch
@@ -348,13 +469,22 @@ def run_reconciliation_pass(
         if time_budget_seconds is not None
         else settings.reconciliation_interval_seconds
     )
+    # The mandatory fairness prefix (1 active-first slot + the expiring-first
+    # reserved slots) always fits inside `limit`: reconciliation_slow_tier_
+    # reserved_slots is validated to stay below reconciliation_batch_size, but
+    # `limit` may be a smaller ad-hoc override (e.g. in tests), so clamp.
+    mandatory_slots = min(1 + settings.reconciliation_slow_tier_reserved_slots, limit)
     started = time.monotonic()
 
-    while stats["processed"] < limit and (time.monotonic() - started) < budget:
+    while stats["processed"] < limit and (
+        stats["processed"] < mandatory_slots or (time.monotonic() - started) < budget
+    ):
         token = request_id_var.set(f"rec-{uuid.uuid4().hex[:16]}")
         try:
             now = now_fn()
-            payment = _claim_next_due(db, settings, worker_id=worker_id, now=now)
+            payment = _claim_next_due(
+                db, settings, worker_id=worker_id, now=now, slot_index=stats["processed"]
+            )
             if payment is None:
                 break
             payment_id = payment.id

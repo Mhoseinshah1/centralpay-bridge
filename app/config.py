@@ -372,18 +372,31 @@ class Settings(BaseSettings):
     # Server-side payment reconciliation: the worker verifies link_created
     # payments whose browser callback never arrived, through the SAME shared
     # verification path the callback uses. The browser callback stays the
-    # primary immediate path. Two-stage, AGE-based retry schedule (the stage
-    # is derived from the real link age — issued-at timestamp — never from
-    # the attempt count, so worker restarts/downtime can never restart the
-    # fast window):
-    #   * first server-side check ~reconciliation_min_age_seconds after the
-    #     link was issued (default 10 s; plus up to one worker scan interval);
-    #   * link age <  fast_window (default 600 s): retry every
+    # primary immediate path. Two age tiers, both anchored on the real link
+    # age (issued-at timestamp, never the attempt count, so worker
+    # restarts/downtime can never restart the fast window):
+    #   * ACTIVE tier — age < fast_window (default 900 s = the 15-minute
+    #     CentralPay link lifetime): highest priority, retried every
     #     fast_interval seconds (default 10 s);
-    #   * link age >= fast_window: retry every slow_interval seconds
-    #     (default 300 s) until reconciliation_max_attempts (default 1000 —
-    #     ~60 fast checks in the first 10 minutes, then every 5 minutes for
-    #     roughly 3 days of fallback monitoring).
+    #   * EXPIRING (slow) tier — fast_window <= age < max_age (default
+    #     7200 s = 2 hours): a safety window for late payment/delayed gateway
+    #     propagation/dropped callbacks, retried every slow_interval seconds
+    #     (default 300 s).
+    #   Every pass has a mandatory fairness prefix at its head, run BEFORE the
+    #   wall-clock budget can stop it even if an earlier slot's verify call
+    #   alone exhausts the budget: slot 0 prefers ACTIVE, the next
+    #   slow_tier_reserved_slots (default 1) slot(s) prefer EXPIRING. This
+    #   guarantees BOTH tiers get a real opportunity every pass regardless of
+    #   gateway latency — sustained active-tier traffic can never starve the
+    #   expiring tier, and a sustained expiring-tier backlog with slow
+    #   verifies can never starve the still-payable active tier. Any slot
+    #   whose preferred tier has nothing due spills to the other tier.
+    #   * age >= max_age: EXCLUDED from selection entirely — not deleted, not
+    #     marked failed or paid, left in link_created for operators. This is
+    #     the PRIMARY lifetime limit; reconciliation_max_attempts (default
+    #     1000) remains only a secondary safety guard.
+    # First server-side check ~reconciliation_min_age_seconds after the link
+    # was issued (default 10 s; plus up to one worker scan interval).
     # Reconciliation stops immediately once the payment is verified, leaves
     # link_created, or moves to manual_review. Disabling it only stops the
     # polling; callbacks are unaffected.
@@ -391,10 +404,19 @@ class Settings(BaseSettings):
     reconciliation_min_age_seconds: int = Field(default=10, ge=0)
     reconciliation_interval_seconds: float = Field(default=5.0, gt=0)
     reconciliation_batch_size: int = Field(default=10, gt=0, le=100)
+    # Per-pass slots reserved for the expiring (slow) tier — see the module
+    # comment above reconciliation_enabled. Must stay below the batch size so
+    # the active tier always keeps at least one slot.
+    reconciliation_slow_tier_reserved_slots: int = Field(default=1, gt=0)
     reconciliation_max_attempts: int = Field(default=1000, gt=0, le=1000)
-    reconciliation_fast_window_seconds: int = Field(default=600, ge=0)
+    reconciliation_fast_window_seconds: int = Field(default=900, ge=0)
     reconciliation_fast_interval_seconds: int = Field(default=10, gt=0)
     reconciliation_slow_interval_seconds: int = Field(default=300, gt=0)
+    # Hard lifetime limit: at/after this age a payment is excluded from
+    # reconciliation SELECTION entirely (never deleted, never marked
+    # failed/paid) — the primary stop condition. reconciliation_max_attempts
+    # remains only a secondary safety guard.
+    reconciliation_max_age_seconds: int = Field(default=7200, gt=0)
     # DEPRECATED (accepted for compatibility with existing environment files;
     # no longer control the retry schedule): the exponential-backoff tuning of
     # the original reconciliation release. The active schedule is the
@@ -502,6 +524,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "RECONCILIATION_MAX_BACKOFF_SECONDS must be >= "
                 "RECONCILIATION_INITIAL_BACKOFF_SECONDS"
+            )
+        if self.reconciliation_max_age_seconds <= self.reconciliation_fast_window_seconds:
+            raise ValueError(
+                "RECONCILIATION_MAX_AGE_SECONDS must be greater than "
+                "RECONCILIATION_FAST_WINDOW_SECONDS"
+            )
+        if self.reconciliation_slow_tier_reserved_slots >= self.reconciliation_batch_size:
+            raise ValueError(
+                "RECONCILIATION_SLOW_TIER_RESERVED_SLOTS must be less than "
+                "RECONCILIATION_BATCH_SIZE"
             )
         return self
 

@@ -381,7 +381,7 @@ def test_migration_0010_from_production_0008(settings, pg_engine):
                 " VALUES ('stuck-1', 910000000501, 55501234, 10000, 10000,"
                 "  'link_created', 'https://gateway.test/pay/stuck-1', :ti)"
             ),
-            {"ti": datetime.now(UTC) - timedelta(hours=3)},
+            {"ti": datetime.now(UTC) - timedelta(hours=1)},
         )
 
     _alembic("upgrade", "head")
