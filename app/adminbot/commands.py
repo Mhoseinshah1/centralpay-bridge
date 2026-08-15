@@ -27,6 +27,8 @@ from app.adminbot.format import (
     payment_block,
     payment_status_fa,
     split_message,
+    stuck_entry_block,
+    stuck_summary_lines,
 )
 from app.audit import record_event
 from app.config import Settings
@@ -37,6 +39,7 @@ from app.services.bulk_resend import (
     preview_bulk_resend,
     requeue_failed_deliveries,
 )
+from app.services.stuck_payments import stuck_payments_overview
 from app.version import APP_VERSION
 
 logger = logging.getLogger("app.adminbot.commands")
@@ -333,23 +336,28 @@ class CommandHandlers:
         return self._split("\n".join(blocks))
 
     def cmd_stuck(self, db: Session, args: list[str]) -> list[str]:
-        entries = queries.stuck_payments(
-            db,
-            claim_timeout_seconds=self._settings.bot_notify_claim_timeout_seconds,
-        )
-        if not entries:
+        """Categorized read-only overview: need-attention, waiting-gateway,
+        and expired-link payments, in that fixed priority order. Shares its
+        categorization with `centralpay stuck` via
+        app.services.stuck_payments — the two surfaces can never disagree.
+        """
+        limit = RECENT_MAX
+        if args and args[0].isdigit():
+            limit = min(int(args[0]), RECENT_MAX)
+        overview = stuck_payments_overview(db, self._settings)
+        ordered = overview.ordered()
+        if not ordered:
             return [f"{OK} هیچ پرداختی نیازمند توجه نیست."]
         tz = self._settings.admin_bot_timezone
-        blocks = [f"<b>پرداخت‌های نیازمند توجه ({len(entries)})</b>"]
-        for entry in entries:
-            payment = entry.payment
-            blocks.append(
-                f"• <b>{esc(payment.bot_order_id)}</b> — "
-                f"{fmt_amount(payment.amount)} تومان\n"
-                f"  دسته: <code>{esc(entry.category)}</code>\n"
-                f"  تلاش‌ها: {payment.bot_notify_attempts} — "
-                f"ایجاد: {fmt_time(payment.created_at, tz)}"
-            )
+        shown = ordered[:limit]
+        blocks = list(stuck_summary_lines(overview))
+        for index, entry in enumerate(shown, start=1):
+            blocks.append("")
+            blocks.append(stuck_entry_block(index, entry, tz))
+        remaining = len(ordered) - len(shown)
+        if remaining > 0:
+            blocks.append("")
+            blocks.append(f"... {fmt_amount(remaining)} مورد دیگر نمایش داده نشد.")
         return self._split("\n".join(blocks))
 
     def cmd_manual_review(self, db: Session, args: list[str]) -> list[str]:

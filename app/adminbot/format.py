@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.models import Payment
+from app.services.stuck_payments import StuckCategory, StuckEntry, StuckOverview
 
 if TYPE_CHECKING:
     from app.adminbot.alerts import ClaimedAlert
@@ -127,6 +128,67 @@ def payment_block(payment: Payment, tz_name: str) -> str:
         lines.append(f"کد پیگیری:\n{esc(payment.reference_id)}")
     lines.append(f"زمان ایجاد:\n{fmt_time(payment.created_at, tz_name)}")
     return "\n\n".join(lines)
+
+
+STUCK_CATEGORY_EMOJI = {
+    StuckCategory.NEEDS_ATTENTION: "🔴",
+    StuckCategory.WAITING_GATEWAY: "🟡",
+    StuckCategory.EXPIRED: "⚫",
+}
+STUCK_CATEGORY_LABEL_FA = {
+    StuckCategory.NEEDS_ATTENTION: "نیازمند توجه",
+    StuckCategory.WAITING_GATEWAY: "در انتظار درگاه",
+    StuckCategory.EXPIRED: "منقضی‌شده",
+}
+
+
+def stuck_summary_lines(overview: StuckOverview) -> list[str]:
+    """Header + category counts. Counts are always exact, independent of
+    how many entries are actually rendered below them."""
+    return [
+        "<b>پرداخت‌های نیازمند توجه</b>",
+        "",
+        f"{STUCK_CATEGORY_EMOJI[StuckCategory.NEEDS_ATTENTION]} "
+        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.NEEDS_ATTENTION]}: "
+        f"{fmt_amount(overview.total_counts['needs_attention'])}",
+        f"{STUCK_CATEGORY_EMOJI[StuckCategory.WAITING_GATEWAY]} "
+        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.WAITING_GATEWAY]}: "
+        f"{fmt_amount(overview.total_counts['waiting_gateway'])}",
+        f"{STUCK_CATEGORY_EMOJI[StuckCategory.EXPIRED]} "
+        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.EXPIRED]}: "
+        f"{fmt_amount(overview.total_counts['expired'])}",
+    ]
+
+
+def stuck_entry_block(index: int, entry: StuckEntry, tz_name: str) -> str:
+    """One numbered entry. Always shows the exact reason/state — never a
+    generic label — matching the invariant the rest of the admin bot
+    already keeps for stuck-payment reporting."""
+    payment = entry.payment
+    is_link_created = payment.status == "link_created"
+    attempts = (
+        payment.reconciliation_attempts if is_link_created else payment.bot_notify_attempts
+    )
+    next_retry = payment.reconciliation_next_at if is_link_created else payment.next_retry_at
+    lines = [
+        f"{index}) {STUCK_CATEGORY_EMOJI[entry.category]} "
+        f"<b>{STUCK_CATEGORY_LABEL_FA[entry.category]}</b>",
+        f"سفارش: <b>{esc(payment.bot_order_id)}</b>",
+        f"مبلغ: {fmt_amount(payment.amount)} تومان",
+        f"وضعیت: {payment_status_fa(payment.status)}",
+    ]
+    if entry.gateway_state is not None:
+        lines.append(f"درگاه: <code>{esc(entry.gateway_state)}</code>")
+    if attempts:
+        lines.append(f"تلاش‌ها: {attempts}")
+    if is_link_created and payment.reconciliation_last_at is not None:
+        lines.append(f"آخرین بررسی: {fmt_time(payment.reconciliation_last_at, tz_name)}")
+    if next_retry is not None:
+        lines.append(f"تلاش بعدی: {fmt_time(next_retry, tz_name)}")
+    if entry.category == StuckCategory.NEEDS_ATTENTION:
+        lines.append(f"دلیل: <code>{esc(entry.reason)}</code>")
+    lines.append(f"ایجاد: {fmt_time(payment.created_at, tz_name)}")
+    return "\n".join(lines)
 
 
 _ALERT_TITLES_FA = {

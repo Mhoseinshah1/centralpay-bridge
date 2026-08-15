@@ -9,6 +9,7 @@ from app.models import Payment, PaymentEvent
 from tests.conftest import (
     TEST_ADMIN_ID,
     TEST_ADMIN_ID_2,
+    create_order,
     make_verified_pending,
     run_pass,
 )
@@ -129,6 +130,61 @@ def test_stuck_uses_exact_categories(
     # The exact reason code appears; never a generic "stuck" label.
     assert "bot_timeout_ambiguous" in text
     assert "stuck" not in text
+
+
+def test_stuck_shows_grouped_summary_with_exact_counts(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    """The redesigned /stuck groups into three categories with a header
+    count each — shared categorization with `centralpay stuck`."""
+    import httpx
+
+    make_verified_pending(client, settings, session_factory, stub, order_id="adm-attn-2")
+    bot_stub.result = httpx.ReadTimeout("t")
+    run_pass(session_factory, notifier, settings)
+    assert create_order(client, settings, order_id="adm-waiting-1").status_code == 200
+
+    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
+    assert "نیازمند توجه: 1" in text
+    assert "در انتظار درگاه: 1" in text
+    assert "منقضی‌شده: 0" in text
+    assert "adm-waiting-1" in text
+
+
+def test_stuck_reports_nothing_when_no_payments_are_stuck(handlers):
+    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
+    assert "هیچ پرداختی نیازمند توجه نیست" in text
+
+
+def test_stuck_link_created_ordinary_retry_is_not_attention(
+    handlers, client, settings, session_factory, stub
+):
+    """A normal, non-exhausted link_created payment must never appear under
+    the "needs attention" count, even once it is well past the active
+    window and the gateway has already reported "not paid" once."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.models import Payment
+
+    assert create_order(client, settings, order_id="adm-notpaid-1").status_code == 200
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "adm-notpaid-1")
+        ).scalar_one()
+        payment.callback_token_issued_at = datetime.now(UTC) - timedelta(
+            seconds=settings.reconciliation_fast_window_seconds + 60
+        )
+        payment.reconciliation_attempts = 4
+        payment.reconciliation_last_error_code = "gateway_not_paid"
+        payment.reconciliation_next_at = datetime.now(UTC) + timedelta(minutes=5)
+        db.commit()
+
+    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
+    assert "نیازمند توجه: 0" in text
+    assert "در انتظار درگاه: 1" in text
+    assert "adm-notpaid-1" in text
 
 
 def test_retry_queue_is_read_only(
