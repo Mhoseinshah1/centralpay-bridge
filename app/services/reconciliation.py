@@ -16,13 +16,16 @@ Design:
   lifetime — older payments are excluded from selection entirely, never
   deleted or mutated, preserved for audit/operator inspection). Split into two
   age tiers — ACTIVE (age < fast window) and EXPIRING (fast window <= age <
-  max age) — each ordered oldest-due-first; every pass reserves a small
-  number of slots at the HEAD of the pass for the expiring tier, with unused
-  capacity from either tier spilling to the other, so a historical backlog
-  can never delay a newly-created payment by more than a few seconds, and
-  sustained fresh traffic can never permanently starve the expiring tier —
-  the reserved slots run before any budget-consuming verify call in the pass,
-  so they are unaffected by the pass's wall-clock time budget (see
+  max age) — each ordered oldest-due-first; every pass has a small MANDATORY
+  fairness prefix at its HEAD — slot 0 prefers the active tier, the next
+  ``RECONCILIATION_SLOW_TIER_RESERVED_SLOTS`` slot(s) prefer the expiring
+  tier — with unused capacity from either tier spilling to the other, so a
+  historical backlog can never delay a newly-created payment by more than a
+  few seconds, and sustained fresh traffic can never permanently starve the
+  expiring tier. The prefix runs before the pass's wall-clock time budget can
+  stop it — even a single verify call slow enough to exhaust the whole
+  budget cannot skip the rest of the prefix — so BOTH tiers get a real
+  opportunity every pass regardless of gateway latency (see
   ``run_reconciliation_pass``). NOTHING else is ever selected — verified,
   notification, and ``manual_review`` states are excluded by the status
   predicate alone.
@@ -244,26 +247,29 @@ def _claim_next_due(
     """Claim ONE due payment for this pass, using reserved-quota-with-
     spillover fairness between the two age tiers.
 
-    The FIRST ``reconciliation_slow_tier_reserved_slots`` slots of every pass
-    (by processing order — ``slot_index`` 0, 1, ...) try the EXPIRING tier
-    first; every other slot tries the ACTIVE tier first. Either way, a slot
-    whose preferred tier has nothing due immediately falls back to the other
-    tier before giving up.
+    Slot 0 of every pass (by processing order) tries the ACTIVE tier first;
+    the next ``reconciliation_slow_tier_reserved_slots`` slot(s) — indices 1
+    through ``reconciliation_slow_tier_reserved_slots`` inclusive — try the
+    EXPIRING tier first; every remaining slot tries the ACTIVE tier first
+    again. Either way, a slot whose preferred tier has nothing due
+    immediately falls back to the other tier before giving up.
 
-    The reservation MUST sit at the head of the pass, not the tail: the pass
-    loop only checks its wall-clock time budget before starting a new claim,
-    never mid-verify, so the head slot(s) run before any budget-consuming
-    verify call in this pass has happened — ``time.monotonic() - started`` is
-    still ~0 the moment the loop body first executes. A tail reservation is
-    reachable only if every earlier slot both claims a row and completes its
-    verify call within the remaining budget, which sustained, slow active-tier
-    traffic can defeat indefinitely. A head reservation therefore guarantees
-    the expiring tier makes real progress every pass it has due rows —
-    regardless of gateway latency — while every other slot still strongly
-    prefers the active tier and capacity still spills freely in both
-    directions when a tier is empty.
+    Slots 0 through ``reconciliation_slow_tier_reserved_slots`` form the
+    pass's MANDATORY fairness prefix (see ``run_reconciliation_pass``, which
+    lets this prefix run even once the wall-clock budget is exhausted). Both
+    tiers therefore get a real opportunity every pass that has due rows,
+    regardless of how slow gateway verify calls are:
+    * slot 0 guarantees the ACTIVE tier is tried BEFORE any verify call in
+      the pass has consumed any budget, so a slow EXPIRING verify can never
+      push active-tier payments — the ones still payable — out of a pass;
+    * the following reserved slot(s) guarantee the EXPIRING tier is tried
+      immediately after, before a slow ACTIVE verify can exhaust the budget
+      first.
+    Everything past the mandatory prefix stays budget-gated and strongly
+    prefers the active tier, with capacity still spilling freely in both
+    directions whenever a tier is empty.
     """
-    prefer_expiring = slot_index < settings.reconciliation_slow_tier_reserved_slots
+    prefer_expiring = 1 <= slot_index <= settings.reconciliation_slow_tier_reserved_slots
     if prefer_expiring:
         return _claim_expiring_tier(
             db, settings, worker_id=worker_id, now=now
@@ -418,21 +424,30 @@ def run_reconciliation_pass(
     """One reconciliation pass: claim due payments one at a time and settle
     or reschedule each in its own transaction.
 
-    A per-payment failure never terminates the pass. The wall-clock budget
-    bounds the pass LENGTH by refusing to START another claim once exceeded;
-    it cannot interrupt an in-flight verify call, so a pass may overrun by up
-    to one gateway timeout. Bot-notification latency does not depend on this
-    budget at all: the worker runs reconciliation in a DEDICATED THREAD (see
-    app/worker.py), never inline in the notification loop.
+    A per-payment failure never terminates the pass. Past the mandatory
+    fairness prefix (below), the wall-clock budget bounds the pass LENGTH by
+    refusing to START another claim once exceeded; it cannot interrupt an
+    in-flight verify call, so a pass may overrun by up to one gateway
+    timeout (or, during the mandatory prefix, by up to
+    ``1 + reconciliation_slow_tier_reserved_slots`` gateway timeouts — see
+    below). Bot-notification latency does not depend on this budget at all:
+    the worker runs reconciliation in a DEDICATED THREAD (see app/worker.py),
+    never inline in the notification loop.
 
-    Fairness: each claim reserves the HEAD of the batch for the expiring age
-    tier (see ``_claim_next_due``) so a historical backlog can never starve
+    Fairness: slot 0 of every pass prefers the ACTIVE tier and the next
+    ``reconciliation_slow_tier_reserved_slots`` slot(s) prefer the EXPIRING
+    tier (see ``_claim_next_due``), each falling back to the other tier when
+    its preference has nothing due — so a historical backlog can never delay
     fresh payments and sustained fresh traffic can never starve the expiring
-    tier — total claims this pass never exceed ``limit`` either way. The
-    reservation sits at the head, not the tail, specifically so it is
-    attempted before the wall-clock budget check below can ever skip it: that
-    check only runs before starting a new claim, so the very first iteration
-    of the loop always runs regardless of how slow later verify calls are.
+    tier. These ``1 + reconciliation_slow_tier_reserved_slots`` slots are the
+    pass's MANDATORY prefix and are allowed to run even once the wall-clock
+    budget is exhausted, because the budget is only ever checked before
+    STARTING a new claim, never mid-verify: without that carve-out, a single
+    slow verify call in an early mandatory slot could exhaust the budget and
+    silently skip a later one, defeating the guarantee for whichever tier
+    lost the race. Only once the mandatory prefix is complete does the normal
+    budget apply to further claims. Total claims this pass never exceed
+    ``limit`` either way.
 
     Load note: ``batch_size / interval`` is an AVERAGE upper bound on verify
     calls, not a burst bound — a single pass may issue its whole batch
@@ -454,9 +469,16 @@ def run_reconciliation_pass(
         if time_budget_seconds is not None
         else settings.reconciliation_interval_seconds
     )
+    # The mandatory fairness prefix (1 active-first slot + the expiring-first
+    # reserved slots) always fits inside `limit`: reconciliation_slow_tier_
+    # reserved_slots is validated to stay below reconciliation_batch_size, but
+    # `limit` may be a smaller ad-hoc override (e.g. in tests), so clamp.
+    mandatory_slots = min(1 + settings.reconciliation_slow_tier_reserved_slots, limit)
     started = time.monotonic()
 
-    while stats["processed"] < limit and (time.monotonic() - started) < budget:
+    while stats["processed"] < limit and (
+        stats["processed"] < mandatory_slots or (time.monotonic() - started) < budget
+    ):
         token = request_id_var.set(f"rec-{uuid.uuid4().hex[:16]}")
         try:
             now = now_fn()

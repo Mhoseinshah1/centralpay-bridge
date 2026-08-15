@@ -608,6 +608,41 @@ def test_expiring_tier_reserved_slot_survives_pass_time_budget_exhaustion(
     assert checked.reconciliation_attempts == 1
 
 
+def test_active_tier_priority_slot_survives_pass_time_budget_exhaustion(
+    client, settings, session_factory, stub
+):
+    """Mirror of the previous test: the ACTIVE tier's priority slot 0 must
+    also survive an EXPIRING-tier verify call that alone exhausts the pass's
+    wall-clock budget. Before the mandatory-prefix fix, slot 0 always
+    preferred the expiring tier outright, so a sustained expiring backlog
+    combined with slow verify calls could exhaust the whole budget on slot 0
+    alone and leave the active tier — the still-payable, highest-priority
+    tier — with ZERO claims, pass after pass. Reproduce that precondition:
+    a sustained expiring-tier backlog (more due rows than one batch), one due
+    active-tier payment, a verify call slower than the whole time budget by
+    itself, and assert the active payment still gets attempted because slot
+    0 (active-first) and the reserved expiring-first slot(s) that follow it
+    are a mandatory prefix that runs regardless of budget exhaustion."""
+    batch_size = settings.reconciliation_batch_size
+    assert settings.reconciliation_slow_tier_reserved_slots >= 1
+    for i in range(batch_size):  # sustained expiring-tier backlog
+        _make_old_link(
+            client, settings, session_factory,
+            order_id=f"rec-slow-expiring-{i}",
+            age_seconds=settings.reconciliation_fast_window_seconds + 60,
+        )
+    _make_stale_link(client, settings, session_factory, order_id="rec-slow-active")
+    stub.verify_delay_seconds = 0.5  # a single verify call alone exceeds the budget below
+    stats = _run_pass(
+        session_factory, settings, stub, batch_size=batch_size, time_budget_seconds=0.3
+    )
+    # The tight budget really did cut the pass short before batch_size claims
+    # completed — otherwise this test would not exercise the starvation bug.
+    assert stats["processed"] < batch_size
+    checked = get_payment(session_factory, "rec-slow-active")
+    assert checked.reconciliation_attempts == 1
+
+
 def test_spillover_from_active_tier_to_expiring_tier(client, settings, session_factory, stub):
     """When the active tier has fewer due rows than the batch, the unused
     capacity spills to the expiring tier instead of going idle."""

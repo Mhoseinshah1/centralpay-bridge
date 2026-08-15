@@ -381,12 +381,16 @@ class Settings(BaseSettings):
     #   * EXPIRING (slow) tier — fast_window <= age < max_age (default
     #     7200 s = 2 hours): a safety window for late payment/delayed gateway
     #     propagation/dropped callbacks, retried every slow_interval seconds
-    #     (default 300 s). Every pass reserves
-    #     slow_tier_reserved_slots (default 1) of its batch for this tier
-    #     FIRST (the head of the pass, before the wall-clock budget can be
-    #     exhausted by earlier claims) so sustained active-tier traffic can
-    #     never starve it; any slot whose preferred tier has nothing due
-    #     spills to the other tier.
+    #     (default 300 s).
+    #   Every pass has a mandatory fairness prefix at its head, run BEFORE the
+    #   wall-clock budget can stop it even if an earlier slot's verify call
+    #   alone exhausts the budget: slot 0 prefers ACTIVE, the next
+    #   slow_tier_reserved_slots (default 1) slot(s) prefer EXPIRING. This
+    #   guarantees BOTH tiers get a real opportunity every pass regardless of
+    #   gateway latency — sustained active-tier traffic can never starve the
+    #   expiring tier, and a sustained expiring-tier backlog with slow
+    #   verifies can never starve the still-payable active tier. Any slot
+    #   whose preferred tier has nothing due spills to the other tier.
     #   * age >= max_age: EXCLUDED from selection entirely — not deleted, not
     #     marked failed or paid, left in link_created for operators. This is
     #     the PRIMARY lifetime limit; reconciliation_max_attempts (default
