@@ -63,6 +63,7 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -137,6 +138,18 @@ def reconciliation_retry_delay_seconds(
     return settings.reconciliation_slow_interval_seconds
 
 
+def link_age_anchor() -> Any:
+    """The timestamp reconciliation ages a ``link_created`` payment from.
+
+    Falls back to ``created_at`` for the (rare) payment that never reached a
+    successful ``getLink`` call. Public so every read of "how old is this
+    link" — the claim queries below, and read-only reporting such as the
+    stuck-payments overview — uses the exact same expression and can never
+    quietly disagree about what "age" means.
+    """
+    return func.coalesce(Payment.callback_token_issued_at, Payment.created_at)
+
+
 def _claim_in_age_range(
     db: Session,
     settings: Settings,
@@ -160,7 +173,7 @@ def _claim_in_age_range(
     path) — that lock IS the double-settlement guard. SKIP LOCKED makes a
     second worker pick a different row instead of waiting.
     """
-    link_age_anchor = func.coalesce(Payment.callback_token_issued_at, Payment.created_at)
+    link_age_anchor_expr = link_age_anchor()
     payment = db.execute(
         select(Payment)
         .where(
@@ -168,8 +181,8 @@ def _claim_in_age_range(
             # manual_review / created / getlink_failed states never match.
             Payment.status == PaymentStatus.LINK_CREATED.value,
             Payment.gateway_verified_at.is_(None),  # belt-and-braces
-            link_age_anchor <= now - age_floor,  # age >= age_floor
-            link_age_anchor > now - age_ceiling,  # age < age_ceiling
+            link_age_anchor_expr <= now - age_floor,  # age >= age_floor
+            link_age_anchor_expr > now - age_ceiling,  # age < age_ceiling
             or_(
                 Payment.reconciliation_next_at.is_(None),
                 Payment.reconciliation_next_at <= now,

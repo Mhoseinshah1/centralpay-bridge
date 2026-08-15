@@ -57,6 +57,8 @@ Service fee (changes apply to NEW orders only; history is permanent):
 
 Inspection:
   diagnose               Full system diagnosis (no secrets printed)
+  stuck [--limit N] [--json]  Categorized view of payments needing attention
+                          (need attention / waiting gateway / expired links)
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
@@ -937,6 +939,7 @@ main() {
         db-check)      cmd_db_check "$@" ;;
         fee)           cmd_fee "$@" ;;
         diagnose)      cmd_diagnose "$@" ;;
+        stuck)         cmd_app_cli stuck "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;
         retry-queue)   cmd_app_cli retry-queue "$@" ;;

@@ -384,7 +384,7 @@ def test_management_cli_syntax_and_help():
     assert result.returncode == 0
     for command in (
         "status", "logs", "logs-errors", "restart", "stop", "start", "update",
-        "migrate", "backup", "backups", "restore", "diagnose", "payment",
+        "migrate", "backup", "backups", "restore", "diagnose", "stuck", "payment",
         "recent", "retry-queue", "manual-review", "credentials", "ssl",
         "version", "uninstall",
     ):
