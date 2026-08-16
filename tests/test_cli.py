@@ -131,3 +131,63 @@ def test_stuck_ordering_is_attention_then_waiting_then_expired(
     # ordering itself is covered by
     # test_stuck_payments.py::test_ordered_priority_is_attention_then_waiting_then_expired.
     assert categories == ["waiting_gateway"]
+
+
+# --- reconciliation status ---------------------------------------------------
+
+
+def test_reconciliation_status_parser_defaults():
+    args = build_parser().parse_args(["reconciliation", "status"])
+    assert args.command == "reconciliation"
+    assert args.reconciliation_command == "status"
+    assert args.as_json is False
+
+
+def test_reconciliation_status_parser_json_flag():
+    args = build_parser().parse_args(["reconciliation", "status", "--json"])
+    assert args.as_json is True
+
+
+def test_reconciliation_status_human_output(cli_env, capsys):
+    assert cli_main(["reconciliation", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "🔄 Reconciliation Status" in out
+    assert "config source:" in out
+    assert "enabled:                  yes" in out
+    assert "Effective configuration:" in out
+    assert "Payment buckets" in out
+    assert "Queue health" in out
+    assert "Recent activity" in out
+    assert "exhausted (within auto-reconciliation lifetime)" in out
+
+
+def test_reconciliation_status_json_output_shape(cli_env, capsys):
+    assert cli_main(["reconciliation", "status", "--json"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1  # exactly one JSON object
+    payload = json.loads(out)
+    assert set(payload) == {"generated_at", "runtime", "config", "buckets", "queue", "recent"}
+    assert payload["runtime"]["enabled"] is True
+    assert payload["config"]["fast_window_seconds"] == cli_env.reconciliation_fast_window_seconds
+    assert payload["buckets"] == {
+        "total_unverified": 0,
+        "active": 0,
+        "expiring": 0,
+        "aged_out": 0,
+    }
+    assert payload["queue"]["exhausted_not_aged_out"] == 0
+    assert payload["recent"]["window_hours"] == 24
+
+
+def test_reconciliation_status_disabled_shows_heartbeat_not_applicable(
+    cli_env, monkeypatch, capsys
+):
+    import app.cli as cli_module
+
+    disabled = cli_env.model_copy(update={"reconciliation_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    assert cli_main(["reconciliation", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runtime"]["enabled"] is False
+    assert payload["runtime"]["heartbeat_fresh"] is None

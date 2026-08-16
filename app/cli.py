@@ -7,12 +7,19 @@ Usage:
     python -m app.cli retry-queue
     python -m app.cli manual-review
     python -m app.cli stuck [--limit N] [--json]
+    python -m app.cli reconciliation status [--json]
 
 ORDER_ID may be the original bot order id or the numeric gateway order id.
-Output is one JSON object per line, EXCEPT `stuck`, which prints a grouped,
-human-readable report by default (pass --json for the one-object-per-line
-form instead). These commands never modify data and never print secrets,
-redirect URLs, or full card numbers.
+Output is one JSON object per line, EXCEPT `stuck` and `reconciliation
+status`, which print a human-readable report by default (pass --json for a
+single machine-readable JSON object instead). These commands never modify
+data and never print secrets, redirect URLs, or full card numbers.
+
+`reconciliation status` reports the CONFIGURATION OF THE PROCESS IT RUNS IN —
+invoke it inside the worker container (the host `centralpay reconciliation
+status` command always does this) for the actual effective runtime
+configuration; the api container's environment can be stale after a
+worker-only redeploy (see scripts/centralpay).
 """
 
 import argparse
@@ -28,6 +35,11 @@ from sqlalchemy.orm import Session
 from app.config import Settings
 from app.db import create_session_factory
 from app.models import Payment, PaymentEvent, PaymentStatus
+from app.services.reconciliation_status import (
+    CONFIG_SOURCE_WORKER_CONTAINER,
+    ReconciliationStatusSnapshot,
+    build_reconciliation_status_snapshot,
+)
 from app.services.stuck_payments import StuckCategory, StuckEntry, stuck_payments_overview
 
 
@@ -282,6 +294,155 @@ def _cmd_stuck(db: Session, settings: Settings, *, limit: int, as_json: bool) ->
     return 0
 
 
+# --- reconciliation status: shared snapshot, human + json renderers --------
+
+
+def _fmt_seconds(value: float | None) -> str:
+    return "—" if value is None else f"{value:.0f}s"
+
+
+def _fmt_bool_na(value: bool | None) -> str:
+    if value is None:
+        return "n/a"
+    return "yes" if value else "no"
+
+
+def _reconciliation_status_dict(snapshot: ReconciliationStatusSnapshot) -> dict[str, Any]:
+    runtime, config = snapshot.runtime, snapshot.config
+    buckets, queue, recent = snapshot.buckets, snapshot.queue, snapshot.recent
+    return {
+        "generated_at": _iso(snapshot.generated_at),
+        "runtime": {
+            "enabled": runtime.enabled,
+            "config_source": runtime.config_source,
+            "heartbeat_present": runtime.heartbeat_present,
+            "heartbeat_age_seconds": runtime.heartbeat_age_seconds,
+            "heartbeat_fresh": runtime.heartbeat_fresh,
+            "last_successful_cycle_at": _iso(runtime.last_successful_cycle_at),
+            "last_successful_cycle_age_seconds": runtime.last_successful_cycle_age_seconds,
+            "last_error_code": runtime.last_error_code,
+        },
+        "config": {
+            "min_age_seconds": config.min_age_seconds,
+            "fast_window_seconds": config.fast_window_seconds,
+            "max_age_seconds": config.max_age_seconds,
+            "fast_interval_seconds": config.fast_interval_seconds,
+            "slow_interval_seconds": config.slow_interval_seconds,
+            "scan_interval_seconds": config.scan_interval_seconds,
+            "batch_size": config.batch_size,
+            "max_attempts": config.max_attempts,
+            "slow_tier_reserved_slots": config.slow_tier_reserved_slots,
+        },
+        "buckets": {
+            "total_unverified": buckets.total_unverified,
+            "active": buckets.active,
+            "expiring": buckets.expiring,
+            "aged_out": buckets.aged_out,
+        },
+        "queue": {
+            "active_due": queue.active_due,
+            "expiring_due": queue.expiring_due,
+            "exhausted_not_aged_out": queue.exhausted_not_aged_out,
+            "oldest_active_due_age_seconds": queue.oldest_active_due_age_seconds,
+            "oldest_expiring_due_age_seconds": queue.oldest_expiring_due_age_seconds,
+            "oldest_due_age_seconds": queue.oldest_due_age_seconds,
+        },
+        "recent": {
+            "window_hours": recent.window_hours,
+            "verified": recent.verified,
+            "retry_scheduled": recent.retry_scheduled,
+            "gateway_not_paid": recent.gateway_not_paid,
+            "transport_failed": recent.transport_failed,
+            "exhausted": recent.exhausted,
+        },
+    }
+
+
+def _print_reconciliation_status_human(snapshot: ReconciliationStatusSnapshot) -> None:
+    runtime, config = snapshot.runtime, snapshot.config
+    buckets, queue, recent = snapshot.buckets, snapshot.queue, snapshot.recent
+
+    source_label = (
+        "running worker container"
+        if runtime.config_source == CONFIG_SOURCE_WORKER_CONTAINER
+        else "this process's environment (NOT confirmed to be the worker container)"
+    )
+    if runtime.heartbeat_present:
+        heartbeat_line = (
+            f"present, age {_fmt_seconds(runtime.heartbeat_age_seconds)}, "
+            f"fresh: {_fmt_bool_na(runtime.heartbeat_fresh)}"
+        )
+    elif not runtime.enabled:
+        heartbeat_line = "none recorded (reconciliation disabled)"
+    else:
+        heartbeat_line = "MISSING — reconciliation is enabled but has never heartbeated"
+    last_cycle_line = (
+        f"{_iso(runtime.last_successful_cycle_at)} "
+        f"({_fmt_seconds(runtime.last_successful_cycle_age_seconds)} ago)"
+        if runtime.last_successful_cycle_at is not None
+        else "never recorded"
+    )
+
+    print("🔄 Reconciliation Status")
+    print("========================")
+    print(f"(config source: {source_label})")
+    print()
+    print("Runtime:")
+    print(f"  enabled:                  {'yes' if runtime.enabled else 'no'}")
+    print(f"  heartbeat:                {heartbeat_line}")
+    print(f"  last successful pass:     {last_cycle_line}")
+    if runtime.last_error_code:
+        print(f"  last pass error:          {runtime.last_error_code}")
+    print()
+    print("Effective configuration:")
+    print(f"  min_age:                  {config.min_age_seconds}s")
+    print(f"  active window:            < {config.fast_window_seconds}s")
+    print(
+        f"  expiring window:          {config.fast_window_seconds}s "
+        f"- {config.max_age_seconds}s"
+    )
+    print(f"  max_age:                  {config.max_age_seconds}s")
+    print(f"  fast_interval:            {config.fast_interval_seconds}s")
+    print(f"  slow_interval:            {config.slow_interval_seconds}s")
+    print(f"  scan_interval:            {config.scan_interval_seconds}s")
+    print(f"  batch_size:               {config.batch_size}")
+    print(f"  max_attempts:             {config.max_attempts}")
+    print(f"  slow_tier_reserved_slots: {config.slow_tier_reserved_slots}")
+    print()
+    print("Payment buckets (link_created, unverified):")
+    print(f"  total:                    {buckets.total_unverified}")
+    print(f"  active:                   {buckets.active}")
+    print(f"  expiring:                 {buckets.expiring}")
+    print(f"  aged_out:                 {buckets.aged_out}")
+    print()
+    print("Queue health (due now):")
+    print(f"  active_due:               {queue.active_due}")
+    print(f"  expiring_due:             {queue.expiring_due}")
+    print(f"  exhausted (within auto-reconciliation lifetime): {queue.exhausted_not_aged_out}")
+    print(f"  oldest active due age:    {_fmt_seconds(queue.oldest_active_due_age_seconds)}")
+    print(f"  oldest expiring due age:  {_fmt_seconds(queue.oldest_expiring_due_age_seconds)}")
+    print(f"  oldest due age (overall): {_fmt_seconds(queue.oldest_due_age_seconds)}")
+    print()
+    print(f"Recent activity (last {recent.window_hours}h):")
+    print(f"  verified:                 {recent.verified}")
+    print(f"  retry_scheduled:          {recent.retry_scheduled}  (normal polling)")
+    print(
+        f"  gateway_not_paid:         {recent.gateway_not_paid}  "
+        "(informational — gateway not yet confirming payment)"
+    )
+    print(f"  transport_failed:         {recent.transport_failed}  (attention)")
+    print(f"  exhausted_not_aged_out:   {recent.exhausted}  (attention)")
+
+
+def _cmd_reconciliation_status(db: Session, settings: Settings, *, as_json: bool) -> int:
+    snapshot = build_reconciliation_status_snapshot(db, settings)
+    if as_json:
+        _print(_reconciliation_status_dict(snapshot))
+    else:
+        _print_reconciliation_status_human(snapshot)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -305,6 +466,19 @@ def build_parser() -> argparse.ArgumentParser:
     stuck.add_argument(
         "--json", action="store_true", dest="as_json", help="one JSON object per line"
     )
+    reconciliation = subparsers.add_parser(
+        "reconciliation", help="reconciliation runtime/config/queue status (read-only)"
+    )
+    reconciliation_sub = reconciliation.add_subparsers(
+        dest="reconciliation_command", required=True
+    )
+    reconciliation_status = reconciliation_sub.add_parser(
+        "status",
+        help="reconciliation runtime, effective config, payment buckets, and queue health",
+    )
+    reconciliation_status.add_argument(
+        "--json", action="store_true", dest="as_json", help="one JSON object"
+    )
     return parser
 
 
@@ -322,6 +496,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_retry_queue(db)
         if args.command == "manual-review":
             return _cmd_manual_review(db)
+        if args.command == "reconciliation":
+            return _cmd_reconciliation_status(db, settings, as_json=args.as_json)
         return _cmd_stuck(db, settings, limit=args.limit, as_json=args.as_json)
     except BrokenPipeError:
         # Piping into head/less that exits early is not an error.

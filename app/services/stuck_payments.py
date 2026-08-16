@@ -48,7 +48,11 @@ from sqlalchemy.orm import Session
 from app.adminbot import queries
 from app.config import Settings
 from app.models import Payment, PaymentStatus
-from app.services.reconciliation import ERROR_GATEWAY_NOT_PAID, link_age_anchor
+from app.services.reconciliation import (
+    ERROR_GATEWAY_NOT_PAID,
+    link_age_anchor,
+    reconciliation_exhausted_conditions,
+)
 
 NowFn = Callable[[], datetime]
 
@@ -161,13 +165,11 @@ def _link_created_buckets(
     expired_conditions = (*base_conditions, anchor <= expired_cutoff)
     # "Exhausted" is the only way reconciliation_next_at can be NULL on a
     # still-link_created, not-yet-expired row with a nonzero attempt count
-    # (see reconciliation.py::_finalize) — never re-derived from anything
-    # but these two columns, and never touches the claim path.
-    exhausted_conditions = (
-        *not_expired,
-        Payment.reconciliation_next_at.is_(None),
-        Payment.reconciliation_attempts >= settings.reconciliation_max_attempts,
-    )
+    # (see reconciliation.py::_finalize) — shared with reconciliation_status.py
+    # via the same pure predicate builder, so the two read-only views can
+    # never quietly disagree about what "exhausted" means; never touches the
+    # claim path.
+    exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
     waiting_conditions = (
         *not_expired,
         or_(

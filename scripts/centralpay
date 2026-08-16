@@ -59,6 +59,11 @@ Inspection:
   diagnose               Full system diagnosis (no secrets printed)
   stuck [--limit N] [--json]  Categorized view of payments needing attention
                           (need attention / waiting gateway / expired links)
+  reconciliation status [--json]
+                          Reconciliation runtime, effective configuration,
+                          payment buckets, and queue health. Reads the
+                          WORKER container's live configuration (never api,
+                          which can be stale after a worker-only redeploy).
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
@@ -787,6 +792,33 @@ cmd_app_cli() {
     compose exec -T api python -m app.cli "$@"
 }
 
+cmd_reconciliation() {
+    require_install
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status)
+            # Reconciliation configuration lives in the WORKER process.
+            # Production may recreate only the worker after a
+            # RECONCILIATION_* environment change — containers only re-read
+            # the env file at creation, so the api container's process
+            # environment can stay stale for an arbitrary amount of time
+            # after such a change (see docker-compose.yml's worker service
+            # comment). Routing here to the worker container — deliberately
+            # never api, and with no fallback to it — is what keeps this
+            # command from silently reporting stale configuration. If the
+            # worker container is not running, this fails loudly instead of
+            # falling back: a down worker means reconciliation is not
+            # running at all, which is itself the operationally correct
+            # thing to surface, not something to paper over.
+            compose exec -T worker python -m app.cli reconciliation status "$@"
+            ;;
+        *)
+            fail "Unknown reconciliation subcommand: ${sub} (status)"
+            ;;
+    esac
+}
+
 cmd_credentials() {
     require_root credentials
     [[ -f "$CREDENTIALS_FILE" ]] || fail "No credentials file at ${CREDENTIALS_FILE}."
@@ -940,6 +972,7 @@ main() {
         fee)           cmd_fee "$@" ;;
         diagnose)      cmd_diagnose "$@" ;;
         stuck)         cmd_app_cli stuck "$@" ;;
+        reconciliation) cmd_reconciliation "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;
         retry-queue)   cmd_app_cli retry-queue "$@" ;;
