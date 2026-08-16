@@ -18,6 +18,7 @@ from app.adminbot.alerts import alert_delivery_pass
 from app.adminbot.auth import UpdateContext
 from app.adminbot.commands import CommandHandlers, default_api_probe
 from app.adminbot.health import HealthMonitor
+from app.adminbot.reply_delivery import deliver_reply_chunks
 from app.adminbot.reports import maybe_queue_daily_report
 from app.adminbot.telegram import TelegramAlertSender
 from app.config import Settings
@@ -75,14 +76,11 @@ class AdminBotService:
             return
         command, args = parsed
         replies = await asyncio.to_thread(self.handlers.handle, ctx, command, args)
-        for reply in replies:
-            try:
-                await message.reply_text(
-                    reply, parse_mode="HTML", disable_web_page_preview=True
-                )
-            except Exception:
-                logger.exception("admin_reply_failed", extra={"command": command})
-                break
+
+        async def send(text: str) -> object:
+            return await message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+        await deliver_reply_chunks(replies, send, command=command)
 
     async def background_loop(self) -> None:
         heartbeat = Path(self.settings.admin_bot_heartbeat_file)
