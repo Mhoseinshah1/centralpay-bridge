@@ -384,8 +384,8 @@ def test_management_cli_syntax_and_help():
     assert result.returncode == 0
     for command in (
         "status", "logs", "logs-errors", "restart", "stop", "start", "update",
-        "migrate", "backup", "backups", "restore", "diagnose", "stuck", "payment",
-        "recent", "retry-queue", "manual-review", "credentials", "ssl",
+        "migrate", "backup", "backups", "restore", "diagnose", "stuck", "reconciliation",
+        "payment", "recent", "retry-queue", "manual-review", "credentials", "ssl",
         "version", "uninstall",
     ):
         assert command in result.stdout, f"help must document {command}"
@@ -396,6 +396,24 @@ def test_management_cli_never_dumps_env_file():
     # The env file may be grepped for single non-secret values, but never
     # printed wholesale.
     assert not re.search(r"cat .*ENV_FILE", text)
+
+
+def test_reconciliation_status_targets_worker_container_not_api():
+    """The task's core safety requirement: reconciliation configuration
+    lives in the worker process (docker-compose.yml keeps RECONCILIATION_*
+    live there), so `centralpay reconciliation status` must always read the
+    worker container's live environment and must NEVER silently fall back
+    to api (which can be stale after a worker-only redeploy)."""
+    text = MANAGEMENT.read_text()
+    body = text[text.index("cmd_reconciliation()") : text.index("cmd_credentials()")]
+    assert "compose exec -T worker python -m app.cli reconciliation status" in body
+    assert "compose exec -T api" not in body
+
+
+def test_main_dispatch_routes_reconciliation_to_cmd_reconciliation():
+    text = MANAGEMENT.read_text()
+    dispatch = text[text.index("main() {") :]
+    assert re.search(r'reconciliation\)\s*cmd_reconciliation "\$@" ;;', dispatch)
 
 
 def test_restore_requires_confirmation():

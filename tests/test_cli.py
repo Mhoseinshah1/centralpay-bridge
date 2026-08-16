@@ -131,3 +131,108 @@ def test_stuck_ordering_is_attention_then_waiting_then_expired(
     # ordering itself is covered by
     # test_stuck_payments.py::test_ordered_priority_is_attention_then_waiting_then_expired.
     assert categories == ["waiting_gateway"]
+
+
+# --- reconciliation status ---------------------------------------------------
+
+
+def test_reconciliation_status_parser_defaults():
+    args = build_parser().parse_args(["reconciliation", "status"])
+    assert args.command == "reconciliation"
+    assert args.reconciliation_command == "status"
+    assert args.as_json is False
+
+
+def test_reconciliation_status_parser_json_flag():
+    args = build_parser().parse_args(["reconciliation", "status", "--json"])
+    assert args.as_json is True
+
+
+def test_reconciliation_status_human_output(cli_env, capsys):
+    assert cli_main(["reconciliation", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "🔄 Reconciliation Status" in out
+    assert "config source:" in out
+    assert "enabled:                  yes" in out
+    assert "Effective configuration:" in out
+    assert "Payment buckets" in out
+    assert "Queue health" in out
+    assert "Recent activity" in out
+    assert "exhausted (within auto-reconciliation lifetime)" in out
+
+
+def test_reconciliation_status_json_output_shape(cli_env, capsys):
+    assert cli_main(["reconciliation", "status", "--json"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") == 1  # exactly one JSON object
+    payload = json.loads(out)
+    assert set(payload) == {"generated_at", "runtime", "config", "buckets", "queue", "recent"}
+    assert payload["runtime"]["enabled"] is True
+    assert payload["config"]["fast_window_seconds"] == cli_env.reconciliation_fast_window_seconds
+    assert payload["buckets"] == {
+        "total_unverified": 0,
+        "active": 0,
+        "expiring": 0,
+        "aged_out": 0,
+    }
+    assert payload["queue"]["exhausted_not_aged_out"] == 0
+    assert payload["recent"]["window_hours"] == 24
+
+
+def test_reconciliation_status_disabled_shows_heartbeat_not_applicable(
+    cli_env, monkeypatch, capsys
+):
+    import app.cli as cli_module
+
+    disabled = cli_env.model_copy(update={"reconciliation_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    assert cli_main(["reconciliation", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runtime"]["enabled"] is False
+    assert payload["runtime"]["heartbeat_fresh"] is None
+
+
+def test_reconciliation_status_recent_exhausted_label_is_distinct_from_queue(
+    cli_env, session_factory, capsys
+):
+    """Regression: recent.exhausted (a `reconciliation_exhausted` EVENT count
+    within the window) must never be rendered with the queue's
+    `exhausted_not_aged_out` label — a payment can have raised that event and
+    since aged out, so the two counts are not the same guarantee and can
+    legitimately diverge (here: 1 recent event, 0 still-not-aged-out)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import Payment, PaymentEvent, PaymentStatus
+
+    now = datetime.now(UTC)
+    aged_out_at = now - timedelta(seconds=cli_env.reconciliation_max_age_seconds + 60)
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="cli-exhausted-recent",
+            gateway_order_id=999001,
+            gateway_user_id=1,
+            amount=10000,
+            payable_amount=10000,
+            status=PaymentStatus.LINK_CREATED.value,
+            created_at=aged_out_at,
+            callback_token_issued_at=aged_out_at,
+            reconciliation_attempts=cli_env.reconciliation_max_attempts,
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+        db.add(
+            PaymentEvent(
+                payment_id=payment.id,
+                event_type="reconciliation_exhausted",
+                created_at=now - timedelta(hours=1),
+            )
+        )
+        db.commit()
+
+    assert cli_main(["reconciliation", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "exhausted (within auto-reconciliation lifetime): 0" in out
+    assert "  exhausted:                1  (attention)" in out
+    assert "exhausted_not_aged_out" not in out

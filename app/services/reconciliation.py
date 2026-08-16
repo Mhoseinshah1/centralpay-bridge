@@ -150,6 +150,80 @@ def link_age_anchor() -> Any:
     return func.coalesce(Payment.callback_token_issued_at, Payment.created_at)
 
 
+def tier_due_conditions(
+    settings: Settings,
+    *,
+    now: datetime,
+    age_floor: timedelta,
+    age_ceiling: timedelta,
+) -> tuple[Any, ...]:
+    """Pure WHERE-condition builder: is a ``link_created`` payment due for
+    reconciliation in the age tier ``[age_floor, age_ceiling)``?
+
+    Extracted from ``_claim_in_age_range`` so read-only reporting (e.g.
+    ``app.services.reconciliation_status``) can mirror selection semantics
+    EXACTLY — by construction, not by re-derivation — without ever calling
+    the mutating claim path itself. Never locks, never orders, never limits;
+    the claim path adds those on top of these same conditions.
+    """
+    link_age_anchor_expr = link_age_anchor()
+    return (
+        # ONLY stuck link_created rows: verified / notification /
+        # manual_review / created / getlink_failed states never match.
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),  # belt-and-braces
+        link_age_anchor_expr <= now - age_floor,  # age >= age_floor
+        link_age_anchor_expr > now - age_ceiling,  # age < age_ceiling
+        or_(
+            Payment.reconciliation_next_at.is_(None),
+            Payment.reconciliation_next_at <= now,
+        ),
+        Payment.reconciliation_attempts < settings.reconciliation_max_attempts,
+    )
+
+
+def active_tier_due_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """The <fast-window (default 15 min) tier's due predicate — read-only
+    counterpart of ``_claim_active_tier``."""
+    return tier_due_conditions(
+        settings,
+        now=now,
+        age_floor=timedelta(seconds=settings.reconciliation_min_age_seconds),
+        age_ceiling=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+    )
+
+
+def expiring_tier_due_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """The fast-window-to-max-age (default 15 min-2 h) tier's due predicate —
+    read-only counterpart of ``_claim_expiring_tier``."""
+    return tier_due_conditions(
+        settings,
+        now=now,
+        age_floor=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+        age_ceiling=timedelta(seconds=settings.reconciliation_max_age_seconds),
+    )
+
+
+def reconciliation_exhausted_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """A ``link_created`` payment whose reconciliation attempts are exhausted
+    but which has NOT (yet) aged out — i.e. polling stopped at the attempts
+    cap while the payment was still inside the reconciliation lifetime.
+    Deliberately excludes aged-out rows: those are reported separately (see
+    ``reconciliation_status.py``'s ``aged_out`` bucket and
+    ``stuck_payments.py``'s ``EXPIRED`` category), which always takes
+    priority over "exhausted" for operator-facing categorization.
+    """
+    link_age_anchor_expr = link_age_anchor()
+    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    return (
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),
+        link_age_anchor_expr > expired_cutoff,  # NOT aged out
+        Payment.reconciliation_next_at.is_(None),
+        Payment.reconciliation_attempts >= settings.reconciliation_max_attempts,
+    )
+
+
 def _claim_in_age_range(
     db: Session,
     settings: Settings,
@@ -173,22 +247,12 @@ def _claim_in_age_range(
     path) — that lock IS the double-settlement guard. SKIP LOCKED makes a
     second worker pick a different row instead of waiting.
     """
-    link_age_anchor_expr = link_age_anchor()
+    due_conditions = tier_due_conditions(
+        settings, now=now, age_floor=age_floor, age_ceiling=age_ceiling
+    )
     payment = db.execute(
         select(Payment)
-        .where(
-            # ONLY stuck link_created rows: verified / notification /
-            # manual_review / created / getlink_failed states never match.
-            Payment.status == PaymentStatus.LINK_CREATED.value,
-            Payment.gateway_verified_at.is_(None),  # belt-and-braces
-            link_age_anchor_expr <= now - age_floor,  # age >= age_floor
-            link_age_anchor_expr > now - age_ceiling,  # age < age_ceiling
-            or_(
-                Payment.reconciliation_next_at.is_(None),
-                Payment.reconciliation_next_at <= now,
-            ),
-            Payment.reconciliation_attempts < settings.reconciliation_max_attempts,
-        )
+        .where(*due_conditions)
         .order_by(func.coalesce(Payment.reconciliation_next_at, Payment.created_at).asc())
         .limit(1)
         .with_for_update(skip_locked=True)
