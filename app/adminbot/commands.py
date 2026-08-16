@@ -7,6 +7,7 @@ full card numbers, and untrusted external error text never appear in output.
 """
 
 import logging
+import re
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -21,17 +22,20 @@ from app.adminbot.format import (
     PENDING,
     REVIEW,
     WARN,
+    bot_delivery_entry_block,
     esc,
+    expired_entry_block,
     fmt_amount,
     fmt_time,
+    fmt_time_only_fa,
     payment_block,
     payment_status_fa,
     split_message,
-    stuck_entry_block,
-    stuck_summary_lines,
+    waiting_entry_block,
 )
 from app.audit import record_event
 from app.config import Settings
+from app.services import stuck_payments as stuck_service
 from app.services.bulk_resend import (
     PREVIEW_ORDER_LIMIT,
     BulkResendPreview,
@@ -39,13 +43,28 @@ from app.services.bulk_resend import (
     preview_bulk_resend,
     requeue_failed_deliveries,
 )
-from app.services.stuck_payments import stuck_payments_overview
 from app.version import APP_VERSION
 
 logger = logging.getLogger("app.adminbot.commands")
 
 RECENT_DEFAULT = 10
 RECENT_MAX = 50
+
+# /waiting and /expired share this default/maximum (kept as separate
+# constants from RECENT_DEFAULT/RECENT_MAX even though numerically equal,
+# so a future change to one command's limits never silently changes the
+# other's).
+LIST_DEFAULT = 10
+LIST_MAX = 50
+
+# At most this many detailed bot-delivery rows in /stuck, before the
+# progressive-length-reduction loop even runs.
+STUCK_DETAIL_MAX = 10
+
+_ASCII_DIGITS = re.compile(r"[0-9]+")
+
+WAITING_USAGE_ERROR = "فرمت صحیح:\n/waiting [1-50]"
+EXPIRED_USAGE_ERROR = "فرمت صحیح:\n/expired [1-50]"
 
 # Fixed rejection shown for /resend_failed (preview AND confirm) when the
 # customer bot's idempotency is not guaranteed. No payment row is modified.
@@ -60,6 +79,26 @@ ApiProbe = Callable[[], dict[str, bool]]
 
 def _mark(ok: bool) -> str:
     return OK if ok else FAIL
+
+
+def _parse_list_count(args: list[str]) -> int | None:
+    """/waiting and /expired's shared argument contract: no argument means
+    LIST_DEFAULT; exactly one ASCII-decimal integer in [1, LIST_MAX] is
+    accepted; anything else (zero, negative, non-numeric, out of range,
+    multiple arguments, non-ASCII digits) returns None so the caller shows
+    a short usage error instead of silently falling back to a default or
+    clamping to the bound."""
+    if not args:
+        return LIST_DEFAULT
+    if len(args) > 1:
+        return None
+    token = args[0]
+    if not _ASCII_DIGITS.fullmatch(token):
+        return None
+    value = int(token)
+    if not (1 <= value <= LIST_MAX):
+        return None
+    return value
 
 
 class CommandHandlers:
@@ -152,6 +191,8 @@ class CommandHandlers:
             "health": self.cmd_health,
             "recent": self.cmd_recent,
             "stuck": self.cmd_stuck,
+            "waiting": self.cmd_waiting,
+            "expired": self.cmd_expired,
             "manual_review": self.cmd_manual_review,
             "resolved_reviews": self.cmd_resolved_reviews,
             "errors": self.cmd_errors,
@@ -183,9 +224,9 @@ class CommandHandlers:
                 f"محیط: {esc(self._settings.environment)}",
                 f"نسخه: {esc(APP_VERSION)}",
                 "",
-                "دستورها: /status /health /recent /stuck /manual_review",
-                "/resolved_reviews /errors /payment /retry_queue /resend_failed",
-                "/backup_status /version /fee /help",
+                "دستورها: /status /health /recent /stuck /waiting /expired",
+                "/manual_review /resolved_reviews /errors /payment /retry_queue",
+                "/resend_failed /backup_status /version /fee /help",
                 "",
                 f"{WARN} این ربات فقط برای دیدبانی عملیاتی است. "
                 "پاسخ 2xx ربات فروش به معنی واریز قطعی اعتبار مشتری نیست.",
@@ -201,7 +242,9 @@ class CommandHandlers:
                 "/status — وضعیت کلی سرویس‌ها و صف‌ها",
                 "/health — جزئیات سلامت اجزا",
                 "/recent [n] — آخرین پرداخت‌ها (حداکثر ۵۰)",
-                "/stuck — پرداخت‌های نیازمند توجه با دلیل دقیق",
+                "/stuck — خطاهای تحویل به ربات فروش",
+                "/waiting [n] — پرداخت‌های در انتظار تأیید درگاه (حداکثر ۵۰)",
+                "/expired [n] — لینک‌های منقضی‌شده (حداکثر ۵۰)",
                 "/manual_review — بررسی‌های دستی باز (تعیین‌تکلیف‌نشده)",
                 "/resolved_reviews [n] — بررسی‌های تعیین‌تکلیف‌شده (حداکثر ۵۰)",
                 "/errors — خلاصهٔ خطاهای ۲۴ ساعت اخیر",
@@ -336,29 +379,157 @@ class CommandHandlers:
         return self._split("\n".join(blocks))
 
     def cmd_stuck(self, db: Session, args: list[str]) -> list[str]:
-        """Categorized read-only overview: need-attention, waiting-gateway,
-        and expired-link payments, in that fixed priority order. Shares its
-        categorization with `centralpay stuck` via
-        app.services.stuck_payments — the two surfaces can never disagree.
+        """ONLY bot-delivery problems: payments that failed, or are stuck
+        trying, to reach the customer bot's webhook (open manual-review rows
+        whose `bot_notify_reason` is set, plus stale/old bot_notify_pending
+        rows). See app.adminbot.queries.bot_delivery_stuck_entries /
+        _bot_delivery_manual_review_conditions for the exact predicate.
+
+        Deliberately excludes financial/verification manual-review rows
+        (amount/user/reference mismatches — never a delivery problem),
+        reconciliation-exhausted rows, and unexpected-status rows: those
+        remain visible via /manual_review, /errors, and the "other" summary
+        line here, never mixed into the detailed list.
+
+        Intentional UX change from the previous /stuck: no longer accepts a
+        numeric argument (it showed three unrelated categories at once, so a
+        display limit applied to all of them together; no existing test or
+        documented usage relied on `/stuck N`). At most STUCK_DETAIL_MAX
+        entries are shown, chosen once a truthful bot-delivery total is
+        already known — never split_message'd into multiple messages:
+        entries are progressively reduced until the single message fits
+        admin_bot_max_message_length.
         """
-        limit = RECENT_MAX
-        if args and args[0].isdigit():
-            limit = min(int(args[0]), RECENT_MAX)
-        overview = stuck_payments_overview(db, self._settings)
-        ordered = overview.ordered()
-        if not ordered:
-            return [f"{OK} هیچ پرداختی نیازمند توجه نیست."]
-        tz = self._settings.admin_bot_timezone
-        shown = ordered[:limit]
-        blocks = list(stuck_summary_lines(overview))
-        for index, entry in enumerate(shown, start=1):
-            blocks.append("")
-            blocks.append(stuck_entry_block(index, entry, tz))
-        remaining = len(ordered) - len(shown)
-        if remaining > 0:
-            blocks.append("")
-            blocks.append(f"... {fmt_amount(remaining)} مورد دیگر نمایش داده نشد.")
-        return self._split("\n".join(blocks))
+        now = datetime.now(UTC)
+        settings = self._settings
+        bot_delivery_total = queries.count_bot_delivery_problems(
+            db, pending_age_minutes=30
+        )
+        waiting_total = stuck_service.count_waiting(db, settings, now=now)
+        expired_total = stuck_service.count_expired(db, settings, now=now)
+        other_total = stuck_service.count_other_attention(db, settings, now=now)
+        entries = queries.bot_delivery_stuck_entries(
+            db,
+            claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
+            limit=STUCK_DETAIL_MAX,
+        )
+        header = self._stuck_header(bot_delivery_total, waiting_total, expired_total, other_total)
+        shown_count = len(entries)
+        text = self._assemble_stuck_message(header, entries, bot_delivery_total, now)
+        while len(text) > settings.admin_bot_max_message_length and shown_count > 0:
+            shown_count -= 1
+            text = self._assemble_stuck_message(
+                header, entries[:shown_count], bot_delivery_total, now
+            )
+        return [text]
+
+    def _stuck_header(
+        self, bot_delivery_total: int, waiting_total: int, expired_total: int, other_total: int
+    ) -> list[str]:
+        status_line = (
+            "🟠 وضعیت کلی: نیازمند توجه" if bot_delivery_total > 0 else f"{OK} وضعیت کلی: سالم"
+        )
+        lines = [
+            "⚠️ گزارش پرداخت‌های نیازمند بررسی",
+            "",
+            status_line,
+            "",
+            "📊 خلاصه",
+            f"• خطای ارسال به ربات: {fmt_amount(bot_delivery_total)}",
+            f"• در انتظار تأیید درگاه: {fmt_amount(waiting_total)}",
+            f"• لینک‌های منقضی‌شده: {fmt_amount(expired_total)}",
+        ]
+        if other_total > 0:
+            lines.append(f"• سایر موارد نیازمند بررسی: {fmt_amount(other_total)}")
+        return lines
+
+    def _assemble_stuck_message(
+        self,
+        header: list[str],
+        shown_entries: list[queries.StuckEntry],
+        total: int,
+        now: datetime,
+    ) -> str:
+        lines = list(header)
+        lines.append("")
+        if total == 0:
+            lines.append(f"{OK} خطایی در تحویل به ربات وجود ندارد.")
+        else:
+            lines.append("🔥 خطاهای ارسال به ربات")
+            for index, entry in enumerate(shown_entries, start=1):
+                lines.append("")
+                lines.append(bot_delivery_entry_block(index, entry, now))
+        lines.append("")
+        lines.append("━━━━━━━━━━━━━━")
+        if total > 0:
+            lines.append(f"نمایش {fmt_amount(len(shown_entries))} مورد از {fmt_amount(total)} مورد")
+            remaining = total - len(shown_entries)
+            if remaining > 0:
+                lines.append(f"+ {fmt_amount(remaining)} مورد دیگر نمایش داده نشد")
+            lines.append("")
+        lines.append("برای مشاهده:")
+        lines.append("🟡 /waiting — در انتظار درگاه")
+        lines.append("⚪ /expired — لینک‌های منقضی‌شده")
+        lines.append("")
+        lines.append(f"🕒 به‌روزرسانی: {fmt_time_only_fa(now, self._settings.admin_bot_timezone)}")
+        return "\n".join(lines)
+
+    def cmd_waiting(self, db: Session, args: list[str]) -> list[str]:
+        """ONLY StuckCategory.WAITING_GATEWAY payments, longest-waiting
+        (oldest link-age anchor) first — the operator's most urgent view.
+        Read-only: no verify action, no retry action, no mutation."""
+        limit = _parse_list_count(args)
+        if limit is None:
+            return [WAITING_USAGE_ERROR]
+        now = datetime.now(UTC)
+        settings = self._settings
+        total = stuck_service.count_waiting(db, settings, now=now)
+        entries = stuck_service.waiting_entries_by_urgency(db, settings, now=now, limit=limit)
+        lines = ["🟡 <b>پرداخت‌های در انتظار تأیید درگاه</b>", "", f"تعداد کل: {fmt_amount(total)}"]
+        if not entries:
+            lines.append("")
+            lines.append(f"{OK} در حال حاضر پرداختی در انتظار تأیید درگاه نیست.")
+        else:
+            for index, entry in enumerate(entries, start=1):
+                lines.append("")
+                lines.append(waiting_entry_block(index, entry, now))
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━")
+            lines.append(f"نمایش {fmt_amount(len(entries))} مورد از {fmt_amount(total)} مورد")
+            if total > len(entries):
+                suggested = min(total, LIST_MAX)
+                lines.append("")
+                lines.append(f"/waiting {suggested} — نمایش {suggested} مورد")
+        return self._split("\n".join(lines))
+
+    def cmd_expired(self, db: Session, args: list[str]) -> list[str]:
+        """ONLY StuckCategory.EXPIRED payments, MOST RECENTLY expired
+        (newest link-age anchor still past the cutoff) first — showing the
+        oldest legacy rows by default would bury what just expired. Read-only:
+        no verify action, no retry action, no mutation."""
+        limit = _parse_list_count(args)
+        if limit is None:
+            return [EXPIRED_USAGE_ERROR]
+        now = datetime.now(UTC)
+        settings = self._settings
+        total = stuck_service.count_expired(db, settings, now=now)
+        entries = stuck_service.expired_entries_by_recency(db, settings, now=now, limit=limit)
+        lines = ["⚪ <b>لینک‌های منقضی‌شده</b>", "", f"تعداد کل: {fmt_amount(total)}"]
+        if not entries:
+            lines.append("")
+            lines.append(f"{OK} در حال حاضر لینک منقضی‌شده‌ای وجود ندارد.")
+        else:
+            for index, entry in enumerate(entries, start=1):
+                lines.append("")
+                lines.append(expired_entry_block(index, entry, now))
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━")
+            lines.append(f"نمایش {fmt_amount(len(entries))} مورد از {fmt_amount(total)} مورد")
+            if total > len(entries):
+                suggested = min(total, LIST_MAX)
+                lines.append("")
+                lines.append(f"/expired {suggested} — نمایش {suggested} مورد")
+        return self._split("\n".join(lines))
 
     def cmd_manual_review(self, db: Session, args: list[str]) -> list[str]:
         payments = queries.manual_review_payments(db)

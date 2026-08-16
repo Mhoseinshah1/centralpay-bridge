@@ -152,17 +152,133 @@ def _reused_needs_attention(db: Session, settings: Settings) -> list[StuckEntry]
     ]
 
 
+def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """A link_created, unverified payment younger than the hard
+    reconciliation lifetime and not exhausted: ordinary in-flight polling.
+    Shared by the overview's WAITING_GATEWAY bucket and
+    ``waiting_entries_by_urgency``/``count_waiting`` so they can never
+    disagree about the definition."""
+    anchor = link_age_anchor()
+    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    return (
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),
+        anchor > expired_cutoff,
+        or_(
+            Payment.reconciliation_next_at.is_not(None),
+            Payment.reconciliation_attempts < settings.reconciliation_max_attempts,
+        ),
+    )
+
+
+def _expired_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """A link_created, unverified payment at or past
+    reconciliation_max_age_seconds. Shared by the overview's EXPIRED bucket
+    and ``expired_entries_by_recency``/``count_expired``."""
+    anchor = link_age_anchor()
+    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    return (
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),
+        anchor <= expired_cutoff,
+    )
+
+
+def _waiting_entry(payment: Payment) -> StuckEntry:
+    return StuckEntry(
+        payment=payment,
+        category=StuckCategory.WAITING_GATEWAY,
+        reason="link_created",
+        gateway_state=_gateway_state(payment),
+    )
+
+
+def _expired_entry(payment: Payment) -> StuckEntry:
+    return StuckEntry(
+        payment=payment,
+        category=StuckCategory.EXPIRED,
+        reason="reconciliation_max_age_exceeded",
+        gateway_state=_gateway_state(payment),
+    )
+
+
+def count_waiting(db: Session, settings: Settings, *, now: datetime) -> int:
+    """EXACT count of WAITING_GATEWAY payments (unbounded, no _QUERY_CAP)."""
+    return db.execute(
+        select(func.count(Payment.id)).where(*_waiting_conditions(settings, now=now))
+    ).scalar_one()
+
+
+def count_expired(db: Session, settings: Settings, *, now: datetime) -> int:
+    """EXACT count of EXPIRED payments (unbounded, no _QUERY_CAP)."""
+    return db.execute(
+        select(func.count(Payment.id)).where(*_expired_conditions(settings, now=now))
+    ).scalar_one()
+
+
+def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> int:
+    """EXACT count of NEEDS_ATTENTION entries that are NOT a bot-delivery
+    problem: reconciliation-exhausted (a financial/reconciliation state) and
+    unexpected-status rows (a system anomaly). Deliberately excludes the
+    reused manual-review/stale-notification bucket entirely — that one is
+    covered exactly by ``app.adminbot.queries.count_bot_delivery_problems``
+    (delivery reasons) and non-delivery manual-review reasons, which this
+    function does not attempt to separately count (see module docstring)."""
+    exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
+    exhausted_total = db.execute(
+        select(func.count(Payment.id)).where(*exhausted_conditions)
+    ).scalar_one()
+    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
+    unexpected_total = db.execute(
+        select(func.count(Payment.id)).where(
+            Payment.status.in_(_UNEXPECTED_STATUSES), Payment.created_at <= cutoff
+        )
+    ).scalar_one()
+    return exhausted_total + unexpected_total
+
+
+def waiting_entries_by_urgency(
+    db: Session, settings: Settings, *, now: datetime, limit: int
+) -> list[StuckEntry]:
+    """WAITING_GATEWAY rows ordered longest-waiting (oldest link-age anchor)
+    first — the operationally most urgent ordering for ``/waiting``: these
+    payments have been polling the gateway without resolution the longest.
+    A fresh, directly-limited query (not a slice of the overview's capped
+    list) so `/waiting N` is correct regardless of total row count."""
+    anchor = link_age_anchor()
+    rows = db.execute(
+        select(Payment)
+        .where(*_waiting_conditions(settings, now=now))
+        .order_by(anchor.asc())
+        .limit(limit)
+    ).scalars()
+    return [_waiting_entry(payment) for payment in rows]
+
+
+def expired_entries_by_recency(
+    db: Session, settings: Settings, *, now: datetime, limit: int
+) -> list[StuckEntry]:
+    """EXPIRED rows ordered MOST RECENTLY expired (newest link-age anchor
+    that is still past the cutoff) first. With potentially thousands of
+    expired rows accumulating over the deployment's lifetime, the
+    overview's ascending-and-capped ``expired`` list would only ever
+    surface the most ancient legacy rows — never useful for an operator
+    checking what JUST expired. A fresh, directly-limited, descending query
+    instead."""
+    anchor = link_age_anchor()
+    rows = db.execute(
+        select(Payment)
+        .where(*_expired_conditions(settings, now=now))
+        .order_by(anchor.desc())
+        .limit(limit)
+    ).scalars()
+    return [_expired_entry(payment) for payment in rows]
+
+
 def _link_created_buckets(
     db: Session, settings: Settings, now: datetime
 ) -> tuple[list[StuckEntry], list[StuckEntry], list[StuckEntry], dict[str, int]]:
     anchor = link_age_anchor()
-    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
-    base_conditions: tuple[Any, ...] = (
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),
-    )
-    not_expired = (*base_conditions, anchor > expired_cutoff)
-    expired_conditions = (*base_conditions, anchor <= expired_cutoff)
     # "Exhausted" is the only way reconciliation_next_at can be NULL on a
     # still-link_created, not-yet-expired row with a nonzero attempt count
     # (see reconciliation.py::_finalize) — shared with reconciliation_status.py
@@ -170,13 +286,8 @@ def _link_created_buckets(
     # never quietly disagree about what "exhausted" means; never touches the
     # claim path.
     exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
-    waiting_conditions = (
-        *not_expired,
-        or_(
-            Payment.reconciliation_next_at.is_not(None),
-            Payment.reconciliation_attempts < settings.reconciliation_max_attempts,
-        ),
-    )
+    waiting_conditions = _waiting_conditions(settings, now=now)
+    expired_conditions = _expired_conditions(settings, now=now)
 
     def count(conditions: tuple[Any, ...]) -> int:
         return db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
@@ -200,24 +311,8 @@ def _link_created_buckets(
         )
         for payment in rows(exhausted_conditions)
     ]
-    waiting = [
-        StuckEntry(
-            payment=payment,
-            category=StuckCategory.WAITING_GATEWAY,
-            reason="link_created",
-            gateway_state=_gateway_state(payment),
-        )
-        for payment in rows(waiting_conditions)
-    ]
-    expired = [
-        StuckEntry(
-            payment=payment,
-            category=StuckCategory.EXPIRED,
-            reason="reconciliation_max_age_exceeded",
-            gateway_state=_gateway_state(payment),
-        )
-        for payment in rows(expired_conditions)
-    ]
+    waiting = [_waiting_entry(payment) for payment in rows(waiting_conditions)]
+    expired = [_expired_entry(payment) for payment in rows(expired_conditions)]
     counts = {
         "reconciliation_exhausted": count(exhausted_conditions),
         "waiting_gateway": count(waiting_conditions),

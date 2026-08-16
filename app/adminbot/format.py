@@ -13,9 +13,10 @@ from zoneinfo import ZoneInfo
 import jdatetime
 from sqlalchemy.orm import Session
 
+from app.adminbot.queries import StuckEntry as BotDeliveryEntry
 from app.config import Settings
 from app.models import Payment
-from app.services.stuck_payments import StuckCategory, StuckEntry, StuckOverview
+from app.services.stuck_payments import StuckEntry
 
 if TYPE_CHECKING:
     from app.adminbot.alerts import ClaimedAlert
@@ -57,6 +58,43 @@ def fmt_time(value: datetime | None, tz_name: str) -> str:
     local = value.astimezone(ZoneInfo(tz_name))
     jalali = jdatetime.datetime.fromgregorian(datetime=local)
     return str(jalali.strftime("%Y/%m/%d %H:%M:%S"))
+
+
+def fmt_time_only_fa(value: datetime, tz_name: str) -> str:
+    """Just HH:MM in the configured timezone (report footer timestamps)."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    local = value.astimezone(ZoneInfo(tz_name))
+    return local.strftime("%H:%M")
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
+def fmt_duration_fa(seconds: float) -> str:
+    """A bare Persian duration: '18 دقیقه', '2 ساعت و 18 دقیقه', '3 روز'.
+    Never negative (clamped to 0)."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} ثانیه"
+    minutes, _ = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} دقیقه"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours} ساعت و {minutes} دقیقه" if minutes else f"{hours} ساعت"
+    days, hours = divmod(hours, 24)
+    return f"{days} روز و {hours} ساعت" if hours else f"{days} روز"
+
+
+def fmt_duration_ago_fa(value: datetime | None, now: datetime) -> str:
+    """'12 ثانیه پیش' / '2 ساعت پیش', or '—' when VALUE is None (never
+    happened yet)."""
+    if value is None:
+        return "—"
+    delta = (now - _as_aware_utc(value)).total_seconds()
+    return f"{fmt_duration_fa(delta)} پیش"
 
 
 def split_message(text: str, max_length: int) -> list[str]:
@@ -130,65 +168,66 @@ def payment_block(payment: Payment, tz_name: str) -> str:
     return "\n\n".join(lines)
 
 
-STUCK_CATEGORY_EMOJI = {
-    StuckCategory.NEEDS_ATTENTION: "🔴",
-    StuckCategory.WAITING_GATEWAY: "🟡",
-    StuckCategory.EXPIRED: "⚫",
-}
-STUCK_CATEGORY_LABEL_FA = {
-    StuckCategory.NEEDS_ATTENTION: "نیازمند توجه",
-    StuckCategory.WAITING_GATEWAY: "در انتظار درگاه",
-    StuckCategory.EXPIRED: "منقضی‌شده",
-}
+def _delivery_reason(entry: BotDeliveryEntry) -> str:
+    """The exact underlying reason code — never a generic label — matching
+    the invariant the rest of the admin bot keeps for stuck-payment
+    reporting. entry.category is either "manual_review:<bot_notify_reason>"
+    (see app.adminbot.queries.bot_delivery_stuck_entries) or a bare pending
+    label ("stale_notification_claim" / an actual bot_notify_reason /
+    "bot_notify_pending_old")."""
+    _, _, reason = entry.category.partition(":")
+    return reason or entry.category
 
 
-def stuck_summary_lines(overview: StuckOverview) -> list[str]:
-    """Header + category counts. Counts are always exact, independent of
-    how many entries are actually rendered below them."""
-    return [
-        "<b>پرداخت‌های نیازمند توجه</b>",
-        "",
-        f"{STUCK_CATEGORY_EMOJI[StuckCategory.NEEDS_ATTENTION]} "
-        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.NEEDS_ATTENTION]}: "
-        f"{fmt_amount(overview.total_counts['needs_attention'])}",
-        f"{STUCK_CATEGORY_EMOJI[StuckCategory.WAITING_GATEWAY]} "
-        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.WAITING_GATEWAY]}: "
-        f"{fmt_amount(overview.total_counts['waiting_gateway'])}",
-        f"{STUCK_CATEGORY_EMOJI[StuckCategory.EXPIRED]} "
-        f"{STUCK_CATEGORY_LABEL_FA[StuckCategory.EXPIRED]}: "
-        f"{fmt_amount(overview.total_counts['expired'])}",
-    ]
-
-
-def stuck_entry_block(index: int, entry: StuckEntry, tz_name: str) -> str:
-    """One numbered entry. Always shows the exact reason/state — never a
-    generic label — matching the invariant the rest of the admin bot
-    already keeps for stuck-payment reporting."""
+def bot_delivery_entry_block(index: int, entry: BotDeliveryEntry, now: datetime) -> str:
+    """One numbered bot-delivery-problem row for /stuck."""
     payment = entry.payment
-    is_link_created = payment.status == "link_created"
-    attempts = (
-        payment.reconciliation_attempts if is_link_created else payment.bot_notify_attempts
+    wait_since = (
+        payment.manual_review_at or payment.created_at
+        if payment.status == "manual_review"
+        else payment.created_at
     )
-    next_retry = payment.reconciliation_next_at if is_link_created else payment.next_retry_at
     lines = [
-        f"{index}) {STUCK_CATEGORY_EMOJI[entry.category]} "
-        f"<b>{STUCK_CATEGORY_LABEL_FA[entry.category]}</b>",
-        f"سفارش: <b>{esc(payment.bot_order_id)}</b>",
-        f"مبلغ: {fmt_amount(payment.amount)} تومان",
-        f"وضعیت: {payment_status_fa(payment.status)}",
+        f"{index:02d}. {esc(payment.bot_order_id)}",
+        "    ⛔ تحویل به ربات ناموفق",
+        f"    دلیل: <code>{esc(_delivery_reason(entry))}</code>",
     ]
-    if entry.gateway_state is not None:
-        lines.append(f"درگاه: <code>{esc(entry.gateway_state)}</code>")
-    if attempts:
-        lines.append(f"تلاش‌ها: {attempts}")
-    if is_link_created and payment.reconciliation_last_at is not None:
-        lines.append(f"آخرین بررسی: {fmt_time(payment.reconciliation_last_at, tz_name)}")
-    if next_retry is not None:
-        lines.append(f"تلاش بعدی: {fmt_time(next_retry, tz_name)}")
-    if entry.category == StuckCategory.NEEDS_ATTENTION:
-        lines.append(f"دلیل: <code>{esc(entry.reason)}</code>")
-    lines.append(f"ایجاد: {fmt_time(payment.created_at, tz_name)}")
+    if payment.bot_notify_attempts:
+        lines.append(f"    تلاش‌ها: {payment.bot_notify_attempts}")
+    if payment.bot_last_http_status:
+        lines.append(f"    آخرین HTTP: {payment.bot_last_http_status}")
+    wait_seconds = (now - _as_aware_utc(wait_since)).total_seconds()
+    lines.append(f"    زمان انتظار: {fmt_duration_fa(wait_seconds)}")
     return "\n".join(lines)
+
+
+def _link_age_entry_block(index: int, entry: StuckEntry, now: datetime, *, age_label: str) -> str:
+    """Shared row shape for /waiting and /expired: order, amount, an
+    age/wait duration (label differs by command), last reconciliation
+    check, and check count."""
+    payment = entry.payment
+    anchor = payment.callback_token_issued_at or payment.created_at
+    age_seconds = (now - _as_aware_utc(anchor)).total_seconds()
+    age = fmt_duration_fa(age_seconds)
+    return "\n".join(
+        [
+            f"{index:02d}. {esc(payment.bot_order_id)}",
+            f"    مبلغ: {fmt_amount(payment.amount)} تومان",
+            f"    {age_label}: {age}",
+            f"    آخرین بررسی: {fmt_duration_ago_fa(payment.reconciliation_last_at, now)}",
+            f"    تعداد بررسی: {payment.reconciliation_attempts}",
+        ]
+    )
+
+
+def waiting_entry_block(index: int, entry: StuckEntry, now: datetime) -> str:
+    """One numbered row for /waiting: WAITING_GATEWAY payments only."""
+    return _link_age_entry_block(index, entry, now, age_label="زمان انتظار")
+
+
+def expired_entry_block(index: int, entry: StuckEntry, now: datetime) -> str:
+    """One numbered row for /expired: EXPIRED payments only."""
+    return _link_age_entry_block(index, entry, now, age_label="قدمت")
 
 
 _ALERT_TITLES_FA = {

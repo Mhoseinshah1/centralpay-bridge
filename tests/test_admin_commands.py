@@ -120,48 +120,34 @@ def test_manual_review_shows_exact_reason_codes(
 def test_stuck_uses_exact_categories(
     handlers, client, settings, session_factory, stub, bot_stub, notifier
 ):
+    """/stuck is now narrowly scoped to bot-delivery problems only (see
+    tests/test_admin_stuck_operations.py for full coverage of the redesign);
+    this preserves the pre-existing "exact reason code, never a generic
+    label" invariant."""
     import httpx
 
     make_verified_pending(client, settings, session_factory, stub, order_id="adm-attn")
     bot_stub.result = httpx.ReadTimeout("t")
     run_pass(session_factory, notifier, settings)
-    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
     assert "adm-attn" in text
     # The exact reason code appears; never a generic "stuck" label.
     assert "bot_timeout_ambiguous" in text
     assert "stuck" not in text
 
 
-def test_stuck_shows_grouped_summary_with_exact_counts(
-    handlers, client, settings, session_factory, stub, bot_stub, notifier
-):
-    """The redesigned /stuck groups into three categories with a header
-    count each — shared categorization with `centralpay stuck`."""
-    import httpx
-
-    make_verified_pending(client, settings, session_factory, stub, order_id="adm-attn-2")
-    bot_stub.result = httpx.ReadTimeout("t")
-    run_pass(session_factory, notifier, settings)
-    assert create_order(client, settings, order_id="adm-waiting-1").status_code == 200
-
-    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
-    assert "نیازمند توجه: 1" in text
-    assert "در انتظار درگاه: 1" in text
-    assert "منقضی‌شده: 0" in text
-    assert "adm-waiting-1" in text
+def test_stuck_reports_healthy_when_no_bot_delivery_problems(handlers):
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "خطایی در تحویل به ربات وجود ندارد" in text
 
 
-def test_stuck_reports_nothing_when_no_payments_are_stuck(handlers):
-    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
-    assert "هیچ پرداختی نیازمند توجه نیست" in text
-
-
-def test_stuck_link_created_ordinary_retry_is_not_attention(
+def test_stuck_link_created_ordinary_retry_is_never_shown(
     handlers, client, settings, session_factory, stub
 ):
-    """A normal, non-exhausted link_created payment must never appear under
-    the "needs attention" count, even once it is well past the active
-    window and the gateway has already reported "not paid" once."""
+    """A normal, non-exhausted link_created payment (ordinary WAITING_GATEWAY
+    polling) must never appear in /stuck at all — it is not a bot-delivery
+    problem. It belongs to /waiting instead (see
+    tests/test_admin_stuck_operations.py)."""
     from datetime import UTC, datetime, timedelta
 
     from sqlalchemy import select
@@ -181,10 +167,9 @@ def test_stuck_link_created_ordinary_retry_is_not_attention(
         payment.reconciliation_next_at = datetime.now(UTC) + timedelta(minutes=5)
         db.commit()
 
-    text = "\n".join(handlers.handle(admin_ctx(), "stuck", []))
-    assert "نیازمند توجه: 0" in text
-    assert "در انتظار درگاه: 1" in text
-    assert "adm-notpaid-1" in text
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "خطای ارسال به ربات: 0" in text
+    assert "adm-notpaid-1" not in text
 
 
 def test_retry_queue_is_read_only(

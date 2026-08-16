@@ -107,6 +107,88 @@ class StuckEntry:
     category: str  # exact reason category, never a generic "stuck"
 
 
+def _stale_bot_notify_pending_conditions(pending_cutoff: datetime) -> tuple[Any, ...]:
+    """A bot_notify_pending row old enough to need operator attention —
+    whether or not its notification claim is ADDITIONALLY stale (claim
+    staleness only changes the displayed reason label below, never whether
+    the row is included)."""
+    return (Payment.status == "bot_notify_pending", Payment.created_at <= pending_cutoff)
+
+
+def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
+    """Open manual-review rows caused SPECIFICALLY by a customer-bot
+    delivery failure. ``app.services.notification._move_to_manual_review``
+    is the ONLY code path that sets ``bot_notify_reason`` alongside
+    ``manual_review``; financial/verification manual-review rows
+    (``app.services.verification`` — amount/user/reference mismatches)
+    never touch ``bot_notify_reason``, so it stays whatever it was before
+    (typically None, since those payments never reached notification at
+    all). Never includes reconciliation-exhausted or unexpected-status
+    rows — those never set ``status = manual_review`` in the first place."""
+    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
+
+
+def count_bot_delivery_problems(db: Session, *, pending_age_minutes: int = 30) -> int:
+    """EXACT total of bot-delivery-attention rows (unbounded — no display
+    cap). Shares its predicates with ``bot_delivery_stuck_entries`` so the
+    list and this count can never disagree."""
+    pending_cutoff = _utcnow() - timedelta(minutes=pending_age_minutes)
+    manual_review_total = db.execute(
+        select(func.count(Payment.id)).where(*_bot_delivery_manual_review_conditions())
+    ).scalar_one()
+    pending_total = db.execute(
+        select(func.count(Payment.id)).where(
+            *_stale_bot_notify_pending_conditions(pending_cutoff)
+        )
+    ).scalar_one()
+    return manual_review_total + pending_total
+
+
+def bot_delivery_stuck_entries(
+    db: Session,
+    *,
+    pending_age_minutes: int = 30,
+    claim_timeout_seconds: float = 120.0,
+    limit: int = 30,
+) -> list[StuckEntry]:
+    """Exactly the bot-delivery subset of ``stuck_payments()``: open
+    manual-review rows caused by a customer-bot delivery failure, then
+    stale/old bot_notify_pending rows. NEVER financial/verification
+    manual-review rows, reconciliation-exhausted rows, or unexpected-status
+    rows — see ``_bot_delivery_manual_review_conditions``."""
+    now = _utcnow()
+    entries: list[StuckEntry] = []
+    manual_review_rows = db.execute(
+        select(Payment)
+        .where(*_bot_delivery_manual_review_conditions())
+        .order_by(Payment.manual_review_at.asc().nulls_first())
+        .limit(limit)
+    ).scalars()
+    for payment in manual_review_rows:
+        entries.append(StuckEntry(payment, f"manual_review:{payment.bot_notify_reason}"))
+
+    pending_cutoff = now - timedelta(minutes=pending_age_minutes)
+    old_pending = db.execute(
+        select(Payment)
+        .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
+        .order_by(Payment.created_at.asc())
+        .limit(limit)
+    ).scalars()
+    claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
+    for payment in old_pending:
+        claimed_at = payment.notification_claimed_at
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+            if claimed_at <= claim_cutoff:
+                entries.append(StuckEntry(payment, "stale_notification_claim"))
+                continue
+        entries.append(
+            StuckEntry(payment, payment.bot_notify_reason or "bot_notify_pending_old")
+        )
+    return entries[:limit]
+
+
 def stuck_payments(
     db: Session,
     *,
@@ -123,7 +205,7 @@ def stuck_payments(
     pending_cutoff = now - timedelta(minutes=pending_age_minutes)
     old_pending = db.execute(
         select(Payment)
-        .where(Payment.status == "bot_notify_pending", Payment.created_at <= pending_cutoff)
+        .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
         .order_by(Payment.created_at.asc())
         .limit(limit)
     ).scalars()
