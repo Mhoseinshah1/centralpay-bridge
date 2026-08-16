@@ -217,13 +217,26 @@ def count_expired(db: Session, settings: Settings, *, now: datetime) -> int:
 
 
 def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> int:
-    """EXACT count of NEEDS_ATTENTION entries that are NOT a bot-delivery
-    problem: reconciliation-exhausted (a financial/reconciliation state) and
-    unexpected-status rows (a system anomaly). Deliberately excludes the
-    reused manual-review/stale-notification bucket entirely — that one is
-    covered exactly by ``app.adminbot.queries.count_bot_delivery_problems``
-    (delivery reasons) and non-delivery manual-review reasons, which this
-    function does not attempt to separately count (see module docstring)."""
+    """EXACT count of every current NEEDS_ATTENTION condition that is NOT a
+    bot-delivery problem:
+
+    * reconciliation-exhausted (a financial/reconciliation state)
+    * unexpected-status rows (a system anomaly)
+    * open manual-review rows caused by a FINANCIAL/verification mismatch
+      (``app.adminbot.queries.count_non_delivery_manual_reviews`` — the
+      exact complement of ``count_bot_delivery_problems``'s manual-review
+      half, sharing the same ``_open_manual_review_conditions``/
+      ``_bot_delivery_manual_review_conditions`` predicates so a row can
+      never be counted in both this function and
+      ``count_bot_delivery_problems``, and never dropped from both).
+
+    Invariant this preserves: for the same (db, settings, now),
+    ``count_bot_delivery_problems(db) + count_other_attention(db, settings, now=now)``
+    equals the total number of rows any current NEEDS_ATTENTION condition
+    would select — reconciliation-exhausted, unexpected-status, and EVERY
+    open manual-review row (delivery or non-delivery), with the
+    stale/old-bot_notify_pending rows folded into the bot-delivery half.
+    Never approximated and never double-counted."""
     exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
     exhausted_total = db.execute(
         select(func.count(Payment.id)).where(*exhausted_conditions)
@@ -234,7 +247,8 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
             Payment.status.in_(_UNEXPECTED_STATUSES), Payment.created_at <= cutoff
         )
     ).scalar_one()
-    return exhausted_total + unexpected_total
+    non_delivery_manual_review_total = queries.count_non_delivery_manual_reviews(db)
+    return exhausted_total + unexpected_total + non_delivery_manual_review_total
 
 
 def waiting_entries_by_urgency(

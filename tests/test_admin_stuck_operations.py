@@ -544,3 +544,315 @@ def test_manual_review_status_errors_retry_queue_still_work(
     retry_text = "\n".join(handlers.handle(admin_ctx(), "retry_queue", []))
     assert "صف ارسال" in retry_text
 
+
+# ============================================================================
+# PR #57 review fixes
+# ============================================================================
+
+# --- fix 1: count_other_attention must include non-delivery manual review ----
+
+
+def test_other_attention_counts_a_lone_financial_manual_review(
+    handlers, client, settings, session_factory
+):
+    assert create_order(client, settings, order_id="oa-fin").status_code == 200
+    _make_financial_manual_review(
+        session_factory, "oa-fin", reason="verify_payable_amount_mismatch"
+    )
+
+    from app.adminbot import queries
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert queries.count_bot_delivery_problems(db) == 0
+        assert stuck_service.count_other_attention(db, settings, now=now) == 1
+
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "سایر موارد نیازمند بررسی: 1" in text
+    assert "oa-fin" not in text
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "verify_payable_amount_mismatch",
+        "verify_user_id_mismatch",
+        "verify_missing_reference_id",
+        "verify_invalid_reference_id",
+        "reference_id_collision",
+    ],
+)
+def test_other_attention_counts_every_financial_reason(
+    handlers, client, settings, session_factory, reason
+):
+    assert create_order(client, settings, order_id="oa-reason").status_code == 200
+    _make_financial_manual_review(session_factory, "oa-reason", reason=reason)
+
+    from app.adminbot import queries
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert queries.count_non_delivery_manual_reviews(db) == 1
+        assert stuck_service.count_other_attention(db, settings, now=now) == 1
+
+
+def test_other_attention_does_not_count_bot_delivery_manual_review(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    """A bot-delivery manual review must count in bot_delivery_total ONLY --
+    never leak into other_attention (no double counting)."""
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "oa-delivery"
+    )
+
+    from app.adminbot import queries
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert queries.count_bot_delivery_problems(db) == 1
+        assert stuck_service.count_other_attention(db, settings, now=now) == 0
+
+
+def test_other_attention_counts_reconciliation_exhausted_alone(
+    handlers, client, settings, session_factory
+):
+    assert create_order(client, settings, order_id="oa-exh").status_code == 200
+    _make_reconciliation_exhausted(session_factory, settings, "oa-exh")
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert stuck_service.count_other_attention(db, settings, now=now) == 1
+
+
+def test_other_attention_counts_unexpected_status_alone(handlers, session_factory, settings):
+    from app.services.stuck_payments import UNEXPECTED_STATE_GRACE_SECONDS
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="oa-unexpected",
+                gateway_order_id=990101,
+                gateway_user_id=1,
+                amount=10000,
+                payable_amount=10000,
+                status=PaymentStatus.GETLINK_FAILED.value,
+                created_at=(
+                    datetime.now(UTC) - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 5)
+                ),
+            )
+        )
+        db.commit()
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert stuck_service.count_other_attention(db, settings, now=now) == 1
+
+
+def test_other_attention_exact_arithmetic_with_all_four_categories_and_no_double_counting(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    """The preferred invariant: bot_delivery_total + other_total equals the
+    total across all four attention-bearing categories, with each row
+    counted in EXACTLY one of the two buckets."""
+    from app.services.stuck_payments import UNEXPECTED_STATE_GRACE_SECONDS
+
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "arith-delivery"
+    )
+    assert create_order(client, settings, order_id="arith-financial").status_code == 200
+    _make_financial_manual_review(session_factory, "arith-financial")
+    assert create_order(client, settings, order_id="arith-exhausted").status_code == 200
+    _make_reconciliation_exhausted(session_factory, settings, "arith-exhausted")
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="arith-unexpected",
+                gateway_order_id=990102,
+                gateway_user_id=1,
+                amount=10000,
+                payable_amount=10000,
+                status=PaymentStatus.CREATED.value,
+                created_at=(
+                    datetime.now(UTC) - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 5)
+                ),
+            )
+        )
+        db.commit()
+    # Non-attention noise that must not be counted by either bucket.
+    assert create_order(client, settings, order_id="arith-waiting").status_code == 200
+
+    from app.adminbot import queries
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        bot_delivery_total = queries.count_bot_delivery_problems(db)
+        other_total = stuck_service.count_other_attention(db, settings, now=now)
+
+    assert bot_delivery_total == 1
+    assert other_total == 3
+    assert bot_delivery_total + other_total == 4
+
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "خطای ارسال به ربات: 1" in text
+    assert "سایر موارد نیازمند بررسی: 3" in text
+    assert "arith-delivery" in text
+    for hidden in ("arith-financial", "arith-exhausted", "arith-unexpected", "arith-waiting"):
+        assert hidden not in text
+
+
+# --- audit: resolved manual review rows must never count as attention --------
+
+
+def test_resolved_financial_manual_review_excluded_from_other_attention(
+    handlers, client, settings, session_factory
+):
+    assert create_order(client, settings, order_id="resolved-fin").status_code == 200
+    _make_financial_manual_review(session_factory, "resolved-fin")
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "resolved-fin")
+        ).scalar_one()
+        payment.review_resolved_at = datetime.now(UTC)
+        payment.review_resolution = "resolved-manually"
+        db.commit()
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert stuck_service.count_other_attention(db, settings, now=now) == 0
+
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "سایر موارد نیازمند بررسی" not in text  # omitted entirely when 0
+    assert "resolved-fin" not in text
+
+
+# --- fix 2: overall health state considers bot-delivery OR other attention ---
+
+
+def test_health_nothing_exists_is_healthy(handlers):
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "✅ وضعیت کلی: سالم" in text
+
+
+def test_health_only_waiting_exists_is_healthy(handlers, client, settings, session_factory):
+    assert create_order(client, settings, order_id="health-waiting").status_code == 200
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "✅ وضعیت کلی: سالم" in text
+
+
+def test_health_only_expired_exists_is_healthy(handlers, client, settings, session_factory):
+    assert create_order(client, settings, order_id="health-expired").status_code == 200
+    _make_expired(session_factory, settings, "health-expired")
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "✅ وضعیت کلی: سالم" in text
+
+
+def test_health_only_bot_delivery_failure_is_attention(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "health-delivery"
+    )
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+def test_health_only_financial_manual_review_is_attention(
+    handlers, client, settings, session_factory
+):
+    assert create_order(client, settings, order_id="health-fin").status_code == 200
+    _make_financial_manual_review(session_factory, "health-fin")
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+def test_health_only_reconciliation_exhausted_is_attention(
+    handlers, client, settings, session_factory
+):
+    assert create_order(client, settings, order_id="health-exh").status_code == 200
+    _make_reconciliation_exhausted(session_factory, settings, "health-exh")
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+def test_health_only_unexpected_status_is_attention(handlers, session_factory):
+    from app.services.stuck_payments import UNEXPECTED_STATE_GRACE_SECONDS
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="health-unexpected",
+                gateway_order_id=990103,
+                gateway_user_id=1,
+                amount=10000,
+                payable_amount=10000,
+                status=PaymentStatus.GATEWAY_VERIFIED.value,
+                created_at=(
+                    datetime.now(UTC) - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 5)
+                ),
+            )
+        )
+        db.commit()
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+def test_health_mixed_conditions_is_attention(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "health-mixed-delivery"
+    )
+    assert create_order(client, settings, order_id="health-mixed-fin").status_code == 200
+    _make_financial_manual_review(session_factory, "health-mixed-fin")
+    assert create_order(client, settings, order_id="health-mixed-wait").status_code == 200
+    assert create_order(client, settings, order_id="health-mixed-exp").status_code == 200
+    _make_expired(session_factory, settings, "health-mixed-exp")
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+# --- fix 3: /stuck rejects any argument, no silent ignore ---------------------
+
+
+@pytest.mark.parametrize("bad_args", [["10"], ["abc"], ["1", "2"], ["50"], ["0"]])
+def test_stuck_rejects_any_argument(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier, bad_args
+):
+    # A bot-delivery problem exists so a silently-ignored argument would
+    # otherwise still render a normal (wrong) report instead of the error.
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "argtest-1"
+    )
+
+    def snapshot():
+        with session_factory() as db:
+            return db.execute(
+                select(Payment.id, Payment.status, Payment.updated_at).order_by(Payment.id)
+            ).all()
+
+    before = snapshot()
+    replies = handlers.handle(admin_ctx(), "stuck", bad_args)
+    assert replies == ["فرمت صحیح:\n/stuck"]
+    assert snapshot() == before
+
+
+def test_stuck_plain_command_still_works(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, "plain-1"
+    )
+    replies = handlers.handle(admin_ctx(), "stuck", [])
+    assert "فرمت صحیح" not in "\n".join(replies)
+    assert "plain-1" in "\n".join(replies)
+

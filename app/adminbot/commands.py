@@ -63,6 +63,7 @@ STUCK_DETAIL_MAX = 10
 
 _ASCII_DIGITS = re.compile(r"[0-9]+")
 
+STUCK_USAGE_ERROR = "فرمت صحیح:\n/stuck"
 WAITING_USAGE_ERROR = "فرمت صحیح:\n/waiting [1-50]"
 EXPIRED_USAGE_ERROR = "فرمت صحیح:\n/expired [1-50]"
 
@@ -394,12 +395,17 @@ class CommandHandlers:
         Intentional UX change from the previous /stuck: no longer accepts a
         numeric argument (it showed three unrelated categories at once, so a
         display limit applied to all of them together; no existing test or
-        documented usage relied on `/stuck N`). At most STUCK_DETAIL_MAX
-        entries are shown, chosen once a truthful bot-delivery total is
-        already known — never split_message'd into multiple messages:
-        entries are progressively reduced until the single message fits
-        admin_bot_max_message_length.
+        documented usage relied on `/stuck N`). Any argument at all is now
+        an explicit usage error — never silently ignored — so an operator
+        typing `/stuck 50` (expecting the old behavior) is told plainly
+        rather than getting a silently different result. At most
+        STUCK_DETAIL_MAX entries are shown, chosen once a truthful
+        bot-delivery total is already known — never split_message'd into
+        multiple messages: entries are progressively reduced until the
+        single message fits admin_bot_max_message_length.
         """
+        if args:
+            return [STUCK_USAGE_ERROR]
         now = datetime.now(UTC)
         settings = self._settings
         bot_delivery_total = queries.count_bot_delivery_problems(
@@ -426,8 +432,16 @@ class CommandHandlers:
     def _stuck_header(
         self, bot_delivery_total: int, waiting_total: int, expired_total: int, other_total: int
     ) -> list[str]:
+        # Waiting-gateway and expired-link counts are separate operational
+        # visibility categories, not actionable attention on their own — a
+        # payment quietly polling the gateway, or one that already aged out,
+        # is normal steady-state and must never flip the headline to
+        # "needs attention" by itself. Only bot-delivery problems and
+        # "other" attention (financial-mismatch manual review,
+        # reconciliation-exhausted, unexpected-status) are actionable.
+        needs_operator_attention = bot_delivery_total > 0 or other_total > 0
         status_line = (
-            "🟠 وضعیت کلی: نیازمند توجه" if bot_delivery_total > 0 else f"{OK} وضعیت کلی: سالم"
+            "🟠 وضعیت کلی: نیازمند توجه" if needs_operator_attention else f"{OK} وضعیت کلی: سالم"
         )
         lines = [
             "⚠️ گزارش پرداخت‌های نیازمند بررسی",

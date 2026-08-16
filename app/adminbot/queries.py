@@ -128,6 +128,30 @@ def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
     return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
 
 
+def _non_delivery_manual_review_conditions() -> tuple[Any, ...]:
+    """The EXACT complement of ``_bot_delivery_manual_review_conditions``
+    within open manual review: financial/verification manual-review rows
+    (amount, user id, reference id mismatches, callback/config failures —
+    ``app.services.verification``) that never reached notification at all,
+    so ``bot_notify_reason`` stayed ``None``. Together with
+    ``_bot_delivery_manual_review_conditions`` this partitions EVERY open
+    manual-review row into exactly one of the two buckets — never both,
+    never neither — so a caller summing both counts can never double-count
+    or silently drop a row."""
+    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_(None))
+
+
+def count_non_delivery_manual_reviews(db: Session) -> int:
+    """EXACT count of open manual-review rows that are NOT a bot-delivery
+    problem (financial/verification mismatches). Shares
+    ``_open_manual_review_conditions`` with ``count_open_manual_reviews``
+    (the /manual_review command's total) and is the exact complement of
+    ``count_bot_delivery_problems``'s manual-review half."""
+    return db.execute(
+        select(func.count(Payment.id)).where(*_non_delivery_manual_review_conditions())
+    ).scalar_one()
+
+
 def count_bot_delivery_problems(db: Session, *, pending_age_minutes: int = 30) -> int:
     """EXACT total of bot-delivery-attention rows (unbounded — no display
     cap). Shares its predicates with ``bot_delivery_stuck_entries`` so the
