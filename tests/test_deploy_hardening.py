@@ -377,20 +377,32 @@ def test_update_self_replaces_the_running_wrapper_without_breaking_it(deploy_san
     assert management_bin.read_text() == NEW_WRAPPER
 
 
-def test_sync_management_wrapper_sets_executable_mode(tmp_path):
-    """Executable mode is guaranteed on the installed copy regardless of the
-    source file's mode in the checked-out commit."""
+def _init_install_with_source(tmp_path: Path, *, source_content: str, source_mode: int) -> Path:
     install_dir = tmp_path / "install"
     scripts_dir = install_dir / "scripts"
     scripts_dir.mkdir(parents=True)
     src = scripts_dir / "centralpay"
-    src.write_text("#!/usr/bin/env bash\necho hi\n")
-    src.chmod(0o644)  # deliberately non-executable
+    src.write_text(source_content)
+    src.chmod(source_mode)
     git("init", "-q", cwd=install_dir)
     git("add", "-A", cwd=install_dir)
     git("commit", "-q", "-m", "x", cwd=install_dir)
+    return install_dir
 
+
+def test_sync_management_wrapper_atomically_replaces_destination(tmp_path):
+    """Requirements 2-4: the destination is replaced via a same-filesystem
+    rename (a genuinely new inode, never edited in place), mode 0755 is
+    guaranteed regardless of the source file's mode, and no temp file is
+    left behind."""
+    install_dir = _init_install_with_source(
+        tmp_path, source_content=NEW_WRAPPER, source_mode=0o644  # deliberately non-executable
+    )
     dest = tmp_path / "installed_centralpay"
+    dest.write_text(OLD_WRAPPER)
+    dest.chmod(0o755)
+    before_inode = dest.stat().st_ino
+
     result = cli_call(
         "sync_management_wrapper",
         {
@@ -400,7 +412,11 @@ def test_sync_management_wrapper_sets_executable_mode(tmp_path):
         },
     )
     assert result.returncode == 0, result.stderr
+
+    assert dest.stat().st_ino != before_inode  # replaced via rename, not edited in place
+    assert dest.read_text() == NEW_WRAPPER
     assert oct(dest.stat().st_mode)[-3:] == "755"
+    assert list(tmp_path.glob(".centralpay.tmp.*")) == []  # no leftover staging file
 
 
 def test_sync_management_wrapper_fails_closed_when_source_script_missing(tmp_path):
@@ -408,12 +424,85 @@ def test_sync_management_wrapper_fails_closed_when_source_script_missing(tmp_pat
     install_dir.mkdir()
     dest = tmp_path / "installed_centralpay"
     dest.write_text("OLD CONTENT")
+    dest.chmod(0o755)
+    before_inode = dest.stat().st_ino
     result = cli_call(
         "sync_management_wrapper",
         {"CENTRALPAY_INSTALL_DIR": str(install_dir), "CENTRALPAY_MANAGEMENT_BIN": str(dest)},
     )
     assert result.returncode != 0
     assert dest.read_text() == "OLD CONTENT"  # left untouched on failure
+    assert dest.stat().st_ino == before_inode
+    assert list(tmp_path.glob(".centralpay.tmp.*")) == []
+
+
+def test_sync_management_wrapper_leaves_destination_unchanged_when_staging_fails(tmp_path):
+    """Requirement 1: a failure BEFORE the rename (staging the new content
+    into the temp file) must leave the destination completely untouched —
+    same inode, same bytes, same mode."""
+    install_dir = _init_install_with_source(
+        tmp_path, source_content=NEW_WRAPPER, source_mode=0o755
+    )
+    dest = tmp_path / "installed_centralpay"
+    dest.write_text(OLD_WRAPPER)
+    dest.chmod(0o755)
+    before_inode = dest.stat().st_ino
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "install").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (bindir / "install").chmod(0o755)
+
+    result = cli_call(
+        "sync_management_wrapper",
+        {
+            "CENTRALPAY_INSTALL_DIR": str(install_dir),
+            "CENTRALPAY_MANAGEMENT_BIN": str(dest),
+            "PATH": f"{bindir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            **_GIT_ENV,
+        },
+    )
+    assert result.returncode != 0
+
+    assert dest.stat().st_ino == before_inode
+    assert dest.read_text() == OLD_WRAPPER
+    assert oct(dest.stat().st_mode)[-3:] == "755"
+    assert list(tmp_path.glob(".centralpay.tmp.*")) == []  # staging file cleaned up
+
+
+def test_sync_management_wrapper_leaves_destination_unchanged_when_rename_fails(tmp_path):
+    """Requirement 1/2/4: inject a failure at the final rename step (staging
+    already succeeded) and prove the OLD destination inode + contents +
+    mode survive untouched — the atomic swap either fully happens or not at
+    all, never a partial/corrupted destination."""
+    install_dir = _init_install_with_source(
+        tmp_path, source_content=NEW_WRAPPER, source_mode=0o755
+    )
+    dest = tmp_path / "installed_centralpay"
+    dest.write_text(OLD_WRAPPER)
+    dest.chmod(0o755)
+    before_inode = dest.stat().st_ino
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "mv").write_text("#!/usr/bin/env bash\nexit 1\n")
+    (bindir / "mv").chmod(0o755)
+
+    result = cli_call(
+        "sync_management_wrapper",
+        {
+            "CENTRALPAY_INSTALL_DIR": str(install_dir),
+            "CENTRALPAY_MANAGEMENT_BIN": str(dest),
+            "PATH": f"{bindir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            **_GIT_ENV,
+        },
+    )
+    assert result.returncode != 0
+
+    assert dest.stat().st_ino == before_inode
+    assert dest.read_text() == OLD_WRAPPER
+    assert oct(dest.stat().st_mode)[-3:] == "755"
+    assert list(tmp_path.glob(".centralpay.tmp.*")) == []  # staging file cleaned up
 
 
 def test_update_and_rollback_acquire_the_deploy_lock():

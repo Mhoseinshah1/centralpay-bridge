@@ -458,24 +458,52 @@ sync_management_wrapper() {
     # from the new image, but this host-side wrapper is a plain file placed
     # by the installer and was previously never refreshed on update.
     #
-    # Self-overwrite safety: this function may be executing FROM
+    # Atomicity / self-overwrite safety: this function may be executing FROM
     # MANAGEMENT_BIN right now, as part of a plain `centralpay update` or
-    # `centralpay rollback` run by an operator. GNU `install` (like `mv` /
-    # rename(2)) creates the replacement file under a fresh inode and links
-    # it into the destination path rather than truncating the destination's
-    # existing bytes in place. A process that already has the old path open
-    # — as the bash interpreter executing THIS script does — keeps reading
-    # the OLD, now-unlinked inode until it exits; only the NEXT invocation
-    # of `centralpay` observes the new file. This has been verified
-    # experimentally: replacing a running script this way never corrupts or
-    # truncates the in-flight process's remaining output. Never replace this
-    # file any other way (e.g. `cat > "$MANAGEMENT_BIN"`), which WOULD
-    # corrupt an in-flight run by truncating the bytes the running
-    # interpreter is still reading.
+    # `centralpay rollback` run by an operator. `install`/`cp` themselves
+    # give NO guarantee of atomic, fresh-inode replacement — they may
+    # overwrite an existing destination's bytes in place, which would
+    # truncate/corrupt this very script while it is still being read. So
+    # `install` is used here ONLY to stage the new content, with its mode
+    # already set, at a brand-new temporary path that does not yet exist —
+    # never directly at MANAGEMENT_BIN. The temporary file lives in the SAME
+    # directory as MANAGEMENT_BIN (same filesystem, guaranteed), and the
+    # final `mv` between two paths on the same filesystem is a POSIX
+    # rename(2), which is (a) atomic — the path always resolves to either
+    # the old or the new inode, with no window where it is missing — and
+    # (b) safe against a process that already holds the old path open: that
+    # process (the bash interpreter executing THIS script, if it's the one
+    # calling this function) keeps reading the OLD, now-unlinked inode until
+    # it exits; only the NEXT invocation of `centralpay` observes the new
+    # file. This has been verified experimentally: replacing a running
+    # script this way never corrupts or truncates the in-flight process's
+    # remaining output. Never replace MANAGEMENT_BIN any other way (e.g.
+    # `install`/`cp` straight onto it, or `cat > "$MANAGEMENT_BIN"`), which
+    # WOULD risk corrupting an in-flight run by truncating the bytes the
+    # running interpreter is still reading.
     local src="${INSTALL_DIR}/scripts/centralpay"
     [[ -f "$src" ]] \
         || fail "scripts/centralpay is missing from the deployed commit; refusing to update ${MANAGEMENT_BIN}."
-    install -m 0755 "$src" "$MANAGEMENT_BIN"
+
+    local dir tmp
+    dir=$(dirname -- "$MANAGEMENT_BIN")
+    tmp=$(mktemp "${dir}/.centralpay.tmp.XXXXXX") \
+        || fail "Cannot create a temporary file next to ${MANAGEMENT_BIN}."
+
+    # Stage into the temp path only. On failure here, MANAGEMENT_BIN itself
+    # was never touched.
+    if ! install -m 0755 "$src" "$tmp"; then
+        rm -f "$tmp"
+        fail "Cannot stage the new management command (${MANAGEMENT_BIN} left unchanged)."
+    fi
+
+    # Atomic, same-filesystem rename: MANAGEMENT_BIN either still points at
+    # the old inode or now points at the new one, never neither.
+    if ! mv -fT -- "$tmp" "$MANAGEMENT_BIN"; then
+        rm -f "$tmp"
+        fail "Cannot replace ${MANAGEMENT_BIN} with the staged management command (left unchanged)."
+    fi
+
     log "Installed management command synced: ${MANAGEMENT_BIN} ($(git -C "$INSTALL_DIR" rev-parse --short HEAD))"
 }
 
