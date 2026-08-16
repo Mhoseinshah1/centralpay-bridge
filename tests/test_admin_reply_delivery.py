@@ -233,6 +233,42 @@ def test_warning_skipped_log_emitted_when_abandoned_via_retry_after(caplog):
     assert failed_records  # sanity: the abandonment itself was still logged
 
 
+def test_unrecognized_exception_logs_bare_type_name_for_diagnostics(caplog):
+    """classify_send_error's catch-all ("telegram_unknown") on its own gives
+    no signal to tell a real bug apart from an unrecognized transient
+    condition -- the bare exception class name (never message/args/
+    traceback) should be attached so operators have an explicit failure
+    reason without risking leaked request content."""
+    caplog.set_level(logging.WARNING, logger="app.adminbot.reply_delivery")
+    sender = ScriptedSender([RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom")])
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["only"], sender, command="stuck", sleep=clock))
+
+    retry_records = [r for r in caplog.records if r.getMessage() == "admin_reply_retry_scheduled"]
+    assert len(retry_records) == 2
+    assert all(r.exception_type == "RuntimeError" for r in retry_records)
+
+    failed_records = [r for r in caplog.records if r.getMessage() == "admin_reply_failed"]
+    assert len(failed_records) == 1
+    assert failed_records[0].exception_type == "RuntimeError"
+
+    # Still never the exception's message/args -- only the bare type name.
+    for record in caplog.records:
+        assert "boom" not in record.getMessage()
+        for value in vars(record).values():
+            assert "boom" not in str(value)
+
+
+def test_recognized_telegram_errors_do_not_carry_exception_type(caplog):
+    caplog.set_level(logging.WARNING, logger="app.adminbot.reply_delivery")
+    sender = ScriptedSender([telegram_error.NetworkError("boom")])
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["only"], sender, command="stuck", sleep=clock))
+    retry_records = [r for r in caplog.records if r.getMessage() == "admin_reply_retry_scheduled"]
+    assert len(retry_records) == 1
+    assert not hasattr(retry_records[0], "exception_type")
+
+
 # --- 16. logs never contain reply chunk text ---------------------------------
 
 

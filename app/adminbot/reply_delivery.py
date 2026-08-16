@@ -126,6 +126,14 @@ async def _deliver_one_chunk(
             await send(chunk)
         except Exception as exc:
             outcome = classify_send_error(exc)
+            # classify_send_error's catch-all ("telegram_unknown") gives no
+            # diagnostic signal on its own -- the bare exception class name
+            # (never its message/args/traceback, which could echo request
+            # content) is enough for an operator to tell a genuine bug apart
+            # from an unrecognized transient condition.
+            exception_type = None
+            if outcome.error_code == "telegram_unknown":
+                exception_type = type(exc).__name__
         else:
             return _ChunkResult(delivered=True), retry_after_budget
 
@@ -165,12 +173,26 @@ async def _deliver_one_chunk(
         if outcome.retryable and not is_last_attempt:
             delay = _RETRY_DELAYS_SECONDS[attempt - 1]
             _log_retry_scheduled(
-                command, chunk_index, chunk_count, attempt, outcome.error_code, delay
+                command,
+                chunk_index,
+                chunk_count,
+                attempt,
+                outcome.error_code,
+                delay,
+                exception_type=exception_type,
             )
             await sleep(delay)
             continue
 
-        _log_failed(command, chunk_index, chunk_count, attempt, outcome.error_code, None)
+        _log_failed(
+            command,
+            chunk_index,
+            chunk_count,
+            attempt,
+            outcome.error_code,
+            None,
+            exception_type=exception_type,
+        )
         return _ChunkResult(delivered=False), retry_after_budget
 
     return _ChunkResult(delivered=False), retry_after_budget
@@ -194,18 +216,20 @@ def _log_retry_scheduled(
     attempt: int,
     error_code: str | None,
     delay_seconds: float,
+    *,
+    exception_type: str | None = None,
 ) -> None:
-    logger.warning(
-        "admin_reply_retry_scheduled",
-        extra={
-            "command": command,
-            "chunk_index": chunk_index,
-            "chunk_count": chunk_count,
-            "attempt": attempt,
-            "error_code": error_code,
-            "delay_seconds": delay_seconds,
-        },
-    )
+    extra: dict[str, object] = {
+        "command": command,
+        "chunk_index": chunk_index,
+        "chunk_count": chunk_count,
+        "attempt": attempt,
+        "error_code": error_code,
+        "delay_seconds": delay_seconds,
+    }
+    if exception_type is not None:
+        extra["exception_type"] = exception_type
+    logger.warning("admin_reply_retry_scheduled", extra=extra)
 
 
 def _log_failed(
@@ -217,6 +241,7 @@ def _log_failed(
     retry_after_seconds: float | None,
     *,
     retry_after_budget_remaining: float | None = None,
+    exception_type: str | None = None,
 ) -> None:
     extra: dict[str, object] = {
         "command": command,
@@ -225,6 +250,8 @@ def _log_failed(
         "attempt": attempt,
         "error_code": error_code,
     }
+    if exception_type is not None:
+        extra["exception_type"] = exception_type
     if retry_after_seconds is not None:
         extra["retry_after_seconds"] = retry_after_seconds
     if retry_after_budget_remaining is not None:
