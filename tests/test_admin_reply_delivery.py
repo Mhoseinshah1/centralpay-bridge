@@ -218,6 +218,36 @@ def test_cumulative_retry_after_budget_persists_across_chunks():
     assert clock.sleeps == [8]
 
 
+def test_ordinary_backoffs_share_the_same_reply_wide_time_budget_as_retry_after():
+    """RetryAfter waits and ordinary fixed backoffs draw from one shared
+    15s-per-reply budget: a RetryAfter that consumes the whole budget on
+    chunk1 must leave chunk2's ordinary retry unable to sleep at all."""
+    sender = ScriptedSender(
+        [
+            telegram_error.RetryAfter(14),  # classified as 15s -- consumes the whole budget
+            None,
+            telegram_error.NetworkError("x"),  # chunk2: ordinary retry, but budget is now 0
+        ]
+    )
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["c1", "c2"], sender, command="recent", sleep=clock))
+    # c2's ordinary backoff is skipped (no budget left) -- abandoned on first
+    # attempt without sleeping. Not RetryAfter-driven, so the warning IS sent.
+    assert sender.calls == ["c1", "c1", "c2", _INCOMPLETE_DELIVERY_WARNING]
+    assert clock.sleeps == [15]
+
+
+def test_ordinary_backoff_budget_exhaustion_logs_remaining_budget(caplog):
+    caplog.set_level(logging.WARNING, logger="app.adminbot.reply_delivery")
+    sender = ScriptedSender([telegram_error.RetryAfter(14), None, telegram_error.NetworkError("x")])
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["c1", "c2"], sender, command="recent", sleep=clock))
+    failed = [r for r in caplog.records if r.getMessage() == "admin_reply_failed"]
+    assert len(failed) == 1
+    assert failed[0].chunk_index == 1
+    assert failed[0].reply_time_budget_remaining_seconds == 0.0
+
+
 def test_warning_skipped_log_emitted_when_abandoned_via_retry_after(caplog):
     caplog.set_level(logging.WARNING, logger="app.adminbot.reply_delivery")
     sender = ScriptedSender([telegram_error.RetryAfter(20)])
