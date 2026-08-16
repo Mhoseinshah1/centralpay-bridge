@@ -152,11 +152,17 @@ def count_non_delivery_manual_reviews(db: Session) -> int:
     ).scalar_one()
 
 
-def count_bot_delivery_problems(db: Session, *, pending_age_minutes: int = 30) -> int:
+def count_bot_delivery_problems(
+    db: Session, *, now: datetime, pending_age_minutes: int = 30
+) -> int:
     """EXACT total of bot-delivery-attention rows (unbounded — no display
-    cap). Shares its predicates with ``bot_delivery_stuck_entries`` so the
-    list and this count can never disagree."""
-    pending_cutoff = _utcnow() - timedelta(minutes=pending_age_minutes)
+    cap), evaluated against the caller-supplied snapshot ``now`` rather than
+    re-reading the wall clock. Shares both its predicates AND its snapshot
+    time with ``bot_delivery_stuck_entries`` — callers MUST pass the exact
+    same ``now`` to both — so the list and this count can never disagree,
+    including for a bot_notify_pending payment sitting exactly at the
+    ``pending_age_minutes`` boundary between the two calls."""
+    pending_cutoff = now - timedelta(minutes=pending_age_minutes)
     manual_review_total = db.execute(
         select(func.count(Payment.id)).where(*_bot_delivery_manual_review_conditions())
     ).scalar_one()
@@ -171,6 +177,7 @@ def count_bot_delivery_problems(db: Session, *, pending_age_minutes: int = 30) -
 def bot_delivery_stuck_entries(
     db: Session,
     *,
+    now: datetime,
     pending_age_minutes: int = 30,
     claim_timeout_seconds: float = 120.0,
     limit: int = 30,
@@ -179,13 +186,20 @@ def bot_delivery_stuck_entries(
     manual-review rows caused by a customer-bot delivery failure, then
     stale/old bot_notify_pending rows. NEVER financial/verification
     manual-review rows, reconciliation-exhausted rows, or unexpected-status
-    rows — see ``_bot_delivery_manual_review_conditions``."""
-    now = _utcnow()
+    rows — see ``_bot_delivery_manual_review_conditions``.
+
+    Takes ``now`` from the caller instead of reading the wall clock itself —
+    see ``count_bot_delivery_problems`` for why this matters: the caller
+    must pass the SAME ``now`` to both so a report built from one call to
+    each can never observe a payment crossing the pending_age_minutes
+    cutoff between the two queries. Ties in the ordering below (identical
+    ``manual_review_at`` or ``created_at``) are broken by ascending
+    ``Payment.id`` for a fully deterministic result."""
     entries: list[StuckEntry] = []
     manual_review_rows = db.execute(
         select(Payment)
         .where(*_bot_delivery_manual_review_conditions())
-        .order_by(Payment.manual_review_at.asc().nulls_first())
+        .order_by(Payment.manual_review_at.asc().nulls_first(), Payment.id.asc())
         .limit(limit)
     ).scalars()
     for payment in manual_review_rows:
@@ -195,7 +209,7 @@ def bot_delivery_stuck_entries(
     old_pending = db.execute(
         select(Payment)
         .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
-        .order_by(Payment.created_at.asc())
+        .order_by(Payment.created_at.asc(), Payment.id.asc())
         .limit(limit)
     ).scalars()
     claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)

@@ -565,7 +565,7 @@ def test_other_attention_counts_a_lone_financial_manual_review(
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        assert queries.count_bot_delivery_problems(db) == 0
+        assert queries.count_bot_delivery_problems(db, now=now) == 0
         assert stuck_service.count_other_attention(db, settings, now=now) == 1
 
     [text] = handlers.handle(admin_ctx(), "stuck", [])
@@ -612,7 +612,7 @@ def test_other_attention_does_not_count_bot_delivery_manual_review(
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        assert queries.count_bot_delivery_problems(db) == 1
+        assert queries.count_bot_delivery_problems(db, now=now) == 1
         assert stuck_service.count_other_attention(db, settings, now=now) == 0
 
 
@@ -693,7 +693,7 @@ def test_other_attention_exact_arithmetic_with_all_four_categories_and_no_double
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        bot_delivery_total = queries.count_bot_delivery_problems(db)
+        bot_delivery_total = queries.count_bot_delivery_problems(db, now=now)
         other_total = stuck_service.count_other_attention(db, settings, now=now)
 
     assert bot_delivery_total == 1
@@ -855,4 +855,231 @@ def test_stuck_plain_command_still_works(
     replies = handlers.handle(admin_ctx(), "stuck", [])
     assert "فرمت صحیح" not in "\n".join(replies)
     assert "plain-1" in "\n".join(replies)
+
+
+# ============================================================================
+# PR #57 second review: single-snapshot invariant + deterministic ordering
+# ============================================================================
+
+# --- fix 1: count_bot_delivery_problems / bot_delivery_stuck_entries must --
+# --- share the exact same snapshot `now`, proven at the 30-minute pending -
+# --- cutoff boundary with pinned datetimes (no sleeping) -------------------
+
+
+def test_bot_delivery_count_and_entries_agree_at_pending_cutoff_boundary(
+    client, settings, session_factory, stub
+):
+    """count_bot_delivery_problems and bot_delivery_stuck_entries are called
+    with the exact same pinned `now` here -- proving they agree exactly at,
+    just before, and just after the 30-minute bot_notify_pending staleness
+    cutoff. The cutoff predicate is `created_at <= pending_cutoff`, so a row
+    created exactly 30 minutes before `now` IS included."""
+    from app.adminbot import queries
+
+    pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    ages = {
+        "cutoff-exact": timedelta(minutes=30),
+        "cutoff-younger": timedelta(minutes=29, seconds=59),
+        "cutoff-older": timedelta(minutes=30, seconds=1),
+    }
+    for order_id in ages:
+        make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        for order_id, age in ages.items():
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.created_at = pinned_now - age
+        db.commit()
+
+    with session_factory() as db:
+        count = queries.count_bot_delivery_problems(db, now=pinned_now)
+        entries = queries.bot_delivery_stuck_entries(db, now=pinned_now, limit=30)
+
+    assert count == 2
+    assert len(entries) == count  # same snapshot -> count and list agree exactly
+    included = {entry.payment.bot_order_id for entry in entries}
+    assert included == {"cutoff-exact", "cutoff-older"}
+    assert "cutoff-younger" not in included
+
+
+def test_stuck_count_and_detail_share_one_snapshot_at_cutoff_boundary(
+    handlers, client, settings, session_factory, stub, monkeypatch
+):
+    """End-to-end: /stuck must build its summary count, detail list, and
+    health line from ONE captured `now` rather than independent wall-clock
+    reads inside count_bot_delivery_problems/bot_delivery_stuck_entries.
+    Proven with a monkeypatched clock and pinned created_at values
+    straddling the 30-minute staleness boundary -- no sleeping."""
+    pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+
+    class _FixedDateTime:
+        @staticmethod
+        def now(tz=None):
+            return pinned_now
+
+    ages = {
+        "snap-exact": timedelta(minutes=30),
+        "snap-younger": timedelta(minutes=29, seconds=59),
+        "snap-older": timedelta(minutes=30, seconds=1),
+    }
+    for order_id in ages:
+        make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        for order_id, age in ages.items():
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.created_at = pinned_now - age
+        db.commit()
+
+    monkeypatch.setattr("app.adminbot.commands.datetime", _FixedDateTime)
+
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "خطای ارسال به ربات: 2" in text
+    assert text.count("⛔ تحویل به ربات ناموفق") == 2
+    assert "snap-exact" in text
+    assert "snap-older" in text
+    assert "snap-younger" not in text
+    # The summary count and the rendered detail count must never disagree --
+    # in particular never claim zero bot-delivery errors while still
+    # listing entries below it, or vice versa.
+    assert "نمایش 1 مورد از 0 مورد" not in text
+    assert "🟠 وضعیت کلی: نیازمند توجه" in text
+
+
+def test_bot_delivery_entries_tie_broken_by_id_when_pending_created_at_ties(
+    client, settings, session_factory, stub
+):
+    """SQL-visible ordering contract for /stuck's own detail query: stale
+    bot_notify_pending rows sharing the exact same created_at sort by
+    ascending Payment.id -- the same tie-break convention as /waiting and
+    /expired -- rather than being left database-dependent."""
+    from app.adminbot import queries
+
+    pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    tied_created_at = pinned_now - timedelta(minutes=45)
+    order_ids = ["tie-bd-a", "tie-bd-b", "tie-bd-c"]
+    for order_id in order_ids:
+        make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        for order_id in order_ids:
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.created_at = tied_created_at
+        db.commit()
+
+    with session_factory() as db:
+        entries = queries.bot_delivery_stuck_entries(db, now=pinned_now, limit=50)
+
+    tied_order = [
+        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+    ]
+    assert tied_order == order_ids  # ascending Payment.id == creation order
+
+
+# --- fix 2: /waiting and /expired equal-anchor ties are deterministic ------
+
+
+def test_waiting_equal_anchor_ties_broken_by_ascending_id(client, settings, session_factory):
+    """SQL-visible ordering contract: WAITING_GATEWAY rows sharing the exact
+    same link-age anchor timestamp sort by ascending Payment.id, not by
+    whatever order the database happens to return ties in."""
+    from app.services import stuck_payments as stuck_service
+
+    tied_anchor = datetime.now(UTC) - timedelta(seconds=1500)
+    order_ids = ["tie-w-a", "tie-w-b", "tie-w-c"]
+    for order_id in order_ids:
+        assert create_order(client, settings, order_id=order_id).status_code == 200
+    with session_factory() as db:
+        for order_id in order_ids:
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.callback_token_issued_at = tied_anchor
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        entries = stuck_service.waiting_entries_by_urgency(db, settings, now=now, limit=50)
+
+    tied_order = [
+        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+    ]
+    assert tied_order == order_ids  # ascending Payment.id == creation order
+
+
+def test_expired_equal_anchor_ties_broken_by_descending_id(client, settings, session_factory):
+    """SQL-visible ordering contract: EXPIRED rows sharing the exact same
+    link-age anchor timestamp sort by descending Payment.id, not by
+    whatever order the database happens to return ties in."""
+    from app.services import stuck_payments as stuck_service
+
+    tied_anchor = datetime.now(UTC) - timedelta(
+        seconds=settings.reconciliation_max_age_seconds + 500
+    )
+    order_ids = ["tie-e-a", "tie-e-b", "tie-e-c"]
+    for order_id in order_ids:
+        assert create_order(client, settings, order_id=order_id).status_code == 200
+    with session_factory() as db:
+        for order_id in order_ids:
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.callback_token_issued_at = tied_anchor
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        entries = stuck_service.expired_entries_by_recency(db, settings, now=now, limit=50)
+
+    tied_order = [
+        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+    ]
+    assert tied_order == list(reversed(order_ids))  # descending Payment.id
+
+
+def test_waiting_command_orders_equal_anchor_ties_deterministically(
+    handlers, client, settings, session_factory
+):
+    """Same tie-break, exercised end-to-end through /waiting."""
+    tied_anchor = datetime.now(UTC) - timedelta(seconds=1500)
+    order_ids = ["tie-cmd-w-a", "tie-cmd-w-b", "tie-cmd-w-c"]
+    for order_id in order_ids:
+        assert create_order(client, settings, order_id=order_id).status_code == 200
+    with session_factory() as db:
+        for order_id in order_ids:
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.callback_token_issued_at = tied_anchor
+        db.commit()
+
+    [text] = handlers.handle(admin_ctx(), "waiting", [])
+    positions = {order_id: text.index(order_id) for order_id in order_ids}
+    assert positions["tie-cmd-w-a"] < positions["tie-cmd-w-b"] < positions["tie-cmd-w-c"]
+
+
+def test_expired_command_orders_equal_anchor_ties_deterministically(
+    handlers, client, settings, session_factory
+):
+    """Same tie-break, exercised end-to-end through /expired."""
+    tied_anchor = datetime.now(UTC) - timedelta(
+        seconds=settings.reconciliation_max_age_seconds + 500
+    )
+    order_ids = ["tie-cmd-e-a", "tie-cmd-e-b", "tie-cmd-e-c"]
+    for order_id in order_ids:
+        assert create_order(client, settings, order_id=order_id).status_code == 200
+    with session_factory() as db:
+        for order_id in order_ids:
+            payment = db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            payment.callback_token_issued_at = tied_anchor
+        db.commit()
+
+    [text] = handlers.handle(admin_ctx(), "expired", [])
+    positions = {order_id: text.index(order_id) for order_id in order_ids}
+    assert positions["tie-cmd-e-c"] < positions["tie-cmd-e-b"] < positions["tie-cmd-e-a"]
 

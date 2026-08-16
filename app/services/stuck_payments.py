@@ -258,12 +258,19 @@ def waiting_entries_by_urgency(
     first — the operationally most urgent ordering for ``/waiting``: these
     payments have been polling the gateway without resolution the longest.
     A fresh, directly-limited query (not a slice of the overview's capped
-    list) so `/waiting N` is correct regardless of total row count."""
+    list) so `/waiting N` is correct regardless of total row count.
+
+    Two rows can share the exact same anchor timestamp (same
+    ``callback_token_issued_at``/``created_at``), which the database is
+    otherwise free to return in an unspecified order. Ties are broken by
+    ascending ``Payment.id`` — the row created first among the tied rows
+    sorts first — keeping the tie-break consistent with the primary
+    "oldest first" ordering instead of leaving it storage-dependent."""
     anchor = link_age_anchor()
     rows = db.execute(
         select(Payment)
         .where(*_waiting_conditions(settings, now=now))
-        .order_by(anchor.asc())
+        .order_by(anchor.asc(), Payment.id.asc())
         .limit(limit)
     ).scalars()
     return [_waiting_entry(payment) for payment in rows]
@@ -278,12 +285,18 @@ def expired_entries_by_recency(
     overview's ascending-and-capped ``expired`` list would only ever
     surface the most ancient legacy rows — never useful for an operator
     checking what JUST expired. A fresh, directly-limited, descending query
-    instead."""
+    instead.
+
+    Two rows can share the exact same anchor timestamp; ties are broken by
+    descending ``Payment.id`` — the row created most recently among the
+    tied rows sorts first — keeping the tie-break consistent with the
+    primary "most recently expired first" ordering instead of leaving it
+    storage-dependent."""
     anchor = link_age_anchor()
     rows = db.execute(
         select(Payment)
         .where(*_expired_conditions(settings, now=now))
-        .order_by(anchor.desc())
+        .order_by(anchor.desc(), Payment.id.desc())
         .limit(limit)
     ).scalars()
     return [_expired_entry(payment) for payment in rows]

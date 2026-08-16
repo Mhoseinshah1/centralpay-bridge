@@ -406,16 +406,22 @@ class CommandHandlers:
         """
         if args:
             return [STUCK_USAGE_ERROR]
+        # One wall-clock read for the entire report: every count and the
+        # detail list below are evaluated against this SAME `now`, so a
+        # bot_notify_pending payment sitting exactly at the 30-minute
+        # staleness boundary can never cross it between the summary count
+        # and the detailed list (or between any of the other totals).
         now = datetime.now(UTC)
         settings = self._settings
         bot_delivery_total = queries.count_bot_delivery_problems(
-            db, pending_age_minutes=30
+            db, now=now, pending_age_minutes=30
         )
         waiting_total = stuck_service.count_waiting(db, settings, now=now)
         expired_total = stuck_service.count_expired(db, settings, now=now)
         other_total = stuck_service.count_other_attention(db, settings, now=now)
         entries = queries.bot_delivery_stuck_entries(
             db,
+            now=now,
             claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
             limit=STUCK_DETAIL_MAX,
         )
