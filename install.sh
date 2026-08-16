@@ -25,6 +25,10 @@ ENV_FILE="${CONFIG_DIR}/centralpay.env"
 CADDYFILE="${CONFIG_DIR}/Caddyfile"
 DB_PASSWORD_FILE="${CONFIG_DIR}/db_password"
 CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
+# Kept in sync with scripts/centralpay's own MANAGEMENT_BIN so a fresh
+# install and a later `centralpay update`/`rollback` always maintain the
+# exact same installed path.
+MANAGEMENT_BIN="${CENTRALPAY_MANAGEMENT_BIN:-/usr/local/bin/centralpay}"
 MIN_DISK_MB=5000
 MIN_MEMORY_MB=750
 MIN_DOCKER_MAJOR=24
@@ -603,14 +607,14 @@ configure_firewall() {
 }
 
 install_management_command() {
-    install -m 0755 "${INSTALL_DIR}/scripts/centralpay" /usr/local/bin/centralpay
+    install -m 0755 "${INSTALL_DIR}/scripts/centralpay" "$MANAGEMENT_BIN"
     # Deployment scripts get explicit safe modes: a plain git clone does not
     # guarantee the executable bit, and a non-executable backup.sh broke the
     # systemd backup timer with "Permission denied" on real hosts.
     chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay"
     chmod 0750 "${INSTALL_DIR}/scripts/backup.sh"
     chmod 0755 "${INSTALL_DIR}/scripts/centralpay"
-    log "Installed management command: /usr/local/bin/centralpay"
+    log "Installed management command: ${MANAGEMENT_BIN}"
 }
 
 ensure_initial_fee_policy() {

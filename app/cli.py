@@ -431,7 +431,12 @@ def _print_reconciliation_status_human(snapshot: ReconciliationStatusSnapshot) -
         "(informational — gateway not yet confirming payment)"
     )
     print(f"  transport_failed:         {recent.transport_failed}  (attention)")
-    print(f"  exhausted_not_aged_out:   {recent.exhausted}  (attention)")
+    # NOT the same guarantee as queue.exhausted_not_aged_out: this counts
+    # `reconciliation_exhausted` events raised in the window, which does not
+    # prove those payments are still not aged-out by now (a payment can be
+    # marked exhausted and later age out before this command runs). Render
+    # plainly as "exhausted" — never "exhausted_not_aged_out".
+    print(f"  exhausted:                {recent.exhausted}  (attention)")
 
 
 def _cmd_reconciliation_status(db: Session, settings: Settings, *, as_json: bool) -> int:

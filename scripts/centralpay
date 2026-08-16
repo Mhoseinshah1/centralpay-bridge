@@ -8,6 +8,9 @@ set -Eeuo pipefail
 INSTALL_DIR="${CENTRALPAY_INSTALL_DIR:-/opt/centralpay-bridge}"
 CONFIG_DIR="${CENTRALPAY_CONFIG_DIR:-/etc/centralpay-bridge}"
 BACKUP_DIR="${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}"
+# Where this very script gets installed (install.sh installs here too — kept
+# in sync so update/rollback always know which file they are maintaining).
+MANAGEMENT_BIN="${CENTRALPAY_MANAGEMENT_BIN:-/usr/local/bin/centralpay}"
 ENV_FILE="${CONFIG_DIR}/centralpay.env"
 CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
 
@@ -440,6 +443,42 @@ cmd_update_check() {
     fi
 }
 
+sync_management_wrapper() {
+    # Keep the installed host command (MANAGEMENT_BIN, normally
+    # /usr/local/bin/centralpay) in lockstep with the scripts/centralpay of
+    # whichever application commit was just SUCCESSFULLY deployed. Callers
+    # must invoke this ONLY after `compose up -d --wait` has already
+    # returned success for the target commit — never on a failed/partial
+    # deploy, so the installed command never advertises subcommands from a
+    # version that isn't actually confirmed running.
+    #
+    # Without this, a newly added host subcommand (e.g. `stuck`) stays
+    # unavailable after `centralpay update` until someone manually copies
+    # scripts/centralpay over the installed copy: containers are rebuilt
+    # from the new image, but this host-side wrapper is a plain file placed
+    # by the installer and was previously never refreshed on update.
+    #
+    # Self-overwrite safety: this function may be executing FROM
+    # MANAGEMENT_BIN right now, as part of a plain `centralpay update` or
+    # `centralpay rollback` run by an operator. GNU `install` (like `mv` /
+    # rename(2)) creates the replacement file under a fresh inode and links
+    # it into the destination path rather than truncating the destination's
+    # existing bytes in place. A process that already has the old path open
+    # — as the bash interpreter executing THIS script does — keeps reading
+    # the OLD, now-unlinked inode until it exits; only the NEXT invocation
+    # of `centralpay` observes the new file. This has been verified
+    # experimentally: replacing a running script this way never corrupts or
+    # truncates the in-flight process's remaining output. Never replace this
+    # file any other way (e.g. `cat > "$MANAGEMENT_BIN"`), which WOULD
+    # corrupt an in-flight run by truncating the bytes the running
+    # interpreter is still reading.
+    local src="${INSTALL_DIR}/scripts/centralpay"
+    [[ -f "$src" ]] \
+        || fail "scripts/centralpay is missing from the deployed commit; refusing to update ${MANAGEMENT_BIN}."
+    install -m 0755 "$src" "$MANAGEMENT_BIN"
+    log "Installed management command synced: ${MANAGEMENT_BIN} ($(git -C "$INSTALL_DIR" rev-parse --short HEAD))"
+}
+
 cmd_update() {
     require_root update
     require_install
@@ -464,6 +503,9 @@ cmd_update() {
     compose build --quiet
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
+        # Only now is the new commit confirmed running: safe to make its
+        # scripts/centralpay the installed command.
+        sync_management_wrapper
         log "Update complete: $(git -C "$INSTALL_DIR" rev-parse --short HEAD) (was ${previous:0:7})"
         cmd_status || true
     else
@@ -472,6 +514,36 @@ cmd_update() {
         warn "Database schema is NOT downgraded automatically (migrations are"
         warn "forward-only; see MIGRATION_GUIDE.md). If the schema changed,"
         warn "restore the pre-update backup: centralpay backups && centralpay restore FILE"
+        warn "The installed 'centralpay' command was left unchanged (still the"
+        warn "previously working version) because this deploy did not succeed."
+        exit 1
+    fi
+}
+
+perform_rollback() {
+    # $1 = commit to roll application files back to. Split out of
+    # cmd_rollback so the state-mutating steps (pre-rollback backup,
+    # checkout, version history, wrapper sync, rebuild/restart) are
+    # reachable in tests without a controlling terminal — the interactive
+    # "Type ROLLBACK to continue" confirmation is the only part left in
+    # cmd_rollback itself.
+    local previous="$1"
+    log "Creating pre-rollback backup..."
+    "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-rollback backup failed; aborted."
+    git -C "$INSTALL_DIR" checkout -q "$previous" \
+        || fail "Cannot check out ${previous}."
+    record_version_history "$previous"
+    compose build --quiet
+    if compose up -d --wait; then
+        # The rolled-back commit is now confirmed running: the installed
+        # command must match IT, not whatever was deployed before the
+        # rollback (which may be a newer, or a failed, version).
+        sync_management_wrapper
+        log "Rollback complete: now at ${previous:0:12}."
+    else
+        warn "Health checks failed after rollback; inspect: centralpay diagnose"
+        warn "The installed 'centralpay' command was left unchanged because this"
+        warn "rollback did not succeed."
         exit 1
     fi
 }
@@ -489,18 +561,7 @@ cmd_rollback() {
     local answer
     read -r -p "Type ROLLBACK to continue: " answer < /dev/tty
     [[ "$answer" == "ROLLBACK" ]] || fail "Rollback cancelled."
-    log "Creating pre-rollback backup..."
-    "${INSTALL_DIR}/scripts/backup.sh" || fail "Pre-rollback backup failed; aborted."
-    git -C "$INSTALL_DIR" checkout -q "$previous" \
-        || fail "Cannot check out ${previous}."
-    record_version_history "$previous"
-    compose build --quiet
-    if compose up -d --wait; then
-        log "Rollback complete: now at ${previous:0:12}."
-    else
-        warn "Health checks failed after rollback; inspect: centralpay diagnose"
-        exit 1
-    fi
+    perform_rollback "$previous"
 }
 
 cmd_review() {
@@ -937,7 +998,7 @@ cmd_uninstall() {
     log "Configuration and credentials preserved in ${CONFIG_DIR}."
     read -r -p "Remove the 'centralpay' command itself? [y/N]: " answer < /dev/tty
     if [[ "$answer" =~ ^[Yy] ]]; then
-        rm -f /usr/local/bin/centralpay
+        rm -f "$MANAGEMENT_BIN"
         log "Management command removed."
     fi
     log "Uninstall finished."

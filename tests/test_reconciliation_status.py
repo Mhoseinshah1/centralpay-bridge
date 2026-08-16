@@ -469,6 +469,38 @@ def test_recent_stats_default_zero_when_nothing_happened(settings, session_facto
     ) == (0, 0, 0, 0, 0)
 
 
+def test_recent_exhausted_event_does_not_prove_still_not_aged_out(settings, session_factory):
+    """The exact distinction the CLI must never blur: recent.exhausted counts
+    `reconciliation_exhausted` EVENTS raised within the window, which proves
+    nothing about whether those payments are STILL not aged-out right now — a
+    payment can be marked exhausted and later age out before this command
+    runs. queue.exhausted_not_aged_out is a live, aged-out-excluded,
+    current-state count and must stay 0 here while recent.exhausted is 1."""
+    _make_payment(
+        session_factory,
+        bot_order_id="exhausted-then-aged-out",
+        callback_token_issued_at=_age(settings.reconciliation_max_age_seconds + 60),
+        reconciliation_attempts=settings.reconciliation_max_attempts,
+    )
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "exhausted-then-aged-out")
+        ).scalar_one()
+        db.add(
+            PaymentEvent(
+                payment_id=payment.id,
+                event_type="reconciliation_exhausted",
+                created_at=_age(3600),
+            )
+        )
+        db.commit()
+
+    snapshot = _snapshot(session_factory, settings)
+    assert snapshot.buckets.aged_out == 1
+    assert snapshot.queue.exhausted_not_aged_out == 0  # aged-out wins, excluded
+    assert snapshot.recent.exhausted == 1  # the event still happened in-window
+
+
 # --- read-only guarantee -----------------------------------------------------
 
 

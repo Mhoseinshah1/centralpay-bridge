@@ -191,3 +191,48 @@ def test_reconciliation_status_disabled_shows_heartbeat_not_applicable(
     payload = json.loads(capsys.readouterr().out)
     assert payload["runtime"]["enabled"] is False
     assert payload["runtime"]["heartbeat_fresh"] is None
+
+
+def test_reconciliation_status_recent_exhausted_label_is_distinct_from_queue(
+    cli_env, session_factory, capsys
+):
+    """Regression: recent.exhausted (a `reconciliation_exhausted` EVENT count
+    within the window) must never be rendered with the queue's
+    `exhausted_not_aged_out` label — a payment can have raised that event and
+    since aged out, so the two counts are not the same guarantee and can
+    legitimately diverge (here: 1 recent event, 0 still-not-aged-out)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import Payment, PaymentEvent, PaymentStatus
+
+    now = datetime.now(UTC)
+    aged_out_at = now - timedelta(seconds=cli_env.reconciliation_max_age_seconds + 60)
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="cli-exhausted-recent",
+            gateway_order_id=999001,
+            gateway_user_id=1,
+            amount=10000,
+            payable_amount=10000,
+            status=PaymentStatus.LINK_CREATED.value,
+            created_at=aged_out_at,
+            callback_token_issued_at=aged_out_at,
+            reconciliation_attempts=cli_env.reconciliation_max_attempts,
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+        db.add(
+            PaymentEvent(
+                payment_id=payment.id,
+                event_type="reconciliation_exhausted",
+                created_at=now - timedelta(hours=1),
+            )
+        )
+        db.commit()
+
+    assert cli_main(["reconciliation", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "exhausted (within auto-reconciliation lifetime): 0" in out
+    assert "  exhausted:                1  (attention)" in out
+    assert "exhausted_not_aged_out" not in out
