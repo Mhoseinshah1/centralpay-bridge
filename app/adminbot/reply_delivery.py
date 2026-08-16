@@ -15,11 +15,28 @@ operator-visible message) combined with exactly-once at the command level
 function was ever called). Telegram's Bot API provides no idempotency
 token for ``sendMessage``, so no de-duplication is attempted here -- this
 is an accepted tradeoff for an interactive, best-effort operator reply.
+
+RetryAfter is bounded by a single cumulative time budget for the *whole*
+reply (all chunks combined), not per occurrence: python-telegram-bot's
+default concurrent_updates=False means every second spent sleeping here
+also stalls every other administrator's command, so allowing each
+RetryAfter to independently spend up to the ceiling could let one reply
+block far longer than the ceiling in aggregate. Once the budget is
+exhausted, any further RetryAfter -- however small -- is treated as
+over-ceiling. When a chunk is abandoned specifically because of an active
+RetryAfter (ceiling breach, budget exhaustion, or attempts exhausted while
+Telegram still says wait), the incomplete-delivery warning is skipped
+rather than attempted: Telegram just told this bot token not to send, and
+retrying immediately would likely also fail and risks prolonging the
+flood-control window for the alert-outbox pipeline, which shares the same
+token. For every other abandonment reason (ordinary retries exhausted,
+permanent error) the warning is still attempted, best-effort, as before.
 """
 
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from app.adminbot.telegram import classify_send_error
 
@@ -40,15 +57,24 @@ SleepFn = Callable[[float], Awaitable[None]]
 _RETRY_DELAYS_SECONDS: tuple[float, ...] = (1.0, 3.0)
 _ATTEMPTS_PER_CHUNK = len(_RETRY_DELAYS_SECONDS) + 1
 
-# Ceiling on how long on_message may block waiting out a Telegram-provided
-# RetryAfter delay. python-telegram-bot's ApplicationBuilder() defaults to
-# concurrent_updates=False, so a long in-loop sleep here would stall every
-# other admin's command too. This is a ceiling on how long WE will block for
-# -- it never truncates or shortens the delay Telegram actually requires;
-# above it we simply stop and let the operator re-run the command.
-_RETRY_AFTER_INTERACTIVE_CEILING_SECONDS = 15
+# Total time budget, across the WHOLE reply (every chunk, every attempt
+# combined), that deliver_reply_chunks may spend blocked on Telegram-provided
+# RetryAfter delays. Not a per-occurrence cap: it never truncates or shortens
+# any single delay Telegram actually requires -- once the delay would exceed
+# the remaining budget, that chunk is abandoned instead of sleeping.
+_RETRY_AFTER_BUDGET_SECONDS = 15.0
 
 _INCOMPLETE_DELIVERY_WARNING = "⚠️ ارسال کامل خروجی ممکن نشد. لطفاً دستور را دوباره اجرا کنید."
+
+
+@dataclass(frozen=True)
+class _ChunkResult:
+    delivered: bool
+    # True only when abandonment happened because Telegram is actively
+    # asking this bot token to wait (ceiling breach, budget exhaustion, or
+    # attempts exhausted while a RetryAfter was still in effect) -- signals
+    # the caller to skip the incomplete-delivery warning for this reply.
+    abandoned_due_to_retry_after: bool = False
 
 
 async def deliver_reply_chunks(
@@ -62,21 +88,26 @@ async def deliver_reply_chunks(
 
     Never re-invokes any business/query logic -- the caller must already have
     produced the full ``chunks`` list. Stops at the first chunk that cannot
-    be delivered (permanent error, retries exhausted, or a RetryAfter beyond
-    the interactive ceiling), attempts one best-effort incomplete-delivery
-    warning, and never sends the chunks that would have followed it.
+    be delivered and never sends the chunks that would have followed it. A
+    best-effort incomplete-delivery warning is attempted unless the chunk was
+    abandoned specifically because of an active Telegram RetryAfter.
     """
+    retry_after_budget = _RETRY_AFTER_BUDGET_SECONDS
     for index, chunk in enumerate(chunks):
-        delivered = await _deliver_one_chunk(
+        result, retry_after_budget = await _deliver_one_chunk(
             chunk,
             send,
             command=command,
             chunk_index=index,
             chunk_count=len(chunks),
             sleep=sleep,
+            retry_after_budget=retry_after_budget,
         )
-        if not delivered:
-            await _send_incomplete_warning(send, command=command)
+        if not result.delivered:
+            if result.abandoned_due_to_retry_after:
+                _log_warning_skipped(command)
+            else:
+                await _send_incomplete_warning(send, command=command)
             return
 
 
@@ -88,33 +119,47 @@ async def _deliver_one_chunk(
     chunk_index: int,
     chunk_count: int,
     sleep: SleepFn,
-) -> bool:
+    retry_after_budget: float,
+) -> tuple[_ChunkResult, float]:
     for attempt in range(1, _ATTEMPTS_PER_CHUNK + 1):
         try:
             await send(chunk)
         except Exception as exc:
             outcome = classify_send_error(exc)
         else:
-            return True
+            return _ChunkResult(delivered=True), retry_after_budget
 
         is_last_attempt = attempt >= _ATTEMPTS_PER_CHUNK
         retry_after = outcome.retry_after_seconds
 
         if outcome.retryable and retry_after is not None:
-            if retry_after > _RETRY_AFTER_INTERACTIVE_CEILING_SECONDS:
+            if retry_after > retry_after_budget:
                 _log_failed(
-                    command, chunk_index, chunk_count, attempt, outcome.error_code, retry_after
+                    command,
+                    chunk_index,
+                    chunk_count,
+                    attempt,
+                    outcome.error_code,
+                    retry_after,
+                    retry_after_budget_remaining=retry_after_budget,
                 )
-                return False
+                return (
+                    _ChunkResult(delivered=False, abandoned_due_to_retry_after=True),
+                    retry_after_budget,
+                )
             if is_last_attempt:
                 _log_failed(
                     command, chunk_index, chunk_count, attempt, outcome.error_code, retry_after
                 )
-                return False
+                return (
+                    _ChunkResult(delivered=False, abandoned_due_to_retry_after=True),
+                    retry_after_budget,
+                )
             _log_retry_scheduled(
                 command, chunk_index, chunk_count, attempt, outcome.error_code, retry_after
             )
             await sleep(retry_after)
+            retry_after_budget -= retry_after
             continue
 
         if outcome.retryable and not is_last_attempt:
@@ -126,9 +171,9 @@ async def _deliver_one_chunk(
             continue
 
         _log_failed(command, chunk_index, chunk_count, attempt, outcome.error_code, None)
-        return False
+        return _ChunkResult(delivered=False), retry_after_budget
 
-    return False
+    return _ChunkResult(delivered=False), retry_after_budget
 
 
 async def _send_incomplete_warning(send: SendFn, *, command: str) -> None:
@@ -170,6 +215,8 @@ def _log_failed(
     attempt: int,
     error_code: str | None,
     retry_after_seconds: float | None,
+    *,
+    retry_after_budget_remaining: float | None = None,
 ) -> None:
     extra: dict[str, object] = {
         "command": command,
@@ -180,4 +227,13 @@ def _log_failed(
     }
     if retry_after_seconds is not None:
         extra["retry_after_seconds"] = retry_after_seconds
+    if retry_after_budget_remaining is not None:
+        extra["retry_after_budget_remaining_seconds"] = retry_after_budget_remaining
     logger.warning("admin_reply_failed", extra=extra)
+
+
+def _log_warning_skipped(command: str) -> None:
+    logger.warning(
+        "admin_reply_incomplete_warning_skipped",
+        extra={"command": command, "reason": "retry_after_active"},
+    )

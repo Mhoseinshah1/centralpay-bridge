@@ -174,15 +174,63 @@ def test_retry_after_above_ceiling_is_not_slept_or_retried_early():
     sender = ScriptedSender([telegram_error.RetryAfter(20)])  # classified as 21 seconds > 15
     clock = FakeClock()
     _run(deliver_reply_chunks(["only"], sender, command="stuck", sleep=clock))
-    assert sender.calls == ["only", _INCOMPLETE_DELIVERY_WARNING]
+    # Abandoned specifically because of an active RetryAfter -- the fallback
+    # warning is skipped, not attempted, so as not to hit the same flood
+    # control window (and risk prolonging it for the shared-token alert
+    # pipeline) that Telegram just imposed.
+    assert sender.calls == ["only"]
     assert clock.sleeps == []
 
 
-def test_retry_after_above_ceiling_stops_subsequent_chunks_and_warns():
+def test_retry_after_above_ceiling_stops_subsequent_chunks_and_skips_warning():
     sender = ScriptedSender([telegram_error.RetryAfter(20)])
     clock = FakeClock()
     _run(deliver_reply_chunks(["c1", "c2"], sender, command="recent", sleep=clock))
-    assert sender.calls == ["c1", _INCOMPLETE_DELIVERY_WARNING]
+    assert sender.calls == ["c1"]
+
+
+def test_cumulative_retry_after_budget_is_enforced_within_one_chunk():
+    """Two individually-within-ceiling RetryAfters on the same chunk must not
+    let total blocking exceed the 15s per-reply budget: 10s then another 10s
+    would be 20s total, so the second one is abandoned rather than slept."""
+    sender = ScriptedSender(
+        [telegram_error.RetryAfter(9), telegram_error.RetryAfter(9)]  # each classified as 10s
+    )
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["only"], sender, command="stuck", sleep=clock))
+    assert sender.calls == ["only", "only"]  # abandoned after 2 attempts, not 3
+    assert clock.sleeps == [10]  # only the first (budget-affordable) wait happened
+
+
+def test_cumulative_retry_after_budget_persists_across_chunks():
+    sender = ScriptedSender(
+        [
+            # classified as 8s; within budget -- chunk1 retries then succeeds
+            telegram_error.RetryAfter(7),
+            None,
+            # classified as 8s again; only 7s of budget left -> abandoned
+            telegram_error.RetryAfter(7),
+        ]
+    )
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["c1", "c2"], sender, command="recent", sleep=clock))
+    assert sender.calls == ["c1", "c1", "c2"]  # c2 abandoned on its first attempt; warning skipped
+    assert clock.sleeps == [8]
+
+
+def test_warning_skipped_log_emitted_when_abandoned_via_retry_after(caplog):
+    caplog.set_level(logging.WARNING, logger="app.adminbot.reply_delivery")
+    sender = ScriptedSender([telegram_error.RetryAfter(20)])
+    clock = FakeClock()
+    _run(deliver_reply_chunks(["only"], sender, command="stuck", sleep=clock))
+    skipped = [
+        r for r in caplog.records if r.getMessage() == "admin_reply_incomplete_warning_skipped"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0].command == "stuck"
+    assert _INCOMPLETE_DELIVERY_WARNING not in sender.calls
+    failed_records = [r for r in caplog.records if r.getMessage() == "admin_reply_failed"]
+    assert failed_records  # sanity: the abandonment itself was still logged
 
 
 # --- 16. logs never contain reply chunk text ---------------------------------
