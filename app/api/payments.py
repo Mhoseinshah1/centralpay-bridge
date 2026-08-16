@@ -267,6 +267,59 @@ def _try_recover_json_key_form(pairs: list[tuple[str, str]]) -> dict[str, Any] |
     return parsed if isinstance(parsed, dict) else None
 
 
+def _json_shape_label(text: str) -> str:
+    """Classify TEXT's JSON-decodability into a fixed, non-secret vocabulary
+    ("object" / "array" / "string" / "scalar" / "invalid") — NEVER returns
+    or logs the text itself. Used only for safe diagnostic logging."""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return "invalid"
+    if isinstance(parsed, dict):
+        return "object"
+    if isinstance(parsed, list):
+        return "array"
+    if isinstance(parsed, str):
+        return "string"
+    return "scalar"  # int, float, bool, or null
+
+
+def _unrecovered_single_pair_diagnostics(pair: tuple[str, str], raw_text: str) -> dict[str, Any]:
+    """SAFE, non-secret structural diagnostics for the one remaining
+    unresolved legacy shape reported in production: application/
+    x-www-form-urlencoded, exactly one parsed pair, none of the three
+    required field names present, and ``_try_recover_json_key_form``
+    declined to recover it (PR #55 fixed the "whole JSON object as the key,
+    empty value" case; at least one other customer's wire shape is not
+    that).
+
+    Every value here is a length, a boolean, or a fixed-vocabulary
+    classification — NEVER the raw key, the raw value, the raw request
+    body, api_key, order_id, or any other attacker/customer-supplied
+    content. Intended as a temporary aid: once production confirms which
+    shape is actually occurring, a targeted compatibility branch replaces
+    this diagnostic-only addition.
+    """
+    key, value = pair
+    return {
+        "key_length": len(key),
+        "value_length": len(value),
+        "value_empty": value == "",
+        "key_json_type": _json_shape_label(key),
+        "value_json_type": _json_shape_label(value),
+        "key_starts_json_object": key.lstrip().startswith("{"),
+        "key_ends_json_object": key.rstrip().endswith("}"),
+        # Count of literal (NOT percent-encoded) '=' characters in the raw
+        # wire text for this single pair. A well-formed
+        # <percent-encoded-JSON>= body has exactly one (the trailing
+        # separator); more than one means the sender failed to
+        # percent-encode an '=' that was part of the JSON content itself,
+        # which truncates the key at the first occurrence — parse_qsl
+        # splits on the FIRST unescaped '=' only.
+        "raw_pair_equals_count": raw_text.count("="),
+    }
+
+
 def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     """Decode a legacy form body, tolerating unrelated extra fields.
 
@@ -323,6 +376,15 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
             "missing_required_fields": missing,
             "duplicate_required_fields": duplicate,
         }
+        # Narrowly scoped, temporary structural diagnostics (see
+        # _unrecovered_single_pair_diagnostics): ONLY for the exact
+        # unresolved shape reported in production — exactly one pair, and
+        # none of the three required field names matched at all (a
+        # confirmed-JSON-key body that _try_recover_json_key_form declined
+        # to recover). Never fires for an ordinary form missing one or two
+        # fields, or with any real extra fields.
+        if total_pairs == 1 and len(missing) == len(_REQUIRED_FIELDS):
+            detail.update(_unrecovered_single_pair_diagnostics(pairs[0], text))
         raise _CompatReject("urlencoded", detail)
     result: dict[str, Any] = {field: values[field] for field in _REQUIRED_FIELDS}
     result.update(aliases)
