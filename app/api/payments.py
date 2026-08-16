@@ -229,6 +229,44 @@ def _decode_json_layers(
     raise _CompatReject(object_category)
 
 
+def _try_recover_json_key_form(pairs: list[tuple[str, str]]) -> dict[str, Any] | None:
+    """Recover the narrow legacy shape where a sender urlencodes an entire
+    JSON document as the KEY of a single form pair with an empty value (the
+    whole document percent-encoded, followed by a bare ``=``). Production
+    evidence: the inaccessible legacy sales bot does this intermittently.
+
+    ``parse_qsl`` treats that as ONE syntactically valid pair, so it never
+    raises and never reaches the JSON-syntax fallback in ``_decode`` (which
+    only triggers when form parsing itself fails) — it must be recovered
+    here, before the ordinary required-field-name check would otherwise see
+    zero of the three real field names and reject the whole body as
+    "missing api_key, amount, order_id".
+
+    Returns the parsed JSON object ONLY when ALL of the following hold —
+    otherwise returns None and the caller falls through to the unchanged
+    ordinary parsing/rejection path:
+      * exactly one parsed pair
+      * the pair's value is empty
+      * the pair's key is not itself one of the required/alias field names
+        (a real, merely-empty field like ``api_key=`` must never be treated
+        as this representation)
+      * the key, JSON-decoded, is an object (dict) — not an array, string,
+        number, boolean, or null, and not malformed JSON
+
+    Exactly one ``json.loads`` call: no recursive/extra-layer decoding.
+    """
+    if len(pairs) != 1:
+        return None
+    key, value = pairs[0]
+    if value != "" or key in _REQUIRED_FIELDS or key in _ALIAS_FIELD_SET:
+        return None
+    try:
+        parsed = json.loads(key)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     """Decode a legacy form body, tolerating unrelated extra fields.
 
@@ -255,6 +293,13 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     total_pairs = len(pairs)
     if total_pairs > _MAX_FORM_PAIRS:
         raise _CompatReject("urlencoded", {"total_pair_count": total_pairs})
+    # A single JSON object encoded as the whole form key (see
+    # _try_recover_json_key_form). Fed through the SAME normalize/validate
+    # pipeline as every other representation below — never a separate,
+    # weaker path.
+    recovered = _try_recover_json_key_form(pairs)
+    if recovered is not None:
+        return "urlencoded_json_key", recovered
     # Count occurrences of the REQUIRED fields; also capture optional aliases.
     # Every other extra field is dropped here (name/value neither retained nor
     # logged).
