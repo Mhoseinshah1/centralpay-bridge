@@ -511,6 +511,15 @@ cmd_update() {
     require_root update
     require_install
     acquire_deploy_lock
+    perform_update
+}
+
+perform_update() {
+    # Split out of cmd_update so the state-mutating steps (resolve commit,
+    # backup, checkout, version history, build/restart, wrapper sync) are
+    # reachable in tests without requiring the calling process to run as
+    # root — require_root, require_install, and the deploy lock are the
+    # only parts left in cmd_update itself.
     local ref previous target_commit
     ref=$(env_value CENTRALPAY_UPDATE_REF)
     ref="${ref:-main}"

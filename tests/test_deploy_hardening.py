@@ -102,13 +102,27 @@ def test_first_update_records_no_empty_previous(tmp_path):
 
 
 def test_cmd_update_passes_pre_update_commit_to_history():
-    """Fix guard: cmd_update must forward the captured pre-update commit as the
-    explicit previous, otherwise the first update records an empty rollback
-    target again."""
+    """Fix guard: perform_update (the state-mutating half of cmd_update) must
+    forward the captured pre-update commit as the explicit previous,
+    otherwise the first update records an empty rollback target again."""
     source = CLI.read_text()
-    body = source[source.index("cmd_update()") :]
+    body = source[source.index("perform_update()") :]
     body = body[: body.index("\n}\n")]
     assert 'record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)" "$previous"' in body
+
+
+def test_cmd_update_requires_root_before_delegating_to_perform_update():
+    """Fix guard: the root/install/lock checks must stay in the thin
+    cmd_update entrypoint, with perform_update doing the actual work — this
+    is what lets tests call perform_update directly without running as
+    root, mirroring the existing cmd_rollback / perform_rollback split."""
+    source = CLI.read_text()
+    body = source[source.index("cmd_update() {") :]
+    body = body[: body.index("\n}\n")]
+    assert "require_root update" in body
+    assert "perform_update" in body
+    # The actual deploy steps live in perform_update, not inline here.
+    assert "compose up" not in body
 
 
 # --- 2. deploy lock serializes update/rollback --------------------------------
@@ -155,7 +169,7 @@ def test_update_and_rollback_sync_wrapper_only_on_health_check_success():
     unconditionally and never in the failure branch."""
     source = CLI.read_text()
     for start, end in (
-        ("cmd_update() {", "\nperform_rollback() {"),
+        ("perform_update() {", "\nperform_rollback() {"),
         ("perform_rollback() {", "\ncmd_rollback() {"),
     ):
         body = source[source.index(start) : source.index(end)]
@@ -270,7 +284,7 @@ def test_update_syncs_installed_wrapper_with_newly_deployed_commit(deploy_sandbo
     commit_b = _commit_deploy(deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B")
     git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
 
-    result = cli_call("cmd_update", _env_for(deploy_sandbox))
+    result = cli_call("perform_update", _env_for(deploy_sandbox))
     assert result.returncode == 0, result.stderr
 
     management_bin = deploy_sandbox["management_bin"]
@@ -299,7 +313,7 @@ def test_update_leaves_wrapper_unchanged_when_deploy_fails(deploy_sandbox):
     _commit_deploy(deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B")
     git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
 
-    result = cli_call("cmd_update", _env_for(deploy_sandbox, fail_compose_up=True))
+    result = cli_call("perform_update", _env_for(deploy_sandbox, fail_compose_up=True))
     assert result.returncode != 0
 
     assert git("rev-parse", "HEAD", cwd=deploy_sandbox["install"]) != deploy_sandbox["commit_a"]
@@ -310,7 +324,7 @@ def test_rollback_restores_wrapper_matching_rolled_back_version(deploy_sandbox):
     _commit_deploy(deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B")
     git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
 
-    update_result = cli_call("cmd_update", _env_for(deploy_sandbox))
+    update_result = cli_call("perform_update", _env_for(deploy_sandbox))
     assert update_result.returncode == 0, update_result.stderr
     assert deploy_sandbox["management_bin"].read_text() == NEW_WRAPPER  # sanity: update landed
 
@@ -333,7 +347,7 @@ def test_rollback_restores_wrapper_matching_rolled_back_version(deploy_sandbox):
 def test_rollback_leaves_wrapper_unchanged_when_health_check_fails(deploy_sandbox):
     _commit_deploy(deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B")
     git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
-    update_result = cli_call("cmd_update", _env_for(deploy_sandbox))
+    update_result = cli_call("perform_update", _env_for(deploy_sandbox))
     assert update_result.returncode == 0, update_result.stderr
 
     rollback_result = cli_call(
@@ -358,12 +372,14 @@ def test_update_self_replaces_the_running_wrapper_without_breaking_it(deploy_san
 
     management_bin = deploy_sandbox["management_bin"]
     # A self-invoking wrapper that sources the real update machinery and
-    # keeps executing (a marker line) after cmd_update — which calls
-    # sync_management_wrapper — replaces this very file mid-run.
+    # keeps executing (a marker line) after perform_update — which calls
+    # sync_management_wrapper — replaces this very file mid-run. Calls
+    # perform_update (not cmd_update) so this test doesn't depend on
+    # running as root, same as the other direct-invocation tests here.
     management_bin.write_text(
         "#!/usr/bin/env bash\n"
         f"source {shlex.quote(str(CLI))}\n"
-        "cmd_update\n"
+        "perform_update\n"
         "echo SELF_UPDATE_SURVIVED\n"
     )
     management_bin.chmod(0o755)
