@@ -277,15 +277,22 @@ unaccounted for — the top priority of AGENTS.md.
 | B1 | Installer never executed on a real Ubuntu host (no VM access from this environment) | `REAL_HOST_VALIDATION.md` |
 | B2 | CentralPay contract never observed for real: staging run against the real/sandbox gateway (verify schema, verify-after-verify idempotency, real Caddy TLS) | `STAGING_VALIDATION.md` |
 | B3 | Live Telegram validation of the admin bot (blocker for enabling the admin bot; the payment path does not depend on it) | `ADMIN_BOT_VALIDATION.md` |
-| B4 | Multi-agent adversarial review **RUN** (2026-07-19, six agents, real PostgreSQL 16) → **`B4_FAILED_CONFIRMED_CODE_BLOCKERS`**: three confirmed defects (topics 33–35) must be fixed in a separate PR before B4 can close | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` |
 | B5 | Release workflow (`.github/workflows/release.yml`) has not yet run green: Docker builds, Trivy scan, SBOM, and artifact packaging are CI-delegated and unverified locally | GitHub Actions |
+
+## Closed release blockers
+
+| # | Blocker | Resolution | Evidence document |
+|---|---------|------------|--------------------|
+| B4 | Multi-agent adversarial review | **CLOSED (2026-08-17), independently revalidated on `c68e86e45b718b1da34439246572dfe5d8ac947a`.** First run 2026-07-19 (six agents, real PostgreSQL 16) on SHA `4e62a552…` → `B4_FAILED_CONFIRMED_CODE_BLOCKERS` (topics 33–35, 38 = CANON-1/2/3/5). Remediated in `fix/b4-confirmed-release-blockers` + `fix/release-manifest-exactness`. Independently rechecked by seven adversarial agents plus a full local verification run (ruff/mypy/pytest incl. real PostgreSQL 16/shellcheck) on current `main`: **zero confirmed B4 blockers**, CANON-1/2/3/5 all FIXED-CONFIRMED, financial and concurrency invariants proven live on PostgreSQL. Seven new non-blocking findings recorded (topics 42–48). The historical FAILED verdict on `4e62a552…` is preserved unchanged. | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` (original, FAILED) + `ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` (recheck, CLOSED) |
 
 **Release decision:** 0.6.0-rc1 is a code-complete release candidate.
 It must not be tagged, published, or used for real payments until B1,
-B2, B4, and B5 are closed (and B3 if the admin bot is to be enabled),
-and a human approval is recorded. **B4 was run on 2026-07-19 and
-FAILED with confirmed code blockers** (topics 33–35); it stays open
-until those are fixed and re-reviewed.
+B2, and B5 are closed (and B3 if the admin bot is to be enabled), and a
+human approval is recorded. **B4 was run on 2026-07-19 and FAILED with
+confirmed code blockers** (topics 33–35); those were fixed and B4 was
+**independently rechecked and CLOSED on 2026-08-17** against
+`c68e86e45b718b1da34439246572dfe5d8ac947a` — see
+`ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md`.
 
 **Final-audit classification (audit/final-financial-correctness):**
 after six focused audits plus the final end-to-end audit, **no code
@@ -293,8 +300,8 @@ blocker remains** — see `FINAL_FINANCIAL_AUDIT.md`
 (CODE_FINANCIALLY_SOUND / PRODUCTION_VALIDATION_STATUS: INCOMPLETE).
 Every open register item is one of: real-host blocker (B1),
 real-CentralPay blocker (B2, incl. TOMAN-unit and verify-idempotency
-confirmation), live-Telegram blocker (B3), process blocker (B4
-adversarial review, B5 release-workflow run), real-bot blocker
+confirmation), live-Telegram blocker (B3), process blocker (B5
+release-workflow run — B4 adversarial review CLOSED 2026-08-17), real-bot blocker
 (2xx/duplicate semantics confirmation), accepted risk (items 2*, 3, 8
 residual, 10, 11, 13, 14, 15, 16, 17 residual, 18, 21, 23, 24), or
 post-release backlog. Migration 0005 added the financial CHECK
@@ -380,20 +387,24 @@ Full evidence, per-invariant verdicts, false-positive appendix, and the
 recommended remediation scope are in `ADVERSARIAL_REVIEW_0.6.0_RC1.md`.
 
 **Remediation status (fix/b4-confirmed-release-blockers):** CANON-1
-(topic 33), CANON-2 (topic 34), and CANON-5 (topic 38) are **FIXED IN
-CODE — INDEPENDENT B4 RECHECK REQUIRED**. CANON-3 (topic 35) is **CORE
-COMMIT BINDING FIXED — MANIFEST EXACTNESS FOLLOW-UP PENDING B4 RECHECK**:
-the core commit-binding landed in fix/b4-confirmed-release-blockers, and
-the residual `SHA256SUMS`/`SOURCE_COMMIT` parsing-exactness defects were
-tightened in `fix/release-manifest-exactness`; the combined result awaits
-the independent B4 recheck before it may be marked fully fixed. The
-historical `ADVERSARIAL_REVIEW_0.6.0_RC1.md` verdict for its audited SHA
-(`4e62a552…`) stands unchanged as an honest record that B4 failed on that
-commit. **B4 remains OPEN**: it can be closed only by a subsequent
-independent review of the fixed `main`. B1, B2, B3, and B5 remain open on
-their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
+(topic 33), CANON-2 (topic 34), and CANON-5 (topic 38) were **FIXED IN
+CODE**. CANON-3 (topic 35)'s core commit-binding landed in
+fix/b4-confirmed-release-blockers, and the residual `SHA256SUMS`/
+`SOURCE_COMMIT` parsing-exactness defects were tightened in
+fix/release-manifest-exactness.
 
-### 33. Installer rerun silently applies a 0% fee — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED DEFECT; MEDIUM; financial correctness)
+**Independent B4 recheck (2026-08-17, seven agents, real PostgreSQL 16,
+SHA `c68e86e4…`):** all four — CANON-1, CANON-2, CANON-3 (including the
+manifest-exactness follow-up), and CANON-5 — are **FIXED-CONFIRMED**. Full
+evidence in `ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md`. The historical
+`ADVERSARIAL_REVIEW_0.6.0_RC1.md` verdict for its audited SHA
+(`4e62a552…`) stands unchanged as an honest record that B4 failed on that
+commit. **B4 is now CLOSED** (see the "Closed release blockers" table
+above). B1, B2, B3, and B5 remain open on their existing, unchanged
+scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE` (B1/B2/B3/B5 still
+open).
+
+### 33. Installer rerun silently applies a 0% fee — **FIXED-CONFIRMED (independent B4 recheck, 2026-08-17, `c68e86e4…`)** (was: CONFIRMED DEFECT; MEDIUM; financial correctness)
 - **Resolution (CANON-1):** the operator's initial fee is persisted as
   `INSTALLER_INITIAL_FEE_PERCENT` recovery metadata (never the live fee)
   and re-read on the keep-existing path. A new typed operation
@@ -417,7 +428,7 @@ their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
   keep-existing path, or refuse to create a policy when the rate was
   never supplied on a rerun. Add a rerun regression test.
 
-### 34. `isdigit()`-gated `int()` crashes on gateway/bot digit-like strings — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: CONFIRMED CODE DEFECT; LOW; fails closed/safe)
+### 34. `isdigit()`-gated `int()` crashes on gateway/bot digit-like strings — **FIXED-CONFIRMED (independent B4 recheck, 2026-08-17, `c68e86e4…`)** (was: CONFIRMED CODE DEFECT; LOW; fails closed/safe)
 - **Resolution (CANON-2):** both parsers now use an explicit ASCII grammar
   (`-?[0-9]+` for gateway numbers, `[0-9]+` for `Retry-After`) and catch
   `ValueError`/`OverflowError` defensively, returning `None` so malformed
@@ -440,7 +451,7 @@ their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
   `re.ASCII`) at both sites, routing to the existing safe paths; add
   tests for `"²"`, `"--5"`, and a `\xb2` Retry-After.
 
-### 35. Update integrity control decoupled from the deployed bytes — **CORE COMMIT BINDING FIXED — MANIFEST EXACTNESS FOLLOW-UP PENDING B4 RECHECK** (was: CONFIRMED DEFECT; MEDIUM; weakened control + doc mismatch)
+### 35. Update integrity control decoupled from the deployed bytes — **FIXED-CONFIRMED, incl. manifest exactness (independent B4 recheck, 2026-08-17, `c68e86e4…`)** (was: CONFIRMED DEFECT; MEDIUM; weakened control + doc mismatch)
 - **Resolution (CANON-3):** the release workflow emits a checksummed
   `SOURCE_COMMIT` asset, and `centralpay update` requires the fetched
   tag's commit to equal the verified `SOURCE_COMMIT` before any
@@ -485,7 +496,7 @@ their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
   builds and a non-deterministic pip-audit set. Fix: `pip-compile`/`uv
   lock` + `pip install --require-hashes`.
 
-### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **FIXED IN CODE — INDEPENDENT B4 RECHECK REQUIRED** (was: DOCUMENTATION MISMATCH; LOW)
+### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **FIXED-CONFIRMED (independent B4 recheck, 2026-08-17, `c68e86e4…`; live `docker build` blocked by sandbox egress policy, ties to B5 — static analysis + regression test corroborate the fix)** (was: DOCUMENTATION MISMATCH; LOW)
 - **Resolution (CANON-5):** the label is now `${APP_VERSION}`, supplied by
   a build ARG that CI and the release workflow set from
   `app.version.APP_VERSION` (a local build with no `--build-arg` gets an
@@ -505,18 +516,112 @@ their existing scope. `PRODUCTION_VALIDATION_STATUS: INCOMPLETE`.
   The UNIQUE constraint is the real backstop — no double credit (proven
   on real PostgreSQL). Optional fix: catch `IntegrityError` → manual
   review.
+  **B4 recheck (2026-08-17):** independently re-proven live on real
+  PostgreSQL (5 trials) — classification unchanged. Incremental detail:
+  `app/services/aged_out_recovery.py`'s `execute_confirmed_recovery` only
+  catches `CentralPayError`, not this `IntegrityError`, so hitting the
+  same collision via `recover-aged-out --confirm` surfaces an unhandled
+  traceback rather than a graceful 500 — same fails-safe outcome, rougher
+  operator UX on a second entry point. See topic 47.
 
-### 40. No reconciliation for a crash in the verify→commit window — **EXTERNAL VALIDATION GAP / POST-RELEASE; LOW-MEDIUM; fails closed**
+### 40. No reconciliation for a crash in the verify→commit window — **PARTIALLY SUPERSEDED — see B4 recheck note** (was: EXTERNAL VALIDATION GAP / POST-RELEASE; LOW-MEDIUM; fails closed)
 - A crash after `client.verify()` succeeds but before `db.commit()`
-  leaves the payment `link_created`; there is no background sweep to
-  re-verify aged `link_created` payments, so recovery relies on the payer
-  re-hitting the callback URL. No money moves incorrectly. Ties to B2
-  (verify-after-verify idempotency). Optional fix: a reconciliation job.
+  leaves the payment `link_created`. Ties to B2 (verify-after-verify
+  idempotency). No money moves incorrectly.
+  **B4 recheck (2026-08-17):** the "no background sweep... recovery
+  relies on the payer re-hitting the callback URL" claim below is now
+  stale. `app/services/reconciliation.py`'s always-on worker
+  (`reconciliation_enabled: bool = True` by default) already re-verifies
+  aged `link_created` payments through the exact same `verify_and_settle`
+  path, and `app/services/aged_out_recovery.py` (`recover-aged-out`)
+  adds an explicit operator escape hatch beyond even that. The residual
+  risk this topic describes is smaller than previously documented, not
+  larger — updated here for accuracy, not because a new defect was
+  found. Original text preserved below for history.
+- *(original text)* There is no background sweep to re-verify aged
+  `link_created` payments, so recovery relies on the payer re-hitting the
+  callback URL. Optional fix: a reconciliation job.
 
 ### 41. `_to_int` accepts non-ASCII decimal digits — **POST-RELEASE BACKLOG; LOW; no financial impact**
 - Diverges from `services/fees.py` (`re.ASCII`); parses to the correct
   integer and must still match the stored ASCII value, so no wrong value
   and no crash. Consistency nit; align with `re.ASCII`.
+
+## Topics 42–48 (independent B4 recheck, 2026-08-17 — `c68e86e4…`)
+
+New findings surfaced by the seven-agent B4 recheck (see
+`ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` for full evidence). None is a
+B4 blocker; recorded here per this register's own practice so nothing
+found during the recheck is fixed-and-hidden.
+
+### 42. `review resend` (app/ops.py) has weaker eligibility checks than `bulk_resend.py` — **CONFIRMED NON-BLOCKING DEFECT; LOW**
+- Independently found by two reviewers: missing the `bot_notify_reason`
+  allowlist filter, and ignoring `review_resolved_at` (a payment just
+  marked "resolved, do not deliver" can still be resent). Mitigated by
+  two mandatory confirmation flags, by requiring `gateway_verified_at`
+  non-null (financial-mismatch reviews never set it), and by being a
+  single-payment, human-reviewed, host-CLI-only action. Fix direction:
+  reuse `bulk_resend.ELIGIBLE_RESEND_REASONS` and add a
+  `review_resolved_at IS NULL` guard.
+
+### 43. CANON-2 `isdigit()`-then-unguarded-`int()` pattern reappears at new sites — **CONFIRMED NON-BLOCKING DEFECT; LOW; fails safe/unreachable**
+- `app/adminbot/queries.py:find_payment`, `app/ops.py:_load_review_payment`,
+  two sites in `app/adminbot/commands.py`, and `app/api/payments.py`'s
+  Content-Length header parsing. Admin/ops sites are gated behind admin
+  auth and/or a broad top-level exception handler (generic error reply,
+  never a crash). The `app/api/payments.py` site was proven empirically
+  unreachable: a raw malformed `Content-Length` header is rejected by
+  uvicorn's own HTTP parser with `400 Bad Request` before the ASGI app is
+  ever entered (verified against the actual production stack). Fix
+  direction: apply the `isdecimal()` + BIGINT-bound pattern already proven
+  in `app/cli.py:_find_payment` to the admin/ops sites.
+
+### 44. `_is_private_bot_host` misclassifies hex/octal/integer IPv4 literals as "private" — **CONFIRMED NON-BLOCKING DEFECT; LOW-MEDIUM; requires non-default opt-in**
+- `app/config.py`'s numeric-IP-literal detection only recognizes
+  strictly-decimal-digit dotted quads; `0x08080808` (resolves to the real
+  public `8.8.8.8`) falls through to the "single-label = private
+  container name" default and is wrongly accepted. Proven live (real DNS
+  resolution). Falsifies the module's own docstring claim for this input
+  class. Not exploitable without the non-default
+  `ALLOW_INSECURE_BOT_NOTIFY_URL=true` opt-in. Fix direction: validate
+  every authority label via `ipaddress.ip_address()`.
+
+### 45. Secret-redaction floor can be undercut by short-configured API keys/tokens — **CONFIRMED NON-BLOCKING DEFECT; LOW; defense-in-depth only**
+- `app/logging_setup.py`'s `_MIN_REDACTABLE_LENGTH = 6` combined with no
+  `Field(min_length=...)` on `centralpay_getlink_api_key`/
+  `centralpay_verify_api_key`/`bot_notify_token`/`admin_bot_token` (unlike
+  `inbound_api_key`/`callback_hmac_secret`, which require ≥16). No
+  currently-live code path logs these raw, so no active leak — proven by
+  configuring a 5-char key and confirming it is not redacted. Fix
+  direction: raise the length floor on these four settings to match the
+  others.
+
+### 46. `CENTRALPAY_UPDATE_REF` passed to `git fetch` without a `--` separator — **CONFIRMED NON-BLOCKING DEFECT; LOW; requires already-compromised config**
+- Permits git-flag injection if the value begins with `-`. Requires the
+  attacker to already control the root-owned, 0600 env file, at which
+  point more direct compromise paths already exist. Fix direction:
+  `git fetch --tags --force origin -- "$ref"`.
+
+### 47. `recover-aged-out --confirm` lacks the `require_root` gate its sibling mutating commands have — **CONFIRMED NON-BLOCKING DEFECT; LOW**
+- `scripts/centralpay`'s `cmd_recover_aged_out` has no `require_root`
+  call, unlike `cmd_review`/`cmd_fee`'s mutating subcommands — the
+  codebase's own established pattern for financial-mutation commands.
+  Bounded in practice: `docker exec` access is already effectively
+  root-equivalent in the standard deployment. Also see topic 39's
+  incremental detail (this command's `IntegrityError` handling gap). Fix
+  direction: add `require_root "recover-aged-out --confirm"`.
+
+### 48. `recover-aged-out --confirm` extends the open B2 verify-after-verify risk to a new scenario — **ALREADY-KNOWN OPEN RELEASE/ENV RISK, scoped to B2, not a new B4 finding**
+- Makes a real gateway `verify()` call and *applies* the result for a
+  payment the reconciliation worker has typically already polled — the
+  same "verify-after-verify against real CentralPay, never confirmed
+  safe" question B2 already tracks, extended to payments outside the
+  worker's normal polling window. Not a code defect this recheck's scope
+  can fix — it is B2's existing whole-system risk. Recommended (not
+  required for B4): extend `STAGING_VALIDATION.md`'s procedure to
+  explicitly cover a `recover-aged-out --confirm` call on a payment with
+  ≥1 prior worker verify attempt before this command is used against
+  production CentralPay.
 
 **Accepted risks confirmed by the B4 review (not defects):** the
 intentional serialization of the gateway HTTP call across the row lock
