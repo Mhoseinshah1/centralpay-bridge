@@ -29,7 +29,7 @@ from sqlalchemy import select
 
 from app.adminbot.auth import UpdateContext
 from app.adminbot.commands import CommandHandlers
-from app.models import Payment, PaymentStatus
+from app.models import Payment, PaymentEvent, PaymentStatus
 from tests.conftest import (
     TEST_ADMIN_ID,
     TEST_ADMIN_ID_2,
@@ -113,6 +113,28 @@ def _make_expired(session_factory, settings, order_id: str, *, extra_seconds=0, 
         )
         payment.reconciliation_attempts = checks
         payment.reconciliation_last_at = datetime.now(UTC) - timedelta(hours=1)
+        db.commit()
+
+
+def _backdate_notification_entry_event(session_factory, order_id: str, *, event_type: str, when):
+    """The notification-age anchor (app.adminbot.queries._notification_age_anchor)
+    reads MAX(created_at) from the payment's own bot_notification_queued /
+    manual_review_resend_requested / admin_bulk_resend_requested events, NOT
+    a Payment column -- so tests that need to simulate an old notification
+    cycle must backdate the event that recorded its start, not
+    gateway_verified_at/created_at (those are only fallbacks for a row with
+    no matching event at all)."""
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        event = db.execute(
+            select(PaymentEvent)
+            .where(PaymentEvent.payment_id == payment.id, PaymentEvent.event_type == event_type)
+            .order_by(PaymentEvent.id.desc())
+            .limit(1)
+        ).scalar_one()
+        event.created_at = when
         db.commit()
 
 
@@ -1095,6 +1117,12 @@ def test_bot_delivery_snapshot_reads_total_and_entries_from_one_statement(
         payment.created_at = pinned_now - timedelta(minutes=45)
         payment.gateway_verified_at = pinned_now - timedelta(minutes=45)
         db.commit()
+    _backdate_notification_entry_event(
+        session_factory,
+        order_id,
+        event_type="bot_notification_queued",
+        when=pinned_now - timedelta(minutes=45),
+    )
 
     statements: list[str] = []
 
@@ -1310,6 +1338,10 @@ def test_bot_delivery_snapshot_count_and_entries_agree_at_pending_cutoff_boundar
             payment.created_at = pinned_now - age
             payment.gateway_verified_at = pinned_now - age
         db.commit()
+    for order_id, age in ages.items():
+        _backdate_notification_entry_event(
+            session_factory, order_id, event_type="bot_notification_queued", when=pinned_now - age
+        )
 
     with session_factory() as db:
         snapshot = queries.bot_delivery_snapshot(db, now=pinned_now, limit=30)
@@ -1351,6 +1383,10 @@ def test_stuck_count_and_detail_share_one_snapshot_at_cutoff_boundary(
             payment.created_at = pinned_now - age
             payment.gateway_verified_at = pinned_now - age
         db.commit()
+    for order_id, age in ages.items():
+        _backdate_notification_entry_event(
+            session_factory, order_id, event_type="bot_notification_queued", when=pinned_now - age
+        )
 
     monkeypatch.setattr("app.adminbot.commands.datetime", _FixedDateTime)
 
@@ -1390,6 +1426,13 @@ def test_bot_delivery_snapshot_tie_broken_by_id_when_pending_created_at_ties(
             payment.created_at = tied_verified_at
             payment.gateway_verified_at = tied_verified_at
         db.commit()
+    for order_id in order_ids:
+        _backdate_notification_entry_event(
+            session_factory,
+            order_id,
+            event_type="bot_notification_queued",
+            when=tied_verified_at,
+        )
 
     with session_factory() as db:
         snapshot = queries.bot_delivery_snapshot(db, now=pinned_now, limit=50)
@@ -1513,23 +1556,43 @@ def test_expired_command_orders_equal_anchor_ties_deterministically(
 
 
 # ============================================================================
-# Hotfix: bot_notify_pending staleness must anchor on notification-phase
-# entry (gateway_verified_at), never bare order-creation time (created_at).
-# An order can be created long before the customer completes payment; using
-# created_at made a brand-new notification job look stale/failed the instant
-# it was queued. Both queries.bot_delivery_snapshot and queries.stuck_payments
-# share _stale_bot_notify_pending_conditions, so fixing it there fixes both
-# /stuck (admin bot) and `centralpay stuck` (CLI) identically.
+# Hotfix: bot_notify_pending staleness must anchor on the START OF THE
+# CURRENT NOTIFICATION CYCLE, never bare order-creation time (created_at)
+# and never bare gateway_verified_at either.
+#
+# gateway_verified_at is a ONE-TIME financial fact, set once at the original
+# gateway verification and never touched again. queue_notification always
+# sets it in the same transaction as the FIRST entry into bot_notify_pending,
+# so it's a fine anchor for that initial cycle -- but app.ops "review resend"
+# and app.services.bulk_resend RE-ENTER bot_notify_pending at a brand-new
+# time while gateway_verified_at stays exactly what it was (a payment
+# verified 2 days ago, resent seconds ago, must look freshly-queued, not
+# 2-days stale).
+#
+# The correct anchor is MAX(created_at) among the payment's own permanent
+# payment_events rows of type bot_notification_queued /
+# manual_review_resend_requested / admin_bulk_resend_requested -- each entry
+# path records exactly one of these, atomically, in the same transaction as
+# the status change. This is deliberately NOT next_retry_at: that field is
+# overwritten to a FUTURE value on every retry-backoff reschedule
+# (app.services.notification.record_attempt_result), so it would make an
+# actively-retrying row look perpetually "fresh" and hide it even once
+# genuinely overdue. See app.adminbot.queries._notification_age_anchor.
+#
+# Both queries.bot_delivery_snapshot and queries.stuck_payments share
+# _stale_bot_notify_pending_conditions, so fixing it there fixes both /stuck
+# (admin bot) and `centralpay stuck` (CLI) identically.
 # ============================================================================
 
 
 def test_old_order_fresh_notification_not_flagged_as_stale_bot_delivery(
     client, settings, session_factory, stub
 ):
-    """The exact bug report: created_at is 45 minutes old, but
-    gateway_verified_at (set by the real verification flow just now) is
-    fresh -- the row must NOT appear as a stale bot-delivery problem in
-    EITHER shared caller."""
+    """The exact bug report: created_at is 45 minutes old, but the
+    notification cycle (bot_notification_queued, fired by the real
+    verification flow just now) is fresh -- the row must NOT appear as a
+    stale bot-delivery problem in EITHER shared caller. INITIAL PAYMENT
+    case #1."""
     from app.adminbot import queries
 
     order_id = "anchor-old-order-fresh-notify"
@@ -1554,9 +1617,10 @@ def test_old_order_fresh_notification_not_flagged_as_stale_bot_delivery(
 def test_old_order_old_notification_flagged_as_stale_bot_delivery(
     client, settings, session_factory, stub
 ):
-    """Both created_at and gateway_verified_at are old: still correctly
-    flagged as stale in both shared callers -- the fix narrows the false
-    positive, it does not stop detecting genuinely stuck rows."""
+    """The notification cycle itself (bot_notification_queued) is old:
+    still correctly flagged as stale in both shared callers -- the fix
+    narrows the false positive, it does not stop detecting genuinely stuck
+    rows. INITIAL OLD NOTIFICATION case #2."""
     from app.adminbot import queries
 
     order_id = "anchor-old-order-old-notify"
@@ -1569,6 +1633,9 @@ def test_old_order_old_notification_flagged_as_stale_bot_delivery(
         payment.created_at = old
         payment.gateway_verified_at = old
         db.commit()
+    _backdate_notification_entry_event(
+        session_factory, order_id, event_type="bot_notification_queued", when=old
+    )
 
     with session_factory() as db:
         now = datetime.now(UTC)
@@ -1583,9 +1650,8 @@ def test_old_order_old_notification_flagged_as_stale_bot_delivery(
 def test_fresh_order_fresh_notification_not_flagged_as_stale_bot_delivery(
     client, settings, session_factory, stub
 ):
-    """Baseline: a payment verified moments ago is never stale, regardless
-    of which anchor is used -- created_at and gateway_verified_at are both
-    fresh here."""
+    """Baseline: a payment verified moments ago is never stale. FRESH ORDER
+    FRESH NOTIFICATION case #3."""
     from app.adminbot import queries
 
     order_id = "anchor-fresh-order-fresh-notify"
@@ -1602,12 +1668,12 @@ def test_fresh_order_fresh_notification_not_flagged_as_stale_bot_delivery(
 def test_stale_notification_claim_label_unaffected_by_age_anchor_change(
     client, settings, session_factory, stub
 ):
-    """stale_notification_claim depends only on notification_claimed_at vs.
-    the claim-timeout cutoff -- entirely separate machinery from the
-    pending-age anchor. A row old enough (by gateway_verified_at) to be in
-    the stale bucket, whose claim is older than claim_timeout_seconds, must
-    still be labeled stale_notification_claim, never the generic
-    bot_notify_pending_old."""
+    """stale_notification_claim (case #9) depends only on
+    notification_claimed_at vs. the claim-timeout cutoff -- entirely
+    separate machinery from the pending-age anchor. A row whose
+    notification cycle is old enough to be in the stale bucket, whose claim
+    is older than claim_timeout_seconds, must still be labeled
+    stale_notification_claim, never the generic bot_notify_pending_old."""
     from app.adminbot import queries
 
     order_id = "claim-stale-anchor-fix"
@@ -1623,6 +1689,9 @@ def test_stale_notification_claim_label_unaffected_by_age_anchor_change(
         payment.notification_claimed_at = now - timedelta(seconds=200)
         payment.notification_claimed_by = "worker-1"
         db.commit()
+    _backdate_notification_entry_event(
+        session_factory, order_id, event_type="bot_notification_queued", when=old
+    )
 
     with session_factory() as db:
         snapshot = queries.bot_delivery_snapshot(
@@ -1680,23 +1749,314 @@ def test_non_delivery_manual_review_excluded_regardless_of_notification_age_anch
     assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
 
 
-def test_legacy_null_gateway_verified_at_never_crashes_and_falls_back_to_created_at(
+# --- CLI resend (app.ops "review resend") re-enters the notification cycle -
+
+
+def _move_to_manual_review_for_resend(session_factory, order_id: str, *, verified_at):
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.gateway_verified_at = verified_at
+        payment.status = PaymentStatus.MANUAL_REVIEW.value
+        payment.bot_notify_reason = "retry_limit_reached"
+        payment.manual_review_at = verified_at
+        payment.next_retry_at = None
+        payment.notification_claimed_at = None
+        payment.notification_claimed_by = None
+        db.commit()
+    # MAX(created_at) picks the LATEST matching event -- keep the original
+    # bot_notification_queued event consistent with the backdated
+    # gateway_verified_at (real timestamps only ever move forward), so a
+    # later-backdated resend event is unambiguously the most recent one.
+    _backdate_notification_entry_event(
+        session_factory, order_id, event_type="bot_notification_queued", when=verified_at
+    )
+
+
+def test_cli_review_resend_not_flagged_stale_immediately_after_resend(
+    client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """CLI RESEND case #3: gateway_verified_at is 2 days old, the payment is
+    in manual_review, `centralpay review resend` runs NOW -- immediately
+    after, the row must NOT be stale, exercised through the actual `app.ops`
+    resend command (not by hand-editing model fields)."""
+    import app.ops as ops_module
+    from app.adminbot import queries
+    from app.ops import main as ops_main
+
+    order_id = "cli-resend-fresh"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    _move_to_manual_review_for_resend(session_factory, order_id, verified_at=old)
+
+    idempotent = settings.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    monkeypatch.setattr(ops_module, "Settings", lambda: idempotent)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    assert ops_main(["review", "resend", order_id, "--confirm-idempotent-bot", "--yes"]) == 0
+    capsys.readouterr()
+
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value  # sanity
+    assert payment.gateway_verified_at.replace(tzinfo=UTC) < datetime.now(UTC) - timedelta(
+        days=1
+    )  # sanity: still the ORIGINAL, untouched, 2-day-old fact
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_cli_review_resend_becomes_stale_once_its_own_cycle_ages(
+    client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """CLI RESEND AGES case #4: the SAME resent row, once ITS OWN cycle
+    (from manual_review_resend_requested) exceeds the pending-age
+    threshold, must become stale -- the anchor tracks re-entry time, it
+    doesn't exempt resent rows forever."""
+    import app.ops as ops_module
+    from app.adminbot import queries
+    from app.ops import main as ops_main
+
+    order_id = "cli-resend-ages"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    _move_to_manual_review_for_resend(session_factory, order_id, verified_at=old)
+
+    idempotent = settings.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    monkeypatch.setattr(ops_module, "Settings", lambda: idempotent)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+    assert ops_main(["review", "resend", order_id, "--confirm-idempotent-bot", "--yes"]) == 0
+    capsys.readouterr()
+
+    _backdate_notification_entry_event(
+        session_factory,
+        order_id,
+        event_type="manual_review_resend_requested",
+        when=datetime.now(UTC) - timedelta(minutes=45),
+    )
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+# --- admin bulk resend (app.services.bulk_resend) re-enters the cycle too --
+
+
+def test_bulk_resend_not_flagged_stale_immediately_after_resend(
     client, settings, session_factory, stub
 ):
-    """gateway_verified_at IS NULL on a bot_notify_pending row is
-    structurally impossible today: ck_payments_delivery_requires_verification
-    (migration 0005) enforces it at the DB level, and SQLite enforces the
-    identical CHECK constraint in this test engine too. This simulates a
-    row from BEFORE that invariant existed (a manual DB edit, a downgrade)
-    by deliberately bypassing the constraint for one UPDATE -- proving the
-    read-side COALESCE(gateway_verified_at, created_at) fallback: such a row
-    is treated as created_at-old (the pre-fix anchor) rather than crashing
-    the query or silently vanishing as if it were fresh."""
-    from sqlalchemy import text
+    """BULK RESEND case #5: same requirement as CLI resend, exercised
+    through the actual /resend_failed admin-bot command (not by
+    hand-editing model fields)."""
+    from app.adminbot import queries
+
+    order_id = "bulk-resend-fresh"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    _move_to_manual_review_for_resend(session_factory, order_id, verified_at=old)
+
+    idem_settings = settings.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    idem_handlers = CommandHandlers(
+        session_factory, idem_settings, ADMIN_IDS, api_probe=lambda: {"live": True, "ready": True}
+    )
+    replies = idem_handlers.handle(admin_ctx(), "resend_failed", ["confirm"])
+    assert any("1" in r for r in replies)  # sanity: exactly one row requeued
+
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+    assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value  # sanity
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_bulk_resend_becomes_stale_once_its_own_cycle_ages(
+    client, settings, session_factory, stub
+):
+    """BULK RESEND AGES case #6: once ITS OWN cycle (from
+    admin_bulk_resend_requested) exceeds the pending-age threshold, the row
+    must become stale."""
+    from app.adminbot import queries
+
+    order_id = "bulk-resend-ages"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    _move_to_manual_review_for_resend(session_factory, order_id, verified_at=old)
+
+    idem_settings = settings.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    idem_handlers = CommandHandlers(
+        session_factory, idem_settings, ADMIN_IDS, api_probe=lambda: {"live": True, "ready": True}
+    )
+    idem_handlers.handle(admin_ctx(), "resend_failed", ["confirm"])
+
+    _backdate_notification_entry_event(
+        session_factory,
+        order_id,
+        event_type="admin_bulk_resend_requested",
+        when=datetime.now(UTC) - timedelta(minutes=45),
+    )
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+# --- retry backoff must not be fooled by an old gateway_verified_at, and --
+# --- must not be hidden forever by an accumulating cycle age either ------
+
+
+def test_retryable_failure_in_active_backoff_not_flagged_stale(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """RETRY BACKOFF case #7: a retryable failure schedules next_retry_at
+    into the FUTURE (app.services.notification.record_attempt_result) --
+    the age anchor must be unaffected by that scheduling, and must judge
+    the row by its notification cycle's actual start (fresh here), not by
+    an old gateway_verified_at that has nothing to do with when this cycle
+    began."""
+    from app.adminbot import queries
+
+    order_id = "retry-backoff-fresh-cycle"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings)
+
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value  # still pending
+        assert payment.next_retry_at is not None
+        assert payment.next_retry_at.replace(tzinfo=UTC) > datetime.now(UTC)  # future backoff
+        # An intentionally old, IRRELEVANT gateway_verified_at -- must not
+        # fool the anchor now that it's cycle-event-driven.
+        payment.gateway_verified_at = datetime.now(UTC) - timedelta(days=2)
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_retryable_failure_becomes_stale_once_the_cycle_is_genuinely_overdue(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """OVERDUE RETRY case #8: the same kind of actively-backing-off row,
+    once its notification CYCLE (from bot_notification_queued) has
+    genuinely run past the pending-age threshold, must still surface --
+    an in-progress backoff schedule alone must never hide a payment that's
+    been undelivered too long."""
+    from app.adminbot import queries
+
+    order_id = "retry-backoff-overdue"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings)
+
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+        assert payment.next_retry_at is not None
+        # A retry is still scheduled a little into the future -- this alone
+        # must not suppress detection once the CYCLE itself is overdue.
+        assert payment.next_retry_at.replace(tzinfo=UTC) > datetime.now(UTC)
+
+    _backdate_notification_entry_event(
+        session_factory,
+        order_id,
+        event_type="bot_notification_queued",
+        when=datetime.now(UTC) - timedelta(minutes=45),
+    )
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+# --- legacy / anomalous data: never crash, always conservative -----------
+
+
+def test_no_matching_entry_event_falls_back_to_gateway_verified_at(
+    client, settings, session_factory, stub
+):
+    """A bot_notify_pending row with NO matching entry event (structurally
+    shouldn't happen -- every entry path records one atomically -- but
+    simulates data from before event logging existed, or a lost event)
+    falls back to gateway_verified_at, the next-best available fact."""
+    from sqlalchemy import delete
 
     from app.adminbot import queries
 
-    order_id = "legacy-null-verified"
+    order_id = "no-event-has-verified-at"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(minutes=45)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.gateway_verified_at = old
+        db.execute(
+            delete(PaymentEvent).where(
+                PaymentEvent.payment_id == payment.id,
+                PaymentEvent.event_type == "bot_notification_queued",
+            )
+        )
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_legacy_null_gateway_verified_at_and_no_event_falls_back_to_created_at(
+    client, settings, session_factory, stub
+):
+    """LEGACY NULL case #10: no matching entry event AND
+    gateway_verified_at IS NULL -- both structurally impossible together
+    (ck_payments_delivery_requires_verification, migration 0005, enforced
+    identically by SQLite here) but deliberately constructed by bypassing
+    the constraint for one UPDATE, proving the final COALESCE fallback to
+    created_at: never crashes, conservatively stays visible for review
+    rather than silently looking fresh."""
+    from sqlalchemy import delete, text
+
+    from app.adminbot import queries
+
+    order_id = "legacy-null-no-event"
     make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
     old = datetime.now(UTC) - timedelta(minutes=45)
     with session_factory() as db:
@@ -1706,6 +2066,12 @@ def test_legacy_null_gateway_verified_at_never_crashes_and_falls_back_to_created
         ).scalar_one()
         payment.created_at = old
         payment.gateway_verified_at = None
+        db.execute(
+            delete(PaymentEvent).where(
+                PaymentEvent.payment_id == payment.id,
+                PaymentEvent.event_type == "bot_notification_queued",
+            )
+        )
         db.commit()
         db.execute(text("PRAGMA ignore_check_constraints = 0"))
         db.commit()

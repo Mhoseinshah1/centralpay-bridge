@@ -107,26 +107,63 @@ class StuckEntry:
     category: str  # exact reason category, never a generic "stuck"
 
 
-def _notification_age_anchor() -> Any:
-    """The moment a payment entered the notification-pending phase — NOT
-    ``created_at`` (order creation can precede payment completion by an
-    arbitrary amount: an order created 45 minutes ago whose customer pays
-    right now must not look 45 minutes stale the instant it's queued).
+# Every code path that sets status=bot_notify_pending records exactly one of
+# these PaymentEvent types, atomically, in the SAME transaction as the status
+# change (never a separate, later write) — see _notification_age_anchor.
+_NOTIFICATION_ENTRY_EVENT_TYPES = (
+    "bot_notification_queued",  # app.services.notification.queue_notification
+    "manual_review_resend_requested",  # app.ops "review resend"
+    "admin_bulk_resend_requested",  # app.services.bulk_resend.requeue_failed_deliveries
+)
 
-    ``gateway_verified_at`` is the correct anchor: ``queue_notification``
-    (``app.services.notification``) always sets ``status=bot_notify_pending``
-    in the SAME transaction as ``gateway_verified_at`` (``app.services.
-    verification``), and every other path that (re)sets the status —
-    ``app.ops`` manual resend, ``app.services.bulk_resend`` — requires
-    ``gateway_verified_at`` to already be non-NULL first. The DB-level
-    ``ck_payments_delivery_requires_verification`` constraint (migration
-    0005) makes this structurally guaranteed for any row this predicate can
-    ever match. ``COALESCE(..., created_at)`` is a defensive fallback only —
-    never expected to trigger — for a row that somehow violates that
-    invariant; it deliberately reuses the OLD anchor rather than treating
-    such an anomalous row as fresh, so it still surfaces for review instead
-    of silently disappearing or crashing the query."""
-    return func.coalesce(Payment.gateway_verified_at, Payment.created_at)
+
+def _notification_age_anchor() -> Any:
+    """The moment THIS payment most recently entered/re-entered the
+    notification-pending phase.
+
+    NOT ``created_at`` (order creation can precede payment completion by an
+    arbitrary amount). NOT bare ``gateway_verified_at`` either: that's a
+    one-time financial fact from the ORIGINAL gateway verification, and a
+    resend (``app.ops`` "review resend", ``app.services.bulk_resend``)
+    re-enters ``bot_notify_pending`` at a NEW time while ``gateway_verified_at``
+    stays exactly what it was — a payment verified 2 days ago, resent just
+    now, must look freshly-queued, not 2-days stale. This must never
+    overwrite or repurpose ``gateway_verified_at`` itself; it stays the
+    durable "gateway verified" fact, independent of delivery status.
+
+    Every entry path (``queue_notification``, ``app.ops`` resend,
+    ``app.services.bulk_resend``) records exactly one matching event in the
+    SAME transaction as the status change, and ``payment_events`` is a
+    permanent, append-only audit trail (never deleted) — so
+    ``MAX(created_at)`` among a payment's own matching events is an exact,
+    reliable record of when its CURRENT cycle began.
+
+    Deliberately NOT ``next_retry_at``: that field is overwritten to a
+    FUTURE value by every backoff reschedule
+    (``app.services.notification.record_attempt_result``), so an actively
+    retrying-and-failing row would perpetually look "fresh" and never
+    surface even after being undelivered for a long time. This anchor is
+    unaffected by backoff — it only moves on a genuine (re-)entry — so a row
+    correctly keeps accumulating age through retries and becomes visible
+    once truly overdue, while a row still within its normal backoff window
+    (cycle just started) is correctly never flagged just because the
+    original ``gateway_verified_at`` happens to be old.
+
+    ``COALESCE`` falls back to ``gateway_verified_at``, then ``created_at``,
+    for a row with no matching event — structurally shouldn't happen, since
+    every entry path commits its event atomically with the status change,
+    but this keeps such a row visible for review instead of crashing the
+    query or silently treating it as fresh."""
+    latest_entry_event = (
+        select(func.max(PaymentEvent.created_at))
+        .where(
+            PaymentEvent.payment_id == Payment.id,
+            PaymentEvent.event_type.in_(_NOTIFICATION_ENTRY_EVENT_TYPES),
+        )
+        .correlate(Payment)
+        .scalar_subquery()
+    )
+    return func.coalesce(latest_entry_event, Payment.gateway_verified_at, Payment.created_at)
 
 
 def _stale_bot_notify_pending_conditions(pending_cutoff: datetime) -> tuple[Any, ...]:
