@@ -148,6 +148,16 @@ class AmbiguousOrderIdError(Exception):
     the wrong payment, so callers must refuse instead of guessing."""
 
 
+# Payment.gateway_order_id is a PostgreSQL BIGINT (signed 64-bit) column;
+# bot_order_id is an arbitrary string (AGENTS.md: "Bot order_id may be a
+# string") that can itself be a longer all-digit value. Binding an
+# out-of-range int to that column raises psycopg.errors.NumericValueOutOfRange
+# -- an unhandled crash instead of the graceful bot_order_id-only lookup
+# below -- so the gateway lookup is skipped entirely for values that cannot
+# fit the column, never attempted and caught.
+_POSTGRES_BIGINT_MAX = 2**63 - 1
+
+
 def _find_payment(db: Session, order_id: str) -> Payment | None:
     """Look up a payment by bot_order_id, falling back to the numeric
     gateway_order_id -- shared by every command that takes ORDER_ID.
@@ -157,7 +167,7 @@ def _find_payment(db: Session, order_id: str) -> Payment | None:
     payment = db.execute(
         select(Payment).where(Payment.bot_order_id == order_id)
     ).scalar_one_or_none()
-    if order_id.isdigit():
+    if order_id.isdigit() and int(order_id) <= _POSTGRES_BIGINT_MAX:
         gateway_payment = db.execute(
             select(Payment).where(Payment.gateway_order_id == int(order_id))
         ).scalar_one_or_none()
@@ -566,7 +576,7 @@ def _reconcile_local_dict(payment: Payment, local: LocalSnapshot) -> dict[str, A
         "bot_order_id": payment.bot_order_id,
         "gateway_order_id": payment.gateway_order_id,
         "status": payment.status,
-        "gateway_verified": payment.gateway_verified_at is not None,
+        "gateway_verified": local.is_gateway_verified,
         "gateway_verified_at": _iso(payment.gateway_verified_at),
         "original_amount": payment.amount,
         "fee_rate_bps": payment.fee_rate_bps,
@@ -582,9 +592,22 @@ def _reconcile_local_dict(payment: Payment, local: LocalSnapshot) -> dict[str, A
             "enabled": local.reconciliation_enabled,
             "schedule_due": local.schedule_due,
             "auto_reconciliation_due": local.auto_reconciliation_due,
-            "aged_out": local.verify_aged_out,
+            # True only for the reconciliation worker's own aged-out tier
+            # (link_created, unverified rows -- see age_bucket). The
+            # broader --verify safety-gate flag, which applies to ANY
+            # unverified status, is reported separately below as it is not
+            # a fact about the reconciliation worker.
+            "aged_out": local.age_bucket == "aged_out",
             "attempts_exhausted": local.attempts_exhausted,
         },
+        # Broader than reconciliation.aged_out: True for ANY unverified
+        # payment (any status) whose link is at least
+        # RECONCILIATION_MAX_AGE_SECONDS old -- the exact condition
+        # determine_verify_refusal's AGED_OUT check uses. A payment can have
+        # this true while reconciliation.aged_out is false (e.g.
+        # manual_review, created, getlink_failed -- statuses the
+        # reconciliation worker never touches).
+        "verify_aged_out": local.verify_aged_out,
     }
 
 
@@ -594,7 +617,7 @@ def _print_reconcile_local_human(payment: Payment, local: LocalSnapshot) -> None
     print(f"  gateway order id:        {payment.gateway_order_id}")
     print(f"  local status:            {payment.status}")
     verified_at = payment.gateway_verified_at
-    verified_flag = "yes" if verified_at else "no"
+    verified_flag = "yes" if local.is_gateway_verified else "no"
     verified_suffix = f" ({_iso(verified_at)})" if verified_at else ""
     print(f"  gateway_verified:        {verified_flag}{verified_suffix}")
     print(f"  original amount:         {payment.amount:,} تومان")
@@ -608,7 +631,11 @@ def _print_reconcile_local_human(payment: Payment, local: LocalSnapshot) -> None
     print(f"  last error code:         {payment.reconciliation_last_error_code or 'none'}")
     print(f"  reconciliation enabled:  {'yes' if local.reconciliation_enabled else 'no'}")
     print(f"  auto-reconciliation due: {'yes' if local.auto_reconciliation_due else 'no'}")
-    print(f"  aged out:                {'yes' if local.verify_aged_out else 'no'}")
+    print(f"  aged out (reconciliation): {'yes' if local.age_bucket == 'aged_out' else 'no'}")
+    print(
+        f"  aged out (verify gate):  {'yes' if local.verify_aged_out else 'no'} "
+        "(broader -- any unverified status, used by --verify)"
+    )
     print(f"  attempts exhausted:      {'yes' if local.attempts_exhausted else 'no'}")
 
 

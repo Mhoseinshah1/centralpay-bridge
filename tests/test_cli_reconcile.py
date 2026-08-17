@@ -233,6 +233,7 @@ def test_reconcile_default_json_shape(cli_env, client, settings, session_factory
     assert local["status"] == "link_created"
     assert local["gateway_verified"] is False
     assert local["payable_amount"] == 7000
+    assert local["verify_aged_out"] is False
     assert "reconciliation" in local
     assert set(local["reconciliation"]) == {
         "age_bucket",
@@ -401,6 +402,52 @@ def test_payment_command_refuses_ambiguous_order_id(cli_env, session_factory, ca
     assert cli_main(["payment", "778899005566"]) == 1
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"error": "ambiguous_order_id", "order_id": "778899005566"}
+
+
+# --- Codex P2 follow-up: bound numeric ORDER_ID before the gateway lookup ---
+#
+# bot_order_id is an arbitrary string (AGENTS.md: "Bot order_id may be a
+# string") and can itself be a longer all-digit value than
+# Payment.gateway_order_id (a PostgreSQL BIGINT, signed 64-bit) can hold.
+# Binding such a value to that column raises psycopg.errors.
+# NumericValueOutOfRange against real PostgreSQL -- SQLite has no fixed
+# integer width and would not reproduce the crash, so this test proves the
+# gateway lookup is skipped (not merely "happens not to crash here"); see
+# test_find_payment_huge_numeric_bot_order_id_does_not_crash_pg in
+# tests/integration/test_reconcile_inspect_pg.py for the real-PostgreSQL,
+# would-have-crashed-under-the-old-code proof.
+
+
+def test_find_payment_skips_gateway_lookup_for_out_of_bigint_range_order_id(
+    cli_env, session_factory, monkeypatch, capsys
+):
+    """A numeric ORDER_ID too large for a signed 64-bit BIGINT must never
+    even be bound into a gateway_order_id query -- only the bot_order_id
+    lookup runs. The bot_order_id lookup alone must still succeed."""
+    huge_bot_order_id = "9" * 30  # far beyond 2**63 - 1 (19 digits)
+    _make_minimal_payment(
+        session_factory, bot_order_id=huge_bot_order_id, gateway_order_id=100210
+    )
+
+    gateway_lookup_count = 0
+    real_execute = Session.execute
+
+    def recording_execute(self, statement, *args, **kwargs):
+        nonlocal gateway_lookup_count
+        # Every Payment SELECT lists the gateway_order_id COLUMN regardless
+        # of filter, so only a WHERE clause filtering ON it counts as "a
+        # gateway lookup" here.
+        compiled = str(statement.compile(compile_kwargs={"literal_binds": False}))
+        if "WHERE payments.gateway_order_id" in compiled:
+            gateway_lookup_count += 1
+        return real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "execute", recording_execute)
+
+    assert cli_main(["payment", huge_bot_order_id]) == 0
+    out = capsys.readouterr().out
+    assert huge_bot_order_id in out
+    assert gateway_lookup_count == 0  # the oversized-value guard short-circuited first
 
 
 # --- scenario 2: --verify, gateway not successful ---------------------------
@@ -840,6 +887,12 @@ def test_reconcile_verify_gateway_verified_status_null_timestamp_zero_network(
     assert payload["verify"]["refused"] == "already_gateway_verified"
     assert payload["verify"]["performed"] is False
     assert len(stub.verify_requests) == before_requests
+    # Codex follow-up: the local report must not contradict the refusal --
+    # "gateway_verified: false" alongside "refused: already_gateway_verified"
+    # would be self-contradictory. gateway_verified_at itself still reports
+    # the real (NULL) timestamp so the anomaly remains visible.
+    assert payload["local"]["gateway_verified"] is True
+    assert payload["local"]["gateway_verified_at"] is None
 
 
 @pytest.mark.parametrize(
@@ -980,6 +1033,32 @@ def test_reconcile_verify_aged_out_with_confirm_makes_one_read_only_call(
 
     assert len(stub.verify_requests) == 1
     _assert_payment_unchanged(session_factory, "rc-aged-out-2", before)
+
+
+def test_reconcile_reports_reconciliation_aged_out_separately_from_verify_gate(
+    cli_env, session_factory, settings, capsys
+):
+    """Codex follow-up: reconciliation.aged_out must reflect only the
+    reconciliation WORKER's own tier (age_bucket == 'aged_out', link_created
+    rows only) -- a manual_review payment the worker never touches must
+    report reconciliation.aged_out=False even though it is old and
+    unverified, while the broader --verify safety-gate flag (verify_aged_out,
+    reported at the top level, not nested under reconciliation) is True for
+    it. Reporting the broad flag AS reconciliation.aged_out would
+    contradict age_bucket=None for this exact payment."""
+    _make_manual_review_payment(
+        session_factory,
+        bot_order_id="rc-aged-manual-review",
+        gateway_order_id=940007,
+        age_seconds=settings.reconciliation_max_age_seconds + 120,
+    )
+
+    assert cli_main(["reconcile", "rc-aged-manual-review", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    local = payload["local"]
+    assert local["reconciliation"]["age_bucket"] is None  # not a link_created row
+    assert local["reconciliation"]["aged_out"] is False  # worker never touches this payment
+    assert local["verify_aged_out"] is True  # but --verify's broader gate would still refuse it
 
 
 # --- final safety follow-up: --verify gated behind an off-by-default flag --

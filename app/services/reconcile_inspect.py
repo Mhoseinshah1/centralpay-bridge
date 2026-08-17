@@ -149,6 +149,13 @@ class LocalSnapshot:
     # seconds old, not only link_created rows -- see
     # _verify_aged_out_conditions.
     verify_aged_out: bool
+    # Whether local state denotes successful gateway verification: status in
+    # VERIFIED_STATUSES OR gateway_verified_at is set -- the SAME rule
+    # determine_verify_refusal uses for ALREADY_VERIFIED, computed once here
+    # so a report can never say "gateway_verified: no" for a payment this
+    # module is simultaneously refusing to re-verify as already verified.
+    # Never re-derived from gateway_verified_at alone anywhere downstream.
+    is_gateway_verified: bool
 
 
 def build_local_snapshot(
@@ -233,6 +240,9 @@ def build_local_snapshot(
         auto_reconciliation_due=settings.reconciliation_enabled and schedule_due,
         attempts_exhausted=attempts_exhausted,
         verify_aged_out=bool(row.verify_aged_out),
+        is_gateway_verified=(
+            payment.status in VERIFIED_STATUSES or payment.gateway_verified_at is not None
+        ),
     )
     return payment, local
 
@@ -262,18 +272,18 @@ def determine_verify_refusal(
     review -- not that it happens to also be gateway-verified. Either way
     the command makes ZERO gateway calls.
 
-    The already-verified check reuses ``VERIFIED_STATUSES`` from
-    ``app.services.verification`` -- the exact same statuses (plus
-    ``gateway_verified_at is not None``) the callback route's settlement
-    handler treats as "verification already happened, do not re-verify".
-    ``gateway_verified_at`` alone is not a reliable proxy for every status in
-    that set: nothing in this module's contract guarantees a payment can
-    only reach a ``VERIFIED_STATUSES`` status together with
-    ``gateway_verified_at`` set (only a database CHECK constraint ties the
-    two bot-notify statuses together today; ``gateway_verified`` carries no
-    such constraint), so the status check must never be dropped in favor of
-    checking ``gateway_verified_at`` alone, and the status list itself must
-    never be locally re-derived -- it is imported, not duplicated.
+    The already-verified check uses ``local.is_gateway_verified``, computed
+    once in :func:`build_local_snapshot` from ``VERIFIED_STATUSES`` (from
+    ``app.services.verification`` -- the exact same statuses the callback
+    route's settlement handler treats as "verification already happened, do
+    not re-verify") OR ``gateway_verified_at is not None``. Reusing that
+    single computed field (rather than re-deriving the same condition here)
+    guarantees this refusal decision can never disagree with what a report
+    built from the SAME snapshot shows as "gateway verified". Only a
+    database CHECK constraint ties ``gateway_verified_at`` to the two
+    bot-notify statuses today; ``gateway_verified`` carries no such
+    constraint, so ``gateway_verified_at`` alone is not a reliable proxy for
+    every status in ``VERIFIED_STATUSES``.
 
     Aged-out is checked last: only a payment that is neither
     already-verified nor manual_review needs --confirm-aged-out, and
@@ -282,7 +292,7 @@ def determine_verify_refusal(
     """
     if payment.status == PaymentStatus.MANUAL_REVIEW.value:
         return VerifyRefusal.MANUAL_REVIEW_OWNED
-    if payment.status in VERIFIED_STATUSES or payment.gateway_verified_at is not None:
+    if local.is_gateway_verified:
         return VerifyRefusal.ALREADY_VERIFIED
     if local.verify_aged_out and not confirm_aged_out:
         return VerifyRefusal.AGED_OUT

@@ -117,6 +117,43 @@ def test_reconcile_lookup_by_bot_order_id_and_numeric_gateway_order_id_on_postgr
     assert "pg-reconcile-lookup" in out_by_gateway_order
 
 
+def test_find_payment_huge_numeric_bot_order_id_does_not_crash_pg(
+    cli_env, pg_session_factory, capsys
+):
+    """Codex follow-up: bot_order_id is an arbitrary string (AGENTS.md:
+    "Bot order_id may be a string") and can be a longer all-digit value than
+    Payment.gateway_order_id -- a real PostgreSQL BIGINT (signed 64-bit) --
+    can hold. Before the fix, `_find_payment` unconditionally bound
+    int(order_id) into a gateway_order_id == ... query whenever the string
+    was all-digit, regardless of range, which raises
+    psycopg.errors.NumericValueOutOfRange against a REAL BIGINT column
+    (SQLite's dynamic typing does not reproduce this the same way). Both
+    `payment` and `reconcile` must look the row up via bot_order_id alone
+    and succeed instead of crashing."""
+    huge_bot_order_id = "9" * 30  # far beyond 2**63 - 1 (19 digits)
+    with pg_session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id=huge_bot_order_id,
+                gateway_order_id=860099,
+                gateway_user_id=1,
+                amount=5000,
+                payable_amount=5000,
+                status=PaymentStatus.LINK_CREATED.value,
+            )
+        )
+        db.commit()
+
+    assert cli_main(["payment", huge_bot_order_id]) == 0
+    payment_out = capsys.readouterr().out
+    assert huge_bot_order_id in payment_out
+
+    assert cli_main(["reconcile", huge_bot_order_id]) == 0
+    reconcile_out = capsys.readouterr().out
+    assert huge_bot_order_id in reconcile_out
+    assert "link_created" in reconcile_out
+
+
 def test_reconcile_verify_reference_id_collision_read_only_on_postgres(
     cli_env, settings, pg_app, pg_session_factory, monkeypatch, capsys
 ):

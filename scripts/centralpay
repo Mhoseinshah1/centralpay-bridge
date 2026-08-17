@@ -69,15 +69,22 @@ Inspection:
                           which can be stale after a worker-only redeploy).
   reconcile ORDER_ID [--verify [--confirm-aged-out]] [--json]
                           Inspect one payment. Local-only by default (no
-                          network call). --verify performs exactly one
-                          READ-ONLY gateway check and reports what
-                          settlement would conclude -- it never settles.
-                          Refuses (no network call) if already verified, in
-                          manual_review, or aged out; --confirm-aged-out
-                          overrides the last case, still read-only. Reads
-                          the WORKER container's live configuration (never
-                          api, which can be stale after a worker-only
-                          redeploy) for tier/aged-out/enabled classification.
+                          network call, never mutates the database).
+                          --verify performs exactly one gateway query and
+                          reports what settlement would conclude -- it
+                          never settles and is read-only on OUR side only;
+                          CentralPay's own verify-after-verify behavior is
+                          NOT confirmed safe to call repeatedly (see
+                          STAGING_VALIDATION.md), so --verify is disabled
+                          by default (CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED).
+                          Refuses (no network call) if diagnostic verify is
+                          disabled, already verified, in manual_review, or
+                          aged out; --confirm-aged-out overrides only the
+                          last case and cannot bypass the disabled-gate
+                          refusal. Reads the WORKER container's live
+                          configuration (never api, which can be stale
+                          after a worker-only redeploy) for
+                          tier/aged-out/enabled classification.
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
