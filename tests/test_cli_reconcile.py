@@ -230,10 +230,64 @@ def test_reconcile_default_json_shape(cli_env, client, settings, session_factory
         "last_at",
         "next_at",
         "last_error_code",
+        "enabled",
+        "schedule_due",
         "auto_reconciliation_due",
         "aged_out",
         "attempts_exhausted",
     }
+
+
+# --- PR #59 follow-up: RECONCILIATION_ENABLED must gate auto_reconciliation_due
+
+
+def test_reconcile_auto_due_true_when_enabled_and_schedule_due(
+    cli_env, client, settings, session_factory, capsys
+):
+    assert create_order(client, settings, order_id="rc-enabled-due", amount=5000).status_code == 200
+    _age_payment(
+        session_factory, "rc-enabled-due", seconds=settings.reconciliation_min_age_seconds + 5
+    )
+
+    assert cli_main(["reconcile", "rc-enabled-due", "--json"]) == 0
+    recon = json.loads(capsys.readouterr().out)["local"]["reconciliation"]
+    assert recon["enabled"] is True
+    assert recon["schedule_due"] is True
+    assert recon["auto_reconciliation_due"] is True
+
+    assert cli_main(["reconcile", "rc-enabled-due"]) == 0
+    out = capsys.readouterr().out
+    assert "reconciliation enabled:  yes" in out
+    assert "auto-reconciliation due: yes" in out
+
+
+def test_reconcile_auto_due_false_when_disabled_even_if_otherwise_due(
+    cli_env, client, settings, session_factory, monkeypatch, capsys
+):
+    """The task's core requirement: RECONCILIATION_ENABLED=false must never
+    let auto_reconciliation_due read true, even for a payment whose age/
+    attempts schedule alone says it is due."""
+    import app.cli as cli_module
+
+    response = create_order(client, settings, order_id="rc-disabled-due", amount=5000)
+    assert response.status_code == 200
+    _age_payment(
+        session_factory, "rc-disabled-due", seconds=settings.reconciliation_min_age_seconds + 5
+    )
+
+    disabled = settings.model_copy(update={"reconciliation_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    assert cli_main(["reconcile", "rc-disabled-due", "--json"]) == 0
+    recon = json.loads(capsys.readouterr().out)["local"]["reconciliation"]
+    assert recon["enabled"] is False
+    assert recon["schedule_due"] is True  # would be due on schedule...
+    assert recon["auto_reconciliation_due"] is False  # ...but the worker is disabled
+
+    assert cli_main(["reconcile", "rc-disabled-due"]) == 0
+    out = capsys.readouterr().out
+    assert "reconciliation enabled:  no" in out
+    assert "auto-reconciliation due: no" in out
 
 
 # --- scenario 12: lookup by bot_order_id and numeric gateway_order_id ------
@@ -574,7 +628,9 @@ def test_determine_verify_refusal_manual_review_takes_precedence_over_already_ve
         db.commit()
         db.refresh(payment)
 
-        local = build_local_snapshot(db, settings, payment, now=datetime.now(UTC))
+        snapshot = build_local_snapshot(db, settings, payment.id, now=datetime.now(UTC))
+        assert snapshot is not None
+        payment, local = snapshot
         refusal = determine_verify_refusal(payment, local, confirm_aged_out=False)
 
     assert refusal == VerifyRefusal.MANUAL_REVIEW_OWNED
@@ -660,6 +716,90 @@ def test_reconcile_verify_aged_out_with_confirm_makes_one_read_only_call(
 
     assert len(stub.verify_requests) == 1
     _assert_payment_unchanged(session_factory, "rc-aged-out-2", before)
+
+
+# --- PR #59 follow-up: --verify row-lock discipline (real-Postgres races --
+# live in tests/integration/test_reconcile_inspect_pg.py; these are the fast,
+# deterministic SQLite-backed proofs of the same contract) --------------------
+
+
+def test_reconcile_default_never_locks_verify_always_locks(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """Default inspection must never request a row lock; --verify always
+    must -- the exact `for_update` flag app.cli._cmd_reconcile passes to
+    build_local_snapshot for each mode."""
+    import app.cli as cli_module
+    from app.services.reconcile_inspect import build_local_snapshot as real_build_local_snapshot
+
+    assert create_order(client, settings, order_id="rc-lock-flag", amount=5000).status_code == 200
+
+    calls: list[bool] = []
+
+    def spy(db, settings_arg, payment_id, *, now, for_update=False):
+        calls.append(for_update)
+        return real_build_local_snapshot(
+            db, settings_arg, payment_id, now=now, for_update=for_update
+        )
+
+    monkeypatch.setattr(cli_module, "build_local_snapshot", spy)
+
+    assert cli_main(["reconcile", "rc-lock-flag"]) == 0
+    capsys.readouterr()
+
+    _patch_centralpay_client(monkeypatch, stub)
+    stub.verify_result = httpx.Response(200, json={"status": "error", "message": "not paid yet"})
+    assert cli_main(["reconcile", "rc-lock-flag", "--verify"]) == 0
+    capsys.readouterr()
+
+    assert calls == [False, True]
+
+
+def test_reconcile_verify_rereads_under_lock_after_race_before_lock_acquired(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """Deterministic simulation of required race scenario A: a settlement
+    that lands AFTER the CLI's initial non-locking lookup but BEFORE it
+    reloads the row under the --verify lock must be visible to that reload
+    -- --verify refuses using the FRESH state and makes zero gateway calls
+    of its own. (The real concurrent-transaction version of this proof,
+    using an actual held FOR UPDATE lock on PostgreSQL, is
+    test_reconcile_verify_reloads_under_lock_after_concurrent_settlement in
+    tests/integration/test_reconcile_inspect_pg.py.)"""
+    _patch_centralpay_client(monkeypatch, stub)
+    assert create_order(client, settings, order_id="rc-race-reload", amount=5000).status_code == 200
+
+    import app.cli as cli_module
+
+    original_find_payment = cli_module._find_payment
+    raced = {"done": False}
+
+    def racing_find_payment(db, order_id):
+        found = original_find_payment(db, order_id)
+        if found is not None and not raced["done"]:
+            raced["done"] = True
+            # A concurrent settlement landing in the window between this
+            # non-locking lookup and the CLI's FOR UPDATE reload.
+            with session_factory() as settle_db:
+                row = settle_db.execute(
+                    select(Payment).where(Payment.id == found.id)
+                ).scalar_one()
+                row.status = PaymentStatus.BOT_NOTIFY_PENDING.value
+                row.gateway_verified_at = datetime.now(UTC)
+                row.reference_id = "REF-raced-settlement"
+                settle_db.commit()
+        return found
+
+    monkeypatch.setattr(cli_module, "_find_payment", racing_find_payment)
+
+    assert cli_main(["reconcile", "rc-race-reload", "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "already locally gateway-verified" in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+    assert len(stub.verify_requests) == 0  # zero calls from the CLI itself
+
+    refetched = get_payment(session_factory, "rc-race-reload")
+    assert refetched.reference_id == "REF-raced-settlement"  # the race's write stands
 
 
 # --- verify: transport/protocol failure -------------------------------------

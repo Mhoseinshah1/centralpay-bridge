@@ -26,6 +26,25 @@ own beyond the ``--verify`` safety gate's deliberately broader status
 scope (see ``_verify_aged_out_conditions`` below) — even that reuses the
 shared ``aged_out_age_condition`` expression, never a separately
 computed cutoff.
+
+Consistency: :func:`build_local_snapshot` issues exactly ONE structured
+``SELECT`` per call, returning the ``Payment`` row together with every
+tier/due/exhausted/aged-out boolean computed from that SAME row read. At
+PostgreSQL READ COMMITTED isolation (the project's isolation level; see
+AGENTS.md) a single statement is evaluated against one consistent
+snapshot, so this never combines a ``Payment`` field read by one query
+with a classification flag computed by a later, separately-timed query —
+the failure mode a concurrent worker/callback UPDATE between several
+separate SELECTs could otherwise produce. ``for_update=True`` takes the
+exact ``SELECT ... FOR UPDATE`` row-lock discipline the mutating settlement
+path in ``app.services.verification`` requires its caller to hold — used
+ONLY by ``--verify`` (see ``app.cli._cmd_reconcile``), which
+must reload the row and its eligibility flags under that lock, check
+refusal AFTER the lock is held, and hold the lock across its own
+diagnostic gateway call, so a concurrent settlement can never land between
+this module's eligibility check and the gateway query. Default
+(non-``--verify``) inspection always calls this with ``for_update=False``:
+no lock is ever taken.
 """
 
 import enum
@@ -33,7 +52,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.centralpay import VerifyResult
@@ -65,22 +84,6 @@ def _as_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _condition_holds(db: Session, payment_id: int, conditions: tuple[Any, ...]) -> bool:
-    """Does this ONE payment currently satisfy a shared condition tuple?
-
-    Filters the exact, unmodified condition tuple down to a single row —
-    never re-expresses the boundary math — so the answer can never drift
-    from what the real claim query (or the read-only snapshot builders)
-    would compute for the same row.
-    """
-    return (
-        db.execute(
-            select(Payment.id).where(Payment.id == payment_id, *conditions)
-        ).scalar_one_or_none()
-        is not None
-    )
-
-
 def _verify_aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
     """Broader than ``app.services.reconciliation.aged_out_conditions``:
     covers EVERY unverified payment regardless of status (not only
@@ -101,8 +104,9 @@ def _verify_aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[A
 @dataclass(frozen=True)
 class LocalSnapshot:
     """Read-only facts about one payment, computed against the shared
-    reconciliation predicates. Never mutated; never derived from a gateway
-    call."""
+    reconciliation predicates from ONE consistent database read (see
+    :func:`build_local_snapshot`). Never mutated; never derived from a
+    gateway call."""
 
     now: datetime
     link_age_seconds: float
@@ -112,6 +116,19 @@ class LocalSnapshot:
     age_bucket: str | None
     active_tier_due: bool
     expiring_tier_due: bool
+    # schedule_due: whether the age/next_at/attempts predicates ALONE say
+    # this payment is due for reconciliation -- independent of whether the
+    # reconciliation worker is administratively enabled right now.
+    schedule_due: bool
+    # reconciliation_enabled: settings.reconciliation_enabled at the moment
+    # this snapshot was built. Exposed so operators can see WHY
+    # auto_reconciliation_due is false when the worker is disabled, rather
+    # than that looking identical to "not due yet".
+    reconciliation_enabled: bool
+    # auto_reconciliation_due: whether automatic reconciliation can
+    # ACTUALLY happen right now -- schedule_due AND the worker being
+    # enabled. Never true while reconciliation_enabled is false, even if
+    # schedule_due is true.
     auto_reconciliation_due: bool
     attempts_exhausted: bool
     # Broader safety-gate flag used by --verify: True for ANY unverified
@@ -122,49 +139,89 @@ class LocalSnapshot:
 
 
 def build_local_snapshot(
-    db: Session, settings: Settings, payment: Payment, *, now: datetime
-) -> LocalSnapshot:
+    db: Session, settings: Settings, payment_id: int, *, now: datetime, for_update: bool = False
+) -> tuple[Payment, LocalSnapshot] | None:
+    """Read exactly one payment and its full classification in ONE
+    structured ``SELECT`` -- see the module docstring for why this matters.
+
+    Returns ``(payment, snapshot)``, or ``None`` if no payment with this id
+    exists. ``for_update=True`` takes a ``SELECT ... FOR UPDATE`` row lock
+    (see the module docstring); the caller is responsible for never
+    mutating or committing through it.
+    """
+    active_age_expr = and_(*active_tier_age_conditions(settings, now=now))
+    expiring_age_expr = and_(*expiring_tier_age_conditions(settings, now=now))
+    aged_out_expr = and_(*aged_out_conditions(settings, now=now))
+    active_due_expr = and_(*active_tier_due_conditions(settings, now=now))
+    expiring_due_expr = and_(*expiring_tier_due_conditions(settings, now=now))
+    exhausted_expr = and_(*reconciliation_exhausted_conditions(settings, now=now))
+    verify_aged_out_expr = and_(*_verify_aged_out_conditions(settings, now=now))
+
+    stmt = (
+        select(
+            Payment,
+            active_age_expr.label("active_age"),
+            expiring_age_expr.label("expiring_age"),
+            aged_out_expr.label("aged_out"),
+            active_due_expr.label("active_due"),
+            expiring_due_expr.label("expiring_due"),
+            exhausted_expr.label("exhausted"),
+            verify_aged_out_expr.label("verify_aged_out"),
+        )
+        .where(Payment.id == payment_id)
+        # Without this, a Payment already present in this SAME session's
+        # identity map (e.g. from an earlier, non-locking lookup such as
+        # app.cli._find_payment) would have its ORM attributes silently left
+        # UNREFRESHED by this query's result -- even though the query itself
+        # reads current data -- defeating both the --verify row-lock reload
+        # and the single-consistent-read guarantee this function exists to
+        # provide.
+        .execution_options(populate_existing=True)
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+
+    row = db.execute(stmt).one_or_none()
+    if row is None:
+        return None
+    payment = row[0]
+
     anchor = payment.callback_token_issued_at or payment.created_at
     link_age_seconds = (now - _as_utc(anchor)).total_seconds()
     is_link_created_unverified = (
         payment.status == PaymentStatus.LINK_CREATED.value and payment.gateway_verified_at is None
     )
-    verify_aged_out = _condition_holds(
-        db, payment.id, _verify_aged_out_conditions(settings, now=now)
-    )
 
-    active_tier_due = False
-    expiring_tier_due = False
-    attempts_exhausted = False
+    # Every boolean below already embeds the same status/gateway_verified_at
+    # scope inside its shared condition tuple, so it is naturally False for
+    # a payment that is not a link_created/unverified row -- never guarded
+    # again here, which would risk drifting from the shared predicates.
+    active_tier_due = bool(row.active_due)
+    expiring_tier_due = bool(row.expiring_due)
+    attempts_exhausted = bool(row.exhausted)
     age_bucket: str | None = None
-    if is_link_created_unverified:
-        active_tier_due = _condition_holds(
-            db, payment.id, active_tier_due_conditions(settings, now=now)
-        )
-        expiring_tier_due = _condition_holds(
-            db, payment.id, expiring_tier_due_conditions(settings, now=now)
-        )
-        attempts_exhausted = _condition_holds(
-            db, payment.id, reconciliation_exhausted_conditions(settings, now=now)
-        )
-        if _condition_holds(db, payment.id, aged_out_conditions(settings, now=now)):
-            age_bucket = "aged_out"
-        elif _condition_holds(db, payment.id, active_tier_age_conditions(settings, now=now)):
-            age_bucket = "active"
-        elif _condition_holds(db, payment.id, expiring_tier_age_conditions(settings, now=now)):
-            age_bucket = "expiring"
+    if row.aged_out:
+        age_bucket = "aged_out"
+    elif row.active_age:
+        age_bucket = "active"
+    elif row.expiring_age:
+        age_bucket = "expiring"
 
-    return LocalSnapshot(
+    schedule_due = active_tier_due or expiring_tier_due
+    local = LocalSnapshot(
         now=now,
         link_age_seconds=link_age_seconds,
         is_link_created_unverified=is_link_created_unverified,
         age_bucket=age_bucket,
         active_tier_due=active_tier_due,
         expiring_tier_due=expiring_tier_due,
-        auto_reconciliation_due=active_tier_due or expiring_tier_due,
+        schedule_due=schedule_due,
+        reconciliation_enabled=settings.reconciliation_enabled,
+        auto_reconciliation_due=settings.reconciliation_enabled and schedule_due,
         attempts_exhausted=attempts_exhausted,
-        verify_aged_out=verify_aged_out,
+        verify_aged_out=bool(row.verify_aged_out),
     )
+    return payment, local
 
 
 class VerifyRefusal(enum.StrEnum):

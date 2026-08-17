@@ -74,7 +74,10 @@ Inspection:
                           settlement would conclude -- it never settles.
                           Refuses (no network call) if already verified, in
                           manual_review, or aged out; --confirm-aged-out
-                          overrides the last case, still read-only.
+                          overrides the last case, still read-only. Reads
+                          the WORKER container's live configuration (never
+                          api, which can be stale after a worker-only
+                          redeploy) for tier/aged-out/enabled classification.
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
@@ -925,6 +928,21 @@ cmd_reconciliation() {
     esac
 }
 
+cmd_reconcile_inspect() {
+    require_install
+    # Same reasoning as cmd_reconciliation's "status" case above: the tier
+    # classification (min/fast/max ages), max attempts, the reconciliation
+    # enabled flag, and the aged-out --verify confirmation gate must all
+    # reflect the RUNNING RECONCILIATION WORKER's configuration, never a
+    # possibly-stale api container environment after a worker-only
+    # redeploy. Routing here to the worker container — deliberately never
+    # api, and with no fallback to it — is what keeps `centralpay
+    # reconcile` from silently reporting against stale configuration. If
+    # the worker container is not running, this fails loudly instead of
+    # falling back.
+    compose exec -T worker python -m app.cli reconcile "$@"
+}
+
 cmd_credentials() {
     require_root credentials
     [[ -f "$CREDENTIALS_FILE" ]] || fail "No credentials file at ${CREDENTIALS_FILE}."
@@ -1079,7 +1097,7 @@ main() {
         diagnose)      cmd_diagnose "$@" ;;
         stuck)         cmd_app_cli stuck "$@" ;;
         reconciliation) cmd_reconciliation "$@" ;;
-        reconcile)     cmd_app_cli reconcile "$@" ;;
+        reconcile)     cmd_reconcile_inspect "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;
         retry-queue)   cmd_app_cli retry-queue "$@" ;;

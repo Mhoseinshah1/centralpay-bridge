@@ -17,22 +17,32 @@ for a single machine-readable JSON object instead). These commands never
 modify data and never print secrets, redirect URLs, or full card numbers.
 
 `reconcile` NEVER writes to the database in either mode. By default it is
-LOCAL-ONLY (no network call at all). `--verify` additionally performs
-exactly ONE fresh, read-only CentralPayClient.verify() call and reports what
-settlement WOULD conclude -- it never settles, never invokes any mutating
-settlement or callback-processing path (app.services.verification /
-app.services.reconciliation), and never claims a reconciliation slot.
-`--verify` refuses (without any network call) when the
-payment is already locally gateway-verified, is in manual_review, or is
-aged out (RECONCILIATION_MAX_AGE_SECONDS or older) -- the last case requires
-the explicit `--confirm-aged-out` override, which remains fully read-only.
-See app.services.reconcile_inspect.
+LOCAL-ONLY (no network call, no lock, one consistent read). `--verify`
+additionally performs exactly ONE fresh, read-only CentralPayClient.verify()
+call and reports what settlement WOULD conclude -- it never settles, never
+invokes any mutating settlement or callback-processing path
+(app.services.verification / app.services.reconciliation), and never claims
+a reconciliation slot. `--verify` acquires the SAME row-lock discipline the
+mutating settlement path (app.services.verification) requires its caller to
+hold (`SELECT ... FOR UPDATE`), RELOADS the payment and its eligibility
+flags under that lock, and holds the lock across its own diagnostic gateway
+call -- closing the race where a concurrent callback or reconciliation
+attempt could settle the payment between an earlier, non-locking read and
+this diagnostic call. `--verify` refuses (without any network call, checked
+AFTER the row lock is held) when the payment is already locally
+gateway-verified, is in manual_review, or is aged out
+(RECONCILIATION_MAX_AGE_SECONDS or older) -- the last case requires the
+explicit `--confirm-aged-out` override, which remains fully read-only. See
+app.services.reconcile_inspect.
 
 `reconciliation status` reports the CONFIGURATION OF THE PROCESS IT RUNS IN —
 invoke it inside the worker container (the host `centralpay reconciliation
 status` command always does this) for the actual effective runtime
 configuration; the api container's environment can be stale after a
-worker-only redeploy (see scripts/centralpay).
+worker-only redeploy (see scripts/centralpay). The host `centralpay reconcile
+...` command routes through the worker container for the same reason: the
+reconciliation tier/aged-out/enabled configuration it reports on must never
+be read from a possibly-stale api container environment.
 """
 
 import argparse
@@ -523,6 +533,8 @@ def _reconcile_local_dict(payment: Payment, local: LocalSnapshot) -> dict[str, A
             "last_at": _iso(payment.reconciliation_last_at),
             "next_at": _iso(payment.reconciliation_next_at),
             "last_error_code": payment.reconciliation_last_error_code,
+            "enabled": local.reconciliation_enabled,
+            "schedule_due": local.schedule_due,
             "auto_reconciliation_due": local.auto_reconciliation_due,
             "aged_out": local.verify_aged_out,
             "attempts_exhausted": local.attempts_exhausted,
@@ -548,6 +560,7 @@ def _print_reconcile_local_human(payment: Payment, local: LocalSnapshot) -> None
     print(f"  last reconciliation:     {_iso(payment.reconciliation_last_at) or 'never'}")
     print(f"  next reconciliation:     {_iso(payment.reconciliation_next_at) or 'none scheduled'}")
     print(f"  last error code:         {payment.reconciliation_last_error_code or 'none'}")
+    print(f"  reconciliation enabled:  {'yes' if local.reconciliation_enabled else 'no'}")
     print(f"  auto-reconciliation due: {'yes' if local.auto_reconciliation_due else 'no'}")
     print(f"  aged out:                {'yes' if local.verify_aged_out else 'no'}")
     print(f"  attempts exhausted:      {'yes' if local.attempts_exhausted else 'no'}")
@@ -619,20 +632,45 @@ def _cmd_reconcile(
         print("--confirm-aged-out requires --verify", file=sys.stderr)
         return 1
 
-    payment = _find_payment(db, order_id)
-    if payment is None:
+    # Non-locking lookup, used only to resolve WHICH payment id this order
+    # id names -- never as the source of the displayed fields or the
+    # eligibility check (see build_local_snapshot calls below, which are
+    # the sole source of both).
+    found = _find_payment(db, order_id)
+    if found is None:
         _print({"error": "payment_not_found", "order_id": order_id})
         return 1
+    payment_id = found.id
 
     now = datetime.now(UTC)
-    local = build_local_snapshot(db, settings, payment, now=now)
 
     if not verify:
+        # Default inspection: no lock, one consistent read.
+        snapshot = build_local_snapshot(db, settings, payment_id, now=now)
+        if snapshot is None:
+            _print({"error": "payment_not_found", "order_id": order_id})
+            return 1
+        payment, local = snapshot
         if as_json:
             _print({"local": _reconcile_local_dict(payment, local), "verify": None})
         else:
             _print_reconcile_local_human(payment, local)
         return 0
+
+    # --verify: acquire the SAME row-lock discipline the mutating settlement
+    # path (app.services.verification) requires its caller to hold, and
+    # RELOAD the payment and its eligibility flags under that lock --
+    # closing the window where a concurrent callback or
+    # reconciliation attempt could settle this payment between an earlier,
+    # non-locking read and the diagnostic gateway call below. The lock is
+    # held across that gateway call and released normally when this
+    # command's database transaction ends (no commit is ever made). Zero
+    # persistent DB mutations either way.
+    locked_snapshot = build_local_snapshot(db, settings, payment_id, now=now, for_update=True)
+    if locked_snapshot is None:
+        _print({"error": "payment_not_found", "order_id": order_id})
+        return 1
+    payment, local = locked_snapshot
 
     refusal = determine_verify_refusal(payment, local, confirm_aged_out=confirm_aged_out)
     if refusal is not None:

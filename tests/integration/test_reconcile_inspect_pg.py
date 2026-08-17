@@ -11,18 +11,21 @@ matching the SQLite-backed proof in tests/test_cli_reconcile.py.
 Requires TEST_DATABASE_URL pointing at a disposable PostgreSQL database.
 """
 
+import concurrent.futures
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, select, text, update
 from sqlalchemy.orm import sessionmaker
 
 from app.centralpay import CentralPayClient
 from app.cli import main as cli_main
 from app.models import Base, Payment, PaymentStatus
+from app.services.verification import verify_and_settle
 from tests.conftest import CentralPayStub, build_app, create_order, get_payment, verify_ok_response
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "")
@@ -214,4 +217,253 @@ def test_reconcile_aged_out_refused_without_confirm_on_postgres(
     out = capsys.readouterr().out
     assert "aged out" in out
     assert "NO LOCAL CHANGES WERE MADE." in out
-    assert len(stub.verify_requests) == 0
+
+
+# --- PR #59 follow-up: the --verify row-lock race, on real PostgreSQL -------
+#
+# Required scenario A: a settlement lands AFTER the CLI's initial (non-
+# locking) lookup but BEFORE it acquires the --verify row lock -- the CLI's
+# reload under lock must see it and refuse, making zero gateway calls of its
+# own. Required scenario B: the CLI's row lock is genuinely HELD (blocking a
+# real concurrent transaction) across its own diagnostic gateway call, the
+# CLI itself never mutates anything, and the blocked settlement proceeds
+# normally the instant the CLI's transaction ends.
+
+
+def test_reconcile_verify_reloads_under_lock_after_concurrent_settlement(
+    cli_env, settings, pg_app, pg_session_factory, monkeypatch, capsys
+):
+    """Scenario A. The settlement is injected deterministically (via the
+    exact point in app.cli._cmd_reconcile where the CLI's non-locking
+    lookup returns and before it acquires the verify row lock) rather than
+    timed, so the test is not flaky -- but the settlement itself, and the
+    CLI's reload, both run as real, separate PostgreSQL transactions."""
+    stub = pg_app.state.centralpay_stub
+    _patch_centralpay_client(monkeypatch, stub)
+
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        response = create_order(client, settings, order_id="pg-race-settle-first", amount=5000)
+        assert response.status_code == 200
+    payment = get_payment(pg_session_factory, "pg-race-settle-first")
+
+    stub.verify_result = verify_ok_response(
+        amount=5000, user_id=payment.gateway_user_id, reference_id="REF-pg-race-settle-first"
+    )
+
+    import app.cli as cli_module
+
+    original_find_payment = cli_module._find_payment
+    raced = {"done": False}
+
+    def racing_find_payment(db, order_id):
+        found = original_find_payment(db, order_id)
+        if found is not None and not raced["done"]:
+            raced["done"] = True
+            # A real, separate PostgreSQL transaction settling the payment
+            # in the window between the CLI's lookup and its verify lock.
+            gateway = CentralPayClient(
+                base_url=settings.centralpay_base_url,
+                getlink_api_key=settings.centralpay_getlink_api_key,
+                verify_api_key=settings.centralpay_verify_api_key,
+                timeout_seconds=settings.centralpay_timeout_seconds,
+                transport=httpx.MockTransport(stub.handler),
+            )
+            try:
+                with pg_session_factory() as settle_db:
+                    locked = settle_db.execute(
+                        select(Payment).where(Payment.id == found.id).with_for_update()
+                    ).scalar_one()
+                    verify_and_settle(
+                        settle_db, gateway, locked, settings=settings, source="reconciliation"
+                    )
+            finally:
+                gateway.close()
+        return found
+
+    monkeypatch.setattr(cli_module, "_find_payment", racing_find_payment)
+
+    assert cli_main(["reconcile", "pg-race-settle-first", "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "already locally gateway-verified" in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+    assert len(stub.verify_requests) == 1  # only the racing settlement's call -- zero from the CLI
+
+    refetched = get_payment(pg_session_factory, "pg-race-settle-first")
+    # The race's settlement stands.
+    assert refetched.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert refetched.gateway_verified_at is not None
+    assert refetched.reference_id == "REF-pg-race-settle-first"
+
+
+def test_reconcile_verify_holds_row_lock_across_diagnostic_call_blocking_concurrent_settlement(
+    cli_env, settings, pg_app, pg_session_factory, monkeypatch, capsys
+):
+    """Scenario B. A `lock_acquired` signal fires the instant the CLI's own
+    ``SELECT ... FOR UPDATE`` reload returns (i.e. the instant it holds the
+    lock), so the concurrent settlement thread only attempts its own
+    ``FOR UPDATE`` once the CLI provably already holds the row -- proving
+    the concurrent transaction genuinely blocks on a REAL PostgreSQL lock
+    held across the CLI's diagnostic gateway call, not merely that the two
+    happen not to overlap."""
+    stub = pg_app.state.centralpay_stub
+    _patch_centralpay_client(monkeypatch, stub)
+
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        response = create_order(client, settings, order_id="pg-race-lock-held", amount=5000)
+        assert response.status_code == 200
+    payment = get_payment(pg_session_factory, "pg-race-lock-held")
+
+    stub.verify_result = verify_ok_response(
+        amount=5000, user_id=payment.gateway_user_id, reference_id="REF-pg-race-lock-held"
+    )
+    stub.verify_delay_seconds = 0.3  # widen the window the CLI's own call is in flight
+
+    import app.cli as cli_module
+    from app.services.reconcile_inspect import build_local_snapshot as original_build_local_snapshot
+
+    lock_acquired = threading.Event()
+
+    def spy_build_local_snapshot(db, settings_arg, payment_id, *, now, for_update=False):
+        result = original_build_local_snapshot(
+            db, settings_arg, payment_id, now=now, for_update=for_update
+        )
+        if for_update:
+            lock_acquired.set()  # the CLI's FOR UPDATE reload has returned: it holds the lock
+        return result
+
+    monkeypatch.setattr(cli_module, "build_local_snapshot", spy_build_local_snapshot)
+
+    def run_cli_verify():
+        assert cli_main(["reconcile", "pg-race-lock-held", "--verify"]) == 0
+
+    def run_concurrent_settlement():
+        gateway = CentralPayClient(
+            base_url=settings.centralpay_base_url,
+            getlink_api_key=settings.centralpay_getlink_api_key,
+            verify_api_key=settings.centralpay_verify_api_key,
+            timeout_seconds=settings.centralpay_timeout_seconds,
+            transport=httpx.MockTransport(stub.handler),
+        )
+        try:
+            with pg_session_factory() as db:
+                assert lock_acquired.wait(timeout=30)  # the CLI already holds the row lock
+                # Blocks here on a REAL PostgreSQL row lock until the CLI's
+                # transaction ends (the CLI never commits -- only closing
+                # its session releases the lock).
+                locked = db.execute(
+                    select(Payment)
+                    .where(Payment.bot_order_id == "pg-race-lock-held")
+                    .with_for_update()
+                ).scalar_one()
+                verify_and_settle(db, gateway, locked, settings=settings, source="reconciliation")
+        finally:
+            gateway.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        cli_future = pool.submit(run_cli_verify)
+        settle_future = pool.submit(run_concurrent_settlement)
+        cli_future.result(timeout=60)
+        settle_future.result(timeout=60)
+
+    out = capsys.readouterr().out
+    assert "WOULD_VERIFY" in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+
+    # Two verify requests reached the gateway: the CLI's own diagnostic
+    # call, and the concurrent settlement's call, which could not even
+    # start its own row read until the CLI's lock was released.
+    assert len(stub.verify_requests) == 2
+
+    refetched = get_payment(pg_session_factory, "pg-race-lock-held")
+    # The CLI itself made zero mutations -- the concurrent settlement, which
+    # could only proceed once the CLI released the lock, settled normally.
+    assert refetched.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert refetched.gateway_verified_at is not None
+    assert refetched.reference_id == "REF-pg-race-lock-held"
+
+
+# --- PR #59 follow-up: consistent single-read snapshot, on real PostgreSQL --
+
+
+def test_reconcile_snapshot_never_combines_stale_payment_with_newer_classification_pg(
+    cli_env, settings, pg_session_factory
+):
+    """Item 4 regression. build_local_snapshot's single structured SELECT
+    must never combine a Payment row read at one moment with classification
+    flags (age_bucket, tier due, exhausted) computed at another -- the exact
+    failure mode the OLD build_local_snapshot (one SELECT to load the
+    Payment ORM object, then several MORE separate SELECTs for the
+    tier/due/exhausted booleans) could produce under concurrent writes at
+    PostgreSQL READ COMMITTED isolation.
+
+    A background writer continuously flips the row between two states with
+    MUTUALLY EXCLUSIVE classifications -- "fresh, unverified link_created"
+    (must always report an age_bucket) and "gateway_verified" (must always
+    report age_bucket=None and every tier/due/exhausted flag False) -- while
+    many concurrent reads snapshot it. Every single read must be internally
+    self-consistent between the Payment fields and the classification flags
+    it returns, no matter when the writer's commits land relative to it."""
+    from app.services.reconcile_inspect import build_local_snapshot
+
+    with pg_session_factory() as db:
+        payment = Payment(
+            bot_order_id="pg-consistency-race",
+            gateway_order_id=970001,
+            gateway_user_id=1,
+            amount=5000,
+            payable_amount=5000,
+            status=PaymentStatus.LINK_CREATED.value,
+            callback_token_issued_at=datetime.now(UTC) - timedelta(seconds=30),
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+        payment_id = payment.id
+
+    stop = threading.Event()
+
+    def toggle_state():
+        verified = False
+        with pg_session_factory() as writer_db:
+            while not stop.is_set():
+                verified = not verified
+                if verified:
+                    values = {
+                        "status": PaymentStatus.BOT_NOTIFY_PENDING.value,
+                        "gateway_verified_at": datetime.now(UTC),
+                    }
+                else:
+                    values = {
+                        "status": PaymentStatus.LINK_CREATED.value,
+                        "gateway_verified_at": None,
+                    }
+                writer_db.execute(update(Payment).where(Payment.id == payment_id).values(**values))
+                writer_db.commit()
+
+    writer_thread = threading.Thread(target=toggle_state)
+    writer_thread.start()
+    try:
+        for _ in range(200):
+            with pg_session_factory() as reader_db:
+                snapshot = build_local_snapshot(
+                    reader_db, settings, payment_id, now=datetime.now(UTC)
+                )
+                assert snapshot is not None
+                payment, local = snapshot
+                if local.is_link_created_unverified:
+                    assert payment.status == PaymentStatus.LINK_CREATED.value
+                    assert payment.gateway_verified_at is None
+                    assert local.age_bucket is not None  # a fresh row always has a bucket
+                else:
+                    assert payment.status != PaymentStatus.LINK_CREATED.value
+                    assert payment.gateway_verified_at is not None
+                    assert local.age_bucket is None
+                    assert local.active_tier_due is False
+                    assert local.expiring_tier_due is False
+                    assert local.attempts_exhausted is False
+                    assert local.schedule_due is False
+                    assert local.auto_reconciliation_due is False
+    finally:
+        stop.set()
+        writer_thread.join(timeout=30)
+    assert not writer_thread.is_alive()

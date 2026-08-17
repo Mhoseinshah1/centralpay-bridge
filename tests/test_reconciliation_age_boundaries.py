@@ -92,8 +92,9 @@ def _classify(session_factory, settings, payment_id: int, now: datetime) -> dict
 
         status_snapshot = build_reconciliation_status_snapshot(db, settings, now_fn=lambda: now)
         stuck_overview = stuck_payments_overview(db, settings, now_fn=lambda: now)
-        payment = db.execute(select(Payment).where(Payment.id == payment_id)).scalar_one()
-        local = build_local_snapshot(db, settings, payment, now=now)
+        snapshot = build_local_snapshot(db, settings, payment_id, now=now)
+        assert snapshot is not None
+        _, local = snapshot
 
     stuck_category = None
     for entry in stuck_overview.ordered():
