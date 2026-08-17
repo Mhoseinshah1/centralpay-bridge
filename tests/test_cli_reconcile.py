@@ -25,6 +25,11 @@ from app.centralpay import CentralPayClient
 from app.cli import build_parser
 from app.cli import main as cli_main
 from app.models import Payment, PaymentStatus
+from app.services.reconcile_inspect import (
+    VerifyRefusal,
+    build_local_snapshot,
+    determine_verify_refusal,
+)
 from tests.conftest import (
     DEFAULT_GATEWAY_USER_ID,
     TEST_ADMIN_BOT_TOKEN,
@@ -650,7 +655,7 @@ def test_reconcile_verify_already_verified_refused_zero_network(
 
     assert cli_main(["reconcile", "rc-already-verified", "--verify"]) == 0
     out = capsys.readouterr().out
-    assert "already locally gateway-verified" in out
+    assert "already denotes successful gateway verification" in out
     assert "NO LOCAL CHANGES WERE MADE." in out
 
     assert len(stub.verify_requests) == verify_requests_before  # zero NEW network calls
@@ -695,12 +700,6 @@ def test_determine_verify_refusal_manual_review_takes_precedence_over_already_ve
     sit in manual_review (e.g. a delivery-failure review that never touched
     the financial/verification facts), and the operationally important
     fact is that an administrator already owns the review."""
-    from app.services.reconcile_inspect import (
-        VerifyRefusal,
-        build_local_snapshot,
-        determine_verify_refusal,
-    )
-
     with session_factory() as db:
         payment = Payment(
             bot_order_id="rc-precedence-unit",
@@ -752,9 +751,185 @@ def test_reconcile_verify_manual_review_with_gateway_verified_refused_zero_netwo
     assert cli_main(["reconcile", "rc-manual-review-verified", "--verify"]) == 0
     out = capsys.readouterr().out
     assert "administrator already owns" in out
-    assert "already locally gateway-verified" not in out
+    assert "already denotes successful gateway verification" not in out
     assert "NO LOCAL CHANGES WERE MADE." in out
     assert len(stub.verify_requests) == before_requests
+
+
+# --- Codex P1 follow-up: refuse VERIFIED_STATUSES, not only gateway_verified_at
+#
+# The callback route's settlement handler (app.services.verification)
+# suppresses re-verification when `payment.status in VERIFIED_STATUSES OR
+# payment.gateway_verified_at is not None`. Only a database CHECK constraint
+# (ck_payments_delivery_requires_verification) ties gateway_verified_at to
+# the two bot-notify statuses -- gateway_verified carries no such constraint,
+# so a gateway_verified row with gateway_verified_at still NULL is a
+# database-valid state, and checking gateway_verified_at alone would have
+# missed it. determine_verify_refusal must check `status in VERIFIED_STATUSES`
+# itself, not rely on that constraint holding for every member of the set.
+
+
+def _make_status_payment(
+    session_factory,
+    *,
+    bot_order_id: str,
+    gateway_order_id: int,
+    status: str,
+    gateway_verified_at: datetime | None = None,
+    amount: int = 8000,
+) -> Payment:
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id=bot_order_id,
+            gateway_order_id=gateway_order_id,
+            gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+            amount=amount,
+            payable_amount=amount,
+            status=status,
+            gateway_verified_at=gateway_verified_at,
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+        return payment
+
+
+def test_determine_verify_refusal_gateway_verified_status_with_null_timestamp(
+    session_factory, settings
+):
+    """status=gateway_verified with gateway_verified_at still NULL (a
+    database-valid row -- no CHECK constraint requires the timestamp for
+    this status) must refuse as already_gateway_verified. Checking
+    gateway_verified_at alone would miss this exact case."""
+    payment = _make_status_payment(
+        session_factory,
+        bot_order_id="rc-p1-gv-null-ts",
+        gateway_order_id=940001,
+        status=PaymentStatus.GATEWAY_VERIFIED.value,
+        gateway_verified_at=None,
+    )
+
+    with session_factory() as db:
+        snapshot = build_local_snapshot(db, settings, payment.id, now=datetime.now(UTC))
+        assert snapshot is not None
+        loaded_payment, local = snapshot
+        refusal = determine_verify_refusal(loaded_payment, local, confirm_aged_out=False)
+
+    assert refusal == VerifyRefusal.ALREADY_VERIFIED
+
+
+def test_reconcile_verify_gateway_verified_status_null_timestamp_zero_network(
+    cli_env, session_factory, stub, monkeypatch, capsys
+):
+    """End-to-end counterpart: the CLI must refuse and make zero HTTP
+    requests for a gateway_verified payment whose gateway_verified_at is
+    still NULL -- this is the exact regression the gateway_verified_at-only
+    check missed."""
+    _patch_centralpay_client(monkeypatch, stub)
+    _make_status_payment(
+        session_factory,
+        bot_order_id="rc-p1-e2e-gateway-verified",
+        gateway_order_id=940006,
+        status=PaymentStatus.GATEWAY_VERIFIED.value,
+        gateway_verified_at=None,
+    )
+    before_requests = len(stub.verify_requests)
+
+    assert cli_main(["reconcile", "rc-p1-e2e-gateway-verified", "--verify", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["refused"] == "already_gateway_verified"
+    assert payload["verify"]["performed"] is False
+    assert len(stub.verify_requests) == before_requests
+
+
+@pytest.mark.parametrize(
+    "status",
+    [PaymentStatus.BOT_NOTIFY_PENDING.value, PaymentStatus.BOT_NOTIFY_ACCEPTED.value],
+)
+def test_reconcile_verify_bot_notify_statuses_refuse_before_gateway_request(
+    cli_env, session_factory, stub, monkeypatch, capsys, status
+):
+    """status=bot_notify_pending / bot_notify_accepted must refuse via
+    already_gateway_verified and make zero HTTP requests -- both are members
+    of app.services.verification.VERIFIED_STATUSES, reused (not
+    re-derived) by determine_verify_refusal."""
+    _patch_centralpay_client(monkeypatch, stub)
+    order_id = f"rc-p1-{status}"
+    _make_status_payment(
+        session_factory,
+        bot_order_id=order_id,
+        gateway_order_id=940002 if status == PaymentStatus.BOT_NOTIFY_PENDING.value else 940003,
+        status=status,
+        gateway_verified_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+    before_requests = len(stub.verify_requests)
+
+    assert cli_main(["reconcile", order_id, "--verify", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["refused"] == "already_gateway_verified"
+    assert payload["verify"]["performed"] is False
+    assert len(stub.verify_requests) == before_requests
+
+
+def test_reconcile_verify_manual_review_precedence_holds_over_verified_status(
+    session_factory, settings
+):
+    """manual_review must still take precedence over already_gateway_verified
+    even when gateway_verified_at is also set -- restates the existing
+    precedence guarantee for a status/timestamp combination this P1 fix
+    touches, so the two checks are proven not to have regressed each other."""
+    payment = _make_status_payment(
+        session_factory,
+        bot_order_id="rc-p1-manual-review-wins",
+        gateway_order_id=940004,
+        status=PaymentStatus.MANUAL_REVIEW.value,
+        gateway_verified_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    with session_factory() as db:
+        snapshot = build_local_snapshot(db, settings, payment.id, now=datetime.now(UTC))
+        assert snapshot is not None
+        loaded_payment, local = snapshot
+        refusal = determine_verify_refusal(loaded_payment, local, confirm_aged_out=False)
+
+    assert refusal == VerifyRefusal.MANUAL_REVIEW_OWNED
+
+
+def test_reconcile_verify_disabled_gate_refuses_first_for_verified_status_payment(
+    cli_env, session_factory, monkeypatch, capsys
+):
+    """The CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED gate is checked before any
+    payment-state refusal -- disabled must refuse with
+    diagnostic_verify_not_enabled (never already_gateway_verified) and make
+    zero HTTP requests, even for a payment already in a VERIFIED_STATUSES
+    status, and without ever taking the verify row lock."""
+    import app.cli as cli_module
+    from app.services.reconcile_inspect import build_local_snapshot as real_build_local_snapshot
+
+    settings = cli_env
+    disabled = settings.model_copy(update={"centralpay_diagnostic_verify_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    _make_status_payment(
+        session_factory,
+        bot_order_id="rc-p1-gate-first",
+        gateway_order_id=940005,
+        status=PaymentStatus.BOT_NOTIFY_PENDING.value,
+        gateway_verified_at=datetime.now(UTC) - timedelta(minutes=5),
+    )
+
+    for_update_flags: list[bool] = []
+
+    def recording_build_local_snapshot(*args, **kwargs):
+        for_update_flags.append(kwargs.get("for_update", False))
+        return real_build_local_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "build_local_snapshot", recording_build_local_snapshot)
+
+    assert cli_main(["reconcile", "rc-p1-gate-first", "--verify", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["refused"] == "diagnostic_verify_not_enabled"
+    assert for_update_flags == [False]  # never locked -- the gate short-circuits first
 
 
 # --- scenario 10: aged-out safety -------------------------------------------
@@ -1044,7 +1219,7 @@ def test_reconcile_verify_rereads_under_lock_after_race_before_lock_acquired(
 
     assert cli_main(["reconcile", "rc-race-reload", "--verify"]) == 0
     out = capsys.readouterr().out
-    assert "already locally gateway-verified" in out
+    assert "already denotes successful gateway verification" in out
     assert "NO LOCAL CHANGES WERE MADE." in out
     assert len(stub.verify_requests) == 0  # zero calls from the CLI itself
 

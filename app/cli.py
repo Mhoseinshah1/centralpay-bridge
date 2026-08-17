@@ -47,8 +47,10 @@ concurrent callback or reconciliation attempt could settle the payment
 between an earlier, non-locking read and this diagnostic call, and the
 narrower race where the payment ages out WHILE this command waits for the
 lock. `--verify` refuses (without any network call, checked AFTER the row
-lock is held and the post-lock timestamp is taken) when the payment is
-already locally gateway-verified, is in manual_review, or is aged out
+lock is held and the post-lock timestamp is taken) when local state already
+denotes successful gateway verification (status in VERIFIED_STATUSES from
+app.services.verification, or gateway_verified_at is set), is in
+manual_review, or is aged out
 (RECONCILIATION_MAX_AGE_SECONDS or older) -- the last case requires the
 explicit `--confirm-aged-out` override, which remains fully read-only. See
 app.services.reconcile_inspect.
@@ -543,8 +545,8 @@ _VERIFY_REFUSAL_MESSAGE = {
         "that staging validation closes. No gateway call was made."
     ),
     VerifyRefusal.ALREADY_VERIFIED: (
-        "Refusing to re-verify: this payment is already locally gateway-verified "
-        "(gateway_verified_at is set). No gateway call was made."
+        "Refusing to re-verify: local state already denotes successful gateway "
+        "verification (verified status or gateway_verified_at). No gateway call was made."
     ),
     VerifyRefusal.MANUAL_REVIEW_OWNED: (
         "Refusing to verify: this payment is in manual_review -- an administrator "

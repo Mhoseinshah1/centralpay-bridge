@@ -285,7 +285,7 @@ def test_reconcile_verify_reloads_under_lock_after_concurrent_settlement(
 
     assert cli_main(["reconcile", "pg-race-settle-first", "--verify"]) == 0
     out = capsys.readouterr().out
-    assert "already locally gateway-verified" in out
+    assert "already denotes successful gateway verification" in out
     assert "NO LOCAL CHANGES WERE MADE." in out
     assert len(stub.verify_requests) == 1  # only the racing settlement's call -- zero from the CLI
 

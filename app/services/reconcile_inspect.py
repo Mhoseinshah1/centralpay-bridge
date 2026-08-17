@@ -79,6 +79,7 @@ from app.services.reconciliation import (
     expiring_tier_due_conditions,
     reconciliation_exhausted_conditions,
 )
+from app.services.verification import VERIFIED_STATUSES
 
 # Fixed diagnostic-only reason vocabulary. Deliberately distinct from the
 # real audit event type strings app.services.verification writes
@@ -253,20 +254,35 @@ def determine_verify_refusal(
 ) -> VerifyRefusal | None:
     """Should ``--verify`` refuse to call the gateway for this payment?
 
-    Order matters. ``manual_review`` is checked FIRST, before
-    ``gateway_verified_at``: a gateway-verified payment can legitimately
+    Order matters. ``manual_review`` is checked FIRST, before the
+    already-verified check: a gateway-verified payment can legitimately
     still be sitting in manual_review (e.g. a delivery-failure review that
     never touched the financial/verification facts), and in that case the
     operationally important fact is that an administrator already owns the
     review -- not that it happens to also be gateway-verified. Either way
-    the command makes ZERO gateway calls. Aged-out is checked last: only a
-    payment that is neither already-verified nor manual_review needs
-    --confirm-aged-out, and neither of the first two reasons has (or
-    needs) a confirmation override.
+    the command makes ZERO gateway calls.
+
+    The already-verified check reuses ``VERIFIED_STATUSES`` from
+    ``app.services.verification`` -- the exact same statuses (plus
+    ``gateway_verified_at is not None``) the callback route's settlement
+    handler treats as "verification already happened, do not re-verify".
+    ``gateway_verified_at`` alone is not a reliable proxy for every status in
+    that set: nothing in this module's contract guarantees a payment can
+    only reach a ``VERIFIED_STATUSES`` status together with
+    ``gateway_verified_at`` set (only a database CHECK constraint ties the
+    two bot-notify statuses together today; ``gateway_verified`` carries no
+    such constraint), so the status check must never be dropped in favor of
+    checking ``gateway_verified_at`` alone, and the status list itself must
+    never be locally re-derived -- it is imported, not duplicated.
+
+    Aged-out is checked last: only a payment that is neither
+    already-verified nor manual_review needs --confirm-aged-out, and
+    neither of the first two reasons has (or needs) a confirmation
+    override.
     """
     if payment.status == PaymentStatus.MANUAL_REVIEW.value:
         return VerifyRefusal.MANUAL_REVIEW_OWNED
-    if payment.gateway_verified_at is not None:
+    if payment.status in VERIFIED_STATUSES or payment.gateway_verified_at is not None:
         return VerifyRefusal.ALREADY_VERIFIED
     if local.verify_aged_out and not confirm_aged_out:
         return VerifyRefusal.AGED_OUT
