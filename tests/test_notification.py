@@ -139,11 +139,67 @@ def test_4xx_becomes_manual_review(
     assert "manual_review_required" in types
 
 
-@pytest.mark.parametrize("status", [500, 503])
-def test_5xx_schedules_retry(client, settings, session_factory, stub, bot_stub, notifier, status):
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_5xx_safe_mode_goes_to_manual_review_without_retry(
+    client, settings, session_factory, stub, bot_stub, notifier, status
+):
+    """Production evidence: a bot that already processed an order (balance
+    credited, no further side effect) can return HTTP 5xx on a duplicate
+    delivery. An HTTP 5xx never proves the bot made no side effects, so in
+    safe mode (the production default) it must not be auto-retried — that
+    could double-credit the customer. It goes straight to manual review
+    instead, carrying the specific HTTP reason code, never a generic
+    transport-timeout label."""
+    assert settings.bot_notify_retry_mode == "safe"
     payment = make_verified_pending(client, settings, session_factory, stub)
     bot_stub.result = httpx.Response(status)
     run_pass(session_factory, notifier, settings, now=FIXED_NOW)
+
+    payment = get_payment(session_factory, payment.bot_order_id)
+    assert payment.status == PaymentStatus.MANUAL_REVIEW.value
+    # The specific HTTP reason is preserved -- never converted into the
+    # generic bot_timeout_ambiguous code used for transport ambiguity.
+    assert payment.bot_notify_reason == f"bot_http_{status}"
+    assert payment.bot_last_http_status == status
+    assert payment.bot_notify_attempts == 1
+    assert as_utc(payment.manual_review_at) == FIXED_NOW
+    # No retry is scheduled and the notification claim is cleared.
+    assert payment.next_retry_at is None
+    assert payment.notification_claimed_at is None
+    assert payment.notification_claimed_by is None
+
+    events = get_events(session_factory, payment.id)
+    types = event_types(events)
+    assert "bot_notification_retry_scheduled" not in types
+    # Audit trail clearly shows both: the specific-HTTP-reason failure, then
+    # the manual-review requirement.
+    failed = next(e for e in events if e.event_type == "bot_notification_failed")
+    assert failed.data is not None
+    assert failed.data["reason_code"] == f"bot_http_{status}"
+    assert failed.data["http_status"] == status
+    required = next(e for e in events if e.event_type == "manual_review_required")
+    assert required.data is not None
+    assert required.data["reason"] == f"bot_http_{status}"
+
+    # Never automatically retried afterwards -- only the one HTTP attempt
+    # was ever made, even long after the old retry schedule would have due.
+    bot_stub.result = httpx.Response(200)
+    result = run_pass(session_factory, notifier, settings, now=FIXED_NOW + timedelta(hours=2))
+    assert result["processed"] == 0
+    assert len(bot_stub.requests) == 1
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 504])
+def test_5xx_idempotent_mode_still_schedules_retry(
+    client, settings, session_factory, stub, bot_stub, notifier, status
+):
+    """idempotent mode is an explicit operator opt-in confirming duplicate
+    order_id delivery is safe; 5xx retry/backoff/max-attempt behavior there
+    is unchanged by the safe-mode policy above."""
+    idempotent = settings.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    payment = make_verified_pending(client, settings, session_factory, stub)
+    bot_stub.result = httpx.Response(status)
+    run_pass(session_factory, notifier, idempotent, now=FIXED_NOW)
 
     payment = get_payment(session_factory, payment.bot_order_id)
     assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value
@@ -159,19 +215,48 @@ def test_5xx_schedules_retry(client, settings, session_factory, stub, bot_stub, 
     # Not due yet: nothing is sent.
     bot_stub.result = httpx.Response(200)
     result = run_pass(
-        session_factory, notifier, settings, now=FIXED_NOW + timedelta(seconds=30)
+        session_factory, notifier, idempotent, now=FIXED_NOW + timedelta(seconds=30)
     )
     assert result["processed"] == 0
     assert len(bot_stub.requests) == 1
 
     # Due: the retry is delivered and accepted.
     result = run_pass(
-        session_factory, notifier, settings, now=FIXED_NOW + timedelta(seconds=61)
+        session_factory, notifier, idempotent, now=FIXED_NOW + timedelta(seconds=61)
     )
     assert result["processed"] == 1
     payment = get_payment(session_factory, payment.bot_order_id)
     assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
     assert payment.bot_notify_attempts == 2
+
+
+def test_duplicate_delivery_500_with_paid_body_is_manual_review_not_retried(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """Reproduces the exact production evidence: a duplicate delivery for an
+    already-processed order returns HTTP 500 with a body claiming the
+    payment is already paid. The body must never be parsed or trusted --
+    only the HTTP status drives classification -- and the proven
+    side-effecting 5xx must not be auto-retried in safe mode."""
+    payment = make_verified_pending(client, settings, session_factory, stub)
+    bot_stub.result = httpx.Response(
+        500, json={"status": False, "msg": "payment is paid", "obj": []}
+    )
+    run_pass(session_factory, notifier, settings, now=FIXED_NOW)
+
+    payment = get_payment(session_factory, payment.bot_order_id)
+    assert payment.status == PaymentStatus.MANUAL_REVIEW.value
+    assert payment.bot_notify_reason == ReasonCode.BOT_HTTP_500.value
+    assert payment.next_retry_at is None
+
+    for event in get_events(session_factory, payment.id):
+        assert "payment is paid" not in repr(event.data)
+    assert "payment is paid" not in (payment.last_error or "")
+
+    # No second automatic attempt is ever made.
+    result = run_pass(session_factory, notifier, settings, now=FIXED_NOW + timedelta(days=1))
+    assert result["processed"] == 0
+    assert len(bot_stub.requests) == 1
 
 
 def test_connection_refused_schedules_retry(
@@ -239,7 +324,9 @@ def test_retry_limit_reached_becomes_manual_review(
         payment.id,
         bot_notify_attempts=settings.bot_notify_max_attempts - 1,
     )
-    bot_stub.result = httpx.Response(500)
+    # 429 stays retryable in safe mode (unlike 5xx), so this exercises the
+    # generic max-attempts-reached path rather than the 5xx safe-mode policy.
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings, now=FIXED_NOW)
 
     payment = get_payment(session_factory, payment.bot_order_id)
@@ -364,7 +451,9 @@ def test_attempt_events_contain_no_secret_values(
     client, settings, session_factory, stub, bot_stub, notifier
 ):
     payment = make_verified_pending(client, settings, session_factory, stub)
-    bot_stub.result = httpx.Response(500)
+    # 429 stays retryable in safe mode (unlike 5xx), so this still exercises
+    # two real attempts with their outcomes.
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings, now=FIXED_NOW)
     bot_stub.result = httpx.Response(200)
     run_pass(session_factory, notifier, settings, now=FIXED_NOW + timedelta(seconds=61))

@@ -1941,7 +1941,10 @@ def test_retryable_failure_in_active_backoff_not_flagged_stale(
 
     order_id = "retry-backoff-fresh-cycle"
     make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
-    bot_stub.result = httpx.Response(500)
+    # 429 stays retryable in safe mode (unlike 5xx, which now goes straight
+    # to manual review); this test is about the age-anchor logic, not about
+    # HTTP-status classification.
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings)
 
     with session_factory() as db:
@@ -1976,7 +1979,10 @@ def test_retryable_failure_becomes_stale_once_the_cycle_is_genuinely_overdue(
 
     order_id = "retry-backoff-overdue"
     make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
-    bot_stub.result = httpx.Response(500)
+    # 429 stays retryable in safe mode (unlike 5xx, which now goes straight
+    # to manual review); this test is about the age-anchor logic, not about
+    # HTTP-status classification.
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings)
 
     with session_factory() as db:

@@ -326,7 +326,8 @@ def _build_full_state(settings, pg_engine, bot_stub, notifier):
         # manual_review (bot rejected with 422)
         assert create_order(client, settings, order_id="fs-rev", amount=5000).status_code == 200
         verify(client, "fs-rev", 5000)
-        # retry-scheduled (bot 500)
+        # retry-scheduled (bot 429; 5xx now goes straight to manual review in
+        # safe mode, so 429 is used to keep a genuinely-retryable state here)
         assert create_order(client, settings, order_id="fs-retry", amount=6000).status_code == 200
         verify(client, "fs-retry", 6000)
     application.state.centralpay.close()
@@ -339,7 +340,7 @@ def _build_full_state(settings, pg_engine, bot_stub, notifier):
     run_pass(session_factory, notifier, settings, batch_size=1)  # fs-acc -> accepted
     bot_stub.result = httpx.Response(422)
     run_pass(session_factory, notifier, settings, batch_size=1)  # fs-rev -> manual review
-    bot_stub.result = httpx.Response(500)
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings, batch_size=1)  # fs-retry -> retry scheduled
 
     with session_factory() as session:
