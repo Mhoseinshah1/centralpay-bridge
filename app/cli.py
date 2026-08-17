@@ -1164,31 +1164,33 @@ def _cmd_recover_aged_out(
                     "  delivery uncertain:      the request may or may not have "
                     "reached the gateway"
                 )
-                # CentralPay's own verify-after-verify/idempotency behavior
-                # has never been confirmed safe against production (see
-                # STAGING_VALIDATION.md, the same caveat that gates
-                # `reconcile --verify`'s diagnostic re-verification). A
-                # connection-level failure means this request's OWN outcome
-                # at the gateway is unknown -- retrying issues a genuinely
-                # NEW verify call while that is still true, so this command
-                # does not auto-retry and an operator choosing to run
-                # --confirm again should do so deliberately, not reflexively.
-                print(
-                    "  This command does not auto-retry. Before running --confirm "
-                    "again, consider that CentralPay's behavior when verify.php is "
-                    "queried again for an order it may already have processed has "
-                    "never been confirmed safe (see STAGING_VALIDATION.md) -- "
-                    "investigate this order with CentralPay directly if unsure."
-                )
             else:
+                # Receiving an HTTP 500 or an unparseable body PROVES some
+                # peer answered -- it does NOT prove CentralPay's own
+                # processing of this verify request failed or never
+                # happened (the error could originate from CentralPay's
+                # app logic after it already processed the check, from an
+                # intermediary in front of it, or otherwise). This is
+                # narrower than "the request reached CentralPay and
+                # nothing happened there" -- so it carries the SAME
+                # verify-after-verify ambiguity as a connection-level
+                # failure, not a lesser one.
                 print("  request reached gateway: yes (response could not be used)")
-                # The gateway answered THIS request -- there is no
-                # verify-after-verify ambiguity to weigh, unlike the
-                # connection-level case above.
-                print(
-                    "  This command does not auto-retry -- run --confirm again for "
-                    "a fresh, deliberate attempt."
-                )
+            # CentralPay's own verify-after-verify/idempotency behavior has
+            # never been confirmed safe against production (see
+            # STAGING_VALIDATION.md, the same caveat that gates `reconcile
+            # --verify`'s diagnostic re-verification). Neither transport
+            # failure mode proves this attempt did not already reach
+            # CentralPay's processing, so this command does not auto-retry,
+            # and an operator choosing to run --confirm again should do so
+            # deliberately, not reflexively.
+            print(
+                "  This command does not auto-retry. Before running --confirm "
+                "again, consider that CentralPay's behavior when verify.php is "
+                "queried again for an order it may already have processed has "
+                "never been confirmed safe (see STAGING_VALIDATION.md) -- "
+                "investigate this order with CentralPay directly if unsure."
+            )
         else:
             print(f"--- --confirm: {outcome.kind.value} ---")
             print(f"  {_RECOVERY_OUTCOME_MESSAGE[outcome.kind]}")

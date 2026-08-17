@@ -918,12 +918,15 @@ def test_recover_aged_out_confirm_non_connection_transport_error_request_proven_
     assert "request reached gateway: yes (response could not be used)" in out
     assert "delivery uncertain" not in out
     assert "No local settlement was applied." in out
-    assert "run --confirm again for a fresh, deliberate attempt" in out
-    # The verify-after-verify safety caveat is specific to the
-    # connection-level (delivery-uncertain) case -- the gateway definitely
-    # answered THIS request, so there is no such ambiguity to weigh here.
-    assert "STAGING_VALIDATION.md" not in out
-    assert "never been confirmed safe" not in out
+    # Codex follow-up: an unusable response (HTTP 500 / malformed body)
+    # proves only that SOME peer answered -- never that CentralPay's own
+    # processing of this verify request did not already succeed before
+    # the failure occurred. That is the SAME verify-after-verify ambiguity
+    # a connection-level failure carries, so the safety caveat applies
+    # here too, not only to the delivery-uncertain case.
+    assert "does not auto-retry" in out
+    assert "never been confirmed safe" in out
+    assert "STAGING_VALIDATION.md" in out
 
     refetched = get_payment(session_factory, "rec-confirm-rejected-status")
     assert refetched.status == PaymentStatus.LINK_CREATED.value
