@@ -301,7 +301,7 @@ def test_confirm_reloads_under_lock_after_concurrent_settlement_lands_first_pg(
     assert cli_main(["recover-aged-out", "pg-rec-race-settle-first", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "refused"
-    assert payload["refusal_reason"] == "already_gateway_verified"
+    assert payload["pre_attempt"]["refusal_reason"] == "already_gateway_verified"
     assert len(stub.verify_requests) == 1  # only the racing settlement's call -- zero from recovery
 
     refetched = get_payment(pg_session_factory, "pg-rec-race-settle-first")
@@ -380,7 +380,7 @@ def test_manual_review_refuses_zero_http_pg(
 
     assert cli_main(["recover-aged-out", "pg-rec-manual-review", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["refusal_reason"] == "manual_review_owned"
+    assert payload["pre_attempt"]["refusal_reason"] == "manual_review_owned"
     assert len(stub.verify_requests) == 0
 
 
@@ -402,7 +402,7 @@ def test_not_aged_out_refuses_zero_http_pg(
 
     assert cli_main(["recover-aged-out", "pg-rec-not-aged-out", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["refusal_reason"] == "not_aged_out"
+    assert payload["pre_attempt"]["refusal_reason"] == "not_aged_out"
     assert len(stub.verify_requests) == 0
 
 
@@ -429,7 +429,7 @@ def test_already_verified_status_with_null_timestamp_refuses_zero_http_pg(
 
     assert cli_main(["recover-aged-out", "pg-rec-verified-null-ts", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["refusal_reason"] == "already_gateway_verified"
+    assert payload["pre_attempt"]["refusal_reason"] == "already_gateway_verified"
     assert len(stub.verify_requests) == 0
 
 
@@ -508,11 +508,18 @@ def test_transport_failure_no_fake_success_no_automatic_retry_pg(
     )
     stub.verify_result = httpx.ConnectError("boom")
 
+    assert cli_main(["recover-aged-out", "pg-rec-transport", "--confirm", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["gateway_request_performed"] is None  # connection-level: cannot be known
+    assert payload["delivery_uncertain"] is True
+
     assert cli_main(["recover-aged-out", "pg-rec-transport", "--confirm"]) == 1
     out = capsys.readouterr().out
     assert "--- --confirm: transport_failed ---" in out
+    assert "delivery uncertain:      the request may or may not have reached the gateway" in out
+    assert "No local settlement was applied." in out
 
-    assert len(stub.verify_requests) == 1  # exactly one attempt -- no automatic retry
+    assert len(stub.verify_requests) == 2  # two deliberate --confirm calls -- no automatic retry
     refetched = get_payment(pg_session_factory, "pg-rec-transport")
     assert refetched.status == PaymentStatus.LINK_CREATED.value
     assert refetched.gateway_verified_at is None

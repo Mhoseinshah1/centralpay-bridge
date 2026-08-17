@@ -944,9 +944,9 @@ _RECOVERY_REFUSAL_MESSAGE = {
     ),
     RecoveryRefusal.NOT_AGED_OUT: (
         "Refusing to recover: this payment has not aged out "
-        "(link age < RECONCILIATION_MAX_AGE_SECONDS). Automatic reconciliation is "
-        "still (or will be) handling it; use `centralpay reconcile ORDER_ID` to "
-        "inspect it instead."
+        "(link age < RECONCILIATION_MAX_AGE_SECONDS). This recovery command only "
+        "applies after the max-age boundary. Use `centralpay reconcile ORDER_ID` "
+        "to inspect the current reconciliation state."
     ),
 }
 
@@ -968,12 +968,9 @@ _RECOVERY_OUTCOME_MESSAGE = {
         "payment ORDER_ID` for the specific mismatch event. No notification "
         "was queued."
     ),
-    RecoveryOutcomeKind.TRANSPORT_FAILED: (
-        "The gateway call failed at the transport/protocol level. No "
-        "settlement occurred and nothing was fabricated as success. This "
-        "command does not auto-retry -- run `--confirm` again later for a "
-        "fresh, deliberate attempt."
-    ),
+    # RecoveryOutcomeKind.TRANSPORT_FAILED is deliberately absent: its
+    # message depends on outcome.delivery_uncertain and is built dynamically
+    # in _cmd_recover_aged_out, never from this fixed dict.
 }
 
 
@@ -991,12 +988,31 @@ def _recovery_snapshot_dict(snapshot: RecoverySnapshot, settings: Settings) -> d
     }
 
 
-def _print_recovery_snapshot_human(snapshot: RecoverySnapshot, settings: Settings) -> None:
+def _print_recovery_snapshot_human(
+    snapshot: RecoverySnapshot, settings: Settings, *, pre_attempt: bool
+) -> None:
+    """``pre_attempt=True`` (used only by ``--confirm``) labels every status/
+    verification field as the state observed the moment the row lock was
+    acquired -- BEFORE any settlement attempt -- so a caller can never
+    mistake it for the payment's current database state after a
+    ``verified``/``gateway_not_paid``/``manual_review`` outcome. See
+    RecoverySnapshot's docstring for why: the canonical settlement function
+    may mutate the underlying ``Payment`` ORM object in place after this
+    snapshot was captured, and this module deliberately never re-reads the
+    row afterward to "refresh" it -- an explicit pre-attempt label is safer
+    and deterministic, never racy."""
     print(f"🛟 Aged-out recovery: {snapshot.bot_order_id}")
     print("=" * (23 + len(snapshot.bot_order_id)))
     print(f"  gateway order id:        {snapshot.gateway_order_id}")
-    print(f"  current status:          {snapshot.status}")
-    print(f"  gateway_verified:        {'yes' if snapshot.gateway_verified else 'no'}")
+    if pre_attempt:
+        print(f"  pre-attempt status:      {snapshot.status}")
+        print(
+            "  pre-attempt gateway_verified: "
+            f"{'yes' if snapshot.gateway_verified else 'no'}"
+        )
+    else:
+        print(f"  current status:          {snapshot.status}")
+        print(f"  gateway_verified:        {'yes' if snapshot.gateway_verified else 'no'}")
     print(f"  link age:                {_humanize_duration(snapshot.link_age_seconds)}")
     print(
         "  reconciliation max age:  "
@@ -1007,15 +1023,17 @@ def _print_recovery_snapshot_human(snapshot: RecoverySnapshot, settings: Setting
     print(f"  attempts cap:            {settings.reconciliation_max_attempts}")
 
 
-def _confirm_would_text(refusal: RecoveryRefusal | None) -> str:
-    if refusal is None:
-        return (
-            "acquire a row lock, reload current state, and -- if still eligible -- "
-            "call the canonical settlement function exactly once."
-        )
+def _confirm_would_text() -> str:
+    # Deliberately does NOT depend on the preview's current refusal (if
+    # any): eligibility is re-evaluated fresh under the row lock at
+    # --confirm time, and the payment may have aged out, become verified,
+    # entered manual_review, or otherwise changed state in between -- a
+    # preview refusal is never a guarantee about what a LATER --confirm
+    # will find.
     return (
-        "refuse with zero gateway requests (same reason as above, re-checked "
-        "under a fresh row lock)."
+        "acquire the row lock and re-evaluate current eligibility; if still "
+        "ineligible it will refuse with zero gateway requests, otherwise it "
+        "may perform the one canonical settlement attempt."
     )
 
 
@@ -1056,17 +1074,17 @@ def _cmd_recover_aged_out(
                     **_recovery_snapshot_dict(snapshot, settings),
                     "eligible": refusal is None,
                     "refusal_reason": refusal.value if refusal is not None else None,
-                    "confirm_would": _confirm_would_text(refusal),
+                    "confirm_would": _confirm_would_text(),
                     "note": _NO_LOCAL_CHANGES_LINE,
                 }
             )
         else:
-            _print_recovery_snapshot_human(snapshot, settings)
+            _print_recovery_snapshot_human(snapshot, settings, pre_attempt=False)
             print(f"  eligible:                {'yes' if refusal is None else 'no'}")
             if refusal is not None:
                 print(f"  refusal reason:          {refusal.value}")
                 print(f"  {_RECOVERY_REFUSAL_MESSAGE[refusal]}")
-            print(f"  --confirm would:         {_confirm_would_text(refusal)}")
+            print(f"  --confirm would:         {_confirm_would_text()}")
             print()
             print("PREVIEW ONLY. Pass --confirm to attempt recovery.")
             print(f"  {_NO_LOCAL_CHANGES_LINE}")
@@ -1087,33 +1105,60 @@ def _cmd_recover_aged_out(
         _print({"error": "payment_not_found", "order_id": order_id})
         return 1
     snapshot, outcome = result
+    eligible_at_attempt = outcome.kind is not RecoveryOutcomeKind.REFUSED
 
     if as_json:
         _print(
             {
                 "preview": False,
                 "confirm_requested": True,
-                **_recovery_snapshot_dict(snapshot, settings),
-                "eligible": outcome.kind is not RecoveryOutcomeKind.REFUSED,
-                "refusal_reason": outcome.refusal.value if outcome.refusal is not None else None,
+                # PRE-ATTEMPT state only -- captured under the row lock
+                # BEFORE the canonical settlement attempt ran, never
+                # re-read afterward (see RecoverySnapshot's docstring).
+                # Nested explicitly so a
+                # machine consumer can never mistake "status": "link_created"
+                # here for the payment's CURRENT database state after a
+                # "verified" outcome.
+                "pre_attempt": {
+                    **_recovery_snapshot_dict(snapshot, settings),
+                    "eligible": eligible_at_attempt,
+                    "refusal_reason": (
+                        outcome.refusal.value if outcome.refusal is not None else None
+                    ),
+                },
                 "outcome": outcome.kind.value,
-                "gateway_call_made": outcome.gateway_call_made,
+                "gateway_request_performed": outcome.gateway_request_performed,
+                "delivery_uncertain": outcome.delivery_uncertain,
                 "transport_error_code": outcome.transport_error_code,
             }
         )
     else:
-        _print_recovery_snapshot_human(snapshot, settings)
+        _print_recovery_snapshot_human(snapshot, settings, pre_attempt=True)
+        print(f"  eligible at attempt:     {'yes' if eligible_at_attempt else 'no'}")
         print()
         if outcome.kind is RecoveryOutcomeKind.REFUSED:
             assert outcome.refusal is not None
             print("--- --confirm: refused ---")
             print(f"  {_RECOVERY_REFUSAL_MESSAGE[outcome.refusal]}")
             print("  Zero gateway requests were made.")
+        elif outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED:
+            print("--- --confirm: transport_failed ---")
+            print(f"  error code:              {outcome.transport_error_code}")
+            if outcome.delivery_uncertain:
+                print(
+                    "  delivery uncertain:      the request may or may not have "
+                    "reached the gateway"
+                )
+            else:
+                print("  request reached gateway: yes (response could not be used)")
+            print("  No local settlement was applied.")
+            print(
+                "  This command does not auto-retry -- run --confirm again later "
+                "for a fresh, deliberate attempt."
+            )
         else:
             print(f"--- --confirm: {outcome.kind.value} ---")
             print(f"  {_RECOVERY_OUTCOME_MESSAGE[outcome.kind]}")
-            if outcome.transport_error_code is not None:
-                print(f"  error code:              {outcome.transport_error_code}")
     return 1 if outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED else 0
 
 

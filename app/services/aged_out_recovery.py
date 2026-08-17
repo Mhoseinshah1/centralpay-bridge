@@ -95,7 +95,7 @@ from sqlalchemy.orm import Session
 from app.audit import record_event
 from app.centralpay import CentralPayClient
 from app.config import Settings
-from app.exceptions import CentralPayError
+from app.exceptions import CentralPayConnectionError, CentralPayError
 from app.models import Payment, PaymentStatus
 from app.services.reconcile_inspect import LocalSnapshot, build_local_snapshot
 from app.services.verification import SettlementOutcome, verify_and_settle
@@ -193,12 +193,21 @@ class RecoveryOutcomeKind(enum.StrEnum):
 @dataclass(frozen=True)
 class RecoveryOutcome:
     kind: RecoveryOutcomeKind
+    # Whether an HTTP request actually reached CentralPay -- mirrors
+    # `reconcile --verify`'s identical semantics (see app.cli._cmd_reconcile).
+    # False ONLY for REFUSED: eligibility failed before any gateway request
+    # was even attempted. True for VERIFIED / GATEWAY_NOT_PAID /
+    # MANUAL_REVIEW (a real, parsed gateway response) and for a
+    # TRANSPORT_FAILED caused by a non-connection CentralPayError (a
+    # non-200 status or an unparseable body PROVES the request was
+    # transmitted and answered). None ONLY for a TRANSPORT_FAILED caused by
+    # CentralPayConnectionError, where httpx cannot distinguish "never left
+    # this process" from "sent, but the response was lost".
+    gateway_request_performed: bool | None
+    # True ONLY for the CentralPayConnectionError case above.
+    delivery_uncertain: bool
     refusal: RecoveryRefusal | None = None
     transport_error_code: str | None = None
-
-    @property
-    def gateway_call_made(self) -> bool:
-        return self.kind is not RecoveryOutcomeKind.REFUSED
 
 
 def execute_confirmed_recovery(
@@ -268,11 +277,26 @@ def execute_confirmed_recovery(
             data={"gateway_order_id": payment.gateway_order_id, "reason": refusal.value},
         )
         db.commit()
-        return snapshot, RecoveryOutcome(RecoveryOutcomeKind.REFUSED, refusal=refusal)
+        return snapshot, RecoveryOutcome(
+            RecoveryOutcomeKind.REFUSED,
+            gateway_request_performed=False,
+            delivery_uncertain=False,
+            refusal=refusal,
+        )
 
     try:
         settled = verify_and_settle(db, client, payment, settings=settings, source=RECOVERY_SOURCE)
     except CentralPayError as exc:
+        # A connection-level failure cannot be told apart from "sent, then
+        # the response never arrived" -- httpx gives no way to know
+        # whether bytes reached the gateway. Any OTHER CentralPayError (a
+        # non-200 status or an unparseable body) PROVES the request was
+        # transmitted and answered -- never "uncertain". Same distinction
+        # `reconcile --verify` already makes (app.cli._cmd_reconcile).
+        if isinstance(exc, CentralPayConnectionError):
+            performed, delivery_uncertain = None, True
+        else:
+            performed, delivery_uncertain = True, False
         # verify_and_settle already recorded centralpay_verify_failed and
         # committed before raising -- this marker is a fresh, separate,
         # lock-free transaction purely to tag the attempt as ours.
@@ -285,7 +309,10 @@ def execute_confirmed_recovery(
         )
         db.commit()
         return snapshot, RecoveryOutcome(
-            RecoveryOutcomeKind.TRANSPORT_FAILED, transport_error_code=exc.code
+            RecoveryOutcomeKind.TRANSPORT_FAILED,
+            gateway_request_performed=performed,
+            delivery_uncertain=delivery_uncertain,
+            transport_error_code=exc.code,
         )
 
     if settled is SettlementOutcome.VERIFIED:
@@ -301,4 +328,4 @@ def execute_confirmed_recovery(
         data={"gateway_order_id": payment.gateway_order_id},
     )
     db.commit()
-    return snapshot, RecoveryOutcome(kind)
+    return snapshot, RecoveryOutcome(kind, gateway_request_performed=True, delivery_uncertain=False)

@@ -417,8 +417,47 @@ def test_recover_aged_out_preview_json_shape(cli_env, session_factory, settings,
     assert payload["refusal_reason"] is None
     assert payload["reconciliation_max_age_seconds"] == settings.reconciliation_max_age_seconds
     assert payload["reconciliation_max_attempts"] == settings.reconciliation_max_attempts
-    assert "canonical settlement function" in payload["confirm_would"]
+    assert "re-evaluate current eligibility" in payload["confirm_would"]
     assert payload["note"] == "NO LOCAL CHANGES WERE MADE."
+
+
+def test_recover_aged_out_confirm_would_text_identical_regardless_of_current_eligibility(
+    cli_env, client, settings, session_factory, capsys
+):
+    """Item G: eligibility is re-evaluated fresh under the row lock at
+    --confirm time, so a preview refusal is NOT a guarantee about what a
+    LATER --confirm will find (the payment may age out, become verified,
+    enter manual_review, or otherwise change state in between). The
+    "--confirm would" text must therefore say the SAME thing regardless of
+    the payment's current eligibility -- never "refuse for the same reason
+    as above" -- and must explicitly acknowledge re-evaluation."""
+    _make_aged_out_payment(
+        session_factory,
+        settings,
+        bot_order_id="rec-confirm-would-eligible",
+        gateway_order_id=210010,
+    )
+    response = create_order(
+        client, settings, order_id="rec-confirm-would-ineligible", amount=5000
+    )
+    assert response.status_code == 200
+
+    assert cli_main(["recover-aged-out", "rec-confirm-would-eligible", "--json"]) == 0
+    eligible_payload = json.loads(capsys.readouterr().out)
+    assert eligible_payload["eligible"] is True
+
+    assert cli_main(["recover-aged-out", "rec-confirm-would-ineligible", "--json"]) == 0
+    ineligible_payload = json.loads(capsys.readouterr().out)
+    assert ineligible_payload["eligible"] is False
+
+    assert eligible_payload["confirm_would"] == ineligible_payload["confirm_would"]
+    assert "re-evaluate current eligibility" in eligible_payload["confirm_would"]
+    assert "same reason" not in eligible_payload["confirm_would"]
+
+    assert cli_main(["recover-aged-out", "rec-confirm-would-ineligible"]) == 0
+    out = capsys.readouterr().out
+    assert "same reason as above" not in out
+    assert "re-evaluate current eligibility" in out
 
 
 def test_recover_aged_out_preview_not_aged_out_shows_refusal(
@@ -438,6 +477,26 @@ def test_recover_aged_out_preview_not_aged_out_shows_refusal(
     assert "eligible:                no" in out
     assert "refusal reason:          not_aged_out" in out
     assert "has not aged out" in out
+
+
+def test_recover_aged_out_not_aged_out_message_never_claims_reconciliation_will_handle_it(
+    cli_env, client, settings, session_factory, capsys
+):
+    """Item F: RECONCILIATION_ENABLED can be false, attempts may already be
+    at the cap, or scheduling may otherwise make the payment non-runnable
+    -- so the not-aged-out refusal must never assert that automatic
+    reconciliation "is still (or will be) handling it". It must only make
+    the narrow, always-true claim that this command applies past the
+    max-age boundary."""
+    response = create_order(client, settings, order_id="rec-not-aged-out-msg", amount=5000)
+    assert response.status_code == 200
+
+    assert cli_main(["recover-aged-out", "rec-not-aged-out-msg"]) == 0
+    out = capsys.readouterr().out
+    assert "still (or will be) handling it" not in out
+    assert "Automatic reconciliation is" not in out
+    assert "This recovery command only applies after the max-age boundary." in out
+    assert "inspect the current reconciliation state" in out
 
 
 def test_recover_aged_out_preview_manual_review_shows_refusal(cli_env, session_factory, capsys):
@@ -527,6 +586,56 @@ def test_recover_aged_out_confirm_eligible_verifies_and_settles(
     assert "bot_notification_queued" in event_types  # normal notification queueing
 
 
+def test_recover_aged_out_confirm_success_output_labels_snapshot_as_pre_attempt(
+    cli_env, session_factory, settings, stub, monkeypatch, capsys
+):
+    """Item A: a successful --confirm's human output must clearly label
+    the returned snapshot as PRE-ATTEMPT state -- captured under the lock
+    BEFORE verify_and_settle ran -- and must never present
+    status=link_created / gateway_verified=no as though they were the
+    payment's current, post-settlement facts sitting next to
+    outcome=verified. The post-settlement facts (BOT_NOTIFY_PENDING,
+    gateway_verified_at set) are asserted directly against the database
+    instead."""
+    _patch_centralpay_client(monkeypatch, stub)
+    payment = _make_aged_out_payment(
+        session_factory,
+        settings,
+        bot_order_id="rec-confirm-pre-attempt-label",
+        gateway_order_id=220010,
+    )
+    stub.verify_result = verify_ok_response(
+        amount=payment.amount,
+        user_id=payment.gateway_user_id,
+        reference_id="REF-rec-confirm-pre-attempt-label",
+    )
+
+    assert cli_main(["recover-aged-out", "rec-confirm-pre-attempt-label", "--confirm"]) == 0
+    out = capsys.readouterr().out
+
+    # Explicitly labeled as pre-attempt, never as "current".
+    assert "pre-attempt status:" in out
+    assert "pre-attempt gateway_verified:" in out
+    assert "current status:" not in out
+    assert "  gateway_verified:        " not in out  # the unqualified preview-only label
+    assert "eligible at attempt:     yes" in out
+
+    # The pre-attempt facts reported are the ones that made recovery
+    # eligible in the first place -- link_created / not yet verified --
+    # which is correct as a PRE-ATTEMPT fact, not a claim about current
+    # state.
+    assert "pre-attempt status:      link_created" in out
+    assert "pre-attempt gateway_verified: no" in out
+    assert "--- --confirm: verified ---" in out
+
+    # The database's actual current state is the opposite of the
+    # pre-attempt snapshot -- proving the snapshot was never re-read or
+    # conflated with post-settlement state.
+    refetched = get_payment(session_factory, "rec-confirm-pre-attempt-label")
+    assert refetched.status == PaymentStatus.BOT_NOTIFY_PENDING.value
+    assert refetched.gateway_verified_at is not None
+
+
 def test_recover_aged_out_confirm_json_shape_verified(
     cli_env, session_factory, settings, stub, monkeypatch, capsys
 ):
@@ -543,14 +652,20 @@ def test_recover_aged_out_confirm_json_shape_verified(
     assert payload["preview"] is False
     assert payload["confirm_requested"] is True
     assert payload["outcome"] == "verified"
-    assert payload["eligible"] is True
-    assert payload["refusal_reason"] is None
-    assert payload["gateway_call_made"] is True
+    assert payload["gateway_request_performed"] is True
+    assert payload["delivery_uncertain"] is False
     assert payload["transport_error_code"] is None
-    # Pre-attempt snapshot fields (captured before mutation) still describe
-    # the aged-out link_created state that made this recovery eligible.
-    assert payload["status"] == "link_created"
-    assert payload["aged_out"] is True
+    assert "status" not in payload  # never a flat, ambiguous "current" field
+    assert "gateway_verified" not in payload
+    # Pre-attempt snapshot (captured under the lock BEFORE verify_and_settle
+    # ran) is explicitly nested and labeled -- never presented as the
+    # payment's current/post-settlement state.
+    pre_attempt = payload["pre_attempt"]
+    assert pre_attempt["eligible"] is True
+    assert pre_attempt["refusal_reason"] is None
+    assert pre_attempt["status"] == "link_created"
+    assert pre_attempt["gateway_verified"] is False
+    assert pre_attempt["aged_out"] is True
 
 
 def test_recover_aged_out_confirm_locks_row(
@@ -652,19 +767,35 @@ def test_recover_aged_out_confirm_amount_mismatch_manual_review(
 # --- --confirm: transport/protocol failure ----------------------------------
 
 
-def test_recover_aged_out_confirm_transport_failure(
+def test_recover_aged_out_confirm_connection_error_delivery_uncertain(
     cli_env, session_factory, settings, stub, monkeypatch, capsys
 ):
+    """Item C: a connection-level failure (CentralPayConnectionError) can
+    never be told apart from "sent, then the response was lost" -- httpx
+    gives no way to know whether the request ever reached CentralPay.
+    gateway_request_performed must be None (never False, never True), and
+    delivery_uncertain must be True."""
     _patch_centralpay_client(monkeypatch, stub)
     payment = _make_aged_out_payment(
         session_factory, settings, bot_order_id="rec-confirm-transport", gateway_order_id=220006
     )
     stub.verify_result = httpx.ConnectError("boom")
 
+    assert cli_main(["recover-aged-out", "rec-confirm-transport", "--confirm", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "transport_failed"
+    assert payload["gateway_request_performed"] is None
+    assert payload["delivery_uncertain"] is True
+    assert payload["transport_error_code"] == "centralpay_connection_error"
+
     assert cli_main(["recover-aged-out", "rec-confirm-transport", "--confirm"]) == 1
     out = capsys.readouterr().out
     assert "--- --confirm: transport_failed ---" in out
     assert "error code:" in out
+    assert "delivery uncertain:      the request may or may not have reached the gateway" in out
+    assert "No local settlement was applied." in out
+    # Never claims a gateway-side fact this command cannot prove.
+    assert "request reached gateway: yes" not in out
 
     refetched = get_payment(session_factory, "rec-confirm-transport")
     assert refetched.status == PaymentStatus.LINK_CREATED.value
@@ -674,6 +805,44 @@ def test_recover_aged_out_confirm_transport_failure(
     event_types = [e.event_type for e in events]
     assert "aged_out_recovery_transport_failed" in event_types
     assert "bot_notification_queued" not in event_types
+
+
+def test_recover_aged_out_confirm_non_connection_transport_error_request_proven_performed(
+    cli_env, session_factory, settings, stub, monkeypatch, capsys
+):
+    """Item D: a non-connection CentralPayError (here: a non-200 HTTP
+    status, which maps to CentralPayRejectedError) PROVES the request was
+    transmitted and answered -- gateway_request_performed must be True and
+    delivery_uncertain must be False, never the connection-level
+    "uncertain" state."""
+    _patch_centralpay_client(monkeypatch, stub)
+    payment = _make_aged_out_payment(
+        session_factory,
+        settings,
+        bot_order_id="rec-confirm-rejected-status",
+        gateway_order_id=220007,
+    )
+    stub.verify_result = httpx.Response(500, text="internal error")
+
+    assert cli_main(["recover-aged-out", "rec-confirm-rejected-status", "--confirm", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["outcome"] == "transport_failed"
+    assert payload["gateway_request_performed"] is True
+    assert payload["delivery_uncertain"] is False
+    assert payload["transport_error_code"] == "centralpay_rejected"
+
+    assert cli_main(["recover-aged-out", "rec-confirm-rejected-status", "--confirm"]) == 1
+    out = capsys.readouterr().out
+    assert "request reached gateway: yes (response could not be used)" in out
+    assert "delivery uncertain" not in out
+    assert "No local settlement was applied." in out
+
+    refetched = get_payment(session_factory, "rec-confirm-rejected-status")
+    assert refetched.status == PaymentStatus.LINK_CREATED.value
+    assert refetched.gateway_verified_at is None
+
+    events = get_events(session_factory, payment.id)
+    assert "aged_out_recovery_transport_failed" in [e.event_type for e in events]
 
 
 # --- --confirm: refused, zero HTTP -------------------------------------------
@@ -711,8 +880,9 @@ def test_recover_aged_out_confirm_refused_manual_review_zero_http(
     assert cli_main(["recover-aged-out", "rec-confirm-manual-review", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "refused"
-    assert payload["refusal_reason"] == "manual_review_owned"
-    assert payload["gateway_call_made"] is False
+    assert payload["pre_attempt"]["refusal_reason"] == "manual_review_owned"
+    assert payload["gateway_request_performed"] is False
+    assert payload["delivery_uncertain"] is False
     assert len(stub.verify_requests) == 0
 
 
@@ -733,7 +903,9 @@ def test_recover_aged_out_confirm_refused_already_verified_zero_http(
         cli_main(["recover-aged-out", "rec-confirm-already-verified", "--confirm", "--json"]) == 0
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["refusal_reason"] == "already_gateway_verified"
+    assert payload["pre_attempt"]["refusal_reason"] == "already_gateway_verified"
+    assert payload["gateway_request_performed"] is False
+    assert payload["delivery_uncertain"] is False
     assert len(stub.verify_requests) == 0
 
 
@@ -800,7 +972,7 @@ def test_recover_aged_out_confirm_rereads_under_lock_after_race_before_lock_acqu
     assert cli_main(["recover-aged-out", "rec-race-reload", "--confirm", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["outcome"] == "refused"
-    assert payload["refusal_reason"] == "already_gateway_verified"
+    assert payload["pre_attempt"]["refusal_reason"] == "already_gateway_verified"
     assert len(stub.verify_requests) == 0  # zero calls from recovery itself
 
     refetched = get_payment(session_factory, "rec-race-reload")
