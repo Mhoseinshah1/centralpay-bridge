@@ -1093,6 +1093,7 @@ def test_bot_delivery_snapshot_reads_total_and_entries_from_one_statement(
             select(Payment).where(Payment.bot_order_id == order_id)
         ).scalar_one()
         payment.created_at = pinned_now - timedelta(minutes=45)
+        payment.gateway_verified_at = pinned_now - timedelta(minutes=45)
         db.commit()
 
     statements: list[str] = []
@@ -1288,8 +1289,9 @@ def test_bot_delivery_snapshot_count_and_entries_agree_at_pending_cutoff_boundar
     """bot_delivery_snapshot's total and entries are read from the SAME
     result set here -- proving they agree exactly at, just before, and
     just after the 30-minute bot_notify_pending staleness cutoff. The
-    cutoff predicate is `created_at <= pending_cutoff`, so a row created
-    exactly 30 minutes before `now` IS included."""
+    cutoff predicate is `gateway_verified_at <= pending_cutoff` (the
+    notification-phase-entry anchor, not order-creation time), so a row
+    verified exactly 30 minutes before `now` IS included."""
     from app.adminbot import queries
 
     pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -1306,6 +1308,7 @@ def test_bot_delivery_snapshot_count_and_entries_agree_at_pending_cutoff_boundar
                 select(Payment).where(Payment.bot_order_id == order_id)
             ).scalar_one()
             payment.created_at = pinned_now - age
+            payment.gateway_verified_at = pinned_now - age
         db.commit()
 
     with session_factory() as db:
@@ -1346,6 +1349,7 @@ def test_stuck_count_and_detail_share_one_snapshot_at_cutoff_boundary(
                 select(Payment).where(Payment.bot_order_id == order_id)
             ).scalar_one()
             payment.created_at = pinned_now - age
+            payment.gateway_verified_at = pinned_now - age
         db.commit()
 
     monkeypatch.setattr("app.adminbot.commands.datetime", _FixedDateTime)
@@ -1367,13 +1371,14 @@ def test_bot_delivery_snapshot_tie_broken_by_id_when_pending_created_at_ties(
     client, settings, session_factory, stub
 ):
     """SQL-visible ordering contract for /stuck's own snapshot query: stale
-    bot_notify_pending rows sharing the exact same created_at sort by
-    ascending Payment.id -- the same tie-break convention as /waiting and
-    /expired -- rather than being left database-dependent."""
+    bot_notify_pending rows sharing the exact same notification-age anchor
+    (gateway_verified_at) sort by ascending Payment.id -- the same
+    tie-break convention as /waiting and /expired -- rather than being left
+    database-dependent."""
     from app.adminbot import queries
 
     pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-    tied_created_at = pinned_now - timedelta(minutes=45)
+    tied_verified_at = pinned_now - timedelta(minutes=45)
     order_ids = ["tie-bd-a", "tie-bd-b", "tie-bd-c"]
     for order_id in order_ids:
         make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
@@ -1382,7 +1387,8 @@ def test_bot_delivery_snapshot_tie_broken_by_id_when_pending_created_at_ties(
             payment = db.execute(
                 select(Payment).where(Payment.bot_order_id == order_id)
             ).scalar_one()
-            payment.created_at = tied_created_at
+            payment.created_at = tied_verified_at
+            payment.gateway_verified_at = tied_verified_at
         db.commit()
 
     with session_factory() as db:
@@ -1504,3 +1510,209 @@ def test_expired_command_orders_equal_anchor_ties_deterministically(
     [text] = handlers.handle(admin_ctx(), "expired", [])
     positions = {order_id: text.index(order_id) for order_id in order_ids}
     assert positions["tie-cmd-e-c"] < positions["tie-cmd-e-b"] < positions["tie-cmd-e-a"]
+
+
+# ============================================================================
+# Hotfix: bot_notify_pending staleness must anchor on notification-phase
+# entry (gateway_verified_at), never bare order-creation time (created_at).
+# An order can be created long before the customer completes payment; using
+# created_at made a brand-new notification job look stale/failed the instant
+# it was queued. Both queries.bot_delivery_snapshot and queries.stuck_payments
+# share _stale_bot_notify_pending_conditions, so fixing it there fixes both
+# /stuck (admin bot) and `centralpay stuck` (CLI) identically.
+# ============================================================================
+
+
+def test_old_order_fresh_notification_not_flagged_as_stale_bot_delivery(
+    client, settings, session_factory, stub
+):
+    """The exact bug report: created_at is 45 minutes old, but
+    gateway_verified_at (set by the real verification flow just now) is
+    fresh -- the row must NOT appear as a stale bot-delivery problem in
+    EITHER shared caller."""
+    from app.adminbot import queries
+
+    order_id = "anchor-old-order-fresh-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = datetime.now(UTC) - timedelta(minutes=45)
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+        stuck_entries = queries.stuck_payments(db, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+    assert order_id not in {entry.payment.bot_order_id for entry in stuck_entries}
+
+
+def test_old_order_old_notification_flagged_as_stale_bot_delivery(
+    client, settings, session_factory, stub
+):
+    """Both created_at and gateway_verified_at are old: still correctly
+    flagged as stale in both shared callers -- the fix narrows the false
+    positive, it does not stop detecting genuinely stuck rows."""
+    from app.adminbot import queries
+
+    order_id = "anchor-old-order-old-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(hours=2)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = old
+        payment.gateway_verified_at = old
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+        stuck_entries = queries.stuck_payments(db, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+    assert order_id in {entry.payment.bot_order_id for entry in stuck_entries}
+
+
+def test_fresh_order_fresh_notification_not_flagged_as_stale_bot_delivery(
+    client, settings, session_factory, stub
+):
+    """Baseline: a payment verified moments ago is never stale, regardless
+    of which anchor is used -- created_at and gateway_verified_at are both
+    fresh here."""
+    from app.adminbot import queries
+
+    order_id = "anchor-fresh-order-fresh-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_stale_notification_claim_label_unaffected_by_age_anchor_change(
+    client, settings, session_factory, stub
+):
+    """stale_notification_claim depends only on notification_claimed_at vs.
+    the claim-timeout cutoff -- entirely separate machinery from the
+    pending-age anchor. A row old enough (by gateway_verified_at) to be in
+    the stale bucket, whose claim is older than claim_timeout_seconds, must
+    still be labeled stale_notification_claim, never the generic
+    bot_notify_pending_old."""
+    from app.adminbot import queries
+
+    order_id = "claim-stale-anchor-fix"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    now = datetime.now(UTC)
+    old = now - timedelta(minutes=45)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = old  # irrelevant to inclusion after the fix
+        payment.gateway_verified_at = old
+        payment.notification_claimed_at = now - timedelta(seconds=200)
+        payment.notification_claimed_by = "worker-1"
+        db.commit()
+
+    with session_factory() as db:
+        snapshot = queries.bot_delivery_snapshot(
+            db, now=now, pending_age_minutes=30, claim_timeout_seconds=120.0
+        )
+
+    [entry] = [e for e in snapshot.entries if e.payment.bot_order_id == order_id]
+    assert entry.category == "stale_notification_claim"
+
+
+def test_manual_review_delivery_failure_included_regardless_of_notification_age_anchor(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    """Bot-delivery manual-review rows are matched by manual_review_at via
+    _bot_delivery_manual_review_conditions, never by the pending-age
+    anchor -- the fix must not change whether they appear, however old
+    gateway_verified_at happens to be."""
+    from app.adminbot import queries
+
+    order_id = "mr-delivery-anchor-fix"
+    _make_bot_delivery_failure(
+        client, settings, session_factory, stub, bot_stub, notifier, order_id
+    )
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.gateway_verified_at = datetime.now(UTC) - timedelta(hours=3)
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_non_delivery_manual_review_excluded_regardless_of_notification_age_anchor(
+    client, settings, session_factory, stub
+):
+    """Financial/verification manual-review rows never reached notification
+    (bot_notify_reason stays None, gateway_verified_at stays NULL here) --
+    still correctly excluded from bot-delivery details after the fix."""
+    from app.adminbot import queries
+
+    order_id = "fin-mr-anchor-fix"
+    assert create_order(client, settings, order_id=order_id).status_code == 200
+    _make_financial_manual_review(session_factory, order_id)
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 0
+    assert order_id not in {entry.payment.bot_order_id for entry in snapshot.entries}
+
+
+def test_legacy_null_gateway_verified_at_never_crashes_and_falls_back_to_created_at(
+    client, settings, session_factory, stub
+):
+    """gateway_verified_at IS NULL on a bot_notify_pending row is
+    structurally impossible today: ck_payments_delivery_requires_verification
+    (migration 0005) enforces it at the DB level, and SQLite enforces the
+    identical CHECK constraint in this test engine too. This simulates a
+    row from BEFORE that invariant existed (a manual DB edit, a downgrade)
+    by deliberately bypassing the constraint for one UPDATE -- proving the
+    read-side COALESCE(gateway_verified_at, created_at) fallback: such a row
+    is treated as created_at-old (the pre-fix anchor) rather than crashing
+    the query or silently vanishing as if it were fresh."""
+    from sqlalchemy import text
+
+    from app.adminbot import queries
+
+    order_id = "legacy-null-verified"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(minutes=45)
+    with session_factory() as db:
+        db.execute(text("PRAGMA ignore_check_constraints = 1"))
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = old
+        payment.gateway_verified_at = None
+        db.commit()
+        db.execute(text("PRAGMA ignore_check_constraints = 0"))
+        db.commit()
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, pending_age_minutes=30)
+
+    assert snapshot.total == 1
+    assert order_id in {entry.payment.bot_order_id for entry in snapshot.entries}

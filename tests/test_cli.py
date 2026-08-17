@@ -133,6 +133,69 @@ def test_stuck_ordering_is_attention_then_waiting_then_expired(
     assert categories == ["waiting_gateway"]
 
 
+# --- hotfix: needs_attention anchors bot_notify_pending staleness on --------
+# --- gateway_verified_at (notification-phase entry), never created_at ------
+
+
+def test_stuck_needs_attention_not_flagged_when_order_old_but_notification_fresh(
+    cli_env, client, settings, session_factory, stub, capsys
+):
+    """`centralpay stuck` shares app.adminbot.queries._stale_bot_notify_pending_
+    conditions with /stuck (via app.services.stuck_payments.stuck_payments_
+    overview), so it must follow the same fix: an order created 45 minutes
+    ago whose customer just paid must not show up as needing attention the
+    instant the notification is queued."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.models import Payment
+    from tests.conftest import make_verified_pending
+
+    order_id = "cli-anchor-fresh-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = datetime.now(UTC) - timedelta(minutes=45)
+        db.commit()
+
+    assert cli_main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "🔴 Need attention: 0" in out
+    assert order_id not in out
+
+
+def test_stuck_needs_attention_flagged_when_notification_itself_is_old(
+    cli_env, client, settings, session_factory, stub, capsys
+):
+    """Symmetric case: gateway_verified_at (not just created_at) is old --
+    `centralpay stuck` must still flag it, exactly as /stuck does."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.models import Payment
+    from tests.conftest import make_verified_pending
+
+    order_id = "cli-anchor-old-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(hours=2)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = old
+        payment.gateway_verified_at = old
+        db.commit()
+
+    assert cli_main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "🔴 Need attention: 1" in out
+    assert order_id in out
+
+
 # --- reconciliation status ---------------------------------------------------
 
 

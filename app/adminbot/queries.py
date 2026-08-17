@@ -107,12 +107,34 @@ class StuckEntry:
     category: str  # exact reason category, never a generic "stuck"
 
 
+def _notification_age_anchor() -> Any:
+    """The moment a payment entered the notification-pending phase — NOT
+    ``created_at`` (order creation can precede payment completion by an
+    arbitrary amount: an order created 45 minutes ago whose customer pays
+    right now must not look 45 minutes stale the instant it's queued).
+
+    ``gateway_verified_at`` is the correct anchor: ``queue_notification``
+    (``app.services.notification``) always sets ``status=bot_notify_pending``
+    in the SAME transaction as ``gateway_verified_at`` (``app.services.
+    verification``), and every other path that (re)sets the status —
+    ``app.ops`` manual resend, ``app.services.bulk_resend`` — requires
+    ``gateway_verified_at`` to already be non-NULL first. The DB-level
+    ``ck_payments_delivery_requires_verification`` constraint (migration
+    0005) makes this structurally guaranteed for any row this predicate can
+    ever match. ``COALESCE(..., created_at)`` is a defensive fallback only —
+    never expected to trigger — for a row that somehow violates that
+    invariant; it deliberately reuses the OLD anchor rather than treating
+    such an anomalous row as fresh, so it still surfaces for review instead
+    of silently disappearing or crashing the query."""
+    return func.coalesce(Payment.gateway_verified_at, Payment.created_at)
+
+
 def _stale_bot_notify_pending_conditions(pending_cutoff: datetime) -> tuple[Any, ...]:
     """A bot_notify_pending row old enough to need operator attention —
     whether or not its notification claim is ADDITIONALLY stale (claim
     staleness only changes the displayed reason label below, never whether
     the row is included)."""
-    return (Payment.status == "bot_notify_pending", Payment.created_at <= pending_cutoff)
+    return (Payment.status == "bot_notify_pending", _notification_age_anchor() <= pending_cutoff)
 
 
 def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
@@ -197,14 +219,14 @@ def bot_delivery_snapshot(
     Ordering: manual-review delivery failures first, then stale/old
     pending rows (an explicit SQL ``CASE`` priority column, replacing what
     used to be Python-side list concatenation of two query results), each
-    group ordered by its own timestamp (``manual_review_at`` /
-    ``created_at``) ascending with NULLS FIRST, ties broken by ascending
-    ``Payment.id`` for a fully deterministic result — the same
+    group ordered by its own timestamp (``manual_review_at`` / the
+    notification-age anchor) ascending with NULLS FIRST, ties broken by
+    ascending ``Payment.id`` for a fully deterministic result — the same
     classification and ordering as before, just from one statement."""
     pending_cutoff = now - timedelta(minutes=pending_age_minutes)
     is_manual_review = and_(*_bot_delivery_manual_review_conditions())
     priority = case((is_manual_review, 0), else_=1)
-    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=Payment.created_at)
+    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=_notification_age_anchor())
     total_col = func.count().over().label("total")
     stmt = (
         select(Payment, priority.label("priority"), total_col)
@@ -256,7 +278,7 @@ def stuck_payments(
     old_pending = db.execute(
         select(Payment)
         .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
-        .order_by(Payment.created_at.asc())
+        .order_by(_notification_age_anchor().asc())
         .limit(limit)
     ).scalars()
     claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
