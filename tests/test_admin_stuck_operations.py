@@ -4,7 +4,7 @@ replacing the old grouped /stuck.
 /stuck is now narrowly scoped to bot-delivery problems ONLY — payments that
 failed, or are stuck trying, to reach the customer bot's webhook. It is
 built from the existing status/reason semantics via
-app.adminbot.queries.bot_delivery_stuck_entries /
+app.adminbot.queries.bot_delivery_snapshot /
 _bot_delivery_manual_review_conditions: an open manual-review row counts
 only when app.services.notification._move_to_manual_review set
 bot_notify_reason (the ONLY code path that does), never when
@@ -565,7 +565,7 @@ def test_other_attention_counts_a_lone_financial_manual_review(
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        assert queries.count_bot_delivery_problems(db, now=now) == 0
+        assert queries.bot_delivery_snapshot(db, now=now).total == 0
         assert stuck_service.count_other_attention(db, settings, now=now) == 1
 
     [text] = handlers.handle(admin_ctx(), "stuck", [])
@@ -612,7 +612,7 @@ def test_other_attention_does_not_count_bot_delivery_manual_review(
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        assert queries.count_bot_delivery_problems(db, now=now) == 1
+        assert queries.bot_delivery_snapshot(db, now=now).total == 1
         assert stuck_service.count_other_attention(db, settings, now=now) == 0
 
 
@@ -693,7 +693,7 @@ def test_other_attention_exact_arithmetic_with_all_four_categories_and_no_double
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        bot_delivery_total = queries.count_bot_delivery_problems(db, now=now)
+        bot_delivery_total = queries.bot_delivery_snapshot(db, now=now).total
         other_total = stuck_service.count_other_attention(db, settings, now=now)
 
     assert bot_delivery_total == 1
@@ -858,22 +858,278 @@ def test_stuck_plain_command_still_works(
 
 
 # ============================================================================
-# PR #57 second review: single-snapshot invariant + deterministic ordering
+# PR #57 third review: count + detail list from ONE SQL statement
 # ============================================================================
 
-# --- fix 1: count_bot_delivery_problems / bot_delivery_stuck_entries must --
-# --- share the exact same snapshot `now`, proven at the 30-minute pending -
-# --- cutoff boundary with pinned datetimes (no sleeping) -------------------
+# --- fix: bot-delivery / waiting / expired total+entries must come from ---
+# --- ONE SQL statement (window COUNT(*) OVER()), not two separate reads ---
 
 
-def test_bot_delivery_count_and_entries_agree_at_pending_cutoff_boundary(
+def test_old_two_statement_design_could_disagree_under_concurrent_mutation(
     client, settings, session_factory, stub
 ):
-    """count_bot_delivery_problems and bot_delivery_stuck_entries are called
-    with the exact same pinned `now` here -- proving they agree exactly at,
-    just before, and just after the 30-minute bot_notify_pending staleness
-    cutoff. The cutoff predicate is `created_at <= pending_cutoff`, so a row
-    created exactly 30 minutes before `now` IS included."""
+    """Regression proof for the exact race described in review: reproduce
+    the PRE-FIX shape -- a separate COUNT, then a separate SELECT, against
+    the same bot-delivery-pending predicate `bot_delivery_snapshot` now
+    combines into one statement -- with a notification-worker-style write
+    (a separate session, committed) landing deterministically in the gap
+    between the two statements. No sleeping, no real threads: the program
+    order alone reproduces the race. The count sees the stale pending row;
+    the worker delivers it; the list SELECT no longer sees it -- exactly
+    the disagreement `bot_delivery_snapshot` (below) cannot produce."""
+    from sqlalchemy import func
+
+    order_id = "race-old-design"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    pinned_now = datetime.now(UTC)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = pinned_now - timedelta(minutes=45)
+        db.commit()
+
+    pending_cutoff = pinned_now - timedelta(minutes=30)
+    conditions = (Payment.status == "bot_notify_pending", Payment.created_at <= pending_cutoff)
+
+    with session_factory() as db:
+        # Statement 1 of the OLD design: the summary COUNT.
+        count = db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
+        db.commit()  # end the read cleanly before a concurrent writer commits
+
+        # The notification worker successfully delivers the payment in the
+        # gap between the OLD design's two statements -- its own session,
+        # its own commit, exactly like the real worker process.
+        with session_factory() as worker_db:
+            worker_payment = worker_db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            worker_payment.status = PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+            worker_db.commit()
+
+        # Statement 2 of the OLD design: the detail SELECT.
+        entries = list(db.execute(select(Payment).where(*conditions)).scalars())
+
+    assert count == 1
+    assert len(entries) == 0  # the disagreement: count said 1, detail rows said 0
+
+
+def test_bot_delivery_snapshot_reads_total_and_entries_from_one_statement(
+    client, settings, session_factory, stub, engine
+):
+    """Structural proof `bot_delivery_snapshot` cannot exhibit the race
+    above: it issues exactly ONE SQL statement -- a window `COUNT(*)
+    OVER()` alongside the LIMIT'd rows -- so there is no gap for a
+    concurrent writer to land in between a count and a list."""
+    from sqlalchemy import event
+
+    from app.adminbot import queries
+
+    order_id = "single-stmt-bd"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    pinned_now = datetime.now(UTC)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = pinned_now - timedelta(minutes=45)
+        db.commit()
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if "payments" in statement.lower():
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        with session_factory() as db:
+            snapshot = queries.bot_delivery_snapshot(db, now=pinned_now, limit=30)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert len(statements) == 1  # one round trip -- no gap for a race
+    assert snapshot.total == 1
+    assert len(snapshot.entries) == 1
+
+
+def test_waiting_snapshot_reads_total_and_entries_from_one_statement(
+    client, settings, session_factory, engine
+):
+    """Same structural proof as bot_delivery_snapshot, for waiting_snapshot."""
+    from sqlalchemy import event
+
+    from app.services import stuck_payments as stuck_service
+
+    assert create_order(client, settings, order_id="single-stmt-w").status_code == 200
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if "payments" in statement.lower():
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        with session_factory() as db:
+            now = datetime.now(UTC)
+            snapshot = stuck_service.waiting_snapshot(db, settings, now=now, limit=30)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert len(statements) == 1
+    assert snapshot.total == 1
+    assert len(snapshot.entries) == 1
+
+
+def test_expired_snapshot_reads_total_and_entries_from_one_statement(
+    client, settings, session_factory, engine
+):
+    """Same structural proof as bot_delivery_snapshot, for expired_snapshot."""
+    from sqlalchemy import event
+
+    from app.services import stuck_payments as stuck_service
+
+    assert create_order(client, settings, order_id="single-stmt-e").status_code == 200
+    _make_expired(session_factory, settings, "single-stmt-e")
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if "payments" in statement.lower():
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        with session_factory() as db:
+            now = datetime.now(UTC)
+            snapshot = stuck_service.expired_snapshot(db, settings, now=now, limit=30)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert len(statements) == 1
+    assert snapshot.total == 1
+    assert len(snapshot.entries) == 1
+
+
+# --- structural invariants: total >= len(entries); total == len(entries) --
+# --- when total <= limit; LIMIT never reduces the window total ------------
+
+
+def test_bot_delivery_snapshot_total_equals_entries_when_under_limit(
+    client, settings, session_factory, stub, bot_stub, notifier
+):
+    from app.adminbot import queries
+
+    for i in range(3):
+        _make_bot_delivery_failure(
+            client, settings, session_factory, stub, bot_stub, notifier, f"bdsnap-small-{i}"
+        )
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, limit=30)
+    assert snapshot.total == 3
+    assert len(snapshot.entries) == 3
+    assert snapshot.total >= len(snapshot.entries)
+
+
+def test_bot_delivery_snapshot_total_not_reduced_by_limit(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    """17 bot-delivery-problem rows, limit=STUCK_DETAIL_MAX (10): the
+    window total must report the full 17, never the truncated 10 -- LIMIT
+    must not affect the COUNT."""
+    from app.adminbot import queries
+    from app.adminbot.commands import STUCK_DETAIL_MAX
+
+    for i in range(17):
+        _make_bot_delivery_failure(
+            client, settings, session_factory, stub, bot_stub, notifier, f"bdsnap-big-{i:02d}"
+        )
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = queries.bot_delivery_snapshot(db, now=now, limit=STUCK_DETAIL_MAX)
+    assert snapshot.total == 17
+    assert len(snapshot.entries) == 10
+    assert snapshot.total >= len(snapshot.entries)
+
+    [text] = handlers.handle(admin_ctx(), "stuck", [])
+    assert "خطای ارسال به ربات: 17" in text
+    assert text.count("⛔ تحویل به ربات ناموفق") == 10
+    assert "نمایش 10 مورد از 17 مورد" in text
+
+
+def test_waiting_snapshot_total_and_entries_invariants(client, settings, session_factory):
+    """total >= len(entries) always; total == len(entries) exactly when
+    total <= limit (never truncated, never inflated)."""
+    from app.services import stuck_payments as stuck_service
+
+    for i in range(3):
+        assert create_order(client, settings, order_id=f"wsnap-small-{i}").status_code == 200
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = stuck_service.waiting_snapshot(db, settings, now=now, limit=30)
+    assert snapshot.total == 3
+    assert len(snapshot.entries) == 3
+    assert snapshot.total >= len(snapshot.entries)
+
+
+def test_waiting_snapshot_total_not_reduced_by_limit(client, settings, session_factory):
+    """15 waiting rows, limit=10: the window total must report the full
+    15, never the truncated 10."""
+    from app.services import stuck_payments as stuck_service
+
+    for i in range(15):
+        assert create_order(client, settings, order_id=f"wsnap-big-{i:02d}").status_code == 200
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = stuck_service.waiting_snapshot(db, settings, now=now, limit=10)
+    assert snapshot.total == 15
+    assert len(snapshot.entries) == 10
+    assert snapshot.total >= len(snapshot.entries)
+
+
+def test_expired_snapshot_total_and_entries_invariants(client, settings, session_factory):
+    from app.services import stuck_payments as stuck_service
+
+    for i in range(3):
+        assert create_order(client, settings, order_id=f"esnap-small-{i}").status_code == 200
+        _make_expired(session_factory, settings, f"esnap-small-{i}", extra_seconds=100 + i)
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = stuck_service.expired_snapshot(db, settings, now=now, limit=30)
+    assert snapshot.total == 3
+    assert len(snapshot.entries) == 3
+    assert snapshot.total >= len(snapshot.entries)
+
+
+def test_expired_snapshot_total_not_reduced_by_limit(client, settings, session_factory):
+    """15 expired rows, limit=10: the window total must report the full
+    15, never the truncated 10."""
+    from app.services import stuck_payments as stuck_service
+
+    for i in range(15):
+        assert create_order(client, settings, order_id=f"esnap-big-{i:02d}").status_code == 200
+        _make_expired(session_factory, settings, f"esnap-big-{i:02d}", extra_seconds=100 + i)
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        snapshot = stuck_service.expired_snapshot(db, settings, now=now, limit=10)
+    assert snapshot.total == 15
+    assert len(snapshot.entries) == 10
+    assert snapshot.total >= len(snapshot.entries)
+
+
+# --- 30-minute pending-cutoff boundary, at the snapshot level -------------
+
+
+def test_bot_delivery_snapshot_count_and_entries_agree_at_pending_cutoff_boundary(
+    client, settings, session_factory, stub
+):
+    """bot_delivery_snapshot's total and entries are read from the SAME
+    result set here -- proving they agree exactly at, just before, and
+    just after the 30-minute bot_notify_pending staleness cutoff. The
+    cutoff predicate is `created_at <= pending_cutoff`, so a row created
+    exactly 30 minutes before `now` IS included."""
     from app.adminbot import queries
 
     pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -893,12 +1149,11 @@ def test_bot_delivery_count_and_entries_agree_at_pending_cutoff_boundary(
         db.commit()
 
     with session_factory() as db:
-        count = queries.count_bot_delivery_problems(db, now=pinned_now)
-        entries = queries.bot_delivery_stuck_entries(db, now=pinned_now, limit=30)
+        snapshot = queries.bot_delivery_snapshot(db, now=pinned_now, limit=30)
 
-    assert count == 2
-    assert len(entries) == count  # same snapshot -> count and list agree exactly
-    included = {entry.payment.bot_order_id for entry in entries}
+    assert snapshot.total == 2
+    assert len(snapshot.entries) == snapshot.total  # same statement -> always agree
+    included = {entry.payment.bot_order_id for entry in snapshot.entries}
     assert included == {"cutoff-exact", "cutoff-older"}
     assert "cutoff-younger" not in included
 
@@ -907,8 +1162,8 @@ def test_stuck_count_and_detail_share_one_snapshot_at_cutoff_boundary(
     handlers, client, settings, session_factory, stub, monkeypatch
 ):
     """End-to-end: /stuck must build its summary count, detail list, and
-    health line from ONE captured `now` rather than independent wall-clock
-    reads inside count_bot_delivery_problems/bot_delivery_stuck_entries.
+    health line from ONE captured `now`, with the count and detail rows
+    additionally coming from `bot_delivery_snapshot`'s single statement.
     Proven with a monkeypatched clock and pinned created_at values
     straddling the 30-minute staleness boundary -- no sleeping."""
     pinned_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -948,10 +1203,10 @@ def test_stuck_count_and_detail_share_one_snapshot_at_cutoff_boundary(
     assert "🟠 وضعیت کلی: نیازمند توجه" in text
 
 
-def test_bot_delivery_entries_tie_broken_by_id_when_pending_created_at_ties(
+def test_bot_delivery_snapshot_tie_broken_by_id_when_pending_created_at_ties(
     client, settings, session_factory, stub
 ):
-    """SQL-visible ordering contract for /stuck's own detail query: stale
+    """SQL-visible ordering contract for /stuck's own snapshot query: stale
     bot_notify_pending rows sharing the exact same created_at sort by
     ascending Payment.id -- the same tie-break convention as /waiting and
     /expired -- rather than being left database-dependent."""
@@ -971,15 +1226,18 @@ def test_bot_delivery_entries_tie_broken_by_id_when_pending_created_at_ties(
         db.commit()
 
     with session_factory() as db:
-        entries = queries.bot_delivery_stuck_entries(db, now=pinned_now, limit=50)
+        snapshot = queries.bot_delivery_snapshot(db, now=pinned_now, limit=50)
 
     tied_order = [
-        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+        entry.payment.bot_order_id
+        for entry in snapshot.entries
+        if entry.payment.bot_order_id in order_ids
     ]
     assert tied_order == order_ids  # ascending Payment.id == creation order
 
 
-# --- fix 2: /waiting and /expired equal-anchor ties are deterministic ------
+# --- fix 2 (previous round): /waiting and /expired equal-anchor ties ------
+# --- are deterministic -- re-verified against the new snapshot functions --
 
 
 def test_waiting_equal_anchor_ties_broken_by_ascending_id(client, settings, session_factory):
@@ -1002,10 +1260,12 @@ def test_waiting_equal_anchor_ties_broken_by_ascending_id(client, settings, sess
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        entries = stuck_service.waiting_entries_by_urgency(db, settings, now=now, limit=50)
+        snapshot = stuck_service.waiting_snapshot(db, settings, now=now, limit=50)
 
     tied_order = [
-        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+        entry.payment.bot_order_id
+        for entry in snapshot.entries
+        if entry.payment.bot_order_id in order_ids
     ]
     assert tied_order == order_ids  # ascending Payment.id == creation order
 
@@ -1032,10 +1292,12 @@ def test_expired_equal_anchor_ties_broken_by_descending_id(client, settings, ses
 
     with session_factory() as db:
         now = datetime.now(UTC)
-        entries = stuck_service.expired_entries_by_recency(db, settings, now=now, limit=50)
+        snapshot = stuck_service.expired_snapshot(db, settings, now=now, limit=50)
 
     tied_order = [
-        entry.payment.bot_order_id for entry in entries if entry.payment.bot_order_id in order_ids
+        entry.payment.bot_order_id
+        for entry in snapshot.entries
+        if entry.payment.bot_order_id in order_ids
     ]
     assert tied_order == list(reversed(order_ids))  # descending Payment.id
 
@@ -1082,4 +1344,3 @@ def test_expired_command_orders_equal_anchor_ties_deterministically(
     [text] = handlers.handle(admin_ctx(), "expired", [])
     positions = {order_id: text.index(order_id) for order_id in order_ids}
     assert positions["tie-cmd-e-c"] < positions["tie-cmd-e-b"] < positions["tie-cmd-e-a"]
-

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.models import AdminAlert, Payment, PaymentEvent, WorkerHeartbeat
@@ -146,74 +146,81 @@ def count_non_delivery_manual_reviews(db: Session) -> int:
     problem (financial/verification mismatches). Shares
     ``_open_manual_review_conditions`` with ``count_open_manual_reviews``
     (the /manual_review command's total) and is the exact complement of
-    ``count_bot_delivery_problems``'s manual-review half."""
+    ``bot_delivery_snapshot``'s manual-review half."""
     return db.execute(
         select(func.count(Payment.id)).where(*_non_delivery_manual_review_conditions())
     ).scalar_one()
 
 
-def count_bot_delivery_problems(
-    db: Session, *, now: datetime, pending_age_minutes: int = 30
-) -> int:
-    """EXACT total of bot-delivery-attention rows (unbounded — no display
-    cap), evaluated against the caller-supplied snapshot ``now`` rather than
-    re-reading the wall clock. Shares both its predicates AND its snapshot
-    time with ``bot_delivery_stuck_entries`` — callers MUST pass the exact
-    same ``now`` to both — so the list and this count can never disagree,
-    including for a bot_notify_pending payment sitting exactly at the
-    ``pending_age_minutes`` boundary between the two calls."""
-    pending_cutoff = now - timedelta(minutes=pending_age_minutes)
-    manual_review_total = db.execute(
-        select(func.count(Payment.id)).where(*_bot_delivery_manual_review_conditions())
-    ).scalar_one()
-    pending_total = db.execute(
-        select(func.count(Payment.id)).where(
-            *_stale_bot_notify_pending_conditions(pending_cutoff)
-        )
-    ).scalar_one()
-    return manual_review_total + pending_total
+@dataclass(frozen=True)
+class BotDeliverySnapshot:
+    # EXACT total matching the bot-delivery predicate (unbounded — never
+    # reduced by `limit`; see `bot_delivery_snapshot`'s docstring for why).
+    total: int
+    entries: list[StuckEntry]
 
 
-def bot_delivery_stuck_entries(
+def bot_delivery_snapshot(
     db: Session,
     *,
     now: datetime,
     pending_age_minutes: int = 30,
     claim_timeout_seconds: float = 120.0,
     limit: int = 30,
-) -> list[StuckEntry]:
-    """Exactly the bot-delivery subset of ``stuck_payments()``: open
-    manual-review rows caused by a customer-bot delivery failure, then
-    stale/old bot_notify_pending rows. NEVER financial/verification
-    manual-review rows, reconciliation-exhausted rows, or unexpected-status
-    rows — see ``_bot_delivery_manual_review_conditions``.
+) -> BotDeliverySnapshot:
+    """/stuck's total AND its detail rows from ONE SQL statement.
 
-    Takes ``now`` from the caller instead of reading the wall clock itself —
-    see ``count_bot_delivery_problems`` for why this matters: the caller
-    must pass the SAME ``now`` to both so a report built from one call to
-    each can never observe a payment crossing the pending_age_minutes
-    cutoff between the two queries. Ties in the ordering below (identical
-    ``manual_review_at`` or ``created_at``) are broken by ascending
-    ``Payment.id`` for a fully deterministic result."""
-    entries: list[StuckEntry] = []
-    manual_review_rows = db.execute(
-        select(Payment)
-        .where(*_bot_delivery_manual_review_conditions())
-        .order_by(Payment.manual_review_at.asc().nulls_first(), Payment.id.asc())
-        .limit(limit)
-    ).scalars()
-    for payment in manual_review_rows:
-        entries.append(StuckEntry(payment, f"manual_review:{payment.bot_notify_reason}"))
+    An earlier version ran the total as a separate ``COUNT(*)`` and the
+    detail rows as a separate ``SELECT ... LIMIT``. Those are two distinct
+    statements: a payment could be counted by the first and then get
+    delivered (leaving `bot_notify_pending`/`manual_review`) by the
+    notification worker before the second ran, so the rendered detail list
+    could silently disagree with the summary count even though both used
+    the same ``now``. Here, ``func.count().over()`` (a window function)
+    computes the exact total over every row matching the WHERE clause
+    BEFORE ``LIMIT`` is applied — standard SQL window-function semantics —
+    in the SAME statement that fetches the (at most ``limit``) detail rows,
+    so both numbers are read from one consistent result set.
 
+    Combines both bot-delivery-problem shapes behind one predicate: open
+    manual-review rows caused by a customer-bot delivery failure
+    (``_bot_delivery_manual_review_conditions``), and stale/old
+    ``bot_notify_pending`` rows (``_stale_bot_notify_pending_conditions``).
+    NEVER financial/verification manual-review rows, reconciliation-
+    exhausted rows, or unexpected-status rows.
+
+    Ordering: manual-review delivery failures first, then stale/old
+    pending rows (an explicit SQL ``CASE`` priority column, replacing what
+    used to be Python-side list concatenation of two query results), each
+    group ordered by its own timestamp (``manual_review_at`` /
+    ``created_at``) ascending with NULLS FIRST, ties broken by ascending
+    ``Payment.id`` for a fully deterministic result — the same
+    classification and ordering as before, just from one statement."""
     pending_cutoff = now - timedelta(minutes=pending_age_minutes)
-    old_pending = db.execute(
-        select(Payment)
-        .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
-        .order_by(Payment.created_at.asc(), Payment.id.asc())
+    is_manual_review = and_(*_bot_delivery_manual_review_conditions())
+    priority = case((is_manual_review, 0), else_=1)
+    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=Payment.created_at)
+    total_col = func.count().over().label("total")
+    stmt = (
+        select(Payment, priority.label("priority"), total_col)
+        .where(
+            or_(
+                is_manual_review,
+                and_(*_stale_bot_notify_pending_conditions(pending_cutoff)),
+            )
+        )
+        .order_by(priority.asc(), sort_ts.asc().nulls_first(), Payment.id.asc())
         .limit(limit)
-    ).scalars()
+    )
+    rows = db.execute(stmt).all()
+    total = rows[0].total if rows else 0
+
     claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
-    for payment in old_pending:
+    entries: list[StuckEntry] = []
+    for payment, priority_value, _total in rows:
+        if priority_value == 0:
+            entries.append(StuckEntry(payment, f"manual_review:{payment.bot_notify_reason}"))
+            continue
         claimed_at = payment.notification_claimed_at
         if claimed_at is not None:
             if claimed_at.tzinfo is None:
@@ -224,7 +231,7 @@ def bot_delivery_stuck_entries(
         entries.append(
             StuckEntry(payment, payment.bot_notify_reason or "bot_notify_pending_old")
         )
-    return entries[:limit]
+    return BotDeliverySnapshot(total=total, entries=entries)
 
 
 def stuck_payments(

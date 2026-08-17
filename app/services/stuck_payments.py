@@ -156,8 +156,8 @@ def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]
     """A link_created, unverified payment younger than the hard
     reconciliation lifetime and not exhausted: ordinary in-flight polling.
     Shared by the overview's WAITING_GATEWAY bucket and
-    ``waiting_entries_by_urgency``/``count_waiting`` so they can never
-    disagree about the definition."""
+    ``waiting_snapshot``/``count_waiting`` so they can never disagree about
+    the definition."""
     anchor = link_age_anchor()
     expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
     return (
@@ -174,7 +174,7 @@ def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]
 def _expired_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
     """A link_created, unverified payment at or past
     reconciliation_max_age_seconds. Shared by the overview's EXPIRED bucket
-    and ``expired_entries_by_recency``/``count_expired``."""
+    and ``expired_snapshot``/``count_expired``."""
     anchor = link_age_anchor()
     expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
     return (
@@ -203,14 +203,21 @@ def _expired_entry(payment: Payment) -> StuckEntry:
 
 
 def count_waiting(db: Session, settings: Settings, *, now: datetime) -> int:
-    """EXACT count of WAITING_GATEWAY payments (unbounded, no _QUERY_CAP)."""
+    """EXACT count of WAITING_GATEWAY payments (unbounded, no _QUERY_CAP).
+    A plain COUNT, not a snapshot: `/stuck`'s header shows this as a bare
+    number with no accompanying detail rows in that command, so there is no
+    count/list pair to keep consistent here. When `/waiting` itself runs
+    and renders entries, use `waiting_snapshot` instead — its total and
+    rows come from one SQL statement."""
     return db.execute(
         select(func.count(Payment.id)).where(*_waiting_conditions(settings, now=now))
     ).scalar_one()
 
 
 def count_expired(db: Session, settings: Settings, *, now: datetime) -> int:
-    """EXACT count of EXPIRED payments (unbounded, no _QUERY_CAP)."""
+    """EXACT count of EXPIRED payments (unbounded, no _QUERY_CAP). Same
+    plain-COUNT rationale as `count_waiting`: use `expired_snapshot` when
+    `/expired` itself renders entries."""
     return db.execute(
         select(func.count(Payment.id)).where(*_expired_conditions(settings, now=now))
     ).scalar_one()
@@ -224,19 +231,25 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     * unexpected-status rows (a system anomaly)
     * open manual-review rows caused by a FINANCIAL/verification mismatch
       (``app.adminbot.queries.count_non_delivery_manual_reviews`` — the
-      exact complement of ``count_bot_delivery_problems``'s manual-review
-      half, sharing the same ``_open_manual_review_conditions``/
+      exact complement of ``bot_delivery_snapshot``'s manual-review half,
+      sharing the same ``_open_manual_review_conditions``/
       ``_bot_delivery_manual_review_conditions`` predicates so a row can
       never be counted in both this function and
-      ``count_bot_delivery_problems``, and never dropped from both).
+      ``bot_delivery_snapshot``, and never dropped from both).
 
     Invariant this preserves: for the same (db, settings, now),
-    ``count_bot_delivery_problems(db) + count_other_attention(db, settings, now=now)``
+    ``queries.bot_delivery_snapshot(db, now=now).total
+    + count_other_attention(db, settings, now=now)``
     equals the total number of rows any current NEEDS_ATTENTION condition
     would select — reconciliation-exhausted, unexpected-status, and EVERY
     open manual-review row (delivery or non-delivery), with the
     stale/old-bot_notify_pending rows folded into the bot-delivery half.
-    Never approximated and never double-counted."""
+    Never approximated and never double-counted. This is a separate COUNT
+    statement (not fused into `bot_delivery_snapshot`'s single statement):
+    `/stuck` shows `other_total` as a bare summary number with no
+    accompanying detail rows, so there is no count/list pair to keep
+    consistent here the way there is for the bot-delivery, waiting, and
+    expired totals."""
     exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
     exhausted_total = db.execute(
         select(func.count(Payment.id)).where(*exhausted_conditions)
@@ -251,14 +264,39 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     return exhausted_total + unexpected_total + non_delivery_manual_review_total
 
 
-def waiting_entries_by_urgency(
+@dataclass(frozen=True)
+class WaitingSnapshot:
+    # EXACT total matching _waiting_conditions (unbounded — never reduced
+    # by `limit`; see `waiting_snapshot`'s docstring for why).
+    total: int
+    entries: list[StuckEntry]
+
+
+@dataclass(frozen=True)
+class ExpiredSnapshot:
+    # EXACT total matching _expired_conditions (unbounded — never reduced
+    # by `limit`; see `expired_snapshot`'s docstring for why).
+    total: int
+    entries: list[StuckEntry]
+
+
+def waiting_snapshot(
     db: Session, settings: Settings, *, now: datetime, limit: int
-) -> list[StuckEntry]:
-    """WAITING_GATEWAY rows ordered longest-waiting (oldest link-age anchor)
-    first — the operationally most urgent ordering for ``/waiting``: these
-    payments have been polling the gateway without resolution the longest.
-    A fresh, directly-limited query (not a slice of the overview's capped
-    list) so `/waiting N` is correct regardless of total row count.
+) -> WaitingSnapshot:
+    """`/waiting`'s total AND its detail rows from ONE SQL statement, so a
+    payment that stops waiting (gets verified, or its link expires)
+    between what would otherwise be a separate COUNT and a separate
+    SELECT can never make the two disagree. ``func.count().over()`` (a
+    window function) computes the exact total over every row matching
+    ``_waiting_conditions`` BEFORE ``LIMIT`` is applied — standard SQL
+    window-function semantics — in the same statement that fetches the (at
+    most ``limit``) rows.
+
+    Rows are ordered longest-waiting (oldest link-age anchor) first — the
+    operationally most urgent ordering: these payments have been polling
+    the gateway without resolution the longest. A fresh, directly-queried
+    statement (not a slice of the overview's capped list) so `/waiting N`
+    is correct regardless of total row count.
 
     Two rows can share the exact same anchor timestamp (same
     ``callback_token_issued_at``/``created_at``), which the database is
@@ -267,25 +305,33 @@ def waiting_entries_by_urgency(
     sorts first — keeping the tie-break consistent with the primary
     "oldest first" ordering instead of leaving it storage-dependent."""
     anchor = link_age_anchor()
-    rows = db.execute(
-        select(Payment)
+    total_col = func.count().over().label("total")
+    stmt = (
+        select(Payment, total_col)
         .where(*_waiting_conditions(settings, now=now))
         .order_by(anchor.asc(), Payment.id.asc())
         .limit(limit)
-    ).scalars()
-    return [_waiting_entry(payment) for payment in rows]
+    )
+    rows = db.execute(stmt).all()
+    total = rows[0].total if rows else 0
+    entries = [_waiting_entry(payment) for payment, _total in rows]
+    return WaitingSnapshot(total=total, entries=entries)
 
 
-def expired_entries_by_recency(
+def expired_snapshot(
     db: Session, settings: Settings, *, now: datetime, limit: int
-) -> list[StuckEntry]:
-    """EXPIRED rows ordered MOST RECENTLY expired (newest link-age anchor
-    that is still past the cutoff) first. With potentially thousands of
-    expired rows accumulating over the deployment's lifetime, the
-    overview's ascending-and-capped ``expired`` list would only ever
-    surface the most ancient legacy rows — never useful for an operator
-    checking what JUST expired. A fresh, directly-limited, descending query
-    instead.
+) -> ExpiredSnapshot:
+    """`/expired`'s total AND its detail rows from ONE SQL statement — same
+    window-function design as ``waiting_snapshot``, so a link that gets
+    verified or reconciled between what would otherwise be a separate
+    COUNT and a separate SELECT can never make the two disagree.
+
+    Rows are ordered MOST RECENTLY expired (newest link-age anchor that is
+    still past the cutoff) first. With potentially thousands of expired
+    rows accumulating over the deployment's lifetime, the overview's
+    ascending-and-capped ``expired`` list would only ever surface the most
+    ancient legacy rows — never useful for an operator checking what JUST
+    expired. A fresh, directly-queried, descending statement instead.
 
     Two rows can share the exact same anchor timestamp; ties are broken by
     descending ``Payment.id`` — the row created most recently among the
@@ -293,13 +339,17 @@ def expired_entries_by_recency(
     primary "most recently expired first" ordering instead of leaving it
     storage-dependent."""
     anchor = link_age_anchor()
-    rows = db.execute(
-        select(Payment)
+    total_col = func.count().over().label("total")
+    stmt = (
+        select(Payment, total_col)
         .where(*_expired_conditions(settings, now=now))
         .order_by(anchor.desc(), Payment.id.desc())
         .limit(limit)
-    ).scalars()
-    return [_expired_entry(payment) for payment in rows]
+    )
+    rows = db.execute(stmt).all()
+    total = rows[0].total if rows else 0
+    entries = [_expired_entry(payment) for payment, _total in rows]
+    return ExpiredSnapshot(total=total, entries=entries)
 
 
 def _link_created_buckets(

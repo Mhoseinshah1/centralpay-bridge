@@ -172,7 +172,7 @@ def _delivery_reason(entry: BotDeliveryEntry) -> str:
     """The exact underlying reason code — never a generic label — matching
     the invariant the rest of the admin bot keeps for stuck-payment
     reporting. entry.category is either "manual_review:<bot_notify_reason>"
-    (see app.adminbot.queries.bot_delivery_stuck_entries) or a bare pending
+    (see app.adminbot.queries.bot_delivery_snapshot) or a bare pending
     label ("stale_notification_claim" / an actual bot_notify_reason /
     "bot_notify_pending_old")."""
     _, _, reason = entry.category.partition(":")

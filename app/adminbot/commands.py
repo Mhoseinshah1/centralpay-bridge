@@ -383,7 +383,7 @@ class CommandHandlers:
         """ONLY bot-delivery problems: payments that failed, or are stuck
         trying, to reach the customer bot's webhook (open manual-review rows
         whose `bot_notify_reason` is set, plus stale/old bot_notify_pending
-        rows). See app.adminbot.queries.bot_delivery_stuck_entries /
+        rows). See app.adminbot.queries.bot_delivery_snapshot /
         _bot_delivery_manual_review_conditions for the exact predicate.
 
         Deliberately excludes financial/verification manual-review rows
@@ -403,35 +403,43 @@ class CommandHandlers:
         bot-delivery total is already known — never split_message'd into
         multiple messages: entries are progressively reduced until the
         single message fits admin_bot_max_message_length.
+
+        Consistency guarantees, precisely: one wall-clock `now` is captured
+        once, below, and passed to every count/snapshot call this method
+        makes. The bot-delivery total and its detail rows additionally come
+        from ONE SQL statement (`queries.bot_delivery_snapshot`), so a
+        payment that gets delivered by the notification worker between what
+        would otherwise be a separate COUNT and a separate detail SELECT
+        can never make the summary line and the rendered rows disagree.
+        `waiting_total`/`expired_total` here are plain COUNTs with no
+        detail rows shown in THIS command (see /waiting, /expired for
+        those), so there is no count/list pair to keep consistent for them
+        in `/stuck`. `other_total` is likewise a standalone COUNT. This is
+        NOT a single atomic database snapshot of the whole report — each of
+        these is (at most) one statement, not one shared transaction/read
+        view across all of them.
         """
         if args:
             return [STUCK_USAGE_ERROR]
-        # One wall-clock read for the entire report: every count and the
-        # detail list below are evaluated against this SAME `now`, so a
-        # bot_notify_pending payment sitting exactly at the 30-minute
-        # staleness boundary can never cross it between the summary count
-        # and the detailed list (or between any of the other totals).
         now = datetime.now(UTC)
         settings = self._settings
-        bot_delivery_total = queries.count_bot_delivery_problems(
-            db, now=now, pending_age_minutes=30
+        bot_delivery = queries.bot_delivery_snapshot(
+            db,
+            now=now,
+            pending_age_minutes=30,
+            claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
+            limit=STUCK_DETAIL_MAX,
         )
         waiting_total = stuck_service.count_waiting(db, settings, now=now)
         expired_total = stuck_service.count_expired(db, settings, now=now)
         other_total = stuck_service.count_other_attention(db, settings, now=now)
-        entries = queries.bot_delivery_stuck_entries(
-            db,
-            now=now,
-            claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
-            limit=STUCK_DETAIL_MAX,
-        )
-        header = self._stuck_header(bot_delivery_total, waiting_total, expired_total, other_total)
-        shown_count = len(entries)
-        text = self._assemble_stuck_message(header, entries, bot_delivery_total, now)
+        header = self._stuck_header(bot_delivery.total, waiting_total, expired_total, other_total)
+        shown_count = len(bot_delivery.entries)
+        text = self._assemble_stuck_message(header, bot_delivery.entries, bot_delivery.total, now)
         while len(text) > settings.admin_bot_max_message_length and shown_count > 0:
             shown_count -= 1
             text = self._assemble_stuck_message(
-                header, entries[:shown_count], bot_delivery_total, now
+                header, bot_delivery.entries[:shown_count], bot_delivery.total, now
             )
         return [text]
 
@@ -497,14 +505,19 @@ class CommandHandlers:
     def cmd_waiting(self, db: Session, args: list[str]) -> list[str]:
         """ONLY StuckCategory.WAITING_GATEWAY payments, longest-waiting
         (oldest link-age anchor) first — the operator's most urgent view.
-        Read-only: no verify action, no retry action, no mutation."""
+        Read-only: no verify action, no retry action, no mutation.
+
+        `total` and `entries` come from ONE SQL statement
+        (`stuck_service.waiting_snapshot`), so a payment that stops
+        waiting between what would otherwise be a separate COUNT and a
+        separate SELECT can never make the two disagree."""
         limit = _parse_list_count(args)
         if limit is None:
             return [WAITING_USAGE_ERROR]
         now = datetime.now(UTC)
         settings = self._settings
-        total = stuck_service.count_waiting(db, settings, now=now)
-        entries = stuck_service.waiting_entries_by_urgency(db, settings, now=now, limit=limit)
+        snapshot = stuck_service.waiting_snapshot(db, settings, now=now, limit=limit)
+        total, entries = snapshot.total, snapshot.entries
         lines = ["🟡 <b>پرداخت‌های در انتظار تأیید درگاه</b>", "", f"تعداد کل: {fmt_amount(total)}"]
         if not entries:
             lines.append("")
@@ -526,14 +539,19 @@ class CommandHandlers:
         """ONLY StuckCategory.EXPIRED payments, MOST RECENTLY expired
         (newest link-age anchor still past the cutoff) first — showing the
         oldest legacy rows by default would bury what just expired. Read-only:
-        no verify action, no retry action, no mutation."""
+        no verify action, no retry action, no mutation.
+
+        `total` and `entries` come from ONE SQL statement
+        (`stuck_service.expired_snapshot`), so a payment that stops being
+        expired between what would otherwise be a separate COUNT and a
+        separate SELECT can never make the two disagree."""
         limit = _parse_list_count(args)
         if limit is None:
             return [EXPIRED_USAGE_ERROR]
         now = datetime.now(UTC)
         settings = self._settings
-        total = stuck_service.count_expired(db, settings, now=now)
-        entries = stuck_service.expired_entries_by_recency(db, settings, now=now, limit=limit)
+        snapshot = stuck_service.expired_snapshot(db, settings, now=now, limit=limit)
+        total, entries = snapshot.total, snapshot.entries
         lines = ["⚪ <b>لینک‌های منقضی‌شده</b>", "", f"تعداد کل: {fmt_amount(total)}"]
         if not entries:
             lines.append("")
