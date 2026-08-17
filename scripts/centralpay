@@ -85,6 +85,23 @@ Inspection:
                           configuration (never api, which can be stale
                           after a worker-only redeploy) for
                           tier/aged-out/enabled classification.
+  recover-aged-out ORDER_ID [--confirm] [--json]
+                          Explicit, single-payment recovery for one
+                          link_created payment the reconciliation worker
+                          has excluded for aging out (link age >=
+                          RECONCILIATION_MAX_AGE_SECONDS). Preview-only by
+                          default (no network call, no lock, no database
+                          write). --confirm locks the row, re-checks
+                          eligibility under that lock, and -- only if still
+                          eligible -- calls the SAME canonical
+                          verify_and_settle() the callback and
+                          reconciliation worker already share, exactly
+                          once; it never re-enables automatic
+                          reconciliation for the payment and never accepts
+                          more than one ORDER_ID. Reads the WORKER
+                          container's live configuration (never api) for
+                          the same reason as `reconcile`/`reconciliation
+                          status` above.
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
@@ -950,6 +967,21 @@ cmd_reconcile_inspect() {
     compose exec -T worker python -m app.cli reconcile "$@"
 }
 
+cmd_recover_aged_out() {
+    require_install
+    # Identical reasoning to cmd_reconcile_inspect above: the effective
+    # RECONCILIATION_MAX_AGE_SECONDS (the eligibility gate this command
+    # checks) must come from the RUNNING RECONCILIATION WORKER's
+    # configuration, never a possibly-stale api container environment.
+    # Routing here to the worker container — deliberately never api, and
+    # with no fallback to it — keeps `centralpay recover-aged-out` from
+    # silently evaluating eligibility against stale configuration. If the
+    # worker container is not running, this fails loudly instead of
+    # falling back. Mutation (--confirm) still requires operator intent via
+    # that explicit flag; this wrapper adds no separate interactive prompt.
+    compose exec -T worker python -m app.cli recover-aged-out "$@"
+}
+
 cmd_credentials() {
     require_root credentials
     [[ -f "$CREDENTIALS_FILE" ]] || fail "No credentials file at ${CREDENTIALS_FILE}."
@@ -1105,6 +1137,7 @@ main() {
         stuck)         cmd_app_cli stuck "$@" ;;
         reconciliation) cmd_reconciliation "$@" ;;
         reconcile)     cmd_reconcile_inspect "$@" ;;
+        recover-aged-out) cmd_recover_aged_out "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;
         retry-queue)   cmd_app_cli retry-queue "$@" ;;

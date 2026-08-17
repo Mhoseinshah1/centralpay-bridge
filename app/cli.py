@@ -9,12 +9,31 @@ Usage:
     python -m app.cli stuck [--limit N] [--json]
     python -m app.cli reconciliation status [--json]
     python -m app.cli reconcile ORDER_ID [--verify [--confirm-aged-out]] [--json]
+    python -m app.cli recover-aged-out ORDER_ID [--confirm] [--json]
 
 ORDER_ID may be the original bot order id or the numeric gateway order id.
 Output is one JSON object per line, EXCEPT `stuck`, `reconciliation status`,
-and `reconcile`, which print a human-readable report by default (pass --json
-for a single machine-readable JSON object instead). These commands never
-modify data and never print secrets, redirect URLs, or full card numbers.
+`reconcile`, and `recover-aged-out`, which print a human-readable report by
+default (pass --json for a single machine-readable JSON object instead).
+`recent`, `payment`, `retry-queue`, `manual-review`, `reconciliation status`,
+and `reconcile` never modify data and never print secrets, redirect URLs, or
+full card numbers.
+
+`recover-aged-out` is a narrowly-scoped, explicit, SINGLE-payment recovery
+command for a `link_created` payment the reconciliation worker has excluded
+from automatic polling because its link age reached
+RECONCILIATION_MAX_AGE_SECONDS (see app.services.reconciliation). By default
+it is a PREVIEW: no gateway HTTP request, no database write, no row lock --
+it reports whether the payment is eligible for recovery and why (or why
+not). `--confirm` is the only mutating path: it acquires a row lock,
+RELOADS the payment under that lock, re-checks eligibility against that
+fresh state, and -- only if still eligible -- calls the SAME canonical
+settlement function the browser callback and the reconciliation worker
+already share (see app.services.verification), exactly once. It never re-enables
+automatic reconciliation for the payment, never duplicates any financial
+check, and never accepts more than one ORDER_ID per invocation (no bulk/all
+mode). See app.services.aged_out_recovery for the full safety contract and
+the duplicate-downstream-delivery analysis.
 
 `reconcile` NEVER writes to the database in either mode. By default it is
 LOCAL-ONLY (no network call, no lock, one consistent read). ORDER_ID
@@ -75,11 +94,20 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adminbot.alerts import configure_alert_creation
 from app.centralpay import CentralPayClient
 from app.config import Settings
 from app.db import create_session_factory
 from app.exceptions import CentralPayConnectionError, CentralPayError
+from app.logging_setup import configure_logging
 from app.models import Payment, PaymentEvent, PaymentStatus
+from app.services.aged_out_recovery import (
+    RecoveryOutcomeKind,
+    RecoveryRefusal,
+    RecoverySnapshot,
+    build_preview,
+    execute_confirmed_recovery,
+)
 from app.services.reconcile_inspect import (
     LocalSnapshot,
     VerifyComparison,
@@ -896,6 +924,279 @@ def _cmd_reconcile(
     return 0
 
 
+# --- recover-aged-out: single-payment recovery for an aged-out link -------
+#
+# See app.services.aged_out_recovery for the full safety contract. This
+# section only renders what that module computes and reuses `_find_payment`
+# for ORDER_ID resolution -- it never re-implements order-id lookup, never
+# calls CentralPayClient.verify directly, and never assigns a Payment
+# attribute itself.
+
+_RECOVERY_REFUSAL_MESSAGE = {
+    RecoveryRefusal.MANUAL_REVIEW_OWNED: (
+        "Refusing to recover: this payment is in manual_review -- an administrator "
+        "already owns it."
+    ),
+    RecoveryRefusal.ALREADY_VERIFIED: (
+        "Refusing to recover: local state already denotes successful gateway "
+        "verification (verified status or gateway_verified_at)."
+    ),
+    RecoveryRefusal.NOT_LINK_CREATED: (
+        "Refusing to recover: this payment is not in link_created."
+    ),
+    RecoveryRefusal.NOT_AGED_OUT: (
+        "Refusing to recover: this payment has not aged out "
+        "(link age < RECONCILIATION_MAX_AGE_SECONDS). This recovery command only "
+        "applies after the max-age boundary. Use `centralpay reconcile ORDER_ID` "
+        "to inspect the current reconciliation state."
+    ),
+}
+
+_RECOVERY_OUTCOME_MESSAGE = {
+    RecoveryOutcomeKind.VERIFIED: (
+        "Gateway confirmed the payment; the canonical settlement function was "
+        "applied. The normal bot notification has been queued."
+    ),
+    RecoveryOutcomeKind.GATEWAY_NOT_PAID: (
+        "Gateway reports this order is NOT paid. The payment remains "
+        "link_created/unverified; no notification was queued, and it is NOT "
+        "re-inserted into automatic reconciliation polling."
+    ),
+    RecoveryOutcomeKind.MANUAL_REVIEW: (
+        "Gateway responded but a financial check failed (invalid/missing "
+        "reference id, amount mismatch, user mismatch, or reference-id "
+        "collision) -- exactly the same canonical behavior as any other "
+        "settlement. The payment moved to manual_review; see `centralpay "
+        "payment ORDER_ID` for the specific mismatch event. No notification "
+        "was queued."
+    ),
+    # RecoveryOutcomeKind.TRANSPORT_FAILED is deliberately absent: its
+    # message depends on outcome.delivery_uncertain and is built dynamically
+    # in _cmd_recover_aged_out, never from this fixed dict.
+}
+
+
+def _recovery_snapshot_dict(snapshot: RecoverySnapshot, settings: Settings) -> dict[str, Any]:
+    return {
+        "bot_order_id": snapshot.bot_order_id,
+        "gateway_order_id": snapshot.gateway_order_id,
+        "status": snapshot.status,
+        "gateway_verified": snapshot.gateway_verified,
+        "link_age_seconds": snapshot.link_age_seconds,
+        "reconciliation_max_age_seconds": settings.reconciliation_max_age_seconds,
+        "aged_out": snapshot.aged_out,
+        "reconciliation_attempts": snapshot.reconciliation_attempts,
+        "reconciliation_max_attempts": settings.reconciliation_max_attempts,
+    }
+
+
+def _print_recovery_snapshot_human(
+    snapshot: RecoverySnapshot, settings: Settings, *, pre_attempt: bool
+) -> None:
+    """``pre_attempt=True`` (used only by ``--confirm``) labels every status/
+    verification field as the state observed the moment the row lock was
+    acquired -- BEFORE any settlement attempt -- so a caller can never
+    mistake it for the payment's current database state after a
+    ``verified``/``gateway_not_paid``/``manual_review`` outcome. See
+    RecoverySnapshot's docstring for why: the canonical settlement function
+    may mutate the underlying ``Payment`` ORM object in place after this
+    snapshot was captured, and this module deliberately never re-reads the
+    row afterward to "refresh" it -- an explicit pre-attempt label is safer
+    and deterministic, never racy."""
+    print(f"🛟 Aged-out recovery: {snapshot.bot_order_id}")
+    print("=" * (23 + len(snapshot.bot_order_id)))
+    print(f"  gateway order id:        {snapshot.gateway_order_id}")
+    if pre_attempt:
+        print(f"  pre-attempt status:      {snapshot.status}")
+        print(
+            "  pre-attempt gateway_verified: "
+            f"{'yes' if snapshot.gateway_verified else 'no'}"
+        )
+    else:
+        print(f"  current status:          {snapshot.status}")
+        print(f"  gateway_verified:        {'yes' if snapshot.gateway_verified else 'no'}")
+    print(f"  link age:                {_humanize_duration(snapshot.link_age_seconds)}")
+    print(
+        "  reconciliation max age:  "
+        f"{_humanize_duration(settings.reconciliation_max_age_seconds)}"
+    )
+    print(f"  aged out:                {'yes' if snapshot.aged_out else 'no'}")
+    print(f"  reconciliation attempts: {snapshot.reconciliation_attempts}")
+    print(f"  attempts cap:            {settings.reconciliation_max_attempts}")
+
+
+def _confirm_would_text() -> str:
+    # Deliberately does NOT depend on the preview's current refusal (if
+    # any): eligibility is re-evaluated fresh under the row lock at
+    # --confirm time, and the payment may have aged out, become verified,
+    # entered manual_review, or otherwise changed state in between -- a
+    # preview refusal is never a guarantee about what a LATER --confirm
+    # will find.
+    return (
+        "acquire the row lock and re-evaluate current eligibility; if still "
+        "ineligible it will refuse with zero gateway requests, otherwise it "
+        "may perform the one canonical settlement attempt."
+    )
+
+
+def _cmd_recover_aged_out(
+    db: Session,
+    settings: Settings,
+    order_id: str,
+    *,
+    confirm: bool,
+    as_json: bool,
+) -> int:
+    # Non-locking lookup, used only to resolve WHICH payment id this order
+    # id names -- reused verbatim from `reconcile`/`payment`, never
+    # re-implemented (see app.services.aged_out_recovery's module
+    # docstring). Never the source of eligibility itself.
+    try:
+        found = _find_payment(db, order_id)
+    except AmbiguousOrderIdError:
+        _print({"error": "ambiguous_order_id", "order_id": order_id})
+        return 1
+    if found is None:
+        _print({"error": "payment_not_found", "order_id": order_id})
+        return 1
+    payment_id = found.id
+
+    if not confirm:
+        now = datetime.now(UTC)
+        preview = build_preview(db, settings, payment_id, now=now)
+        if preview is None:
+            _print({"error": "payment_not_found", "order_id": order_id})
+            return 1
+        snapshot, refusal = preview
+        if as_json:
+            _print(
+                {
+                    "preview": True,
+                    "confirm_requested": False,
+                    **_recovery_snapshot_dict(snapshot, settings),
+                    "eligible": refusal is None,
+                    "refusal_reason": refusal.value if refusal is not None else None,
+                    "confirm_would": _confirm_would_text(),
+                    "note": _NO_LOCAL_CHANGES_LINE,
+                }
+            )
+        else:
+            _print_recovery_snapshot_human(snapshot, settings, pre_attempt=False)
+            print(f"  eligible:                {'yes' if refusal is None else 'no'}")
+            if refusal is not None:
+                print(f"  refusal reason:          {refusal.value}")
+                print(f"  {_RECOVERY_REFUSAL_MESSAGE[refusal]}")
+            print(f"  --confirm would:         {_confirm_would_text()}")
+            print()
+            print("PREVIEW ONLY. Pass --confirm to attempt recovery.")
+            print(f"  {_NO_LOCAL_CHANGES_LINE}")
+        return 0
+
+    # --confirm is the only mutating path in this command, so -- unlike
+    # every other app.cli command, which is read-only -- it must match the
+    # setup app.ops's own mutating commands (e.g. `review resend`) already
+    # do: structured/redacted logging for the events this attempt records,
+    # and admin-alert creation so a manual_review or verified outcome from
+    # a deliberate operator recovery alerts administrators exactly like any
+    # other settlement does. Logs are routed to STDERR (never the default
+    # stdout) so they can never interleave with and corrupt this command's
+    # own `--json` single-object-on-stdout contract.
+    configure_logging(settings, stream=sys.stderr)
+    configure_alert_creation(settings)
+
+    client = CentralPayClient(
+        base_url=settings.centralpay_base_url,
+        getlink_api_key=settings.centralpay_getlink_api_key,
+        verify_api_key=settings.centralpay_verify_api_key,
+        timeout_seconds=settings.centralpay_timeout_seconds,
+    )
+    try:
+        result = execute_confirmed_recovery(db, client, payment_id=payment_id, settings=settings)
+    finally:
+        client.close()
+
+    if result is None:
+        _print({"error": "payment_not_found", "order_id": order_id})
+        return 1
+    snapshot, outcome = result
+    eligible_at_attempt = outcome.kind is not RecoveryOutcomeKind.REFUSED
+
+    if as_json:
+        _print(
+            {
+                "preview": False,
+                "confirm_requested": True,
+                # PRE-ATTEMPT state only -- captured under the row lock
+                # BEFORE the canonical settlement attempt ran, never
+                # re-read afterward (see RecoverySnapshot's docstring).
+                # Nested explicitly so a
+                # machine consumer can never mistake "status": "link_created"
+                # here for the payment's CURRENT database state after a
+                # "verified" outcome.
+                "pre_attempt": {
+                    **_recovery_snapshot_dict(snapshot, settings),
+                    "eligible": eligible_at_attempt,
+                    "refusal_reason": (
+                        outcome.refusal.value if outcome.refusal is not None else None
+                    ),
+                },
+                "outcome": outcome.kind.value,
+                "gateway_request_performed": outcome.gateway_request_performed,
+                "delivery_uncertain": outcome.delivery_uncertain,
+                "transport_error_code": outcome.transport_error_code,
+            }
+        )
+    else:
+        _print_recovery_snapshot_human(snapshot, settings, pre_attempt=True)
+        print(f"  eligible at attempt:     {'yes' if eligible_at_attempt else 'no'}")
+        print()
+        if outcome.kind is RecoveryOutcomeKind.REFUSED:
+            assert outcome.refusal is not None
+            print("--- --confirm: refused ---")
+            print(f"  {_RECOVERY_REFUSAL_MESSAGE[outcome.refusal]}")
+            print("  Zero gateway requests were made.")
+        elif outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED:
+            print("--- --confirm: transport_failed ---")
+            print(f"  error code:              {outcome.transport_error_code}")
+            print("  No local settlement was applied.")
+            if outcome.delivery_uncertain:
+                print(
+                    "  delivery uncertain:      the request may or may not have "
+                    "reached the gateway"
+                )
+            else:
+                # Receiving an HTTP 500 or an unparseable body PROVES some
+                # peer answered -- it does NOT prove CentralPay's own
+                # processing of this verify request failed or never
+                # happened (the error could originate from CentralPay's
+                # app logic after it already processed the check, from an
+                # intermediary in front of it, or otherwise). This is
+                # narrower than "the request reached CentralPay and
+                # nothing happened there" -- so it carries the SAME
+                # verify-after-verify ambiguity as a connection-level
+                # failure, not a lesser one.
+                print("  request reached gateway: yes (response could not be used)")
+            # CentralPay's own verify-after-verify/idempotency behavior has
+            # never been confirmed safe against production (see
+            # STAGING_VALIDATION.md, the same caveat that gates `reconcile
+            # --verify`'s diagnostic re-verification). Neither transport
+            # failure mode proves this attempt did not already reach
+            # CentralPay's processing, so this command does not auto-retry,
+            # and an operator choosing to run --confirm again should do so
+            # deliberately, not reflexively.
+            print(
+                "  This command does not auto-retry. Before running --confirm "
+                "again, consider that CentralPay's behavior when verify.php is "
+                "queried again for an order it may already have processed has "
+                "never been confirmed safe (see STAGING_VALIDATION.md) -- "
+                "investigate this order with CentralPay directly if unsure."
+            )
+        else:
+            print(f"--- --confirm: {outcome.kind.value} ---")
+            print(f"  {_RECOVERY_OUTCOME_MESSAGE[outcome.kind]}")
+    return 1 if outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -958,6 +1259,26 @@ def build_parser() -> argparse.ArgumentParser:
         dest="as_json",
         help="single JSON object instead of the report",
     )
+    recover_aged_out = subparsers.add_parser(
+        "recover-aged-out",
+        help="explicit, single-payment recovery for a link_created payment the "
+        "reconciliation worker has excluded for aging out; preview-only by default",
+    )
+    recover_aged_out.add_argument("order_id")
+    recover_aged_out.add_argument(
+        "--confirm",
+        action="store_true",
+        help="the ONLY mutating path: locks the row, re-checks eligibility under "
+        "that lock, and -- if still eligible -- calls the canonical settlement "
+        "function exactly once; without this flag the command is a read-only "
+        "preview (no lock, no gateway call, no database write)",
+    )
+    recover_aged_out.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="single JSON object instead of the report",
+    )
     return parser
 
 
@@ -984,6 +1305,14 @@ def main(argv: list[str] | None = None) -> int:
                 args.order_id,
                 verify=args.verify,
                 confirm_aged_out=args.confirm_aged_out,
+                as_json=args.as_json,
+            )
+        if args.command == "recover-aged-out":
+            return _cmd_recover_aged_out(
+                db,
+                settings,
+                args.order_id,
+                confirm=args.confirm,
                 as_json=args.as_json,
             )
         return _cmd_stuck(db, settings, limit=args.limit, as_json=args.as_json)
