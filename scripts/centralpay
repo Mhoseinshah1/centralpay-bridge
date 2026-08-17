@@ -67,6 +67,14 @@ Inspection:
                           payment buckets, and queue health. Reads the
                           WORKER container's live configuration (never api,
                           which can be stale after a worker-only redeploy).
+  reconcile ORDER_ID [--verify [--confirm-aged-out]] [--json]
+                          Inspect one payment. Local-only by default (no
+                          network call). --verify performs exactly one
+                          READ-ONLY gateway check and reports what
+                          settlement would conclude -- it never settles.
+                          Refuses (no network call) if already verified, in
+                          manual_review, or aged out; --confirm-aged-out
+                          overrides the last case, still read-only.
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
@@ -1071,6 +1079,7 @@ main() {
         diagnose)      cmd_diagnose "$@" ;;
         stuck)         cmd_app_cli stuck "$@" ;;
         reconciliation) cmd_reconciliation "$@" ;;
+        reconcile)     cmd_app_cli reconcile "$@" ;;
         payment)       cmd_app_cli payment "$@" ;;
         recent)        cmd_app_cli recent "$@" ;;
         retry-queue)   cmd_app_cli retry-queue "$@" ;;
