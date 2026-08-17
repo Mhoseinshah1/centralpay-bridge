@@ -22,9 +22,11 @@ said was required before B4 could close.
   (`/scratchpad/b4-audit`, detached HEAD, `git status` clean throughout
   the audit — no tracked file was ever modified during review).
 - This is `origin/main` HEAD, a merge of PR #62 ("Add read-only anomaly
-  drill-down to centralpay db-check"), itself descended from PR #61
-  ("Add explicit single-payment recovery for aged-out link_created
-  payments") and, further back, the CANON-1/2/3/5 remediation PRs #31/#32
+  drill-down to centralpay db-check"), itself descended from PR #61 ("Do
+  not auto-retry HTTP 5xx bot notifications in safe mode") and, before
+  that, PR #60 ("Add explicit single-payment recovery for aged-out
+  link_created payments" — the `recover-aged-out` command this document
+  reviews), and, further back, the CANON-1/2/3/5 remediation PRs #31/#32
   — i.e. current `main`, not an old or unmerged branch.
 
 ## Independent reviewers/agents used
@@ -220,18 +222,32 @@ shellcheck install.sh scripts/centralpay scripts/backup.sh  → clean (no output
 bash -n install.sh scripts/centralpay scripts/backup.sh     → OK (all three)
 ```
 
-**Environment note (Docker):** the release/artifact reviewer (F) attempted
-a live `docker build` to empirically confirm CANON-5's OCI label
-behavior; the base-image (`python:3.12-slim`) blob pull was blocked by
-this sandbox's egress proxy policy (`production.cloudfront.docker.com` →
-403 Forbidden, consistent on retry — a policy denial, not a transient
-failure) and could not complete. This is an environment limitation, not a
-code finding, and is already covered by the existing, still-open **B5**
-("release workflow has not yet run green: Docker builds ... CI-delegated
-and unverified locally"). CANON-5's conclusion does not rest on this step
-alone — it is independently corroborated by static code reading plus a
-passing dedicated regression test (`test_dockerfile_oci_version_label_is_not_a_stale_literal`)
-that asserts no stale literal can appear in the label under any build.
+**Environment note (Docker, sandbox):** the release/artifact reviewer (F)
+attempted a live `docker build` in this local sandbox to empirically
+confirm CANON-5's OCI label behavior; the base-image (`python:3.12-slim`)
+blob pull was blocked by the sandbox's egress proxy policy
+(`production.cloudfront.docker.com` → 403 Forbidden, consistent on retry
+— a policy denial, not a transient failure) and could not complete
+locally. This is a local-sandbox limitation, not a code finding, and is
+already covered by the existing, still-open **B5** ("release workflow has
+not yet run green: Docker builds ... CI-delegated and unverified
+locally"). CANON-5's conclusion does not rest on this local step alone —
+it is independently corroborated by static code reading, a passing
+dedicated regression test
+(`test_dockerfile_oci_version_label_is_not_a_stale_literal`), and by
+GitHub Actions CI on PR #63 (which is NOT sandbox-egress-restricted),
+below.
+
+**GitHub Actions CI on PR #63:** as of this update, ShellCheck, the
+dependency vulnerability scan, the secret scan (gitleaks), and Docker
+build and compose validation (including image smoke/version/OCI-label
+validation) have all completed successfully — corroborating CANON-5's
+Docker-build conclusion directly in CI where the sandbox's egress
+restriction does not apply. Both Python test matrix jobs (Tests
+ubuntu-22.04, Tests ubuntu-24.04) have also completed successfully;
+all 6 of PR #63's checks are green as of this update. This is CI status
+on the docs-only PR itself, not a re-audit of application code — see the
+verification commands above for this session's own local run.
 
 ## New findings from this recheck
 
@@ -356,9 +372,11 @@ previously documented, not larger.
 - No old finding is hidden behind documentation or tests: topic 39
   (reference_id collision) and the B2/B1/B5-scoped items were
   independently re-derived and reconfirmed at their existing
-  classification, not silently dropped; seven new non-blocking findings
-  surfaced by this recheck are recorded above and in the register below,
-  not fixed-and-hidden.
+  classification, not silently dropped; the seven new items surfaced by
+  this recheck (six new non-blocking-defect topics 42–47, one incremental
+  detail folded into existing topic 39, and one already-known B2-scoped
+  risk note at topic 48 — none a new B4 finding in its own right) are
+  recorded above and in the register below, not fixed-and-hidden.
 - Current `main` (not an old or unmerged branch) was audited, with the
   SHA independently verified via `git fetch`+`git rev-parse` before any
   review work began.

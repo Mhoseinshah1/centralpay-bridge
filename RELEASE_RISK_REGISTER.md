@@ -283,7 +283,7 @@ unaccounted for — the top priority of AGENTS.md.
 
 | # | Blocker | Resolution | Evidence document |
 |---|---------|------------|--------------------|
-| B4 | Multi-agent adversarial review | **CLOSED (2026-08-17), independently revalidated on `c68e86e45b718b1da34439246572dfe5d8ac947a`.** First run 2026-07-19 (six agents, real PostgreSQL 16) on SHA `4e62a552…` → `B4_FAILED_CONFIRMED_CODE_BLOCKERS` (topics 33–35, 38 = CANON-1/2/3/5). Remediated in `fix/b4-confirmed-release-blockers` + `fix/release-manifest-exactness`. Independently rechecked by seven adversarial agents plus a full local verification run (ruff/mypy/pytest incl. real PostgreSQL 16/shellcheck) on current `main`: **zero confirmed B4 blockers**, CANON-1/2/3/5 all FIXED-CONFIRMED, financial and concurrency invariants proven live on PostgreSQL. Seven new non-blocking findings recorded (topics 42–48). The historical FAILED verdict on `4e62a552…` is preserved unchanged. | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` (original, FAILED) + `ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` (recheck, CLOSED) |
+| B4 | Multi-agent adversarial review | **CLOSED (2026-08-17), independently revalidated on `c68e86e45b718b1da34439246572dfe5d8ac947a`.** First run 2026-07-19 (six agents, real PostgreSQL 16) on SHA `4e62a552…` → `B4_FAILED_CONFIRMED_CODE_BLOCKERS` (topics 33–35, 38 = CANON-1/2/3/5). Remediated in `fix/b4-confirmed-release-blockers` + `fix/release-manifest-exactness`. Independently rechecked by seven adversarial agents plus a full local verification run (ruff/mypy/pytest incl. real PostgreSQL 16/shellcheck) on current `main`: **zero confirmed B4 blockers**, CANON-1/2/3/5 all FIXED-CONFIRMED, financial and concurrency invariants proven live on PostgreSQL. Six new non-blocking-defect topics recorded (42–47), plus one incremental detail folded into existing topic 39 and one already-known B2-scoped risk note recorded at topic 48 (not a new B4 finding). The historical FAILED verdict on `4e62a552…` is preserved unchanged. | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` (original, FAILED) + `ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` (recheck, CLOSED) |
 
 **Release decision:** 0.6.0-rc1 is a code-complete release candidate.
 It must not be tagged, published, or used for real payments until B1,
@@ -496,7 +496,7 @@ open).
   builds and a non-deterministic pip-audit set. Fix: `pip-compile`/`uv
   lock` + `pip install --require-hashes`.
 
-### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **FIXED-CONFIRMED (independent B4 recheck, 2026-08-17, `c68e86e4…`; live `docker build` blocked by sandbox egress policy, ties to B5 — static analysis + regression test corroborate the fix)** (was: DOCUMENTATION MISMATCH; LOW)
+### 38. Dockerfile OCI version label stale (`0.5.0-rc1`) — **FIXED-CONFIRMED (independent B4 recheck, 2026-08-17, `c68e86e4…`; live `docker build` blocked by *local sandbox* egress policy — static analysis, a regression test, and GitHub Actions' Docker build/compose validation job on PR #63 all corroborate the fix)** (was: DOCUMENTATION MISMATCH; LOW)
 - **Resolution (CANON-5):** the label is now `${APP_VERSION}`, supplied by
   a build ARG that CI and the release workflow set from
   `app.version.APP_VERSION` (a local build with no `--build-arg` gets an
@@ -549,10 +549,17 @@ open).
 
 ## Topics 42–48 (independent B4 recheck, 2026-08-17 — `c68e86e4…`)
 
-New findings surfaced by the seven-agent B4 recheck (see
-`ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` for full evidence). None is a
-B4 blocker; recorded here per this register's own practice so nothing
-found during the recheck is fixed-and-hidden.
+New items surfaced by the seven-agent B4 recheck (see
+`ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` for full evidence), recorded
+here per this register's own practice so nothing found during the recheck
+is fixed-and-hidden. Topics 42–47 are six **new non-blocking defects**.
+A seventh new finding — `recover-aged-out --confirm`'s `IntegrityError`
+handling gap on a `reference_id` collision — is NOT a new topic; it is
+recorded as an incremental detail under the existing topic 39 (see
+topic 47's cross-reference). Topic 48 is **not a non-blocking defect**:
+it is an already-known open release/environment risk scoped entirely to
+B2, extended by this recheck to one more scenario — not a new B4 finding.
+None of topics 42–48 is a B4 blocker.
 
 ### 42. `review resend` (app/ops.py) has weaker eligibility checks than `bulk_resend.py` — **CONFIRMED NON-BLOCKING DEFECT; LOW**
 - Independently found by two reviewers: missing the `bot_notify_reason`
