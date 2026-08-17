@@ -64,7 +64,8 @@ the adversarial review, and a green release workflow. Original topics:
   update, ssl, uninstall, …)
 - Validated daily PostgreSQL backups via a host systemd timer — atomic
   creation, SHA-256 manifest sidecars, checksum-verified restores with a
-  post-restore integrity check (`centralpay db-check`)
+  post-restore integrity check (`centralpay db-check`; `--details` adds a
+  bounded, read-only drill-down into the rows behind any failed check)
 - Configurable payment amount bounds; application version in `/health/live`
 - GitHub Actions CI (tests, lint, types, ShellCheck, Docker build, compose
   validation, secret and dependency scanning)

@@ -8,6 +8,7 @@ database:
 """
 
 import concurrent.futures
+import json
 import os
 import subprocess
 import sys
@@ -857,6 +858,121 @@ def test_db_check_detects_policyless_fee_corruption(
         ).scalar_one()
     assert payment.fee_rate_bps == 500
     assert payment.fee_amount == 0
+
+
+def test_db_check_details_finds_invalid_status_row_on_real_postgres(
+    settings, pg_engine, monkeypatch, capsys
+):
+    """The production anomaly this feature targets: a payment whose `status`
+    is not one of the known PaymentStatus values. `--details` must find it,
+    print the raw legacy status verbatim, include its audit trail (JSONB
+    event data, not SQLite's generic JSON type), and make zero writes."""
+    _alembic_upgrade("head")
+    session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
+    stub = CentralPayStub()
+    application = build_app(settings, session_factory, stub)
+    with TestClient(application, raise_server_exceptions=False) as client:
+        assert (
+            create_order(client, settings, order_id="pg-invalid-status", amount=5000).status_code
+            == 200
+        )
+    application.state.centralpay.close()
+
+    import app.ops as ops_module
+    from app.ops import main as ops_main
+
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    assert ops_main(["db-check"]) == 0  # healthy before corruption
+    capsys.readouterr()
+
+    payment = get_payment(session_factory, "pg-invalid-status")
+    with pg_engine.begin() as connection:
+        connection.execute(
+            text("UPDATE payments SET status = 'bot_notified' WHERE id = :id"),
+            {"id": payment.id},
+        )
+    corrupted = get_payment(session_factory, "pg-invalid-status")
+    events_before = get_events(session_factory, payment.id)
+
+    assert ops_main(["db-check", "--details", "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    detail = report["details"]["invalid_payment_status"]
+    assert detail["total"] == 1
+    row = detail["rows"][0]
+    assert row["bot_order_id"] == "pg-invalid-status"
+    assert row["status"] == "bot_notified"  # raw, never reinterpreted
+    audit = row["audit_events"]
+    assert audit["total"] >= 1
+    assert any(e["event_type"] == "payment_created" for e in audit["events"])
+    # Chronological.
+    timestamps = [e["created_at"] for e in audit["events"]]
+    assert timestamps == sorted(timestamps)
+
+    # Zero writes: the corrupted status (and everything else) is unchanged,
+    # and no PaymentEvent was appended by --details itself.
+    reloaded = get_payment(session_factory, "pg-invalid-status")
+    assert reloaded.status == "bot_notified"
+    assert reloaded.updated_at == corrupted.updated_at
+    events_after = get_events(session_factory, payment.id)
+    assert len(events_after) == len(events_before)
+    assert event_types(events_after) == event_types(events_before)
+
+
+def test_db_check_details_rejects_repair_sequences_combo_on_real_postgres(
+    settings, pg_engine, monkeypatch, capsys
+):
+    """--details + --repair-sequences must be refused before touching the
+    database -- confirmed against a REAL drifted PostgreSQL sequence, not
+    just the argparse-level check."""
+    _alembic_upgrade("head")
+    session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
+    stub = CentralPayStub()
+    application = build_app(settings, session_factory, stub)
+    with TestClient(application, raise_server_exceptions=False) as client:
+        assert (
+            create_order(client, settings, order_id="pg-seq-drift", amount=5000).status_code
+            == 200
+        )
+    application.state.centralpay.close()
+    payment = get_payment(session_factory, "pg-seq-drift")
+
+    # Drift the sequence behind the table maximum (simulating a restored
+    # dump), same technique as test_backup_restore's sequence-drift test.
+    with pg_engine.begin() as connection:
+        seq_name = connection.execute(
+            text("SELECT pg_get_serial_sequence('payments', 'id')")
+        ).scalar_one()
+        connection.execute(text(f"SELECT setval('{seq_name}', 1, false)"))
+
+    import app.ops as ops_module
+    from app.ops import main as ops_main
+
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+
+    capsys.readouterr()  # drain app-level request logs from setup above
+    assert ops_main(["db-check", "--details", "--repair-sequences"]) == 1
+    captured = capsys.readouterr()
+    assert "cannot be combined" in captured.err
+    assert captured.out == ""
+
+    # The sequence must still be behind -- the rejected combination performed
+    # no repair.
+    with pg_engine.begin() as connection:
+        seq_name = connection.execute(
+            text("SELECT pg_get_serial_sequence('payments', 'id')")
+        ).scalar_one()
+        last_value, is_called = connection.execute(
+            text(f"SELECT last_value, is_called FROM {seq_name}")
+        ).one()
+    assert int(last_value) < payment.id or not is_called
+
+    # Plain --repair-sequences (without --details) still works afterward.
+    assert ops_main(["db-check", "--repair-sequences"]) == 0
 
 
 def test_concurrent_ensure_initial_creates_exactly_one_policy(

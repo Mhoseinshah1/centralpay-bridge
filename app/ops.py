@@ -13,6 +13,9 @@ Commands:
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
   db-check [--repair-sequences]   read-only integrity checks (restore verification)
+  db-check --details [--json]     same report, plus a bounded, read-only drill-down
+                                   into the rows behind any failed check
+                                   (mutually exclusive with --repair-sequences)
 """
 
 import argparse
@@ -352,6 +355,198 @@ _SEQUENCE_TABLES = (
 )
 
 
+# --- db-check --details: bounded, read-only drill-down ---------------------
+#
+# Strictly read-only (SELECT only, never `FOR UPDATE`) and strictly local (no
+# CentralPay/bot/Telegram request of any kind). Every value printed is either
+# a Payment column printed VERBATIM -- a legacy/unrecognized status is never
+# reinterpreted or mapped onto a known one -- or a PaymentEvent.data value
+# that passed the explicit allowlist below. PaymentEvent.data can carry
+# gateway-influenced text or a Telegram identifier for OTHER event types (see
+# app.centralpay's "gateway-controlled data policy" and the
+# admin_command_received/succeeded/failed events in app.adminbot.commands),
+# so nothing outside that allowlist is ever printed here.
+
+_DETAILS_ROW_LIMIT = 20
+_DETAILS_EVENT_LIMIT = 50
+
+# Fixed-vocabulary, non-secret PaymentEvent.data keys only. Every key here
+# has been verified at every call site to originate from an internal enum, an
+# HTTP status code, a bounded fixed-vocabulary reason string, or an existing
+# safe Payment column (e.g. `previous_reason` mirrors bot_notify_reason) --
+# never raw gateway response text, an operator's free-text note, or a
+# Telegram user/chat id.
+_SAFE_EVENT_DATA_KEYS = (
+    "reason",
+    "reason_code",
+    "previous_reason",
+    "error_code",
+    "http_status",
+    "attempt",
+    "duration_ms",
+    "stage",
+    "worker_id",
+    "payment_status",
+    "resolution",
+    "field_errors",
+    "retry_mode",
+    "scheduled",
+    "idempotent",
+)
+
+_SAFE_SCALAR_TYPES = (str, int, float, bool)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _safe_event_data(data: object) -> dict[str, object]:
+    """Extract only the allowlisted, fixed-vocabulary keys from event data.
+
+    Defense in depth beyond the key allowlist itself: any value of an
+    unexpected shape (not a plain scalar, or not a list/tuple of plain
+    scalars) is dropped rather than printed, and every string is bounded --
+    so a future call site that adds an unexpected value under an allowed key
+    name still cannot leak arbitrary-length or structured content here.
+    """
+    if not isinstance(data, dict):
+        return {}
+    safe: dict[str, object] = {}
+    for key in _SAFE_EVENT_DATA_KEYS:
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, str):
+            safe[key] = value[:200]
+        elif isinstance(value, _SAFE_SCALAR_TYPES) or value is None:
+            safe[key] = value
+        elif isinstance(value, (list, tuple)):
+            safe[key] = [
+                item[:200] if isinstance(item, str) else item
+                for item in value
+                if isinstance(item, _SAFE_SCALAR_TYPES)
+            ]
+    return safe
+
+
+def _payment_audit_trail(db: Session, payment_id: int) -> dict[str, object]:
+    from app.models import PaymentEvent
+
+    total = int(
+        db.execute(
+            select(func.count(PaymentEvent.id)).where(PaymentEvent.payment_id == payment_id)
+        ).scalar_one()
+    )
+    rows = (
+        db.execute(
+            select(PaymentEvent)
+            .where(PaymentEvent.payment_id == payment_id)
+            .order_by(PaymentEvent.created_at.asc(), PaymentEvent.id.asc())
+            .limit(_DETAILS_EVENT_LIMIT)
+        )
+        .scalars()
+        .all()
+    )
+    events = [
+        {
+            "event_type": event.event_type,
+            "level": event.level,
+            "created_at": _iso(event.created_at),
+            "request_id": event.request_id,
+            "reason_fields": _safe_event_data(event.data),
+        }
+        for event in rows
+    ]
+    return {
+        "total": total,
+        "shown": len(events),
+        "truncated": total > len(events),
+        "limit": _DETAILS_EVENT_LIMIT,
+        "events": events,
+    }
+
+
+def _invalid_payment_status_row(db: Session, payment: Payment) -> dict[str, object]:
+    return {
+        "id": payment.id,
+        "bot_order_id": payment.bot_order_id,
+        "gateway_order_id": payment.gateway_order_id,
+        # Raw current status, printed exactly as stored -- never
+        # reinterpreted or mapped onto a known PaymentStatus value.
+        "status": payment.status,
+        "gateway_verified": payment.gateway_verified_at is not None,
+        "gateway_verified_at": _iso(payment.gateway_verified_at),
+        "bot_notify_reason": payment.bot_notify_reason,
+        "bot_notify_attempts": payment.bot_notify_attempts,
+        "bot_last_http_status": payment.bot_last_http_status,
+        "bot_notify_started_at": _iso(payment.bot_notify_started_at),
+        "bot_notify_accepted_at": _iso(payment.bot_notify_accepted_at),
+        "next_retry_at": _iso(payment.next_retry_at),
+        "manual_review_at": _iso(payment.manual_review_at),
+        "review_acknowledged_at": _iso(payment.review_acknowledged_at),
+        "review_resolved_at": _iso(payment.review_resolved_at),
+        "review_resolution": payment.review_resolution,
+        "created_at": _iso(payment.created_at),
+        "updated_at": _iso(payment.updated_at),
+        "audit_events": _payment_audit_trail(db, payment.id),
+    }
+
+
+def _invalid_payment_status_detail(
+    db: Session, condition: Any, total: int
+) -> dict[str, object]:
+    rows = (
+        db.execute(
+            select(Payment)
+            .where(condition)
+            .order_by(Payment.id.asc())
+            .limit(_DETAILS_ROW_LIMIT)
+        )
+        .scalars()
+        .all()
+    )
+    shown = [_invalid_payment_status_row(db, row) for row in rows]
+    return {
+        "total": total,
+        "shown": len(shown),
+        "truncated": total > len(shown),
+        "limit": _DETAILS_ROW_LIMIT,
+        "ordering": "id_ascending",
+        "rows": shown,
+    }
+
+
+def _build_db_check_details(
+    db: Session, checks: dict[str, int], invalid_status_condition: Any
+) -> dict[str, object]:
+    """Bounded, read-only drill-down for every FAILED check in `checks`.
+
+    Only `invalid_payment_status` has a row-level implementation in this
+    release (it is the check this feature was built to inspect). Every other
+    failing check gets an explicit `supported: false` marker instead of a
+    silent omission, so a caller can never mistake "not implemented yet" for
+    "checked and clean".
+    """
+    details: dict[str, object] = {}
+    if checks.get("invalid_payment_status"):
+        details["invalid_payment_status"] = _invalid_payment_status_detail(
+            db, invalid_status_condition, checks["invalid_payment_status"]
+        )
+    for name, count in checks.items():
+        if name == "invalid_payment_status" or count == 0:
+            continue
+        details[name] = {
+            "supported": False,
+            "total": count,
+            "note": (
+                "row-level detail is not implemented for this check yet; "
+                "see 'checks' for the exact failing count"
+            ),
+        }
+    return details
+
+
 def _cmd_db_check(args: argparse.Namespace) -> int:
     """Database integrity checks used after a restore (and on demand).
 
@@ -391,12 +586,17 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
             )
             return int(db.execute(select(func.count()).select_from(sub)).scalar_one())
 
+        # Reused verbatim (same expression object) by --details below, so the
+        # detail rows are guaranteed to match this exact predicate -- never a
+        # separately maintained copy that could silently drift from it.
+        invalid_status_condition = Payment.status.not_in(
+            [status.value for status in PaymentStatus]
+        )
+
         checks: dict[str, int] = {
             "invalid_payment_status": int(
                 db.execute(
-                    select(func.count(Payment.id)).where(
-                        Payment.status.not_in([status.value for status in PaymentStatus])
-                    )
+                    select(func.count(Payment.id)).where(invalid_status_condition)
                 ).scalar_one()
             ),
             "duplicate_bot_order_id": dup_count(Payment.bot_order_id),
@@ -517,9 +717,15 @@ def _cmd_db_check(args: argparse.Namespace) -> int:
                 report["repaired_sequences"] = repaired
         report["sequences"] = sequences
 
+        if args.details:
+            report["details"] = _build_db_check_details(db, checks, invalid_status_condition)
+
     report["status"] = "ok" if not failures else "failed"
     report["failures"] = failures
-    print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    if args.details and args.details_json:
+        print(json.dumps(report, ensure_ascii=False, default=str))
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
     return 0 if not failures else 1
 
 
@@ -744,6 +950,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="advance sequences that fell behind their table maxima",
     )
+    db_check.add_argument(
+        "--details",
+        action="store_true",
+        help="bounded, read-only drill-down into the rows behind any failed check "
+        "(no writes, no network calls; mutually exclusive with --repair-sequences)",
+    )
+    db_check.add_argument(
+        "--json",
+        action="store_true",
+        dest="details_json",
+        help="with --details, emit a single compact-JSON line instead of the "
+        "indented report (requires --details)",
+    )
 
     fee = sub.add_parser("fee", help="fee policy operations (append-only, audited)")
     fee_sub = fee.add_subparsers(dest="fee_command", required=True)
@@ -800,6 +1019,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backup-event":
         return _cmd_backup_event(args)
     if args.command == "db-check":
+        if args.details and args.repair_sequences:
+            print(
+                "error: --details cannot be combined with --repair-sequences. "
+                "--details is a strictly read-only inspection; --repair-sequences "
+                "performs a write. Run them separately.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.details_json and not args.details:
+            print("error: --json requires --details", file=sys.stderr)
+            return 1
         return _cmd_db_check(args)
     if args.command == "privacy-audit":
         return _cmd_privacy_audit(args)

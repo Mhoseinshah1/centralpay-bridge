@@ -50,6 +50,9 @@ Data:
   backups                List backups with validation state
   restore FILE [--yes]   Restore a backup (asks for confirmation)
   db-check [--repair-sequences]  Database integrity checks (read-only by default)
+  db-check --details [--json]    Same report, plus a bounded, read-only drill-down
+                                  into the rows behind any failed check
+                                  (mutually exclusive with --repair-sequences)
 
 Service fee (changes apply to NEW orders only; history is permanent):
   fee status             Current fee, policy ID, and next scheduled change
@@ -816,6 +819,9 @@ cmd_db_check() {
     # Read-only integrity checks (constraints, orphans, statuses, claim
     # anomalies, fee snapshots, sequence positions). --repair-sequences
     # additionally advances any sequence that fell behind its table maximum.
+    # --details adds a bounded, read-only drill-down into the rows behind any
+    # failed check (no writes, no network calls); it refuses to combine with
+    # --repair-sequences.
     compose run --rm migrate python -m app.ops db-check "$@"
 }
 
