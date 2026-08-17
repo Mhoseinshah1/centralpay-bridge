@@ -65,7 +65,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, not_, or_, select
 from sqlalchemy.orm import Session
 
 from app.audit import record_event
@@ -150,6 +150,114 @@ def link_age_anchor() -> Any:
     return func.coalesce(Payment.callback_token_issued_at, Payment.created_at)
 
 
+def aged_out_age_condition(settings: Settings, *, now: datetime) -> Any:
+    """THE single boolean AGE expression for "aged out": link age >=
+    ``reconciliation_max_age_seconds``. Not a full condition tuple — just
+    the raw boundary comparison against :func:`link_age_anchor`, for
+    callers to combine with whatever ``status``/``gateway_verified_at``
+    scope they need (see :func:`aged_out_conditions` for the ``link_created``
+    -scoped default every read-only bucket view uses, and
+    ``app.services.reconcile_inspect`` for the broader, status-unscoped
+    variant the ``--verify`` safety gate needs).
+
+    Every aged-out/not-aged-out check in this codebase evaluates exactly
+    this expression — never a locally re-derived
+    ``now - timedelta(seconds=reconciliation_max_age_seconds)`` cutoff —
+    so none of them can quietly drift apart.
+    """
+    cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    return link_age_anchor() <= cutoff
+
+
+def tier_age_conditions(
+    settings: Settings,
+    *,
+    now: datetime,
+    age_floor: timedelta | None,
+    age_ceiling: timedelta | None,
+) -> tuple[Any, ...]:
+    """Pure age/status/gateway_verified BOUNDARY for a ``link_created``
+    payment — no due/attempt predicates. ``age_floor``/``age_ceiling`` of
+    ``None`` means "no lower bound"/"no upper bound" respectively.
+
+    THE single authoritative shape every link_created age tier in this
+    codebase is built from: :func:`tier_due_conditions` adds the
+    due/attempt predicates on top of exactly this, and
+    :func:`active_tier_age_conditions` / :func:`expiring_tier_age_conditions`
+    call this with the ACTIVE/EXPIRING tiers' fixed bounds — so the claim
+    path, the due-predicate reporting, and the pure age-bucket reporting
+    (``app.services.reconciliation_status``, ``app.services.stuck_payments``,
+    ``app.services.reconcile_inspect``) all evaluate the exact same boundary
+    math, never a locally re-derived one.
+    """
+    link_age_anchor_expr = link_age_anchor()
+    conditions: list[Any] = [
+        # ONLY stuck link_created rows: verified / notification /
+        # manual_review / created / getlink_failed states never match.
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),  # belt-and-braces
+    ]
+    if age_floor is not None:
+        conditions.append(link_age_anchor_expr <= now - age_floor)  # age >= age_floor
+    if age_ceiling is not None:
+        conditions.append(link_age_anchor_expr > now - age_ceiling)  # age < age_ceiling
+    return tuple(conditions)
+
+
+def active_tier_age_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """The ACTIVE bucket's age/status/gateway_verified boundary:
+    ``link_created``, unverified, age < fast_window. NO
+    ``reconciliation_min_age_seconds`` floor — that is a DUE-only
+    refinement (see :func:`active_tier_due_conditions`), not a bucket
+    boundary: a payment 2 seconds old is still in the ACTIVE age bucket
+    even though the worker will not yet attempt it.
+
+    THE single authoritative definition of where the active tier's age
+    boundary sits — shared by the worker's claim (via
+    :func:`active_tier_due_conditions`), ``reconciliation_status``'s
+    ``PaymentBuckets.active``, and ``reconcile_inspect``'s ``age_bucket``.
+    """
+    return tier_age_conditions(
+        settings,
+        now=now,
+        age_floor=None,
+        age_ceiling=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+    )
+
+
+def expiring_tier_age_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """The EXPIRING bucket's age/status/gateway_verified boundary:
+    ``link_created``, unverified, fast_window <= age < max_age.
+
+    THE single authoritative definition — shared by the worker's claim
+    (via :func:`expiring_tier_due_conditions`), ``reconciliation_status``'s
+    ``PaymentBuckets.expiring``, and ``reconcile_inspect``'s ``age_bucket``.
+    """
+    return tier_age_conditions(
+        settings,
+        now=now,
+        age_floor=timedelta(seconds=settings.reconciliation_fast_window_seconds),
+        age_ceiling=timedelta(seconds=settings.reconciliation_max_age_seconds),
+    )
+
+
+def aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """``link_created``, unverified, aged out (age >= max_age).
+
+    THE single authoritative AGED_OUT boundary — shared by
+    ``reconciliation_status``'s ``PaymentBuckets.aged_out`` and
+    ``stuck_payments``'s ``EXPIRED`` category. (``reconcile_inspect``'s
+    ``--verify`` safety gate needs a broader, status-unscoped variant —
+    every unverified payment, not only ``link_created`` rows — built
+    directly from :func:`aged_out_age_condition`; see that module.)
+    """
+    return (
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),
+        aged_out_age_condition(settings, now=now),
+    )
+
+
 def tier_due_conditions(
     settings: Settings,
     *,
@@ -158,7 +266,9 @@ def tier_due_conditions(
     age_ceiling: timedelta,
 ) -> tuple[Any, ...]:
     """Pure WHERE-condition builder: is a ``link_created`` payment due for
-    reconciliation in the age tier ``[age_floor, age_ceiling)``?
+    reconciliation in the age tier ``[age_floor, age_ceiling)``? Builds on
+    :func:`tier_age_conditions` — never re-expresses the boundary math —
+    adding only the due/attempt predicates.
 
     Extracted from ``_claim_in_age_range`` so read-only reporting (e.g.
     ``app.services.reconciliation_status``) can mirror selection semantics
@@ -166,14 +276,8 @@ def tier_due_conditions(
     the mutating claim path itself. Never locks, never orders, never limits;
     the claim path adds those on top of these same conditions.
     """
-    link_age_anchor_expr = link_age_anchor()
     return (
-        # ONLY stuck link_created rows: verified / notification /
-        # manual_review / created / getlink_failed states never match.
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),  # belt-and-braces
-        link_age_anchor_expr <= now - age_floor,  # age >= age_floor
-        link_age_anchor_expr > now - age_ceiling,  # age < age_ceiling
+        *tier_age_conditions(settings, now=now, age_floor=age_floor, age_ceiling=age_ceiling),
         or_(
             Payment.reconciliation_next_at.is_(None),
             Payment.reconciliation_next_at <= now,
@@ -211,14 +315,14 @@ def reconciliation_exhausted_conditions(settings: Settings, *, now: datetime) ->
     Deliberately excludes aged-out rows: those are reported separately (see
     ``reconciliation_status.py``'s ``aged_out`` bucket and
     ``stuck_payments.py``'s ``EXPIRED`` category), which always takes
-    priority over "exhausted" for operator-facing categorization.
+    priority over "exhausted" for operator-facing categorization. The
+    "NOT aged out" half reuses :func:`aged_out_age_condition` (negated),
+    never a locally re-derived cutoff.
     """
-    link_age_anchor_expr = link_age_anchor()
-    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
     return (
         Payment.status == PaymentStatus.LINK_CREATED.value,
         Payment.gateway_verified_at.is_(None),
-        link_age_anchor_expr > expired_cutoff,  # NOT aged out
+        not_(aged_out_age_condition(settings, now=now)),  # NOT aged out
         Payment.reconciliation_next_at.is_(None),
         Payment.reconciliation_attempts >= settings.reconciliation_max_attempts,
     )

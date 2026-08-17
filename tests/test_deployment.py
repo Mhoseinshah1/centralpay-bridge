@@ -416,6 +416,24 @@ def test_main_dispatch_routes_reconciliation_to_cmd_reconciliation():
     assert re.search(r'reconciliation\)\s*cmd_reconciliation "\$@" ;;', dispatch)
 
 
+def test_reconcile_targets_worker_container_not_api():
+    """PR #59 follow-up: `centralpay reconcile` reports on the same
+    RECONCILIATION_* configuration (tier ages, max attempts, enabled flag,
+    aged-out --verify gate) that `centralpay reconciliation status`
+    documents as living in the worker process — so it must be routed there
+    too, deliberately never api, and with no fallback to it."""
+    text = MANAGEMENT.read_text()
+    body = text[text.index("cmd_reconcile_inspect()") : text.index("cmd_credentials()")]
+    assert "compose exec -T worker python -m app.cli reconcile" in body
+    assert "compose exec -T api" not in body
+
+
+def test_main_dispatch_routes_reconcile_to_cmd_reconcile_inspect():
+    text = MANAGEMENT.read_text()
+    dispatch = text[text.index("main() {") :]
+    assert re.search(r'reconcile\)\s*cmd_reconcile_inspect "\$@" ;;', dispatch)
+
+
 def test_restore_requires_confirmation():
     text = MANAGEMENT.read_text()
     assert 'Type RESTORE to continue' in text

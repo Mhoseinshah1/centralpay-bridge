@@ -9,11 +9,13 @@ settlement path this module deliberately never calls.
 
 Every age boundary and due predicate mirrors ``app.services.reconciliation``
 EXACTLY, via the shared pure (non-mutating) condition builders there
-(``active_tier_due_conditions`` / ``expiring_tier_due_conditions`` /
-``reconciliation_exhausted_conditions``) and the shared ``link_age_anchor()``
-expression — so this view can never quietly disagree with what the
-reconciliation worker is actually doing (the same reuse pattern
-``app.services.stuck_payments`` follows).
+(``active_tier_age_conditions`` / ``expiring_tier_age_conditions`` /
+``aged_out_conditions`` for the buckets; ``active_tier_due_conditions`` /
+``expiring_tier_due_conditions`` / ``reconciliation_exhausted_conditions``
+for the queue) and the shared ``link_age_anchor()`` expression — so this
+view can never quietly disagree with what the reconciliation worker is
+actually doing (the same reuse pattern ``app.services.stuck_payments`` and
+``app.services.reconcile_inspect`` follow).
 """
 
 import os
@@ -28,9 +30,12 @@ from sqlalchemy.orm import Session
 
 from app.adminbot.queries import latest_worker_heartbeat
 from app.config import Settings
-from app.models import Payment, PaymentEvent, PaymentStatus, WorkerHeartbeat
+from app.models import Payment, PaymentEvent, WorkerHeartbeat
 from app.services.reconciliation import (
+    active_tier_age_conditions,
     active_tier_due_conditions,
+    aged_out_conditions,
+    expiring_tier_age_conditions,
     expiring_tier_due_conditions,
     link_age_anchor,
     reconciliation_exhausted_conditions,
@@ -246,20 +251,12 @@ def _config(settings: Settings) -> ReconciliationConfig:
 
 
 def _buckets(db: Session, settings: Settings, now: datetime) -> PaymentBuckets:
-    anchor = link_age_anchor()
-    base = (
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),
-    )
-    fast_cutoff = now - timedelta(seconds=settings.reconciliation_fast_window_seconds)
-    max_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    def count(conditions: tuple[Any, ...]) -> int:
+        return db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
 
-    def count(*conditions: Any) -> int:
-        return db.execute(select(func.count(Payment.id)).where(*base, *conditions)).scalar_one()
-
-    active = count(anchor > fast_cutoff)
-    expiring = count(anchor <= fast_cutoff, anchor > max_cutoff)
-    aged_out = count(anchor <= max_cutoff)
+    active = count(active_tier_age_conditions(settings, now=now))
+    expiring = count(expiring_tier_age_conditions(settings, now=now))
+    aged_out = count(aged_out_conditions(settings, now=now))
     return PaymentBuckets(
         total_unverified=active + expiring + aged_out,
         active=active,

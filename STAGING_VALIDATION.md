@@ -43,7 +43,15 @@ On a staging install (after `REAL_HOST_VALIDATION.md` steps 1–4), with
    re-contacting verify.
 3. Attempt a second verify for the same order (e.g. by replaying before
    the first commit in a controlled test) — record how the real gateway
-   responds; confirm our conservative handling matches.
+   responds; confirm our conservative handling matches. This is also the
+   procedure that closes the diagnostic-verify gate: `centralpay reconcile
+   ORDER_ID --verify` (`app.cli`, backed by `app.services.reconcile_inspect`)
+   is a read-side-only-on-OUR-side gateway check that intentionally makes
+   NO local database mutation, and is disabled by default
+   (`CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED=false`) for exactly this reason —
+   only flip it to `true` once this step confirms real verify-after-verify
+   behavior is safe to call repeatedly without diverging gateway and local
+   state.
 4. Force a mismatch (wrong amount expectation in a test record) — must
    route to manual review, never credit.
 5. Confirm `FIRST_PAYMENT_GUARD_ENABLED=true` produces the one-time

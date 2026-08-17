@@ -139,6 +139,11 @@ def settings() -> Settings:
         centralpay_user_id=TEST_USER_ID,
         centralpay_payer_id_secret=TEST_PAYER_ID_SECRET,
         centralpay_timeout_seconds=5.0,
+        # Off by default in production (see app.config); enabled here so the
+        # shared fixture continues to exercise the full --verify code path.
+        # Tests for the disabled gate itself build their own settings via
+        # model_copy(update={"centralpay_diagnostic_verify_enabled": False}).
+        centralpay_diagnostic_verify_enabled=True,
         bot_payment_notify_url="https://bot.test.local/api/payment",
         bot_notify_token=TEST_BOT_TOKEN,
         bot_notify_retry_mode="safe",
