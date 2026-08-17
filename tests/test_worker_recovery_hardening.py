@@ -221,7 +221,10 @@ def test_scheduled_retry_survives_restart(
     """A retry scheduled before a process restart is delivered after it —
     nothing lives in process memory."""
     make_verified_pending(client, settings, session_factory, stub, order_id="rt-dur")
-    bot_stub.result = httpx.Response(500)
+    # 429 stays retryable in safe mode (unlike 5xx, which now goes straight
+    # to manual review); this test is about restart durability of a
+    # scheduled retry, not about HTTP-status classification.
+    bot_stub.result = httpx.Response(429)
     run_pass(session_factory, notifier, settings, now=FIXED_NOW)
     payment = get_payment(session_factory, "rt-dur")
     assert payment.status == PaymentStatus.BOT_NOTIFY_PENDING.value

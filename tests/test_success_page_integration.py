@@ -270,26 +270,36 @@ def test_pending_renders_unified_page_and_stays_pending(
     )
 
 
-def test_bot_500_stays_retryable_pending_and_renders_unified_page(
+def test_bot_500_goes_to_manual_review_and_renders_unified_page(
     client, settings, session_factory, stub, bot_stub, notifier
 ):
     """The observed production case: verification succeeded, the customer bot
-    returned HTTP 500. The worker keeps retrying (5xx is retryable), the
-    stored status stays pending, and the payer sees the SAME unified page."""
+    returned HTTP 500 for an order it had already processed. An HTTP 5xx
+    never proves the bot made no side effects, so in safe mode (the
+    production default) the worker does NOT auto-retry -- that could
+    double-credit the customer. The payment moves straight to manual
+    review, and the payer still sees the SAME unified page (now on the
+    under_review branch)."""
     payment = make_verified_pending(
         client, settings, session_factory, stub, order_id="bot-500"
     )
     bot_stub.result = httpx.Response(500)
     run_pass(session_factory, notifier, settings)
     stored = get_payment(session_factory, "bot-500")
-    assert stored.status == PaymentStatus.BOT_NOTIFY_PENDING.value  # not promoted
+    assert stored.status == PaymentStatus.MANUAL_REVIEW.value  # not promoted, not left pending
     assert stored.bot_notify_attempts == 1
-    assert stored.next_retry_at is not None  # 5xx stays retryable
+    assert stored.next_retry_at is None  # 5xx is no longer auto-retried in safe mode
     assert stored.bot_last_http_status == 500
     response = client.get(valid_callback_path(stub, payment.gateway_order_id))
     assert response.status_code == 200
-    assert 'data-status="bot_pending"' in response.text
+    assert 'data-status="under_review"' in response.text
     assert NEW_HEADING in response.text
+
+    # Never automatically retried afterwards.
+    bot_stub.result = httpx.Response(200)
+    result = run_pass(session_factory, notifier, settings)
+    assert result["processed"] == 0
+    assert len(bot_stub.requests) == 1
 
 
 def test_under_review_renders_unified_page_and_stays_under_review(

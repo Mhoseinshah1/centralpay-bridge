@@ -44,6 +44,18 @@ logger = logging.getLogger("app.services.notification")
 # the table reuse the final delay until the attempt limit is reached.
 RETRY_DELAYS_SECONDS: tuple[int, ...] = (60, 120, 300, 600, 1800, 3600)
 
+# Production evidence: a bot that had already processed an order (balance
+# credited, no further side effect) returned HTTP 500 on a duplicate
+# delivery. An HTTP 5xx therefore does NOT prove the bot made no side
+# effects, so in safe mode these statuses are not auto-retried — an
+# automatic resend could double-credit the customer. classify_response()
+# still reports them as the generic RETRYABLE kind (the HTTP classification
+# contract in app/bot.py is unchanged); only this delivery layer, which has
+# access to Settings.bot_notify_retry_mode, downgrades them to manual
+# review when in safe mode. idempotent mode (an explicit operator opt-in
+# confirming duplicate delivery is safe) keeps the original retry behavior.
+_SAFE_MODE_NON_RETRYABLE_HTTP_STATUSES = frozenset({500, 502, 503, 504})
+
 _DEFAULT_BATCH_SIZE = 20
 
 NowFn = Callable[[], datetime]
@@ -253,6 +265,16 @@ def record_attempt_result(
         # Only when the bot developer has explicitly confirmed duplicate
         # order_id delivery is idempotent.
         effective_kind = OutcomeKind.RETRYABLE
+    elif (
+        outcome.kind is OutcomeKind.RETRYABLE
+        and settings.bot_notify_retry_mode == "safe"
+        and outcome.http_status in _SAFE_MODE_NON_RETRYABLE_HTTP_STATUSES
+    ):
+        # See _SAFE_MODE_NON_RETRYABLE_HTTP_STATUSES: a proven side-effecting
+        # 5xx must not be auto-resent in safe mode. The MANUAL branch below
+        # preserves outcome.reason_code as-is (bot_http_500/502/503/504),
+        # never overwriting it with the transport-ambiguity code.
+        effective_kind = OutcomeKind.MANUAL
 
     extra = _log_extra(claimed, attempt=claimed.attempt, outcome=outcome)
     extra["duration_ms"] = duration_ms
