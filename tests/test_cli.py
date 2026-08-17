@@ -133,6 +133,127 @@ def test_stuck_ordering_is_attention_then_waiting_then_expired(
     assert categories == ["waiting_gateway"]
 
 
+# --- hotfix: needs_attention anchors bot_notify_pending staleness on the --
+# --- start of the CURRENT notification cycle, never bare created_at or ----
+# --- bare gateway_verified_at (see app.adminbot.queries._notification_age_
+# --- anchor) -----------------------------------------------------------
+
+
+def test_stuck_needs_attention_not_flagged_when_order_old_but_notification_fresh(
+    cli_env, client, settings, session_factory, stub, capsys
+):
+    """`centralpay stuck` shares app.adminbot.queries._stale_bot_notify_pending_
+    conditions with /stuck (via app.services.stuck_payments.stuck_payments_
+    overview), so it must follow the same fix: an order created 45 minutes
+    ago whose customer just paid must not show up as needing attention the
+    instant the notification is queued."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.models import Payment
+    from tests.conftest import make_verified_pending
+
+    order_id = "cli-anchor-fresh-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = datetime.now(UTC) - timedelta(minutes=45)
+        db.commit()
+
+    assert cli_main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "🔴 Need attention: 0" in out
+    assert order_id not in out
+
+
+def test_stuck_needs_attention_flagged_when_notification_itself_is_old(
+    cli_env, client, settings, session_factory, stub, capsys
+):
+    """Symmetric case: the notification cycle itself (bot_notification_queued)
+    is old, not just created_at -- `centralpay stuck` must still flag it,
+    exactly as /stuck does."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.models import Payment, PaymentEvent
+    from tests.conftest import make_verified_pending
+
+    order_id = "cli-anchor-old-notify"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(hours=2)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.created_at = old
+        payment.gateway_verified_at = old
+        event = db.execute(
+            select(PaymentEvent)
+            .where(
+                PaymentEvent.payment_id == payment.id,
+                PaymentEvent.event_type == "bot_notification_queued",
+            )
+            .order_by(PaymentEvent.id.desc())
+            .limit(1)
+        ).scalar_one()
+        event.created_at = old
+        db.commit()
+
+    assert cli_main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "🔴 Need attention: 1" in out
+    assert order_id in out
+
+
+def test_stuck_needs_attention_not_flagged_immediately_after_cli_resend(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """CLI resend end-to-end: gateway_verified_at is 2 days old, the payment
+    sits in manual_review, `centralpay review resend` runs NOW -- `centralpay
+    stuck` must not flag it immediately after, exercised through the actual
+    `app.ops` resend command."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    import app.ops as ops_module
+    from app.models import Payment, PaymentStatus
+    from app.ops import main as ops_main
+    from tests.conftest import make_verified_pending
+
+    order_id = "cli-stuck-after-resend"
+    make_verified_pending(client, settings, session_factory, stub, order_id=order_id)
+    old = datetime.now(UTC) - timedelta(days=2)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.gateway_verified_at = old
+        payment.status = PaymentStatus.MANUAL_REVIEW.value
+        payment.bot_notify_reason = "retry_limit_reached"
+        payment.manual_review_at = old
+        payment.next_retry_at = None
+        payment.notification_claimed_at = None
+        payment.notification_claimed_by = None
+        db.commit()
+
+    idempotent = cli_env.model_copy(update={"bot_notify_retry_mode": "idempotent"})
+    monkeypatch.setattr(ops_module, "Settings", lambda: idempotent)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+    assert ops_main(["review", "resend", order_id, "--confirm-idempotent-bot", "--yes"]) == 0
+    capsys.readouterr()  # flush the resend confirmation
+
+    assert cli_main(["stuck"]) == 0
+    out = capsys.readouterr().out
+    assert "🔴 Need attention: 0" in out
+    assert order_id not in out
+
+
 # --- reconciliation status ---------------------------------------------------
 
 

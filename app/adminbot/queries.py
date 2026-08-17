@@ -107,12 +107,71 @@ class StuckEntry:
     category: str  # exact reason category, never a generic "stuck"
 
 
+# Every code path that sets status=bot_notify_pending records exactly one of
+# these PaymentEvent types, atomically, in the SAME transaction as the status
+# change (never a separate, later write) — see _notification_age_anchor.
+_NOTIFICATION_ENTRY_EVENT_TYPES = (
+    "bot_notification_queued",  # app.services.notification.queue_notification
+    "manual_review_resend_requested",  # app.ops "review resend"
+    "admin_bulk_resend_requested",  # app.services.bulk_resend.requeue_failed_deliveries
+)
+
+
+def _notification_age_anchor() -> Any:
+    """The moment THIS payment most recently entered/re-entered the
+    notification-pending phase.
+
+    NOT ``created_at`` (order creation can precede payment completion by an
+    arbitrary amount). NOT bare ``gateway_verified_at`` either: that's a
+    one-time financial fact from the ORIGINAL gateway verification, and a
+    resend (``app.ops`` "review resend", ``app.services.bulk_resend``)
+    re-enters ``bot_notify_pending`` at a NEW time while ``gateway_verified_at``
+    stays exactly what it was — a payment verified 2 days ago, resent just
+    now, must look freshly-queued, not 2-days stale. This must never
+    overwrite or repurpose ``gateway_verified_at`` itself; it stays the
+    durable "gateway verified" fact, independent of delivery status.
+
+    Every entry path (``queue_notification``, ``app.ops`` resend,
+    ``app.services.bulk_resend``) records exactly one matching event in the
+    SAME transaction as the status change, and ``payment_events`` is a
+    permanent, append-only audit trail (never deleted) — so
+    ``MAX(created_at)`` among a payment's own matching events is an exact,
+    reliable record of when its CURRENT cycle began.
+
+    Deliberately NOT ``next_retry_at``: that field is overwritten to a
+    FUTURE value by every backoff reschedule
+    (``app.services.notification.record_attempt_result``), so an actively
+    retrying-and-failing row would perpetually look "fresh" and never
+    surface even after being undelivered for a long time. This anchor is
+    unaffected by backoff — it only moves on a genuine (re-)entry — so a row
+    correctly keeps accumulating age through retries and becomes visible
+    once truly overdue, while a row still within its normal backoff window
+    (cycle just started) is correctly never flagged just because the
+    original ``gateway_verified_at`` happens to be old.
+
+    ``COALESCE`` falls back to ``gateway_verified_at``, then ``created_at``,
+    for a row with no matching event — structurally shouldn't happen, since
+    every entry path commits its event atomically with the status change,
+    but this keeps such a row visible for review instead of crashing the
+    query or silently treating it as fresh."""
+    latest_entry_event = (
+        select(func.max(PaymentEvent.created_at))
+        .where(
+            PaymentEvent.payment_id == Payment.id,
+            PaymentEvent.event_type.in_(_NOTIFICATION_ENTRY_EVENT_TYPES),
+        )
+        .correlate(Payment)
+        .scalar_subquery()
+    )
+    return func.coalesce(latest_entry_event, Payment.gateway_verified_at, Payment.created_at)
+
+
 def _stale_bot_notify_pending_conditions(pending_cutoff: datetime) -> tuple[Any, ...]:
     """A bot_notify_pending row old enough to need operator attention —
     whether or not its notification claim is ADDITIONALLY stale (claim
     staleness only changes the displayed reason label below, never whether
     the row is included)."""
-    return (Payment.status == "bot_notify_pending", Payment.created_at <= pending_cutoff)
+    return (Payment.status == "bot_notify_pending", _notification_age_anchor() <= pending_cutoff)
 
 
 def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
@@ -197,14 +256,14 @@ def bot_delivery_snapshot(
     Ordering: manual-review delivery failures first, then stale/old
     pending rows (an explicit SQL ``CASE`` priority column, replacing what
     used to be Python-side list concatenation of two query results), each
-    group ordered by its own timestamp (``manual_review_at`` /
-    ``created_at``) ascending with NULLS FIRST, ties broken by ascending
-    ``Payment.id`` for a fully deterministic result — the same
+    group ordered by its own timestamp (``manual_review_at`` / the
+    notification-age anchor) ascending with NULLS FIRST, ties broken by
+    ascending ``Payment.id`` for a fully deterministic result — the same
     classification and ordering as before, just from one statement."""
     pending_cutoff = now - timedelta(minutes=pending_age_minutes)
     is_manual_review = and_(*_bot_delivery_manual_review_conditions())
     priority = case((is_manual_review, 0), else_=1)
-    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=Payment.created_at)
+    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=_notification_age_anchor())
     total_col = func.count().over().label("total")
     stmt = (
         select(Payment, priority.label("priority"), total_col)
@@ -256,7 +315,7 @@ def stuck_payments(
     old_pending = db.execute(
         select(Payment)
         .where(*_stale_bot_notify_pending_conditions(pending_cutoff))
-        .order_by(Payment.created_at.asc())
+        .order_by(_notification_age_anchor().asc())
         .limit(limit)
     ).scalars()
     claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
