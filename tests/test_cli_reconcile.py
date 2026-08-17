@@ -543,6 +543,75 @@ def test_reconcile_verify_manual_review_refused_zero_network(
     assert "manual_review" in default_out
 
 
+def test_determine_verify_refusal_manual_review_takes_precedence_over_already_verified(
+    session_factory, settings
+):
+    """Review-requested regression: status=manual_review with
+    gateway_verified_at != NULL must return manual_review_owned, not
+    already_gateway_verified -- a gateway-verified payment can legitimately
+    sit in manual_review (e.g. a delivery-failure review that never touched
+    the financial/verification facts), and the operationally important
+    fact is that an administrator already owns the review."""
+    from app.services.reconcile_inspect import (
+        VerifyRefusal,
+        build_local_snapshot,
+        determine_verify_refusal,
+    )
+
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="rc-precedence-unit",
+            gateway_order_id=930002,
+            gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+            amount=8000,
+            payable_amount=8000,
+            status=PaymentStatus.MANUAL_REVIEW.value,
+            gateway_verified_at=datetime.now(UTC) - timedelta(minutes=5),
+            reference_id="REF-precedence-unit",
+            manual_review_at=datetime.now(UTC),
+        )
+        db.add(payment)
+        db.commit()
+        db.refresh(payment)
+
+        local = build_local_snapshot(db, settings, payment, now=datetime.now(UTC))
+        refusal = determine_verify_refusal(payment, local, confirm_aged_out=False)
+
+    assert refusal == VerifyRefusal.MANUAL_REVIEW_OWNED
+
+
+def test_reconcile_verify_manual_review_with_gateway_verified_refused_zero_network(
+    cli_env, session_factory, stub, monkeypatch, capsys
+):
+    """End-to-end counterpart of the unit-level precedence test above: the
+    CLI must report manual_review_owned (not already-verified) and make
+    zero HTTP requests either way."""
+    _patch_centralpay_client(monkeypatch, stub)
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="rc-manual-review-verified",
+            gateway_order_id=930003,
+            gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+            amount=8000,
+            payable_amount=8000,
+            status=PaymentStatus.MANUAL_REVIEW.value,
+            gateway_verified_at=datetime.now(UTC) - timedelta(minutes=5),
+            reference_id="REF-manual-review-verified",
+            manual_review_at=datetime.now(UTC),
+            bot_notify_reason="retry_limit_reached",
+        )
+        db.add(payment)
+        db.commit()
+    before_requests = len(stub.verify_requests)
+
+    assert cli_main(["reconcile", "rc-manual-review-verified", "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "administrator already owns" in out
+    assert "already locally gateway-verified" not in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+    assert len(stub.verify_requests) == before_requests
+
+
 # --- scenario 10: aged-out safety -------------------------------------------
 
 

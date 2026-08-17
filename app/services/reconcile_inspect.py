@@ -13,18 +13,24 @@ HTTP call (read-only on the gateway side too, per app.centralpay) and
 reports what settlement WOULD conclude; it never applies that outcome.
 
 Age-boundary predicates are never hand-rederived: every tier/aged-out/
-exhausted check below queries the exact shared condition tuples from
-``app.services.reconciliation`` (``active_tier_due_conditions``,
-``expiring_tier_due_conditions``, ``reconciliation_exhausted_conditions``,
-``link_age_anchor``), scoped down to this one payment's id — so this view
-can never quietly disagree with what the reconciliation worker itself
-would do, the same reuse pattern ``app.services.reconciliation_status``
-and ``app.services.stuck_payments`` already follow.
+exhausted check below queries the exact shared condition tuples imported
+from ``app.services.reconciliation`` (``active_tier_age_conditions``,
+``expiring_tier_age_conditions``, ``aged_out_age_condition``,
+``active_tier_due_conditions``, ``expiring_tier_due_conditions``,
+``reconciliation_exhausted_conditions``), scoped down to this one
+payment's id — so this view can never quietly disagree with what the
+reconciliation worker itself would do, the same reuse pattern
+``app.services.reconciliation_status`` and ``app.services.stuck_payments``
+already follow. This module defines NO local age-boundary math of its
+own beyond the ``--verify`` safety gate's deliberately broader status
+scope (see ``_verify_aged_out_conditions`` below) — even that reuses the
+shared ``aged_out_age_condition`` expression, never a separately
+computed cutoff.
 """
 
 import enum
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -34,9 +40,12 @@ from app.centralpay import VerifyResult
 from app.config import Settings
 from app.models import Payment, PaymentStatus
 from app.services.reconciliation import (
+    active_tier_age_conditions,
     active_tier_due_conditions,
+    aged_out_age_condition,
+    aged_out_conditions,
+    expiring_tier_age_conditions,
     expiring_tier_due_conditions,
-    link_age_anchor,
     reconciliation_exhausted_conditions,
 )
 
@@ -72,40 +81,20 @@ def _condition_holds(db: Session, payment_id: int, conditions: tuple[Any, ...]) 
     )
 
 
-def _aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
-    """A still-unverified payment whose link is at least
-    ``reconciliation_max_age_seconds`` old — the SAME cutoff
-    ``app.services.reconciliation_status``'s ``PaymentBuckets.aged_out`` and
-    ``app.services.stuck_payments``'s ``EXPIRED`` category use
-    (``link_age_anchor() <= now - max_age``). Scoped only by
-    ``gateway_verified_at IS NULL`` (never by ``status``) so the
-    ``--verify`` aged-out safety gate covers every unverified payment, not
-    only ``link_created`` rows.
+def _verify_aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
+    """Broader than ``app.services.reconciliation.aged_out_conditions``:
+    covers EVERY unverified payment regardless of status (not only
+    ``link_created`` rows) — the ``--verify`` safety gate must refuse for
+    ANY old, unverified payment, since a stale ``created``/``getlink_failed``
+    anomaly should not be able to dodge the aged-out refusal just by never
+    having reached ``link_created``. Reuses the EXACT same age-boundary
+    expression (``aged_out_age_condition``) the link_created-scoped
+    ``aged_out_conditions`` uses — only the ``status`` scope differs, never
+    a separately computed cutoff.
     """
-    cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
     return (
         Payment.gateway_verified_at.is_(None),
-        link_age_anchor() <= cutoff,
-    )
-
-
-def _active_bucket_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
-    fast_cutoff = now - timedelta(seconds=settings.reconciliation_fast_window_seconds)
-    return (
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),
-        link_age_anchor() > fast_cutoff,
-    )
-
-
-def _expiring_bucket_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
-    fast_cutoff = now - timedelta(seconds=settings.reconciliation_fast_window_seconds)
-    max_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
-    return (
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),
-        link_age_anchor() <= fast_cutoff,
-        link_age_anchor() > max_cutoff,
+        aged_out_age_condition(settings, now=now),
     )
 
 
@@ -127,7 +116,8 @@ class LocalSnapshot:
     attempts_exhausted: bool
     # Broader safety-gate flag used by --verify: True for ANY unverified
     # payment (any status) whose link is at least reconciliation_max_age_
-    # seconds old, not only link_created rows -- see _aged_out_conditions.
+    # seconds old, not only link_created rows -- see
+    # _verify_aged_out_conditions.
     verify_aged_out: bool
 
 
@@ -139,7 +129,9 @@ def build_local_snapshot(
     is_link_created_unverified = (
         payment.status == PaymentStatus.LINK_CREATED.value and payment.gateway_verified_at is None
     )
-    verify_aged_out = _condition_holds(db, payment.id, _aged_out_conditions(settings, now=now))
+    verify_aged_out = _condition_holds(
+        db, payment.id, _verify_aged_out_conditions(settings, now=now)
+    )
 
     active_tier_due = False
     expiring_tier_due = False
@@ -155,11 +147,11 @@ def build_local_snapshot(
         attempts_exhausted = _condition_holds(
             db, payment.id, reconciliation_exhausted_conditions(settings, now=now)
         )
-        if verify_aged_out:
+        if _condition_holds(db, payment.id, aged_out_conditions(settings, now=now)):
             age_bucket = "aged_out"
-        elif _condition_holds(db, payment.id, _active_bucket_conditions(settings, now=now)):
+        elif _condition_holds(db, payment.id, active_tier_age_conditions(settings, now=now)):
             age_bucket = "active"
-        elif _condition_holds(db, payment.id, _expiring_bucket_conditions(settings, now=now)):
+        elif _condition_holds(db, payment.id, expiring_tier_age_conditions(settings, now=now)):
             age_bucket = "expiring"
 
     return LocalSnapshot(
@@ -188,15 +180,21 @@ def determine_verify_refusal(
 ) -> VerifyRefusal | None:
     """Should ``--verify`` refuse to call the gateway for this payment?
 
-    Order matters: an already-verified or manual_review payment is refused
-    for its own specific reason even if it also happens to be old --
-    neither of those has (or needs) a confirmation override. Only a
-    payment that is none of those AND aged out needs --confirm-aged-out.
+    Order matters. ``manual_review`` is checked FIRST, before
+    ``gateway_verified_at``: a gateway-verified payment can legitimately
+    still be sitting in manual_review (e.g. a delivery-failure review that
+    never touched the financial/verification facts), and in that case the
+    operationally important fact is that an administrator already owns the
+    review -- not that it happens to also be gateway-verified. Either way
+    the command makes ZERO gateway calls. Aged-out is checked last: only a
+    payment that is neither already-verified nor manual_review needs
+    --confirm-aged-out, and neither of the first two reasons has (or
+    needs) a confirmation override.
     """
-    if payment.gateway_verified_at is not None:
-        return VerifyRefusal.ALREADY_VERIFIED
     if payment.status == PaymentStatus.MANUAL_REVIEW.value:
         return VerifyRefusal.MANUAL_REVIEW_OWNED
+    if payment.gateway_verified_at is not None:
+        return VerifyRefusal.ALREADY_VERIFIED
     if local.verify_aged_out and not confirm_aged_out:
         return VerifyRefusal.AGED_OUT
     return None

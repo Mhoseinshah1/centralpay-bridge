@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, not_, or_, select
 from sqlalchemy.orm import Session
 
 # app.adminbot.queries is a plain, Telegram-agnostic set of read-only SQL
@@ -50,6 +50,8 @@ from app.config import Settings
 from app.models import Payment, PaymentStatus
 from app.services.reconciliation import (
     ERROR_GATEWAY_NOT_PAID,
+    aged_out_age_condition,
+    aged_out_conditions,
     link_age_anchor,
     reconciliation_exhausted_conditions,
 )
@@ -157,13 +159,14 @@ def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]
     reconciliation lifetime and not exhausted: ordinary in-flight polling.
     Shared by the overview's WAITING_GATEWAY bucket and
     ``waiting_snapshot``/``count_waiting`` so they can never disagree about
-    the definition."""
-    anchor = link_age_anchor()
-    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
+    the definition. The "not aged out" half reuses
+    ``app.services.reconciliation.aged_out_age_condition`` (negated) --
+    the exact same boundary ``_expired_conditions`` below evaluates
+    positively -- never a locally re-derived cutoff."""
     return (
         Payment.status == PaymentStatus.LINK_CREATED.value,
         Payment.gateway_verified_at.is_(None),
-        anchor > expired_cutoff,
+        not_(aged_out_age_condition(settings, now=now)),
         or_(
             Payment.reconciliation_next_at.is_not(None),
             Payment.reconciliation_attempts < settings.reconciliation_max_attempts,
@@ -174,14 +177,11 @@ def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]
 def _expired_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
     """A link_created, unverified payment at or past
     reconciliation_max_age_seconds. Shared by the overview's EXPIRED bucket
-    and ``expired_snapshot``/``count_expired``."""
-    anchor = link_age_anchor()
-    expired_cutoff = now - timedelta(seconds=settings.reconciliation_max_age_seconds)
-    return (
-        Payment.status == PaymentStatus.LINK_CREATED.value,
-        Payment.gateway_verified_at.is_(None),
-        anchor <= expired_cutoff,
-    )
+    and ``expired_snapshot``/``count_expired`` -- identical to
+    ``app.services.reconciliation.aged_out_conditions``, reused directly
+    rather than re-derived, so this view can never quietly disagree with
+    ``reconciliation_status``'s ``PaymentBuckets.aged_out``."""
+    return aged_out_conditions(settings, now=now)
 
 
 def _waiting_entry(payment: Payment) -> StuckEntry:
