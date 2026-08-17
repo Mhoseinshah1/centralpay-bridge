@@ -12,6 +12,7 @@ mode performs zero writes and zero network calls.
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
@@ -87,7 +88,7 @@ def _add_event(
     event_type: str,
     level: str = "info",
     request_id: str | None = None,
-    data: dict | None = None,
+    data: dict[str, Any] | None = None,
     created_at: datetime | None = None,
 ) -> None:
     with session_factory() as db:
