@@ -20,20 +20,27 @@ enabled`` (default ``False``, checked in ``app.cli._cmd_reconcile`` before
 any lock or HTTP request) -- enable only after that staging validation
 closes B2.
 
-Age-boundary predicates are never hand-rederived: every tier/aged-out/
-exhausted check below queries the exact shared condition tuples imported
-from ``app.services.reconciliation`` (``active_tier_age_conditions``,
+Age-boundary predicates are never hand-rederived: every tier/aged-out
+check below queries the exact shared condition tuples imported from
+``app.services.reconciliation`` (``active_tier_age_conditions``,
 ``expiring_tier_age_conditions``, ``aged_out_age_condition``,
-``active_tier_due_conditions``, ``expiring_tier_due_conditions``,
-``reconciliation_exhausted_conditions``), scoped down to this one
-payment's id — so this view can never quietly disagree with what the
-reconciliation worker itself would do, the same reuse pattern
-``app.services.reconciliation_status`` and ``app.services.stuck_payments``
-already follow. This module defines NO local age-boundary math of its
-own beyond the ``--verify`` safety gate's deliberately broader status
-scope (see ``_verify_aged_out_conditions`` below) — even that reuses the
-shared ``aged_out_age_condition`` expression, never a separately
-computed cutoff.
+``active_tier_due_conditions``, ``expiring_tier_due_conditions``),
+scoped down to this one payment's id — so this view can never quietly
+disagree with what the reconciliation worker itself would do, the same
+reuse pattern ``app.services.reconciliation_status`` and
+``app.services.stuck_payments`` already follow. This module defines NO
+local age-boundary math of its own beyond the ``--verify`` safety gate's
+deliberately broader status scope (see ``_verify_aged_out_conditions``
+below) — even that reuses the shared ``aged_out_age_condition``
+expression, never a separately computed cutoff. The one deliberate
+exception is ``attempts_exhausted``: it is the raw fact ``reconciliation_
+attempts >= reconciliation_max_attempts`` read directly off the fetched
+row, NOT ``app.services.reconciliation.reconciliation_exhausted_
+conditions`` — that helper is a mutually-exclusive dashboard bucket
+(excludes aged-out rows, requires ``reconciliation_next_at IS NULL``) for
+``reconciliation_status.py``'s categorized summary, and would silently
+disagree with the ``reconciliation_attempts`` count shown in this same
+per-payment report for an aged-out or anomalous capped row.
 
 Consistency: :func:`build_local_snapshot` issues exactly ONE structured
 ``SELECT`` per call, returning the ``Payment`` row together with every
@@ -77,7 +84,6 @@ from app.services.reconciliation import (
     aged_out_conditions,
     expiring_tier_age_conditions,
     expiring_tier_due_conditions,
-    reconciliation_exhausted_conditions,
 )
 from app.services.verification import VERIFIED_STATUSES
 
@@ -107,8 +113,18 @@ def _verify_aged_out_conditions(settings: Settings, *, now: datetime) -> tuple[A
     expression (``aged_out_age_condition``) the link_created-scoped
     ``aged_out_conditions`` uses — only the ``status`` scope differs, never
     a separately computed cutoff.
+
+    "Unverified" here is defined the SAME way ``LocalSnapshot.
+    is_gateway_verified`` (negated) and ``determine_verify_refusal`` define
+    it: ``status NOT IN VERIFIED_STATUSES AND gateway_verified_at IS NULL``.
+    Checking ``gateway_verified_at`` alone would let a ``gateway_verified``
+    row with ``gateway_verified_at`` still NULL (a database-valid state --
+    see ``LocalSnapshot.is_gateway_verified``) report ``verify_aged_out:
+    true`` in the very same snapshot that reports ``gateway_verified: true``
+    and refuses ``--verify`` as already verified.
     """
     return (
+        Payment.status.not_in(VERIFIED_STATUSES),
         Payment.gateway_verified_at.is_(None),
         aged_out_age_condition(settings, now=now),
     )
@@ -174,7 +190,6 @@ def build_local_snapshot(
     aged_out_expr = and_(*aged_out_conditions(settings, now=now))
     active_due_expr = and_(*active_tier_due_conditions(settings, now=now))
     expiring_due_expr = and_(*expiring_tier_due_conditions(settings, now=now))
-    exhausted_expr = and_(*reconciliation_exhausted_conditions(settings, now=now))
     verify_aged_out_expr = and_(*_verify_aged_out_conditions(settings, now=now))
 
     stmt = (
@@ -185,7 +200,6 @@ def build_local_snapshot(
             aged_out_expr.label("aged_out"),
             active_due_expr.label("active_due"),
             expiring_due_expr.label("expiring_due"),
-            exhausted_expr.label("exhausted"),
             verify_aged_out_expr.label("verify_aged_out"),
         )
         .where(Payment.id == payment_id)
@@ -218,7 +232,16 @@ def build_local_snapshot(
     # again here, which would risk drifting from the shared predicates.
     active_tier_due = bool(row.active_due)
     expiring_tier_due = bool(row.expiring_due)
-    attempts_exhausted = bool(row.exhausted)
+    # Deliberately NOT app.services.reconciliation.reconciliation_exhausted_
+    # conditions: that helper is a mutually-exclusive DASHBOARD BUCKET (it
+    # excludes aged-out rows and requires reconciliation_next_at IS NULL) so
+    # a bucketed summary never double-counts one payment. A single-payment
+    # report has no such constraint -- attempts_exhausted here is the raw
+    # fact "attempts >= the cap", read directly off this SAME row, so it can
+    # never contradict the reconciliation_attempts count in the same report
+    # (e.g. for a payment that is BOTH capped on attempts AND aged out, or
+    # an anomalous capped row whose reconciliation_next_at is still set).
+    attempts_exhausted = payment.reconciliation_attempts >= settings.reconciliation_max_attempts
     age_bucket: str | None = None
     if row.aged_out:
         age_bucket = "aged_out"

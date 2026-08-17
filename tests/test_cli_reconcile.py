@@ -1061,6 +1061,96 @@ def test_reconcile_reports_reconciliation_aged_out_separately_from_verify_gate(
     assert local["verify_aged_out"] is True  # but --verify's broader gate would still refuse it
 
 
+def test_verify_aged_out_excludes_verified_statuses_even_with_null_timestamp(
+    cli_env, session_factory, settings, capsys
+):
+    """Codex follow-up: verify_aged_out must be defined by the SAME
+    "unverified" rule as is_gateway_verified's negation (status NOT IN
+    VERIFIED_STATUSES AND gateway_verified_at IS NULL), not by
+    gateway_verified_at alone. An old gateway_verified payment with
+    gateway_verified_at still NULL is database-valid (see
+    is_gateway_verified) and must report verify_aged_out=False -- reporting
+    True would contradict gateway_verified=True in the very same
+    response."""
+    _make_status_payment(
+        session_factory,
+        bot_order_id="rc-p1-gv-null-ts-old",
+        gateway_order_id=940008,
+        status=PaymentStatus.GATEWAY_VERIFIED.value,
+        gateway_verified_at=None,
+    )
+    _age_payment(
+        session_factory,
+        "rc-p1-gv-null-ts-old",
+        seconds=settings.reconciliation_max_age_seconds + 120,
+    )
+
+    assert cli_main(["reconcile", "rc-p1-gv-null-ts-old", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    local = payload["local"]
+    assert local["gateway_verified"] is True
+    assert local["verify_aged_out"] is False
+
+
+def test_reconcile_attempts_exhausted_reported_even_when_also_aged_out(
+    cli_env, session_factory, settings, capsys
+):
+    """Codex follow-up: attempts_exhausted must be the raw fact
+    (reconciliation_attempts >= reconciliation_max_attempts), not
+    app.services.reconciliation.reconciliation_exhausted_conditions -- that
+    helper deliberately EXCLUDES aged-out rows (it is a mutually-exclusive
+    dashboard bucket for reconciliation_status.py), which would make a
+    payment that is BOTH capped on attempts AND aged out report
+    attempts_exhausted=False, directly contradicting the
+    reconciliation_attempts count shown in the very same report."""
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="rc-attempts-and-aged-out",
+            gateway_order_id=940009,
+            gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+            amount=5000,
+            payable_amount=5000,
+            status=PaymentStatus.LINK_CREATED.value,
+            callback_token_issued_at=(
+                datetime.now(UTC)
+                - timedelta(seconds=settings.reconciliation_max_age_seconds + 120)
+            ),
+            reconciliation_attempts=settings.reconciliation_max_attempts,
+        )
+        db.add(payment)
+        db.commit()
+
+    assert cli_main(["reconcile", "rc-attempts-and-aged-out", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    reconciliation = payload["local"]["reconciliation"]
+    assert reconciliation["attempts"] == settings.reconciliation_max_attempts
+    assert reconciliation["age_bucket"] == "aged_out"
+    assert reconciliation["attempts_exhausted"] is True
+
+
+def test_find_payment_handles_unicode_digit_characters_int_cannot_parse(
+    cli_env, session_factory, capsys
+):
+    """Codex follow-up: str.isdigit() is True for Unicode "digit" characters
+    (e.g. superscript '²') that int() cannot parse (ValueError).
+    bot_order_id's validation pattern (app/api/payments.py) permits any
+    non-control Unicode character, so such an order_id is reachable in
+    practice. _find_payment must use str.isdecimal() -- exactly the set
+    int() accepts -- instead, and must not crash."""
+    weird_bot_order_id = "²²²"  # "²²²": isdigit() True, isdecimal() False
+    _make_minimal_payment(
+        session_factory, bot_order_id=weird_bot_order_id, gateway_order_id=940010
+    )
+
+    assert cli_main(["payment", weird_bot_order_id]) == 0
+    payment_out = capsys.readouterr().out
+    assert weird_bot_order_id in payment_out
+
+    assert cli_main(["reconcile", weird_bot_order_id]) == 0
+    reconcile_out = capsys.readouterr().out
+    assert weird_bot_order_id in reconcile_out
+
+
 # --- final safety follow-up: --verify gated behind an off-by-default flag --
 #
 # settings.centralpay_diagnostic_verify_enabled defaults False in production

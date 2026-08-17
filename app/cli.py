@@ -167,7 +167,12 @@ def _find_payment(db: Session, order_id: str) -> Payment | None:
     payment = db.execute(
         select(Payment).where(Payment.bot_order_id == order_id)
     ).scalar_one_or_none()
-    if order_id.isdigit() and int(order_id) <= _POSTGRES_BIGINT_MAX:
+    # str.isdigit() is True for Unicode "digit" characters int() cannot
+    # parse (e.g. superscript '²', ValueError) -- bot_order_id's validation
+    # pattern permits any non-control Unicode, so this is reachable.
+    # str.isdecimal() is exactly the set int() accepts (Unicode category
+    # Nd), so it is used here instead.
+    if order_id.isdecimal() and int(order_id) <= _POSTGRES_BIGINT_MAX:
         gateway_payment = db.execute(
             select(Payment).where(Payment.gateway_order_id == int(order_id))
         ).scalar_one_or_none()
