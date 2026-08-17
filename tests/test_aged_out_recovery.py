@@ -701,6 +701,82 @@ def test_recover_aged_out_confirm_locks_row(
     assert for_update_flags == [True]
 
 
+def test_recover_aged_out_confirm_configures_structured_logging_and_admin_alerts(
+    cli_env, session_factory, settings, stub, monkeypatch, capsys
+):
+    """Codex follow-up: --confirm is the ONLY mutating command in app.cli,
+    so -- like app.ops's own mutating commands (e.g. `review resend`) --
+    it must configure structured/redacted logging and enable admin-alert
+    creation before attempting settlement; otherwise a manual_review or
+    verified outcome from a deliberate operator recovery would silently
+    never alert administrators, and its audit events would never reach
+    the structured log stream. Logging must be routed to STDERR (never
+    the default stdout) so it can never interleave with and corrupt
+    --json's single-object-on-stdout contract."""
+    import sys as sys_module
+
+    import app.cli as cli_module
+
+    _patch_centralpay_client(monkeypatch, stub)
+    payment = _make_aged_out_payment(
+        session_factory,
+        settings,
+        bot_order_id="rec-confirm-logging-alerts",
+        gateway_order_id=220021,
+    )
+    stub.verify_result = verify_ok_response(
+        amount=payment.amount, user_id=payment.gateway_user_id, reference_id="REF-logging-alerts"
+    )
+
+    logging_calls: list[dict[str, object]] = []
+    alert_calls: list[object] = []
+
+    def spy_configure_logging(settings_arg, *, stream=None):
+        logging_calls.append({"settings": settings_arg, "stream": stream})
+
+    def spy_configure_alert_creation(settings_arg):
+        alert_calls.append(settings_arg)
+
+    monkeypatch.setattr(cli_module, "configure_logging", spy_configure_logging)
+    monkeypatch.setattr(cli_module, "configure_alert_creation", spy_configure_alert_creation)
+
+    assert (
+        cli_main(["recover-aged-out", "rec-confirm-logging-alerts", "--confirm", "--json"]) == 0
+    )
+    capsys.readouterr()
+
+    assert len(logging_calls) == 1
+    assert logging_calls[0]["settings"] is settings
+    assert logging_calls[0]["stream"] is sys_module.stderr
+    assert alert_calls == [settings]
+
+
+def test_recover_aged_out_preview_never_configures_logging_or_alerts(
+    cli_env, session_factory, settings, monkeypatch, capsys
+):
+    """The read-only preview path must never touch shared logging/alert
+    configuration -- only --confirm, the one mutating path, needs it."""
+    import app.cli as cli_module
+
+    _make_aged_out_payment(
+        session_factory,
+        settings,
+        bot_order_id="rec-preview-no-logging-alerts",
+        gateway_order_id=220022,
+    )
+
+    calls: list[str] = []
+    monkeypatch.setattr(cli_module, "configure_logging", lambda *a, **k: calls.append("logging"))
+    monkeypatch.setattr(
+        cli_module, "configure_alert_creation", lambda *a, **k: calls.append("alerts")
+    )
+
+    assert cli_main(["recover-aged-out", "rec-preview-no-logging-alerts"]) == 0
+    capsys.readouterr()
+
+    assert calls == []
+
+
 # --- --confirm: gateway not paid --------------------------------------------
 
 
@@ -796,6 +872,12 @@ def test_recover_aged_out_confirm_connection_error_delivery_uncertain(
     assert "No local settlement was applied." in out
     # Never claims a gateway-side fact this command cannot prove.
     assert "request reached gateway: yes" not in out
+    # Codex follow-up: must never casually suggest an immediate retry
+    # without acknowledging CentralPay's own unconfirmed verify-after-verify
+    # behavior for a request whose delivery is uncertain.
+    assert "does not auto-retry" in out
+    assert "never been confirmed safe" in out
+    assert "STAGING_VALIDATION.md" in out
 
     refetched = get_payment(session_factory, "rec-confirm-transport")
     assert refetched.status == PaymentStatus.LINK_CREATED.value
@@ -836,6 +918,12 @@ def test_recover_aged_out_confirm_non_connection_transport_error_request_proven_
     assert "request reached gateway: yes (response could not be used)" in out
     assert "delivery uncertain" not in out
     assert "No local settlement was applied." in out
+    assert "run --confirm again for a fresh, deliberate attempt" in out
+    # The verify-after-verify safety caveat is specific to the
+    # connection-level (delivery-uncertain) case -- the gateway definitely
+    # answered THIS request, so there is no such ambiguity to weigh here.
+    assert "STAGING_VALIDATION.md" not in out
+    assert "never been confirmed safe" not in out
 
     refetched = get_payment(session_factory, "rec-confirm-rejected-status")
     assert refetched.status == PaymentStatus.LINK_CREATED.value

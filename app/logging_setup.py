@@ -11,6 +11,7 @@ import sys
 from collections.abc import Iterable
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from typing import TextIO
 
 from sqlalchemy.engine.url import make_url
 
@@ -118,9 +119,21 @@ class TextFormatter(logging.Formatter):
         return line
 
 
-def configure_logging(settings: Settings) -> None:
+def configure_logging(settings: Settings, *, stream: TextIO | None = None) -> None:
+    """``stream=None`` (the default) resolves to ``sys.stdout`` AT CALL
+    TIME, not at import time -- a default of literal ``sys.stdout`` would
+    bind whatever stream object existed when this module was first
+    imported, silently breaking any caller whose ``sys.stdout`` is later
+    replaced (e.g. pytest's ``capsys``). Every existing caller (the API,
+    worker, admin bot, and app.ops -- all long-running services or
+    single-purpose commands whose stdout IS the log-collection stream)
+    keeps this default. A caller whose stdout is ALREADY a machine-readable
+    command result (e.g. `app.cli recover-aged-out --confirm --json`,
+    which promises exactly one JSON object on stdout) must pass
+    ``stream=sys.stderr`` instead, so structured/redacted log lines can
+    never interleave with and corrupt that single-object contract."""
     redactor = SecretRedactor(collect_secret_values(settings))
-    handler = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
     formatter: logging.Formatter
     if settings.log_format == "text":
         formatter = TextFormatter(redactor)

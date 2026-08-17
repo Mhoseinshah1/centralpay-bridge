@@ -94,10 +94,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adminbot.alerts import configure_alert_creation
 from app.centralpay import CentralPayClient
 from app.config import Settings
 from app.db import create_session_factory
 from app.exceptions import CentralPayConnectionError, CentralPayError
+from app.logging_setup import configure_logging
 from app.models import Payment, PaymentEvent, PaymentStatus
 from app.services.aged_out_recovery import (
     RecoveryOutcomeKind,
@@ -1090,6 +1092,18 @@ def _cmd_recover_aged_out(
             print(f"  {_NO_LOCAL_CHANGES_LINE}")
         return 0
 
+    # --confirm is the only mutating path in this command, so -- unlike
+    # every other app.cli command, which is read-only -- it must match the
+    # setup app.ops's own mutating commands (e.g. `review resend`) already
+    # do: structured/redacted logging for the events this attempt records,
+    # and admin-alert creation so a manual_review or verified outcome from
+    # a deliberate operator recovery alerts administrators exactly like any
+    # other settlement does. Logs are routed to STDERR (never the default
+    # stdout) so they can never interleave with and corrupt this command's
+    # own `--json` single-object-on-stdout contract.
+    configure_logging(settings, stream=sys.stderr)
+    configure_alert_creation(settings)
+
     client = CentralPayClient(
         base_url=settings.centralpay_base_url,
         getlink_api_key=settings.centralpay_getlink_api_key,
@@ -1144,18 +1158,37 @@ def _cmd_recover_aged_out(
         elif outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED:
             print("--- --confirm: transport_failed ---")
             print(f"  error code:              {outcome.transport_error_code}")
+            print("  No local settlement was applied.")
             if outcome.delivery_uncertain:
                 print(
                     "  delivery uncertain:      the request may or may not have "
                     "reached the gateway"
                 )
+                # CentralPay's own verify-after-verify/idempotency behavior
+                # has never been confirmed safe against production (see
+                # STAGING_VALIDATION.md, the same caveat that gates
+                # `reconcile --verify`'s diagnostic re-verification). A
+                # connection-level failure means this request's OWN outcome
+                # at the gateway is unknown -- retrying issues a genuinely
+                # NEW verify call while that is still true, so this command
+                # does not auto-retry and an operator choosing to run
+                # --confirm again should do so deliberately, not reflexively.
+                print(
+                    "  This command does not auto-retry. Before running --confirm "
+                    "again, consider that CentralPay's behavior when verify.php is "
+                    "queried again for an order it may already have processed has "
+                    "never been confirmed safe (see STAGING_VALIDATION.md) -- "
+                    "investigate this order with CentralPay directly if unsure."
+                )
             else:
                 print("  request reached gateway: yes (response could not be used)")
-            print("  No local settlement was applied.")
-            print(
-                "  This command does not auto-retry -- run --confirm again later "
-                "for a fresh, deliberate attempt."
-            )
+                # The gateway answered THIS request -- there is no
+                # verify-after-verify ambiguity to weigh, unlike the
+                # connection-level case above.
+                print(
+                    "  This command does not auto-retry -- run --confirm again for "
+                    "a fresh, deliberate attempt."
+                )
         else:
             print(f"--- --confirm: {outcome.kind.value} ---")
             print(f"  {_RECOVERY_OUTCOME_MESSAGE[outcome.kind]}")
