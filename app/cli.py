@@ -17,20 +17,38 @@ for a single machine-readable JSON object instead). These commands never
 modify data and never print secrets, redirect URLs, or full card numbers.
 
 `reconcile` NEVER writes to the database in either mode. By default it is
-LOCAL-ONLY (no network call, no lock, one consistent read). `--verify`
-additionally performs exactly ONE fresh, read-only CentralPayClient.verify()
-call and reports what settlement WOULD conclude -- it never settles, never
-invokes any mutating settlement or callback-processing path
-(app.services.verification / app.services.reconciliation), and never claims
-a reconciliation slot. `--verify` acquires the SAME row-lock discipline the
+LOCAL-ONLY (no network call, no lock, one consistent read). ORDER_ID
+resolution refuses rather than guesses: if the numeric string given also
+happens to be a DIFFERENT payment's bot_order_id and gateway_order_id, the
+command reports `ambiguous_order_id` instead of silently picking one.
+
+`--verify` performs exactly ONE fresh CentralPayClient.verify() call and
+reports what settlement WOULD conclude -- it never settles, never invokes
+any mutating settlement or callback-processing path (app.services.
+verification / app.services.reconciliation), and never claims a
+reconciliation slot. This is diagnostic gateway verification with no LOCAL
+database mutation; it is NOT known to be read-only on the gateway side --
+real CentralPay verify.php verify-after-verify/idempotency behavior has
+never been confirmed (release blocker B2, see STAGING_VALIDATION.md) --
+so `--verify` is gated behind `settings.centralpay_diagnostic_verify_
+enabled` (env `CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED`, default false).
+When disabled, `--verify` refuses with `diagnostic_verify_not_enabled`
+BEFORE any row lock and BEFORE any HTTP request; `--confirm-aged-out`
+cannot bypass this gate. Only enable after the STAGING_VALIDATION.md
+procedure confirms real verify-after-verify behavior is safe.
+
+Once enabled, `--verify` acquires the SAME row-lock discipline the
 mutating settlement path (app.services.verification) requires its caller to
 hold (`SELECT ... FOR UPDATE`), RELOADS the payment and its eligibility
-flags under that lock, and holds the lock across its own diagnostic gateway
-call -- closing the race where a concurrent callback or reconciliation
-attempt could settle the payment between an earlier, non-locking read and
-this diagnostic call. `--verify` refuses (without any network call, checked
-AFTER the row lock is held) when the payment is already locally
-gateway-verified, is in manual_review, or is aged out
+flags under that lock USING A TIMESTAMP TAKEN AFTER THE LOCK IS ACQUIRED
+(not before any wait behind a concurrent transaction), and holds the lock
+across its own diagnostic gateway call -- closing both the race where a
+concurrent callback or reconciliation attempt could settle the payment
+between an earlier, non-locking read and this diagnostic call, and the
+narrower race where the payment ages out WHILE this command waits for the
+lock. `--verify` refuses (without any network call, checked AFTER the row
+lock is held and the post-lock timestamp is taken) when the payment is
+already locally gateway-verified, is in manual_review, or is aged out
 (RECONCILIATION_MAX_AGE_SECONDS or older) -- the last case requires the
 explicit `--confirm-aged-out` override, which remains fully read-only. See
 app.services.reconcile_inspect.
@@ -58,7 +76,7 @@ from sqlalchemy.orm import Session
 from app.centralpay import CentralPayClient
 from app.config import Settings
 from app.db import create_session_factory
-from app.exceptions import CentralPayError
+from app.exceptions import CentralPayConnectionError, CentralPayError
 from app.models import Payment, PaymentEvent, PaymentStatus
 from app.services.reconcile_inspect import (
     LocalSnapshot,
@@ -121,21 +139,40 @@ def _cmd_recent(db: Session, limit: int) -> int:
     return 0
 
 
+class AmbiguousOrderIdError(Exception):
+    """Raised by `_find_payment` when ORDER_ID is a numeric string that
+    names TWO DIFFERENT payments at once -- one by bot_order_id, another by
+    gateway_order_id. Silently picking either risks inspecting or verifying
+    the wrong payment, so callers must refuse instead of guessing."""
+
+
 def _find_payment(db: Session, order_id: str) -> Payment | None:
     """Look up a payment by bot_order_id, falling back to the numeric
-    gateway_order_id -- shared by every command that takes ORDER_ID."""
+    gateway_order_id -- shared by every command that takes ORDER_ID.
+
+    Raises AmbiguousOrderIdError if ORDER_ID is numeric and matches one
+    payment's bot_order_id and a DIFFERENT payment's gateway_order_id."""
     payment = db.execute(
         select(Payment).where(Payment.bot_order_id == order_id)
     ).scalar_one_or_none()
-    if payment is None and order_id.isdigit():
-        payment = db.execute(
+    if order_id.isdigit():
+        gateway_payment = db.execute(
             select(Payment).where(Payment.gateway_order_id == int(order_id))
         ).scalar_one_or_none()
+        if gateway_payment is not None:
+            if payment is None:
+                payment = gateway_payment
+            elif payment.id != gateway_payment.id:
+                raise AmbiguousOrderIdError(order_id)
     return payment
 
 
 def _cmd_payment(db: Session, order_id: str) -> int:
-    payment = _find_payment(db, order_id)
+    try:
+        payment = _find_payment(db, order_id)
+    except AmbiguousOrderIdError:
+        _print({"error": "ambiguous_order_id", "order_id": order_id})
+        return 1
     if payment is None:
         _print({"error": "payment_not_found", "order_id": order_id})
         return 1
@@ -498,6 +535,13 @@ def _cmd_reconciliation_status(db: Session, settings: Settings, *, as_json: bool
 _NO_LOCAL_CHANGES_LINE = "NO LOCAL CHANGES WERE MADE."
 
 _VERIFY_REFUSAL_MESSAGE = {
+    VerifyRefusal.DIAGNOSTIC_VERIFY_DISABLED: (
+        "Refusing to verify: diagnostic gateway verification is disabled "
+        "(CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED=false). Real CentralPay verify.php "
+        "verify-after-verify/idempotency behavior has not been confirmed against "
+        "the production gateway (see STAGING_VALIDATION.md); enable only after "
+        "that staging validation closes. No gateway call was made."
+    ),
     VerifyRefusal.ALREADY_VERIFIED: (
         "Refusing to re-verify: this payment is already locally gateway-verified "
         "(gateway_verified_at is set). No gateway call was made."
@@ -509,7 +553,7 @@ _VERIFY_REFUSAL_MESSAGE = {
     VerifyRefusal.AGED_OUT: (
         "Refusing to verify: this payment's link is aged out "
         "(>= RECONCILIATION_MAX_AGE_SECONDS old) and unverified. "
-        "Pass --verify --confirm-aged-out to force one read-only gateway query anyway. "
+        "Pass --verify --confirm-aged-out to force one diagnostic gateway query anyway. "
         "No gateway call was made."
     ),
 }
@@ -586,7 +630,7 @@ def _verify_comparison_dict(comparison: VerifyComparison) -> dict[str, Any]:
 
 def _print_verify_comparison_human(comparison: VerifyComparison) -> None:
     print()
-    print("--- --verify: fresh READ-ONLY gateway check (diagnostic only) ---")
+    print("--- --verify: fresh diagnostic gateway check (no LOCAL database mutation) ---")
     print(f"  gateway response:        {comparison.assessment.value}")
     if not comparison.gateway_success:
         print(f"  internal failure reason: {comparison.gateway_failure_reason or 'unknown'}")
@@ -636,16 +680,19 @@ def _cmd_reconcile(
     # id names -- never as the source of the displayed fields or the
     # eligibility check (see build_local_snapshot calls below, which are
     # the sole source of both).
-    found = _find_payment(db, order_id)
+    try:
+        found = _find_payment(db, order_id)
+    except AmbiguousOrderIdError:
+        _print({"error": "ambiguous_order_id", "order_id": order_id})
+        return 1
     if found is None:
         _print({"error": "payment_not_found", "order_id": order_id})
         return 1
     payment_id = found.id
 
-    now = datetime.now(UTC)
-
     if not verify:
         # Default inspection: no lock, one consistent read.
+        now = datetime.now(UTC)
         snapshot = build_local_snapshot(db, settings, payment_id, now=now)
         if snapshot is None:
             _print({"error": "payment_not_found", "order_id": order_id})
@@ -657,15 +704,61 @@ def _cmd_reconcile(
             _print_reconcile_local_human(payment, local)
         return 0
 
-    # --verify: acquire the SAME row-lock discipline the mutating settlement
-    # path (app.services.verification) requires its caller to hold, and
-    # RELOAD the payment and its eligibility flags under that lock --
-    # closing the window where a concurrent callback or
-    # reconciliation attempt could settle this payment between an earlier,
-    # non-locking read and the diagnostic gateway call below. The lock is
-    # held across that gateway call and released normally when this
-    # command's database transaction ends (no commit is ever made). Zero
-    # persistent DB mutations either way.
+    # --verify is gated behind an explicit, off-by-default configuration
+    # flag -- see the module docstring and STAGING_VALIDATION.md. Checked
+    # BEFORE any row lock and BEFORE any HTTP request; --confirm-aged-out
+    # cannot bypass it.
+    if not settings.centralpay_diagnostic_verify_enabled:
+        now = datetime.now(UTC)
+        snapshot = build_local_snapshot(db, settings, payment_id, now=now)
+        if snapshot is None:
+            _print({"error": "payment_not_found", "order_id": order_id})
+            return 1
+        payment, local = snapshot
+        if as_json:
+            _print(
+                {
+                    "local": _reconcile_local_dict(payment, local),
+                    "verify": {
+                        "requested": True,
+                        "performed": False,
+                        "refused": VerifyRefusal.DIAGNOSTIC_VERIFY_DISABLED.value,
+                        "note": _NO_LOCAL_CHANGES_LINE,
+                    },
+                }
+            )
+        else:
+            _print_reconcile_local_human(payment, local)
+            print()
+            print("--- --verify: refused ---")
+            print(f"  {_VERIFY_REFUSAL_MESSAGE[VerifyRefusal.DIAGNOSTIC_VERIFY_DISABLED]}")
+            print(f"  {_NO_LOCAL_CHANGES_LINE}")
+        return 0
+
+    # Acquire the SAME row-lock discipline the mutating settlement path
+    # (app.services.verification) requires its caller to hold. This minimal
+    # lock probe may BLOCK behind a concurrent callback or reconciliation
+    # transaction -- only once it returns is the lock actually held.
+    locked = db.execute(
+        select(Payment.id).where(Payment.id == payment_id).with_for_update()
+    ).scalar_one_or_none()
+    if locked is None:
+        _print({"error": "payment_not_found", "order_id": order_id})
+        return 1
+
+    # `now` is captured AFTER the lock above is actually acquired -- never
+    # before any wait behind a concurrent transaction -- so the aged-out
+    # gate below cannot be evaluated against a stale pre-wait timestamp.
+    now = datetime.now(UTC)
+
+    # RELOAD the payment and its eligibility flags under the lock just
+    # acquired (a second `FOR UPDATE` on a row this transaction already
+    # locks is instant, never a second wait) -- closing the window where a
+    # concurrent callback or reconciliation attempt could settle this
+    # payment between an earlier, non-locking read and the diagnostic
+    # gateway call below. The lock is held across that gateway call and
+    # released normally when this command's database transaction ends (no
+    # commit is ever made). Zero persistent DB mutations either way.
     locked_snapshot = build_local_snapshot(db, settings, payment_id, now=now, for_update=True)
     if locked_snapshot is None:
         _print({"error": "payment_not_found", "order_id": order_id})
@@ -704,13 +797,28 @@ def _cmd_reconcile(
         try:
             result = client.verify(order_id=payment.gateway_order_id)
         except CentralPayError as exc:
+            # The POST may have already reached the gateway even though no
+            # usable result came back -- httpx cannot distinguish "never
+            # left this process" from "sent, but the response was lost" for
+            # a connection-level failure (a timeout can occur after the
+            # request bytes were already written), so that case is reported
+            # as genuinely uncertain rather than guessed as not-performed.
+            # A non-200 status or an unparseable body both PROVE the
+            # request was transmitted and answered -- never "not performed".
+            performed: bool | None
+            delivery_uncertain: bool
+            if isinstance(exc, CentralPayConnectionError):
+                performed, delivery_uncertain = None, True
+            else:
+                performed, delivery_uncertain = True, False
             if as_json:
                 _print(
                     {
                         "local": _reconcile_local_dict(payment, local),
                         "verify": {
                             "requested": True,
-                            "performed": False,
+                            "performed": performed,
+                            "delivery_uncertain": delivery_uncertain,
                             "refused": None,
                             "transport_error_code": exc.code,
                             "note": _NO_LOCAL_CHANGES_LINE,
@@ -722,6 +830,13 @@ def _cmd_reconcile(
                 print()
                 print("--- --verify: gateway call failed (transport/protocol) ---")
                 print(f"  error code:              {exc.code}")
+                if delivery_uncertain:
+                    print(
+                        "  delivery uncertain:      the request may or may not have "
+                        "reached the gateway"
+                    )
+                else:
+                    print("  request reached gateway: yes (response could not be used)")
                 print(f"  {_NO_LOCAL_CHANGES_LINE}")
             return 1
     finally:
@@ -785,15 +900,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reconcile = subparsers.add_parser(
         "reconcile",
-        help="inspect one payment (local-only); --verify performs one read-only "
-        "gateway check, never a settlement",
+        help="inspect one payment (local-only); --verify performs one diagnostic "
+        "gateway check (off by default), never a settlement",
     )
     reconcile.add_argument("order_id")
     reconcile.add_argument(
         "--verify",
         action="store_true",
-        help="perform exactly one fresh, read-only CentralPay verify.php call and "
-        "report what settlement would conclude; never writes to the database",
+        help="perform exactly one fresh, diagnostic CentralPay verify.php call and "
+        "report what settlement would conclude; never writes to the database; "
+        "requires CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED=true",
     )
     reconcile.add_argument(
         "--confirm-aged-out",

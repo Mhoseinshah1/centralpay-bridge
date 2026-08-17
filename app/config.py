@@ -352,6 +352,16 @@ class Settings(BaseSettings):
     # payments already in flight is never affected.
     payment_creation_enabled: bool = True
     centralpay_timeout_seconds: float = Field(default=15.0, gt=0)
+    # Off by default: real CentralPay verify.php verify-after-verify /
+    # idempotency behavior has never been confirmed against the production
+    # gateway (release blocker B2 -- see STAGING_VALIDATION.md). `centralpay
+    # reconcile ORDER_ID --verify` intentionally performs a gateway call
+    # while making NO local database mutation; if verify.php is not safe to
+    # call repeatedly, an unguarded diagnostic call could diverge gateway
+    # state from local state. Set true only after the staging procedure in
+    # STAGING_VALIDATION.md closes B2. `centralpay reconcile ORDER_ID`
+    # without --verify is unaffected -- it never contacts the gateway.
+    centralpay_diagnostic_verify_enabled: bool = False
 
     # Bot notification (Phase 2). Empty values are allowed so the API service
     # can run without notification configured; the worker refuses to start

@@ -14,6 +14,7 @@ Requires TEST_DATABASE_URL pointing at a disposable PostgreSQL database.
 import concurrent.futures
 import os
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -467,3 +468,82 @@ def test_reconcile_snapshot_never_combines_stale_payment_with_newer_classificati
         stop.set()
         writer_thread.join(timeout=30)
     assert not writer_thread.is_alive()
+
+
+# --- final safety follow-up: `now` recomputed AFTER the lock is acquired ----
+
+
+def test_reconcile_verify_recomputes_aged_out_gate_using_time_after_lock_wait_pg(
+    cli_env, settings, pg_app, pg_session_factory, monkeypatch, capsys
+):
+    """`now` must be captured AFTER the --verify row lock is actually
+    acquired, not before any wait behind a concurrent transaction's hold on
+    the SAME row -- otherwise a payment that crosses
+    RECONCILIATION_MAX_AGE_SECONDS WHILE the CLI waits for the lock could
+    bypass the aged-out gate using a stale, pre-wait timestamp.
+
+    A background thread acquires and holds a REAL PostgreSQL row lock on
+    the payment BEFORE the CLI starts, for long enough that the payment
+    crosses RECONCILIATION_MAX_AGE_SECONDS purely from elapsed wall-clock
+    time while the CLI's own ``SELECT ... FOR UPDATE`` blocks waiting for
+    it. The payment is NOT yet aged out at the moment the CLI queues behind
+    the lock -- only by the time the lock is actually acquired. Once the
+    background thread releases and the CLI's wait ends, the CLI must
+    classify the payment as aged out USING THE TIME AT THAT MOMENT and
+    refuse, making zero gateway calls."""
+    stub = pg_app.state.centralpay_stub
+    _patch_centralpay_client(monkeypatch, stub)
+
+    hold_seconds = 2.5
+    with pg_session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="pg-post-lock-aged-out",
+                gateway_order_id=850010,
+                gateway_user_id=1,
+                amount=4000,
+                payable_amount=4000,
+                status=PaymentStatus.LINK_CREATED.value,
+                # Just under RECONCILIATION_MAX_AGE_SECONDS when the holder
+                # thread starts locking the row -- not aged out yet.
+                callback_token_issued_at=datetime.now(UTC)
+                - timedelta(seconds=settings.reconciliation_max_age_seconds - 1.0),
+            )
+        )
+        db.commit()
+
+    holder_ready = threading.Event()
+
+    def hold_lock():
+        with pg_session_factory() as holder_db:
+            holder_db.execute(
+                select(Payment)
+                .where(Payment.bot_order_id == "pg-post-lock-aged-out")
+                .with_for_update()
+            ).scalar_one()
+            holder_ready.set()
+            # Held for longer than the payment's remaining margin to
+            # RECONCILIATION_MAX_AGE_SECONDS -- it ages out purely from
+            # this real elapsed wait, not from any injected state change.
+            time.sleep(hold_seconds)
+            holder_db.commit()
+
+    holder_thread = threading.Thread(target=hold_lock)
+    holder_thread.start()
+    try:
+        assert holder_ready.wait(timeout=10)  # the background thread genuinely holds the row
+        # Blocks here on the SAME real PostgreSQL row lock until the
+        # holder releases -- proving the wait is real, not merely sequenced.
+        assert cli_main(["reconcile", "pg-post-lock-aged-out", "--verify"]) == 0
+    finally:
+        holder_thread.join(timeout=30)
+    assert not holder_thread.is_alive()
+
+    out = capsys.readouterr().out
+    assert "aged out" in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+    assert len(stub.verify_requests) == 0  # refused before any gateway call
+
+    refetched = get_payment(pg_session_factory, "pg-post-lock-aged-out")
+    assert refetched.status == PaymentStatus.LINK_CREATED.value
+    assert refetched.gateway_verified_at is None

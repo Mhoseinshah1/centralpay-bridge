@@ -1,11 +1,15 @@
 """app.cli / app.services.reconcile_inspect: `centralpay reconcile ORDER_ID`.
 
 The safety contract under test: `reconcile` (default mode) NEVER makes a
-network call and NEVER writes to the database; `--verify` makes EXACTLY ONE
-read-only CentralPayClient.verify() call and still never writes to the
-database, never queues a notification, never records a PaymentEvent, and
-never calls verify_and_settle / process_callback / run_reconciliation_pass.
-It is a diagnostic prediction only -- see app/services/reconcile_inspect.py.
+network call and NEVER writes to the database; `--verify` (gated behind
+settings.centralpay_diagnostic_verify_enabled, off by default -- see
+app.config) makes EXACTLY ONE diagnostic CentralPayClient.verify() call and
+still never writes to the database, never queues a notification, never
+records a PaymentEvent, and never calls verify_and_settle / process_callback
+/ run_reconciliation_pass. It is a diagnostic prediction only -- see
+app/services/reconcile_inspect.py. The `settings` fixture (tests/conftest.py)
+enables the diagnostic-verify gate so this file's --verify tests exercise
+the real flow; the gate itself is tested directly further below.
 """
 
 import inspect
@@ -15,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.centralpay import CentralPayClient
 from app.cli import build_parser
@@ -307,6 +312,90 @@ def test_reconcile_lookup_supports_bot_order_id_and_numeric_gateway_order_id(
     by_gateway_order = capsys.readouterr().out
     assert "rc-lookup-1" in by_gateway_order
     assert str(payment.gateway_order_id) in by_gateway_order
+
+
+# --- Codex follow-up: refuse ambiguous numeric ORDER_IDs --------------------
+
+
+def _make_minimal_payment(session_factory, *, bot_order_id: str, gateway_order_id: int) -> None:
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id=bot_order_id,
+                gateway_order_id=gateway_order_id,
+                gateway_user_id=1,
+                amount=4000,
+                payable_amount=4000,
+                status=PaymentStatus.LINK_CREATED.value,
+            )
+        )
+        db.commit()
+
+
+def test_reconcile_refuses_ambiguous_order_id(cli_env, session_factory, capsys):
+    """A numeric ORDER_ID that is simultaneously one payment's bot_order_id
+    AND a DIFFERENT payment's gateway_order_id must never be silently
+    resolved to either one -- that could point --verify at the wrong
+    payment's gateway_order_id entirely."""
+    _make_minimal_payment(
+        session_factory, bot_order_id="778899001122", gateway_order_id=100201
+    )
+    _make_minimal_payment(
+        session_factory, bot_order_id="rc-ambiguous-other", gateway_order_id=778899001122
+    )
+
+    assert cli_main(["reconcile", "778899001122"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"error": "ambiguous_order_id", "order_id": "778899001122"}
+
+
+def test_reconcile_verify_also_refuses_ambiguous_order_id_with_zero_gateway_calls(
+    cli_env, session_factory, stub, monkeypatch, capsys
+):
+    """The ambiguity refusal is checked before anything else -- including
+    the diagnostic-verify-enabled gate and any gateway call."""
+    _patch_centralpay_client(monkeypatch, stub)
+    _make_minimal_payment(
+        session_factory, bot_order_id="778899003344", gateway_order_id=100202
+    )
+    _make_minimal_payment(
+        session_factory, bot_order_id="rc-ambiguous-verify-other", gateway_order_id=778899003344
+    )
+
+    assert cli_main(["reconcile", "778899003344", "--verify"]) == 1
+    out = capsys.readouterr().out
+    assert "ambiguous_order_id" in out
+    assert len(stub.verify_requests) == 0
+
+
+def test_reconcile_lookup_by_own_gateway_order_id_is_not_ambiguous(
+    cli_env, client, settings, session_factory, capsys
+):
+    """The common case must keep working: looking a payment up by its OWN
+    numeric gateway_order_id (which trivially also equals itself, not a
+    DIFFERENT payment) is not ambiguous."""
+    response = create_order(client, settings, order_id="rc-not-ambiguous", amount=5000)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "rc-not-ambiguous")
+
+    assert cli_main(["reconcile", str(payment.gateway_order_id)]) == 0
+    out = capsys.readouterr().out
+    assert "rc-not-ambiguous" in out
+
+
+def test_payment_command_refuses_ambiguous_order_id(cli_env, session_factory, capsys):
+    """The `payment` command shares `_find_payment` with `reconcile` and
+    must refuse the same way."""
+    _make_minimal_payment(
+        session_factory, bot_order_id="778899005566", gateway_order_id=100203
+    )
+    _make_minimal_payment(
+        session_factory, bot_order_id="payment-ambiguous-other", gateway_order_id=778899005566
+    )
+
+    assert cli_main(["payment", "778899005566"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"error": "ambiguous_order_id", "order_id": "778899005566"}
 
 
 # --- scenario 2: --verify, gateway not successful ---------------------------
@@ -718,6 +807,114 @@ def test_reconcile_verify_aged_out_with_confirm_makes_one_read_only_call(
     _assert_payment_unchanged(session_factory, "rc-aged-out-2", before)
 
 
+# --- final safety follow-up: --verify gated behind an off-by-default flag --
+#
+# settings.centralpay_diagnostic_verify_enabled defaults False in production
+# (app.config) -- real CentralPay verify.php verify-after-verify/idempotency
+# behavior has never been confirmed (STAGING_VALIDATION.md, blocker B2). The
+# shared `settings` fixture sets it True so every OTHER --verify test in this
+# file exercises the real flow; these tests build their own disabled copy.
+
+
+def test_reconcile_verify_disabled_by_default_refuses_before_any_http_request(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    import app.cli as cli_module
+
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-diag-disabled", amount=5000)
+    assert response.status_code == 200
+
+    disabled = settings.model_copy(update={"centralpay_diagnostic_verify_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    requests_before = len(stub.verify_requests)
+    assert cli_main(["reconcile", "rc-diag-disabled", "--verify", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"] == {
+        "requested": True,
+        "performed": False,
+        "refused": "diagnostic_verify_not_enabled",
+        "note": "NO LOCAL CHANGES WERE MADE.",
+    }
+    assert len(stub.verify_requests) == requests_before  # zero HTTP calls
+
+    assert cli_main(["reconcile", "rc-diag-disabled", "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "diagnostic gateway verification is disabled" in out
+    assert "CENTRALPAY_DIAGNOSTIC_VERIFY_ENABLED=false" in out
+    assert "NO LOCAL CHANGES WERE MADE." in out
+    assert len(stub.verify_requests) == requests_before
+
+
+def test_reconcile_verify_disabled_confirm_aged_out_cannot_bypass_gate(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    import app.cli as cli_module
+
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-diag-disabled-aged", amount=5000)
+    assert response.status_code == 200
+    _age_payment(
+        session_factory,
+        "rc-diag-disabled-aged",
+        seconds=settings.reconciliation_max_age_seconds + 120,
+    )
+
+    disabled = settings.model_copy(update={"centralpay_diagnostic_verify_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    assert (
+        cli_main(
+            ["reconcile", "rc-diag-disabled-aged", "--verify", "--confirm-aged-out", "--json"]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["refused"] == "diagnostic_verify_not_enabled"
+    assert len(stub.verify_requests) == 0
+
+
+def test_reconcile_default_inspection_unaffected_by_disabled_verify_gate(
+    cli_env, client, settings, session_factory, monkeypatch, capsys
+):
+    """`centralpay reconcile ORDER_ID` (no --verify) must keep working
+    identically whether or not diagnostic verify is enabled."""
+    import app.cli as cli_module
+
+    response = create_order(client, settings, order_id="rc-diag-disabled-default", amount=5000)
+    assert response.status_code == 200
+
+    disabled = settings.model_copy(update={"centralpay_diagnostic_verify_enabled": False})
+    monkeypatch.setattr(cli_module, "Settings", lambda: disabled)
+
+    assert cli_main(["reconcile", "rc-diag-disabled-default"]) == 0
+    out = capsys.readouterr().out
+    assert "rc-diag-disabled-default" in out
+    assert "link_created" in out
+
+
+def test_reconcile_verify_enabled_setting_preserves_full_verify_flow(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """Sanity check that the shared `settings` fixture actually exercises
+    the real --verify flow when the gate is enabled -- i.e. the gate is not
+    accidentally always-refusing."""
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-diag-enabled", amount=5000)
+    assert response.status_code == 200
+    payment = get_payment(session_factory, "rc-diag-enabled")
+    stub.verify_result = verify_ok_response(
+        amount=5000, user_id=payment.gateway_user_id, reference_id="REF-diag-enabled"
+    )
+
+    assert settings.centralpay_diagnostic_verify_enabled is True
+    assert cli_main(["reconcile", "rc-diag-enabled", "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "WOULD_VERIFY" in out
+    assert len(stub.verify_requests) == 1
+
+
 # --- PR #59 follow-up: --verify row-lock discipline (real-Postgres races --
 # live in tests/integration/test_reconcile_inspect_pg.py; these are the fast,
 # deterministic SQLite-backed proofs of the same contract) --------------------
@@ -753,6 +950,59 @@ def test_reconcile_default_never_locks_verify_always_locks(
     capsys.readouterr()
 
     assert calls == [False, True]
+
+
+def test_reconcile_verify_captures_now_after_lock_acquired_not_before(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """PR #59 final safety follow-up: `now` must be captured AFTER the row
+    lock is acquired, not before -- otherwise a payment that crosses
+    RECONCILIATION_MAX_AGE_SECONDS while --verify waits behind a concurrent
+    transaction's lock could pass the aged-out gate using a stale, pre-wait
+    timestamp. This proves the CODE ORDER: the lock-acquiring probe SELECT
+    executes, THEN datetime.now() is captured, THEN the locked
+    classification SELECT (reusing that same now) executes -- never
+    datetime.now() before the first lock-acquiring execute. SQLite's single
+    shared connection cannot simulate a REAL blocking wait, so this is a
+    structural proof, not a timing one -- see
+    test_reconcile_verify_recomputes_aged_out_gate_using_time_after_lock_wait_pg
+    in tests/integration/test_reconcile_inspect_pg.py for the real
+    concurrent-transaction, blocking-wait version."""
+    import app.cli as cli_module
+
+    response = create_order(client, settings, order_id="rc-post-lock-time", amount=5000)
+    assert response.status_code == 200
+
+    events: list[str] = []
+    real_execute = Session.execute
+
+    def recording_execute(self, statement, *args, **kwargs):
+        if getattr(statement, "_for_update_arg", None) is not None:
+            events.append("lock_execute")
+        return real_execute(self, statement, *args, **kwargs)
+
+    class _RecordingClock:
+        @staticmethod
+        def now(tz=None):
+            events.append("now")
+            return datetime.now(tz)
+
+    monkeypatch.setattr(Session, "execute", recording_execute)
+    monkeypatch.setattr(cli_module, "datetime", _RecordingClock)
+
+    _patch_centralpay_client(monkeypatch, stub)
+    stub.verify_result = httpx.Response(200, json={"status": "error", "message": "not paid yet"})
+
+    assert cli_main(["reconcile", "rc-post-lock-time", "--verify"]) == 0
+    capsys.readouterr()
+
+    lock_indexes = [i for i, e in enumerate(events) if e == "lock_execute"]
+    now_indexes = [i for i, e in enumerate(events) if e == "now"]
+    # The minimal lock-probe SELECT, then now(), then the locked
+    # classification SELECT reusing that same now -- in that exact order.
+    assert len(lock_indexes) == 2
+    assert len(now_indexes) == 1
+    assert lock_indexes[0] < now_indexes[0] < lock_indexes[1]
 
 
 def test_reconcile_verify_rereads_under_lock_after_race_before_lock_acquired(
@@ -822,6 +1072,77 @@ def test_reconcile_verify_transport_error_zero_mutation(
     assert "NO LOCAL CHANGES WERE MADE." in out
 
     _assert_payment_unchanged(session_factory, "rc-transport-error", before)
+
+
+# --- Codex follow-up: a failed verify attempt is not necessarily "unperformed"
+
+
+def test_reconcile_verify_connection_error_reports_delivery_uncertain_not_false(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """A connection-level failure (ConnectError, timeout, ...) cannot be
+    told apart from "sent, then the response never arrived" -- httpx gives
+    us no way to know whether bytes reached the gateway. Reporting
+    `performed: false` here would tell a machine consumer no request was
+    made, when it may well have been -- report it as uncertain instead."""
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-delivery-uncertain", amount=5000)
+    assert response.status_code == 200
+
+    stub.verify_result = httpx.ConnectError("boom")
+
+    assert cli_main(["reconcile", "rc-delivery-uncertain", "--verify", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["requested"] is True
+    assert payload["verify"]["performed"] is None
+    assert payload["verify"]["delivery_uncertain"] is True
+    assert payload["verify"]["refused"] is None
+    assert payload["verify"]["transport_error_code"] == "centralpay_connection_error"
+
+    assert cli_main(["reconcile", "rc-delivery-uncertain", "--verify"]) == 1
+    out = capsys.readouterr().out
+    assert "delivery uncertain" in out
+
+
+def test_reconcile_verify_non_200_status_reports_performed_true(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """A non-200 HTTP status PROVES the request was transmitted and
+    answered -- this must never be reported as `performed: false`."""
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-rejected-status", amount=5000)
+    assert response.status_code == 200
+
+    stub.verify_result = httpx.Response(500, text="internal error")
+
+    assert cli_main(["reconcile", "rc-rejected-status", "--verify", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["requested"] is True
+    assert payload["verify"]["performed"] is True
+    assert payload["verify"]["delivery_uncertain"] is False
+    assert payload["verify"]["transport_error_code"] == "centralpay_rejected"
+
+    assert cli_main(["reconcile", "rc-rejected-status", "--verify"]) == 1
+    out = capsys.readouterr().out
+    assert "request reached gateway: yes" in out
+
+
+def test_reconcile_verify_malformed_json_reports_performed_true(
+    cli_env, client, settings, session_factory, stub, monkeypatch, capsys
+):
+    """A 200 response with an unparseable body also PROVES the request was
+    transmitted and answered."""
+    _patch_centralpay_client(monkeypatch, stub)
+    response = create_order(client, settings, order_id="rc-invalid-body", amount=5000)
+    assert response.status_code == 200
+
+    stub.verify_result = httpx.Response(200, text="not json at all")
+
+    assert cli_main(["reconcile", "rc-invalid-body", "--verify", "--json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["verify"]["performed"] is True
+    assert payload["verify"]["delivery_uncertain"] is False
+    assert payload["verify"]["transport_error_code"] == "centralpay_invalid_response"
 
 
 # --- scenario 13: no secret / raw body / card / raw gateway user id leak ----

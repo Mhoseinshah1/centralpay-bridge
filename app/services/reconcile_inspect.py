@@ -9,8 +9,16 @@ callback-processing function from ``app.services.verification`` or
 ``app.services.reconciliation`` — those are the mutating settlement paths
 this module deliberately stays independent of.
 ``--verify`` is allowed to make exactly one ``CentralPayClient.verify()``
-HTTP call (read-only on the gateway side too, per app.centralpay) and
-reports what settlement WOULD conclude; it never applies that outcome.
+HTTP call and reports what settlement WOULD conclude; it never applies that
+outcome. This is diagnostic gateway verification with no LOCAL database
+mutation; the gateway's OWN verify-after-verify/idempotency semantics have
+never been confirmed against production CentralPay (release blocker B2 --
+see STAGING_VALIDATION.md) and must not be assumed read-only or safe to
+call repeatedly just because this module makes no local change. For that
+reason the call is gated behind ``settings.centralpay_diagnostic_verify_
+enabled`` (default ``False``, checked in ``app.cli._cmd_reconcile`` before
+any lock or HTTP request) -- enable only after that staging validation
+closes B2.
 
 Age-boundary predicates are never hand-rederived: every tier/aged-out/
 exhausted check below queries the exact shared condition tuples imported
@@ -42,7 +50,11 @@ ONLY by ``--verify`` (see ``app.cli._cmd_reconcile``), which
 must reload the row and its eligibility flags under that lock, check
 refusal AFTER the lock is held, and hold the lock across its own
 diagnostic gateway call, so a concurrent settlement can never land between
-this module's eligibility check and the gateway query. Default
+this module's eligibility check and the gateway query. The caller must
+also capture ``now`` AFTER the row lock is actually acquired (not before
+any wait behind a concurrent transaction) and pass that same fresh
+timestamp into this call, so the aged-out gate reflects time at lock
+acquisition, not time at lock request. Default
 (non-``--verify``) inspection always calls this with ``for_update=False``:
 no lock is ever taken.
 """
@@ -227,6 +239,10 @@ def build_local_snapshot(
 class VerifyRefusal(enum.StrEnum):
     """Why ``--verify`` declined to contact the gateway at all."""
 
+    # Configuration gate, not a payment-state fact: checked in app.cli
+    # BEFORE any row lock or payment-state check below, and before any
+    # network call. See settings.centralpay_diagnostic_verify_enabled.
+    DIAGNOSTIC_VERIFY_DISABLED = "diagnostic_verify_not_enabled"
     ALREADY_VERIFIED = "already_gateway_verified"
     MANUAL_REVIEW_OWNED = "manual_review_owned"
     AGED_OUT = "aged_out"
