@@ -414,10 +414,17 @@ class CommandHandlers:
         `waiting_total`/`expired_total` here are plain COUNTs with no
         detail rows shown in THIS command (see /waiting, /expired for
         those), so there is no count/list pair to keep consistent for them
-        in `/stuck`. `other_total` is likewise a standalone COUNT. This is
-        NOT a single atomic database snapshot of the whole report — each of
-        these is (at most) one statement, not one shared transaction/read
-        view across all of them.
+        in `/stuck`. `other_total` (`stuck_service.count_other_attention`)
+        is also a single COUNT statement — its three sub-conditions
+        (reconciliation-exhausted, unexpected-status, non-delivery manual
+        review) are combined with SQL `OR` into one `WHERE` clause rather
+        than run as three separate COUNTs summed in Python, so a payment
+        that transitions between those categories mid-sequence (e.g. a
+        worker moves an exhausted row into manual_review) cannot be seen —
+        and counted — by more than one of them. This is NOT a single atomic
+        database snapshot of the whole report — each of these is (at most)
+        one statement, not one shared transaction/read view across all of
+        them.
         """
         if args:
             return [STUCK_USAGE_ERROR]

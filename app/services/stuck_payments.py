@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 # app.adminbot.queries is a plain, Telegram-agnostic set of read-only SQL
@@ -225,17 +225,29 @@ def count_expired(db: Session, settings: Settings, *, now: datetime) -> int:
 
 def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> int:
     """EXACT count of every current NEEDS_ATTENTION condition that is NOT a
-    bot-delivery problem:
+    bot-delivery problem — the union of:
 
     * reconciliation-exhausted (a financial/reconciliation state)
     * unexpected-status rows (a system anomaly)
     * open manual-review rows caused by a FINANCIAL/verification mismatch
-      (``app.adminbot.queries.count_non_delivery_manual_reviews`` — the
-      exact complement of ``bot_delivery_snapshot``'s manual-review half,
-      sharing the same ``_open_manual_review_conditions``/
+      (``queries.non_delivery_manual_review_conditions`` — the exact
+      complement of ``bot_delivery_snapshot``'s manual-review half, sharing
+      the same ``_open_manual_review_conditions``/
       ``_bot_delivery_manual_review_conditions`` predicates so a row can
       never be counted in both this function and
       ``bot_delivery_snapshot``, and never dropped from both).
+
+    An earlier version ran these as three separate ``COUNT(*)`` statements
+    summed in Python. Under READ COMMITTED, a payment that transitions
+    between categories WHILE those three statements run — e.g. a
+    reconciliation-exhausted ``link_created`` row that a worker moves to
+    ``manual_review`` between the first and third ``SELECT`` — could be
+    counted by more than one of them, inflating this total for a single
+    payment. The three underlying predicates are mutually exclusive at any
+    single instant (each keys off a disjoint ``Payment.status`` value), so
+    fusing them into one ``WHERE ... OR ...`` statement — read as one
+    consistent snapshot — makes that impossible: a row is evaluated against
+    all three conditions against the exact same row state, exactly once.
 
     Invariant this preserves: for the same (db, settings, now),
     ``queries.bot_delivery_snapshot(db, now=now).total
@@ -244,24 +256,25 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     would select — reconciliation-exhausted, unexpected-status, and EVERY
     open manual-review row (delivery or non-delivery), with the
     stale/old-bot_notify_pending rows folded into the bot-delivery half.
-    Never approximated and never double-counted. This is a separate COUNT
-    statement (not fused into `bot_delivery_snapshot`'s single statement):
-    `/stuck` shows `other_total` as a bare summary number with no
-    accompanying detail rows, so there is no count/list pair to keep
-    consistent here the way there is for the bot-delivery, waiting, and
-    expired totals."""
-    exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
-    exhausted_total = db.execute(
-        select(func.count(Payment.id)).where(*exhausted_conditions)
-    ).scalar_one()
+    Never approximated and never double-counted. This remains a separate
+    statement from `bot_delivery_snapshot`'s (not fused into it): `/stuck`
+    shows `other_total` as a bare summary number with no accompanying
+    detail rows, so there is no count/list pair to keep consistent here the
+    way there is for the bot-delivery, waiting, and expired totals — only
+    the union WITHIN this count itself needed to become one statement."""
     cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
-    unexpected_total = db.execute(
+    return db.execute(
         select(func.count(Payment.id)).where(
-            Payment.status.in_(_UNEXPECTED_STATUSES), Payment.created_at <= cutoff
+            or_(
+                and_(*reconciliation_exhausted_conditions(settings, now=now)),
+                and_(
+                    Payment.status.in_(_UNEXPECTED_STATUSES),
+                    Payment.created_at <= cutoff,
+                ),
+                and_(*queries.non_delivery_manual_review_conditions()),
+            )
         )
     ).scalar_one()
-    non_delivery_manual_review_total = queries.count_non_delivery_manual_reviews(db)
-    return exhausted_total + unexpected_total + non_delivery_manual_review_total
 
 
 @dataclass(frozen=True)

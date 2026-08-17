@@ -735,6 +735,166 @@ def test_resolved_financial_manual_review_excluded_from_other_attention(
     assert "resolved-fin" not in text
 
 
+def test_other_attention_excludes_waiting_payments(client, settings, session_factory):
+    assert create_order(client, settings, order_id="oa-waiting").status_code == 200
+    _make_waiting(session_factory, "oa-waiting")
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert stuck_service.count_other_attention(db, settings, now=now) == 0
+
+
+def test_other_attention_excludes_expired_payments(client, settings, session_factory):
+    assert create_order(client, settings, order_id="oa-expired").status_code == 200
+    _make_expired(session_factory, settings, "oa-expired")
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        assert stuck_service.count_other_attention(db, settings, now=now) == 0
+
+
+# ============================================================================
+# PR #57 fourth review: count_other_attention's union in ONE SQL statement
+# ============================================================================
+
+# --- fix: reconciliation-exhausted / unexpected-status / non-delivery ------
+# --- manual-review must be counted by ONE `WHERE ... OR ...` SELECT, not ---
+# --- three separate COUNTs summed in Python -- a payment transitioning ----
+# --- between categories mid-sequence could otherwise be counted twice -----
+
+
+def test_old_three_statement_design_could_double_count_a_transitioning_row(
+    client, settings, session_factory
+):
+    """Regression proof for the exact race described in review: reproduce
+    the PRE-FIX shape `count_other_attention` used to have -- a separate
+    COUNT for reconciliation-exhausted, then a separate COUNT for
+    unexpected-status, then a separate COUNT for non-delivery manual
+    review, summed in Python -- with a worker-style write (a separate
+    session, committed) moving a reconciliation-exhausted payment into an
+    open financial manual review in the gap between the first and third
+    statements. No sleeping, no real threads: program order alone
+    reproduces the race. The first COUNT sees the payment while it is
+    still exhausted; the worker moves it to manual_review; the third COUNT
+    sees the SAME payment again under its new state -- one payment,
+    counted twice."""
+    from sqlalchemy import func
+
+    from app.adminbot.queries import non_delivery_manual_review_conditions
+    from app.services.reconciliation import reconciliation_exhausted_conditions
+    from app.services.stuck_payments import _UNEXPECTED_STATUSES, UNEXPECTED_STATE_GRACE_SECONDS
+
+    order_id = "race-other-attention"
+    assert create_order(client, settings, order_id=order_id).status_code == 200
+    _make_reconciliation_exhausted(session_factory, settings, order_id)
+    now = datetime.now(UTC)
+    exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
+    unexpected_cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
+
+    with session_factory() as db:
+        # Statement 1 of the OLD design: reconciliation-exhausted COUNT.
+        exhausted_total = db.execute(
+            select(func.count(Payment.id)).where(*exhausted_conditions)
+        ).scalar_one()
+        db.commit()  # end the read cleanly before a concurrent writer commits
+
+        # A worker moves the payment out of the exhausted shape and into an
+        # open financial manual review in the gap between the OLD design's
+        # statements -- its own session, its own commit.
+        with session_factory() as worker_db:
+            worker_payment = worker_db.execute(
+                select(Payment).where(Payment.bot_order_id == order_id)
+            ).scalar_one()
+            worker_payment.status = PaymentStatus.MANUAL_REVIEW.value
+            worker_payment.last_error = "verify_payable_amount_mismatch"
+            worker_payment.manual_review_at = datetime.now(UTC)
+            worker_db.commit()
+
+        # Statement 2 of the OLD design: unexpected-status COUNT -- 0 here,
+        # included only to reproduce the exact three-statement shape.
+        unexpected_total = db.execute(
+            select(func.count(Payment.id)).where(
+                Payment.status.in_(_UNEXPECTED_STATUSES), Payment.created_at <= unexpected_cutoff
+            )
+        ).scalar_one()
+
+        # Statement 3 of the OLD design: non-delivery-manual-review COUNT --
+        # now ALSO counts the same payment, since the worker's commit landed.
+        non_delivery_total = db.execute(
+            select(func.count(Payment.id)).where(*non_delivery_manual_review_conditions())
+        ).scalar_one()
+
+    old_design_total = exhausted_total + unexpected_total + non_delivery_total
+    assert exhausted_total == 1
+    assert non_delivery_total == 1
+    assert old_design_total == 2  # one payment, double-counted
+
+
+def test_count_other_attention_issues_exactly_one_sql_statement(
+    client, settings, session_factory, engine
+):
+    """Structural proof the fused union query is a single round trip."""
+    from sqlalchemy import event
+
+    from app.services import stuck_payments as stuck_service
+
+    assert create_order(client, settings, order_id="single-stmt-oa").status_code == 200
+    _make_financial_manual_review(session_factory, "single-stmt-oa")
+
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        if "payments" in statement.lower():
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        with session_factory() as db:
+            now = datetime.now(UTC)
+            total = stuck_service.count_other_attention(db, settings, now=now)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert len(statements) == 1  # one round trip -- no gap for a race
+    assert total == 1
+
+
+def test_count_other_attention_single_statement_cannot_double_count_a_transitioning_row(
+    client, settings, session_factory
+):
+    """Same setup as the OLD-design reproduction above, but exercised
+    through the new, single-statement `count_other_attention`: the same
+    payment moved from reconciliation-exhausted to an open financial
+    manual review BEFORE the (one) call. Because the fused query evaluates
+    all three conditions against one consistent read of the row's CURRENT
+    state in a single statement, there is no gap between sub-queries for a
+    transition to land in -- the payment is counted exactly once, never
+    twice."""
+    order_id = "no-race-other-attention"
+    assert create_order(client, settings, order_id=order_id).status_code == 200
+    _make_reconciliation_exhausted(session_factory, settings, order_id)
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        payment.status = PaymentStatus.MANUAL_REVIEW.value
+        payment.last_error = "verify_payable_amount_mismatch"
+        payment.manual_review_at = datetime.now(UTC)
+        db.commit()
+
+    from app.services import stuck_payments as stuck_service
+
+    with session_factory() as db:
+        now = datetime.now(UTC)
+        total = stuck_service.count_other_attention(db, settings, now=now)
+
+    assert total == 1  # never 2 -- the payment is in exactly one state, counted once
+
+
 # --- fix 2: overall health state considers bot-delivery OR other attention ---
 
 
