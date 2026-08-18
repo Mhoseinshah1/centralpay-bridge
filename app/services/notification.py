@@ -239,8 +239,25 @@ def record_attempt_result(
     now: datetime,
     jitter: JitterFn = default_jitter,
 ) -> None:
+    # populate_existing: run_worker_pass reuses ONE Session across
+    # claim_next_due -> (HTTP request, no transaction open) -> here. Because
+    # the session factory sets expire_on_commit=False, the Payment object
+    # claim_next_due loaded stays in this Session's identity map, UNEXPIRED,
+    # after its commit. Without populate_existing, SQLAlchemy would hand
+    # back that SAME cached object -- with its pre-HTTP-call attribute
+    # values -- instead of refreshing it from this FOR UPDATE SELECT's
+    # result, even though the SELECT itself does execute and lock the
+    # current row. If a different session changed the row in the gap (a
+    # concurrent worker, stale-claim recovery, or a manual admin action),
+    # this discard guard would then compare against stale cached values and
+    # could incorrectly let a late/stale result overwrite that newer state.
+    # Mirrors the same discipline already used by
+    # app.services.reconcile_inspect.build_local_snapshot.
     payment = db.execute(
-        select(Payment).where(Payment.id == claimed.payment_id).with_for_update()
+        select(Payment)
+        .where(Payment.id == claimed.payment_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
     ).scalar_one()
     if (
         payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value
