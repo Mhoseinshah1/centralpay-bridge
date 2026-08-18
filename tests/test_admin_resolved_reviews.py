@@ -170,8 +170,18 @@ def test_resolved_reviews_shows_only_resolved_with_metadata(
 
 
 def test_resolved_reviews_default_and_max_limits(
-    handlers, client, settings, session_factory, stub
+    app, handlers, client, settings, session_factory, stub
 ):
+    # Seeds 55 distinct NEW orders in a tight loop purely to populate rows
+    # for pagination -- unrelated to rate-limiting semantics, so the
+    # per-IP create limiter (which a single TestClient would otherwise
+    # trip well before 55) is raised for this test only, exactly like
+    # test_create_payment_burst_limited overrides the opposite direction.
+    from app.ratelimit import BoundedLimiterStore
+
+    app.state.rate_limiters.create_per_ip = BoundedLimiterStore(
+        limit=1000, window_seconds=60.0, capacity=10
+    )
     for index in range(55):
         payment = make_review(
             client, settings, session_factory, stub, order_id=f"rev-n-{index:02d}"
