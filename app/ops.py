@@ -12,6 +12,10 @@ Commands:
   review list | show ORDER_ID | acknowledge ORDER_ID --note TEXT
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
+  notification accept ORDER_ID --note TEXT --yes
+      Mark one already-processed, gateway-verified bot notification (stuck
+      in bot_notify_pending) as operator-confirmed accepted. Makes NO bot
+      or gateway request; see app.services.notification.execute_manual_accept.
   db-check [--repair-sequences]   read-only integrity checks (restore verification)
   db-check --details [--json]     same report, plus a bounded, read-only drill-down
                                    into the rows behind any failed check
@@ -29,10 +33,12 @@ from sqlalchemy.orm import Session
 
 from app.adminbot.alerts import configure_alert_creation, create_alert
 from app.audit import record_event
+from app.cli import AmbiguousOrderIdError, _find_payment
 from app.config import Settings
 from app.db import create_session_factory
 from app.logging_setup import configure_logging
 from app.models import FeePolicy, Payment, PaymentStatus
+from app.services.notification import ManualAcceptRefusal, execute_manual_accept
 
 # Non-financial operational resolution states only.
 ALLOWED_RESOLUTIONS = (
@@ -929,6 +935,82 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 1
 
 
+# --- notification accept: manual acceptance of a stuck bot_notify_pending --
+#
+# See app.services.notification.execute_manual_accept for the full safety
+# contract. This section only renders what that function decides and
+# reuses app.cli's `_find_payment`/`AmbiguousOrderIdError` for ORDER_ID
+# resolution -- it never re-implements order-id lookup and never assigns a
+# Payment attribute itself.
+
+_NOTIFICATION_ACCEPT_REFUSAL_MESSAGE = {
+    ManualAcceptRefusal.NOT_BOT_NOTIFY_PENDING: (
+        "refused: payment is not in bot_notify_pending (status={status})"
+    ),
+    ManualAcceptRefusal.NOT_GATEWAY_VERIFIED: (
+        "refused: payment has no recorded gateway verification "
+        "(gateway_verified_at is NULL) even though status=bot_notify_pending"
+    ),
+}
+
+
+def _notification_accept_warning(order_id: str) -> str:
+    return (
+        f"About to mark {order_id}'s bot notification as operator-confirmed "
+        "accepted.\n"
+        "  - Does NOT contact the bot.\n"
+        "  - Does NOT credit the customer.\n"
+        "  - Does NOT change gateway verification.\n"
+        "  - Does NOT change payment amounts.\n"
+        "  - Records an operator-confirmed notification outcome.\n"
+        "  - Permanently stops automatic notification retries for this "
+        "payment.\n"
+        "Re-run with --yes to confirm."
+    )
+
+
+def _cmd_notification(args: argparse.Namespace) -> int:
+    settings = Settings()
+    configure_logging(settings)
+    configure_alert_creation(settings)
+    session_factory = create_session_factory(settings.database_url)
+
+    with session_factory() as db:
+        if args.notification_command == "accept":
+            try:
+                found = _find_payment(db, args.order_id)
+            except AmbiguousOrderIdError:
+                print(f"ambiguous order id: {args.order_id}", file=sys.stderr)
+                db.rollback()
+                return 1
+            if found is None:
+                print(f"payment not found: {args.order_id}", file=sys.stderr)
+                db.rollback()
+                return 1
+
+            outcome = execute_manual_accept(
+                db, payment_id=found.id, note=args.note, now=datetime.now(UTC)
+            )
+            if outcome is None:
+                print(f"payment not found: {args.order_id}", file=sys.stderr)
+                return 1
+            if not outcome.accepted:
+                assert outcome.refusal is not None
+                print(
+                    _NOTIFICATION_ACCEPT_REFUSAL_MESSAGE[outcome.refusal].format(
+                        status=outcome.status
+                    ),
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"accepted {found.bot_order_id}: "
+                "bot_notify_pending -> bot_notify_accepted (manual)"
+            )
+            return 0
+    return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.ops", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1011,6 +1093,18 @@ def build_parser() -> argparse.ArgumentParser:
     review_resend.add_argument("order_id")
     review_resend.add_argument("--confirm-idempotent-bot", action="store_true")
     review_resend.add_argument("--yes", action="store_true")
+
+    notification = sub.add_parser(
+        "notification",
+        help="bot notification operator overrides (host only; never contacts the bot)",
+    )
+    notification_sub = notification.add_subparsers(
+        dest="notification_command", required=True
+    )
+    notification_accept = notification_sub.add_parser("accept")
+    notification_accept.add_argument("order_id")
+    notification_accept.add_argument("--note", required=True)
+    notification_accept.add_argument("--yes", action="store_true")
     return parser
 
 
@@ -1054,6 +1148,14 @@ def main(argv: list[str] | None = None) -> int:
             print("a non-empty --note is required", file=sys.stderr)
             return 1
         return _cmd_review(args)
+    if args.command == "notification":
+        if args.notification_command == "accept" and not args.note.strip():
+            print("a non-empty --note is required", file=sys.stderr)
+            return 1
+        if args.notification_command == "accept" and not args.yes:
+            print(_notification_accept_warning(args.order_id), file=sys.stderr)
+            return 1
+        return _cmd_notification(args)
     return _cmd_test_alert(args)
 
 

@@ -401,6 +401,30 @@ full attempt history is preserved in `payment_events`. An administrator
 must inspect it (`python -m app.cli manual-review`) and resolve it
 manually. Administrator tooling for resolution arrives in later phases.
 
+### Manual acceptance of a stuck notification
+
+Rare escape hatch for a payment stuck in `bot_notify_pending` even though
+the operator has independently confirmed (with the downstream bot, outside
+this system) that the bot already processed it — for example a proven
+side-effecting `bot_http_500` (see [Retry modes](#retry-modes)) where safe
+mode correctly stopped auto-retrying. `centralpay review resolve`/`resend`
+do not apply: the payment was never in `manual_review`.
+
+```bash
+centralpay notification accept ORDER_ID --note "VPN bot operator confirmed the order was already processed" --yes
+```
+
+Requires `status == bot_notify_pending` AND a recorded gateway
+verification, re-checked fresh under a row lock (refuses safely if the
+worker or another operator already moved the payment). It makes **zero**
+bot or gateway HTTP requests, never fabricates a verification fact or a
+reference id, and never touches an amount, `bot_notify_attempts`, or the
+historical `bot_last_http_status`/`bot_last_error_code` diagnostics.
+Records a distinct `manual_bot_notification_accepted` audit event (never
+the automatic `bot_notification_accepted` event) and permanently stops
+retries for that one payment (`next_retry_at` cleared). Without `--yes` it
+refuses and prints exactly what the command will and will not do.
+
 ### Worker lifecycle and recovery guarantees (audit)
 
 The delivery pipeline is a strict four-step sequence designed around

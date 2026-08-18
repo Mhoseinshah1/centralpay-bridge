@@ -45,6 +45,16 @@ Manual review (host-only; never changes financial records):
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
 
+Notification:
+  notification accept ORDER_ID --note TEXT [--yes]
+      Mark one already-processed, gateway-verified bot notification as
+      operator-confirmed accepted without contacting the bot. For a
+      payment stuck in bot_notify_pending after the operator has
+      independently confirmed (with the downstream bot) that it was
+      already delivered and processed. Never contacts the bot or
+      CentralPay, never changes payment amounts or gateway verification,
+      and permanently stops automatic retries for that one payment.
+
 Data:
   backup                 Create a validated PostgreSQL backup now
   backups                List backups with validation state
@@ -668,6 +678,25 @@ cmd_review() {
     esac
 }
 
+cmd_notification() {
+    require_root notification
+    require_install
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        accept)
+            # No separate shell-level prompt: python -m app.ops notification
+            # accept already refuses (printing the full explanation) unless
+            # --yes is present, exactly like `review resend`'s
+            # --confirm-idempotent-bot/--yes gate.
+            compose exec -T api python -m app.ops notification accept "$@"
+            ;;
+        *)
+            fail "Unknown notification subcommand: ${sub} (accept)"
+            ;;
+    esac
+}
+
 cmd_backup() {
     require_root backup
     require_install
@@ -1133,6 +1162,7 @@ main() {
             ;;
         rollback)      cmd_rollback "$@" ;;
         review)        cmd_review "$@" ;;
+        notification)  cmd_notification "$@" ;;
         migrate)       cmd_migrate "$@" ;;
         backup)        cmd_backup "$@" ;;
         backups)       cmd_backups "$@" ;;
