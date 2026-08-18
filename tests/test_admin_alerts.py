@@ -355,6 +355,43 @@ def test_reconciliation_exhausted_alert_deduplicates_per_payment(
     assert alerts[1].status == AlertStatus.SUPPRESSED.value
 
 
+def test_reconciliation_exhausted_alert_renders_error_code(
+    alert_policy, admin_settings, client, settings, session_factory
+):
+    """The alert's payload carrying error_code is not enough on its own --
+    app.adminbot.format.alert_message only renders payload keys in its
+    fixed, safe allowlist, so this proves the DELIVERED Telegram text
+    itself contains the actual reconciliation failure reason (never just
+    the generic attempt count), not merely that the row was inserted."""
+    from app.audit import record_event
+
+    assert create_order(client, settings, order_id="al-exh-render").status_code == 200
+    payment = get_payment(session_factory, "al-exh-render")
+
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="reconciliation_exhausted",
+            level="error",
+            data={
+                "gateway_order_id": payment.gateway_order_id,
+                "attempt": 6,
+                "worker_id": "w1",
+                "error_code": "gateway_not_paid",
+            },
+        )
+        db.commit()
+
+    sender = FakeAlertSender()
+    run_alert_pass(session_factory, sender, admin_settings)
+    assert sender.sent
+    rendered = "\n".join(text for _, text in sender.sent)
+    assert "gateway_not_paid" in rendered
+    # worker_id is internal bookkeeping, never delivered to an operator.
+    assert "w1" not in rendered
+
+
 def test_reconciliation_routine_retry_events_never_create_alerts(
     alert_policy, client, settings, session_factory
 ):

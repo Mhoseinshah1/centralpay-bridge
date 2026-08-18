@@ -6,7 +6,11 @@ Two things here specifically need real PostgreSQL, not SQLite:
    numerically IDENTICAL to `app.services.stuck_payments.stuck_payments_overview`
    -- the exact function `centralpay stuck` itself calls -- for the same
    database state. This is the "stuck classifications match existing
-   `centralpay stuck`" proof the roadmap item asks for.
+   `centralpay stuck`" proof the roadmap item asks for. (Both are exact
+   whenever there are 200 or fewer simultaneous bot-delivery problems --
+   the realistic case exercised here and the only one this test asserts
+   about; see cmd_status's own docstring for the documented, pre-existing
+   divergence above that count.)
 2. `app.adminbot.queries.find_payment` (used by `/payment`) now shares
    `app.services.payment_lookup.find_payment_by_order_id` with the CLI.
    Before this PR, the admin bot's own lookup had two real bugs only a

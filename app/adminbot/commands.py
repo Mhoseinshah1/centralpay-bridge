@@ -297,9 +297,24 @@ class CommandHandlers:
         (`queries.bot_delivery_snapshot` for the bot-delivery half of
         `needs_attention`, `stuck_service.count_other_attention` for the
         rest, `stuck_service.count_waiting`/`count_expired`) -- never a
-        locally re-derived count, so this can never quietly disagree with
-        `/stuck` or `centralpay stuck`. One `now` is captured once and
-        reused for every one of those calls."""
+        locally re-derived count, so this is always numerically identical
+        to `/stuck`'s own header. One `now` is captured once and reused for
+        every one of those calls.
+
+        `queries.bot_delivery_snapshot`'s `func.count().over()` window
+        function counts every matching row exactly, regardless of `limit`
+        (limit only bounds how many rows are RETURNED, not what the window
+        function counts over) -- unlike `centralpay stuck`
+        (`stuck_service.stuck_payments_overview`), whose reused bot-delivery
+        bucket is deliberately capped at `stuck_service._QUERY_CAP` (200)
+        for that command's own documented reasons. Practically identical
+        (both exact) whenever there are 200 or fewer simultaneous
+        bot-delivery problems -- the only realistic case -- but this means
+        `/status` and `centralpay stuck` are NOT guaranteed identical in the
+        extreme case of more than 200 at once; `/status` would show the
+        true (larger) count in that case. This mirrors a difference that
+        already exists between `/stuck` and `centralpay stuck` today and is
+        not introduced here."""
         now = datetime.now(UTC)
         api = self._probe_api()
         db_ok = queries.database_ok(db)
