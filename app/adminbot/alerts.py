@@ -253,6 +253,24 @@ def _map_event(
                 deduplication_key=f"{event_type}:{payment_id}",
                 payload={k: v for k, v in data.items() if k != "reason"},
             )
+    elif event_type == "reconciliation_exhausted":
+        # Fires exactly once per payment (app.services.reconciliation only
+        # records this when attempt >= reconciliation_max_attempts, and
+        # reconciliation_next_at is cleared so the payment is never
+        # selected again) -- never for ordinary gateway_not_paid retries
+        # (those are reconciliation_retry_scheduled /
+        # reconciliation_gateway_not_paid, deliberately unmapped here so
+        # routine polling never spams an alert). The deduplication key is
+        # still set defensively, matching every other error-class alert.
+        if policy.error_alerts:
+            create_alert(
+                db,
+                alert_type="reconciliation_exhausted",
+                severity="error",
+                payment_id=payment_id,
+                deduplication_key=f"reconciliation_exhausted:{payment_id}",
+                payload={k: v for k, v in data.items() if k != "worker_id"},
+            )
     elif event_type == "notification_recovered_after_restart":
         if policy.error_alerts:
             create_alert(

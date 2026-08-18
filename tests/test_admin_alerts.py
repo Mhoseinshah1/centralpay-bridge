@@ -301,6 +301,88 @@ def test_payment_success_alerts_when_enabled(
     assert len(get_alerts(session_factory, "gateway_payment_verified")) == 1
 
 
+def test_reconciliation_exhausted_creates_alert(
+    alert_policy, client, settings, session_factory, stub
+):
+    from app.audit import record_event
+
+    assert create_order(client, settings, order_id="al-exhausted").status_code == 200
+    payment = get_payment(session_factory, "al-exhausted")
+
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="reconciliation_exhausted",
+            level="error",
+            data={"gateway_order_id": payment.gateway_order_id, "attempt": 6, "worker_id": "w1"},
+        )
+        db.commit()
+
+    alerts = get_alerts(session_factory, "reconciliation_exhausted")
+    assert len(alerts) == 1
+    assert alerts[0].severity == "error"
+    assert alerts[0].payment_id == payment.id
+    assert alerts[0].deduplication_key == f"reconciliation_exhausted:{payment.id}"
+    # worker_id is internal bookkeeping, never surfaced in an operator alert.
+    assert alerts[0].payload is not None
+    assert "worker_id" not in alerts[0].payload
+
+
+def test_reconciliation_exhausted_alert_deduplicates_per_payment(
+    alert_policy, client, settings, session_factory
+):
+    from app.audit import record_event
+
+    assert create_order(client, settings, order_id="al-exh-dedup").status_code == 200
+    payment = get_payment(session_factory, "al-exh-dedup")
+
+    for attempt in (6, 7):
+        with session_factory() as db:
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="reconciliation_exhausted",
+                level="error",
+                data={"attempt": attempt},
+            )
+            db.commit()
+
+    alerts = get_alerts(session_factory, "reconciliation_exhausted")
+    assert len(alerts) == 2
+    assert alerts[0].status == AlertStatus.PENDING.value
+    # The second, within the dedup window, is stored but never sent again.
+    assert alerts[1].status == AlertStatus.SUPPRESSED.value
+
+
+def test_reconciliation_routine_retry_events_never_create_alerts(
+    alert_policy, client, settings, session_factory
+):
+    """Routine gateway_not_paid polling must never spam an alert -- only
+    reconciliation_exhausted does."""
+    from app.audit import record_event
+
+    assert create_order(client, settings, order_id="al-routine").status_code == 200
+    payment = get_payment(session_factory, "al-routine")
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="reconciliation_gateway_not_paid",
+            level="warning",
+            data={"attempt": 1},
+        )
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="reconciliation_retry_scheduled",
+            data={"attempt": 1},
+        )
+        db.commit()
+
+    assert get_alerts(session_factory) == []
+
+
 def test_classify_send_error_maps_ptb_exceptions():
     import telegram.error as terr
 

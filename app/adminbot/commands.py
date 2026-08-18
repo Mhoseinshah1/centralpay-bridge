@@ -26,6 +26,7 @@ from app.adminbot.format import (
     esc,
     expired_entry_block,
     fmt_amount,
+    fmt_duration_ago_fa,
     fmt_time,
     fmt_time_only_fa,
     payment_block,
@@ -43,6 +44,7 @@ from app.services.bulk_resend import (
     preview_bulk_resend,
     requeue_failed_deliveries,
 )
+from app.services.payment_lookup import AmbiguousOrderIdError
 from app.version import APP_VERSION
 
 logger = logging.getLogger("app.adminbot.commands")
@@ -290,6 +292,15 @@ class CommandHandlers:
         return self._split("\n".join(lines))
 
     def cmd_status(self, db: Session, args: list[str]) -> list[str]:
+        """Compact operational snapshot. `needs_attention`/`waiting_gateway`/
+        `expired` reuse the exact same primitives `/stuck`'s own header does
+        (`queries.bot_delivery_snapshot` for the bot-delivery half of
+        `needs_attention`, `stuck_service.count_other_attention` for the
+        rest, `stuck_service.count_waiting`/`count_expired`) -- never a
+        locally re-derived count, so this can never quietly disagree with
+        `/stuck` or `centralpay stuck`. One `now` is captured once and
+        reused for every one of those calls."""
+        now = datetime.now(UTC)
         api = self._probe_api()
         db_ok = queries.database_ok(db)
         heartbeat_age = queries.worker_heartbeat_age_seconds(db)
@@ -300,8 +311,20 @@ class CommandHandlers:
         review = queries.count_open_manual_reviews(db)
         getlink_failures = queries.event_count_since(db, "centralpay_getlink_failed")
         verify_failures = queries.event_count_since(db, "centralpay_verify_failed")
+        settings = self._settings
+        bot_delivery_total = queries.bot_delivery_snapshot(
+            db,
+            now=now,
+            pending_age_minutes=30,
+            claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
+            limit=1,
+        ).total
+        waiting_total = stuck_service.count_waiting(db, settings, now=now)
+        expired_total = stuck_service.count_expired(db, settings, now=now)
+        other_total = stuck_service.count_other_attention(db, settings, now=now)
+        needs_attention_total = bot_delivery_total + other_total
         backup = queries.latest_backup_alert(db, "backup_succeeded")
-        tz = self._settings.admin_bot_timezone
+        tz = settings.admin_bot_timezone
         lines = [
             "<b>وضعیت CentralPay Bridge</b>",
             "",
@@ -316,16 +339,28 @@ class CommandHandlers:
             f"ربات مدیریتی: {OK} فعال",
             "پروکسی معکوس: از داخل کانتینر قابل مشاهده نیست",
             "",
-            f"نسخه: {esc(APP_VERSION)} — محیط: {esc(self._settings.environment)}",
+            f"نسخه: {esc(APP_VERSION)} — محیط: {esc(settings.environment)}",
+        ]
+        if settings.git_commit_sha:
+            lines.append(f"کامیت: <code>{esc(settings.git_commit_sha[:12])}</code>")
+        lines += [
             "",
             f"{PENDING} در صف ارسال: {fmt_amount(pending)}",
             f"{REVIEW} بررسی دستی: {fmt_amount(review)}",
+            f"{WARN if needs_attention_total else OK} نیازمند بررسی: "
+            f"{fmt_amount(needs_attention_total)}",
+            f"🟡 در انتظار تأیید درگاه: {fmt_amount(waiting_total)}",
+            f"⚪ لینک‌های منقضی‌شده: {fmt_amount(expired_total)}",
             f"{FAIL} خطای ایجاد لینک (۲۴س): {fmt_amount(getlink_failures)}",
             f"{FAIL} خطای تأیید (۲۴س): {fmt_amount(verify_failures)}",
             "",
             "آخرین پشتیبان موفق: "
-            + (fmt_time(backup.created_at, tz) if backup else "ثبت نشده"),
-            f"زمان کنونی: {fmt_time(datetime.now(UTC), tz)}",
+            + (
+                f"{fmt_time(backup.created_at, tz)} ({fmt_duration_ago_fa(backup.created_at, now)})"
+                if backup
+                else "ثبت نشده"
+            ),
+            f"زمان کنونی: {fmt_time(now, tz)}",
         ]
         return self._split("\n".join(lines))
 
@@ -648,6 +683,7 @@ class CommandHandlers:
             "notification_recovered_after_restart": "بازیابی ورکر",
             "backup_failed": "خطای پشتیبان‌گیری",
             "callback_signature_failures": "امضای نامعتبر کال‌بک",
+            "reconciliation_exhausted": "اتمام تلاش‌های تطبیق",
         }
         lines = ["<b>خطاهای ۲۴ ساعت اخیر</b>", ""]
         for event_type, count in sorted(summary.items(), key=lambda kv: -kv[1]):
@@ -659,7 +695,17 @@ class CommandHandlers:
         if not args:
             return ["استفاده: /payment ORDER_ID"]
         identifier = args[0][:128]
-        payment = queries.find_payment(db, identifier)
+        try:
+            payment = queries.find_payment(db, identifier)
+        except AmbiguousOrderIdError:
+            record_event(
+                db,
+                payment_id=None,
+                event_type="admin_command_received",
+                data={"command": "payment_lookup", "ambiguous": True},
+            )
+            db.commit()
+            return ["این شناسه بین چند پرداخت مشترک است؛ شناسهٔ دقیق‌تری وارد کنید."]
         record_event(
             db,
             payment_id=payment.id if payment else None,
@@ -673,8 +719,12 @@ class CommandHandlers:
         lines = [f"<b>جزئیات پرداخت #{payment.id}</b>", "", payment_block(payment, tz)]
         if payment.card_last4:
             lines.append(f"چهار رقم آخر کارت:\n{esc(payment.card_last4)}")
+        if payment.gateway_verified_at:
+            lines.append(f"زمان تأیید درگاه:\n{fmt_time(payment.gateway_verified_at, tz)}")
         if payment.bot_last_http_status:
             lines.append(f"آخرین وضعیت HTTP:\n{payment.bot_last_http_status}")
+        if payment.bot_last_error_code:
+            lines.append(f"کد خطای آخرین ارسال:\n<code>{esc(payment.bot_last_error_code)}</code>")
         if payment.next_retry_at:
             lines.append(f"تلاش بعدی:\n{fmt_time(payment.next_retry_at, tz)}")
         if payment.manual_review_at:
@@ -711,9 +761,15 @@ class CommandHandlers:
                 retry = (
                     fmt_time(payment.next_retry_at, tz) if payment.next_retry_at else "—"
                 )
+                detail_bits = [f"تلاش‌ها: {payment.bot_notify_attempts}"]
+                if payment.bot_last_http_status:
+                    detail_bits.append(f"HTTP: {payment.bot_last_http_status}")
+                if payment.bot_last_error_code:
+                    detail_bits.append(f"خطا: {esc(payment.bot_last_error_code)}")
                 lines.append(
                     f"• {esc(payment.bot_order_id)} — "
-                    f"<code>{esc(payment.bot_notify_reason or 'queued')}</code> — {retry}"
+                    f"<code>{esc(payment.bot_notify_reason or 'queued')}</code> — {retry}\n"
+                    f"  {' — '.join(detail_bits)}"
                 )
             lines.append("")
         return self._split("\n".join(lines))

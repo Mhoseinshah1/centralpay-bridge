@@ -240,3 +240,128 @@ def test_errors_summary_lists_reason_events(
 def test_version_command(handlers):
     text = "\n".join(handlers.handle(admin_ctx(), "version", []))
     assert "0.6.0-rc1" in text
+
+
+def test_status_shows_needs_attention_waiting_expired_and_commit_sha(
+    handlers, admin_settings, client, settings, session_factory, stub, bot_stub, notifier
+):
+    """/status's overview counts reuse the exact same primitives /stuck's
+    header does (see cmd_status's docstring) -- this proves they render,
+    not merely that the underlying functions exist; PostgreSQL parity with
+    `centralpay stuck` itself is proven separately in
+    tests/integration/test_admin_overview_pg.py."""
+    from datetime import UTC, datetime, timedelta
+
+    import httpx
+    from sqlalchemy import select as sa_select
+
+    from app.models import Payment as PaymentModel
+
+    make_verified_pending(client, settings, session_factory, stub, order_id="st-attn")
+    bot_stub.result = httpx.Response(422)
+    run_pass(session_factory, notifier, settings)
+
+    assert create_order(client, settings, order_id="st-waiting").status_code == 200
+    with session_factory() as db:
+        payment = db.execute(
+            sa_select(PaymentModel).where(PaymentModel.bot_order_id == "st-waiting")
+        ).scalar_one()
+        payment.callback_token_issued_at = datetime.now(UTC) - timedelta(seconds=1200)
+        db.commit()
+
+    assert create_order(client, settings, order_id="st-expired").status_code == 200
+    with session_factory() as db:
+        payment = db.execute(
+            sa_select(PaymentModel).where(PaymentModel.bot_order_id == "st-expired")
+        ).scalar_one()
+        payment.callback_token_issued_at = datetime.now(UTC) - timedelta(
+            seconds=settings.reconciliation_max_age_seconds + 60
+        )
+        db.commit()
+
+    text = "\n".join(handlers.handle(admin_ctx(), "status", []))
+    assert "نیازمند بررسی: 1" in text
+    assert "در انتظار تأیید درگاه: 1" in text
+    assert "لینک‌های منقضی‌شده: 1" in text
+
+    # git_commit_sha is opt-in (empty by default in tests); when set it must
+    # appear, truncated, exactly like /version already shows it.
+    with_sha = admin_settings.model_copy(update={"git_commit_sha": "abc123def456extra"})
+    sha_handlers = CommandHandlers(
+        session_factory, with_sha, ADMIN_IDS, api_probe=lambda: {"live": True, "ready": True}
+    )
+    sha_text = "\n".join(sha_handlers.handle(admin_ctx(), "status", []))
+    assert "abc123def456" in sha_text
+
+
+def test_payment_shows_gateway_verified_at_and_last_error_code(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    import httpx
+
+    make_verified_pending(client, settings, session_factory, stub, order_id="pay-err")
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings)
+
+    text = "\n".join(handlers.handle(admin_ctx(), "payment", ["pay-err"]))
+    assert "زمان تأیید درگاه" in text
+    assert "کد خطای آخرین ارسال" in text
+    assert "http_500" in text
+
+
+def test_payment_ambiguous_numeric_id_reports_ambiguity_not_wrong_payment(
+    handlers, client, settings, session_factory
+):
+    """A numeric string matching one payment's bot_order_id and a
+    DIFFERENT payment's gateway_order_id must be refused, never silently
+    resolved to either candidate -- shared with app.cli._find_payment via
+    app.services.payment_lookup."""
+    assert create_order(client, settings, order_id="700123", amount=5000).status_code == 200
+    assert create_order(client, settings, order_id="amb-other", amount=5000).status_code == 200
+    with session_factory() as db:
+        other = db.execute(
+            select(Payment).where(Payment.bot_order_id == "amb-other")
+        ).scalar_one()
+        other.gateway_order_id = 700123
+        db.commit()
+
+    text = "\n".join(handlers.handle(admin_ctx(), "payment", ["700123"]))
+    assert "چند پرداخت" in text
+    assert "amb-other" not in text
+
+
+def test_retry_queue_shows_attempt_count_http_status_and_error_code(
+    handlers, client, settings, session_factory, stub, bot_stub, notifier
+):
+    import httpx
+
+    # 429 is retryable (unlike 500/502/503/504, which safe mode sends
+    # straight to manual_review) -- the payment must stay bot_notify_pending
+    # so it actually appears in /retry_queue.
+    make_verified_pending(client, settings, session_factory, stub, order_id="rq-detail")
+    bot_stub.result = httpx.Response(429)
+    run_pass(session_factory, notifier, settings)
+
+    text = "\n".join(handlers.handle(admin_ctx(), "retry_queue", []))
+    assert "rq-detail" in text
+    assert "تلاش‌ها: 1" in text
+    assert "HTTP: 429" in text
+    assert "خطا: http_429" in text
+
+
+def test_new_payment_and_status_fields_contain_no_secrets(
+    handlers, admin_settings, client, settings, session_factory, stub, bot_stub, notifier
+):
+    import httpx
+
+    make_verified_pending(client, settings, session_factory, stub, order_id="new-secret")
+    bot_stub.result = httpx.Response(500)
+    run_pass(session_factory, notifier, settings)
+
+    payment_text = "\n".join(handlers.handle(admin_ctx(), "payment", ["new-secret"]))
+    status_text = "\n".join(handlers.handle(admin_ctx(), "status", []))
+    retry_text = "\n".join(handlers.handle(admin_ctx(), "retry_queue", []))
+    for secret in _all_secrets(admin_settings):
+        assert secret not in payment_text
+        assert secret not in status_text
+        assert secret not in retry_text

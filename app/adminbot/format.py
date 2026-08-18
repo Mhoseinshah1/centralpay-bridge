@@ -242,6 +242,7 @@ _ALERT_TITLES_FA = {
     "verify_invalid_reference_id": "کد پیگیری نامعتبر در تأیید پرداخت",
     "centralpay_getlink_failed": "خطا در ایجاد لینک پرداخت",
     "centralpay_verify_failed": "خطا در تأیید پرداخت",
+    "reconciliation_exhausted": "اتمام تلاش‌های تطبیق — نیازمند بررسی",
     "callback_signature_failures": "امضاهای نامعتبر مکرر در کال‌بک",
     "notification_recovered_after_restart": "بازیابی اعلان پس از راه‌اندازی مجدد",
     "backup_succeeded": "پشتیبان‌گیری موفق",

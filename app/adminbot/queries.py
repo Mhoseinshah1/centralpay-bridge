@@ -13,6 +13,7 @@ from sqlalchemy import and_, case, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from app.models import AdminAlert, Payment, PaymentEvent, WorkerHeartbeat
+from app.services.payment_lookup import find_payment_by_order_id
 
 
 def _utcnow() -> datetime:
@@ -377,13 +378,15 @@ def retry_queue_snapshot(db: Session, *, limit: int = 30) -> dict[str, list[Paym
 
 
 def find_payment(db: Session, identifier: str) -> Payment | None:
-    payment = db.execute(
-        select(Payment).where(Payment.bot_order_id == identifier)
-    ).scalar_one_or_none()
-    if payment is None and identifier.isdigit():
-        payment = db.execute(
-            select(Payment).where(Payment.gateway_order_id == int(identifier))
-        ).scalar_one_or_none()
+    """Shares `app.services.payment_lookup.find_payment_by_order_id` (also
+    used by `app.cli`/`app.ops`) so a numeric identifier that ambiguously
+    names two different payments (one by bot_order_id, another by
+    gateway_order_id) raises AmbiguousOrderIdError here exactly as it does
+    for the CLI, instead of silently guessing which payment to show an
+    operator. Only when that lookup finds nothing at all does this fall
+    back to an admin-bot-only convenience: an unambiguous reference_id
+    match (the CLI has no equivalent fallback)."""
+    payment = find_payment_by_order_id(db, identifier)
     if payment is None:
         matches = list(
             db.execute(
@@ -424,6 +427,7 @@ def errors_summary(db: Session, *, hours: int = 24) -> dict[str, int]:
                     "bot_timeout_ambiguous",
                     "notification_recovered_after_restart",
                     "backup_failed",
+                    "reconciliation_exhausted",
                 ]
             ),
         )
