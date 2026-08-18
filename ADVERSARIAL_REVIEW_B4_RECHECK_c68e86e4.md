@@ -372,11 +372,12 @@ previously documented, not larger.
 - No old finding is hidden behind documentation or tests: topic 39
   (reference_id collision) and the B2/B1/B5-scoped items were
   independently re-derived and reconfirmed at their existing
-  classification, not silently dropped; the seven new items surfaced by
-  this recheck (six new non-blocking-defect topics 42–47, one incremental
-  detail folded into existing topic 39, and one already-known B2-scoped
-  risk note at topic 48 — none a new B4 finding in its own right) are
-  recorded above and in the register below, not fixed-and-hidden.
+  classification, not silently dropped; seven new non-blocking findings
+  were surfaced by this recheck (six new topics 42–47 plus one
+  incremental finding under existing topic 39), plus one already-known
+  B2-scoped risk note at topic 48 (none a new B4 finding in its own
+  right) — all recorded above and in the register below, not
+  fixed-and-hidden.
 - Current `main` (not an old or unmerged branch) was audited, with the
   SHA independently verified via `git fetch`+`git rev-parse` before any
   review work began.
