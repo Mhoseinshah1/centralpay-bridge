@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -31,6 +32,7 @@ from tests.conftest import (
     get_events,
     get_payment,
     getlink_ok_response,
+    run_pass,
     valid_callback_path,
     verify_ok_response,
 )
@@ -615,6 +617,276 @@ def test_race_review_acknowledge_against_callback(
     assert len(stub.verify_requests) == 1  # manual review never re-verifies
     events = event_types(get_events(pg_session_factory, payment.id))
     assert "manual_review_acknowledged" in events
+
+
+# --- manual notification acceptance: real row-lock concurrency races -------
+#
+# `centralpay notification accept` (app.ops -> app.services.notification.
+# execute_manual_accept) must be safe against the notification worker and
+# against itself. Every race below uses a REAL PostgreSQL row lock -- never
+# SQLite -- to prove it.
+
+
+def _ops_env(monkeypatch, settings, pg_session_factory):
+    import app.ops as ops_module
+
+    monkeypatch.setattr(ops_module, "Settings", lambda: settings)
+    monkeypatch.setattr(ops_module, "create_session_factory", lambda url: pg_session_factory)
+    monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+    from app.ops import main as ops_main
+
+    return ops_main
+
+
+def test_race_a_worker_accepts_first_manual_refuses(
+    settings, pg_app, pg_session_factory, bot_stub, notifier, monkeypatch
+):
+    """Race A (section 10): a worker's automatic acceptance commits WHILE
+    the manual command is blocked waiting for the very same row lock. Only
+    once the worker's transaction commits does the manual command's lock
+    wait resolve -- it must then re-check state, see bot_notify_accepted,
+    and refuse with zero mutation and zero manual audit event."""
+    import app.services.notification as notification_module
+    from app.services.notification import claim_next_due, execute_claimed_attempt, utcnow
+
+    ops_main = _ops_env(monkeypatch, settings, pg_session_factory)
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="race-a", amount=5000).status_code == 200
+        payment = get_payment(pg_session_factory, "race-a")
+        stub.verify_result = verify_ok_response(amount=5000, reference_id="REF-race-a")
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+
+    session = pg_session_factory()
+    try:
+        claimed = claim_next_due(session, worker_id="race-a-worker", now=utcnow())
+    finally:
+        session.close()
+    assert claimed is not None
+
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+    from app.audit import record_event as real_record_event
+
+    def _slow_record_event(db, **kwargs):
+        result = real_record_event(db, **kwargs)
+        if kwargs.get("event_type") == "bot_notification_accepted":
+            # The row's FOR UPDATE lock is already held here (acquired
+            # earlier in record_attempt_result, well before this call) and
+            # stays held until this function returns and the caller commits.
+            lock_acquired.set()
+            release_lock.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(notification_module, "record_event", _slow_record_event)
+
+    def run_worker_accept():
+        worker_session = pg_session_factory()
+        try:
+            return execute_claimed_attempt(worker_session, notifier, settings, claimed)
+        finally:
+            worker_session.close()
+
+    def run_manual_accept():
+        return ops_main(
+            ["notification", "accept", "race-a", "--note", "manual after worker", "--yes"]
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        worker_future = pool.submit(run_worker_accept)
+        lock_acquired.wait(timeout=10)
+        manual_future = pool.submit(run_manual_accept)
+        # Give the manual thread's blocking `SELECT ... FOR UPDATE` time to
+        # actually reach PostgreSQL and start waiting on the still-open
+        # worker transaction before that transaction is allowed to commit --
+        # proving real lock contention, not just program-order luck.
+        time.sleep(0.2)
+        release_lock.set()
+        worker_future.result(timeout=30)
+        manual_code = manual_future.result(timeout=30)
+
+    assert manual_code == 1  # refused
+    assert len(bot_stub.requests) == 1  # exactly one real delivery, by the worker
+    payment = get_payment(pg_session_factory, "race-a")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    assert payment.bot_notify_attempts == 1  # never touched by the refused manual attempt
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("bot_notification_accepted") == 1
+    assert events.count("manual_bot_notification_accepted") == 0  # never created
+
+
+def test_race_b_manual_locks_first_worker_skips(
+    settings, pg_app, pg_session_factory, bot_stub, notifier, monkeypatch
+):
+    """Race B (section 10): the manual command holds the row lock across
+    its whole transaction; a concurrent worker claim (FOR UPDATE SKIP
+    LOCKED) must skip the locked row rather than block or double-claim it,
+    so the worker can never send while the manual transition owns the
+    lock. After commit the worker observes bot_notify_accepted and the
+    payment never returns to bot_notify_pending."""
+    import app.services.notification as notification_module
+    from app.services.notification import claim_next_due, utcnow
+
+    ops_main = _ops_env(monkeypatch, settings, pg_session_factory)
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="race-b", amount=6000).status_code == 200
+        payment = get_payment(pg_session_factory, "race-b")
+        stub.verify_result = verify_ok_response(amount=6000, reference_id="REF-race-b")
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    from app.audit import record_event as real_record_event
+
+    def _slow_record_event(db, **kwargs):
+        result = real_record_event(db, **kwargs)
+        if kwargs.get("event_type") == "manual_bot_notification_accepted":
+            lock_held.set()
+            release_lock.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(notification_module, "record_event", _slow_record_event)
+
+    def run_manual_accept():
+        return ops_main(
+            ["notification", "accept", "race-b", "--note", "manual first", "--yes"]
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        manual_future = pool.submit(run_manual_accept)
+        lock_held.wait(timeout=10)
+        # claim_next_due uses SKIP LOCKED, so this never blocks: it must
+        # either skip the locked row (claiming nothing) or -- if it happens
+        # to run after commit -- find no row at all (status already
+        # changed). Run it synchronously; no thread needed.
+        worker_session = pg_session_factory()
+        try:
+            claimed = claim_next_due(worker_session, worker_id="race-b-worker", now=utcnow())
+        finally:
+            worker_session.close()
+        release_lock.set()
+        manual_code = manual_future.result(timeout=30)
+
+    assert manual_code == 0
+    assert claimed is None  # SKIP LOCKED: the worker claimed nothing
+    assert bot_stub.requests == []  # the manual operation caused no bot request
+
+    payment = get_payment(pg_session_factory, "race-b")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+
+    # A subsequent worker pass, now that manual has committed, must not
+    # revert or re-claim the payment: the due-scan predicate requires
+    # status == bot_notify_pending, which no longer holds.
+    result = run_pass(pg_session_factory, notifier, settings, worker_id="race-b-worker-2")
+    assert result["processed"] == 0
+    payment = get_payment(pg_session_factory, "race-b")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    assert bot_stub.requests == []
+
+
+def test_race_c_two_manual_accepts_only_one_succeeds(
+    settings, pg_app, pg_session_factory, bot_stub, monkeypatch
+):
+    """Race C (section 10): two concurrent manual accepts against the same
+    payment. At most one transition succeeds, exactly one
+    manual_bot_notification_accepted event exists, and the loser refuses
+    safely with no duplicate audit event and no state corruption."""
+    ops_main = _ops_env(monkeypatch, settings, pg_session_factory)
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="race-c", amount=7000).status_code == 200
+        payment = get_payment(pg_session_factory, "race-c")
+        stub.verify_result = verify_ok_response(amount=7000, reference_id="REF-race-c")
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+
+    barrier = threading.Barrier(2)
+
+    def attempt(note):
+        barrier.wait(timeout=10)
+        return ops_main(["notification", "accept", "race-c", "--note", note, "--yes"])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(attempt, f"attempt-{i}") for i in range(2)]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert sorted(results) == [0, 1]  # exactly one winner, one refusal
+    assert bot_stub.requests == []  # never contacts the bot
+
+    payment = get_payment(pg_session_factory, "race-c")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    events = event_types(get_events(pg_session_factory, payment.id))
+    assert events.count("manual_bot_notification_accepted") == 1  # never duplicated
+
+
+def test_manual_accept_during_inflight_worker_send_is_discarded_safely(
+    settings, pg_app, pg_session_factory, bot_stub, notifier, monkeypatch
+):
+    """Beyond the three required races: the notification pipeline
+    deliberately holds NO database lock while the bot HTTP request is in
+    flight (see app.services.notification's module docstring), so a
+    manual accept can land in exactly that window. record_attempt_result's
+    existing claim-ownership discard guard (audit fix; see
+    test_worker_recovery_hardening.py) must make this safe regardless of
+    which side wins: exactly one accepted-shaped event survives, the bot
+    is contacted exactly once (by the worker, which had already started
+    before the manual command could exist), and the final state is
+    bot_notify_accepted either way -- never corrupted, never reverted."""
+    from app.services.notification import claim_next_due, execute_claimed_attempt, utcnow
+
+    ops_main = _ops_env(monkeypatch, settings, pg_session_factory)
+    stub = pg_app.state.centralpay_stub
+    with TestClient(pg_app, raise_server_exceptions=False) as client:
+        assert create_order(client, settings, order_id="race-d", amount=8000).status_code == 200
+        payment = get_payment(pg_session_factory, "race-d")
+        stub.verify_result = verify_ok_response(amount=8000, reference_id="REF-race-d")
+        assert client.get(valid_callback_path(stub, payment.gateway_order_id)).status_code == 200
+
+    session = pg_session_factory()
+    try:
+        claimed = claim_next_due(session, worker_id="race-d-worker", now=utcnow())
+    finally:
+        session.close()
+    assert claimed is not None
+    bot_stub.result = httpx.Response(200, json={"ok": True})
+
+    barrier = threading.Barrier(2)
+
+    def run_worker_send():
+        barrier.wait(timeout=10)
+        worker_session = pg_session_factory()
+        try:
+            return execute_claimed_attempt(worker_session, notifier, settings, claimed)
+        finally:
+            worker_session.close()
+
+    def run_manual_accept():
+        barrier.wait(timeout=10)
+        return ops_main(
+            ["notification", "accept", "race-d", "--note", "manual mid-flight", "--yes"]
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        worker_future = pool.submit(run_worker_send)
+        manual_future = pool.submit(run_manual_accept)
+        worker_future.result(timeout=30)
+        manual_code = manual_future.result(timeout=30)
+
+    assert len(bot_stub.requests) == 1  # sent exactly once, whichever side "won" the lock
+    payment = get_payment(pg_session_factory, "race-d")
+    assert payment.status == PaymentStatus.BOT_NOTIFY_ACCEPTED.value  # never lost or corrupted
+    assert payment.next_retry_at is None
+
+    events = event_types(get_events(pg_session_factory, payment.id))
+    accepted_events = [
+        e for e in events if e in ("bot_notification_accepted", "manual_bot_notification_accepted")
+    ]
+    assert len(accepted_events) == 1  # exactly one acceptance wins, never both
+    if manual_code == 0:
+        assert accepted_events == ["manual_bot_notification_accepted"]
+        assert "bot_notification_result_discarded" in events
+    else:
+        assert accepted_events == ["bot_notification_accepted"]
 
 
 # --- dynamic fee: migration backfill, concurrency, db-check ------------------

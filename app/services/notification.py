@@ -13,6 +13,7 @@ unknown; release_stale_claims handles it according to the retry mode (safe:
 manual review, idempotent: requeue).
 """
 
+import enum
 import logging
 import random
 import time
@@ -116,6 +117,22 @@ def queue_notification(db: Session, payment: Payment, *, now: datetime) -> None:
 def _clear_claim(payment: Payment) -> None:
     payment.notification_claimed_at = None
     payment.notification_claimed_by = None
+
+
+def apply_accepted_state(payment: Payment, *, now: datetime) -> None:
+    """The state mutation shared by every path that marks a payment's bot
+    notification "accepted" -- the automatic HTTP 2xx branch of
+    :func:`record_attempt_result` and manual operator acceptance
+    (:func:`execute_manual_accept`). Owns ONLY the fields both paths must
+    agree on; each caller records its own, distinct audit event and sets
+    any outcome-specific field itself (e.g. ``bot_last_http_status``, which
+    a manual acceptance -- having sent no request -- must never touch)."""
+    payment.status = PaymentStatus.BOT_NOTIFY_ACCEPTED.value
+    payment.bot_notify_reason = ReasonCode.BOT_NOTIFY_ACCEPTED.value
+    payment.bot_notify_accepted_at = now
+    payment.next_retry_at = None
+    payment.last_error = None
+    _clear_claim(payment)
 
 
 def _log_extra(
@@ -282,12 +299,7 @@ def record_attempt_result(
     if effective_kind is OutcomeKind.ACCEPTED:
         # HTTP 2xx means the bot API accepted the request — never proof that
         # the user balance was credited.
-        payment.status = PaymentStatus.BOT_NOTIFY_ACCEPTED.value
-        payment.bot_notify_reason = ReasonCode.BOT_NOTIFY_ACCEPTED.value
-        payment.bot_notify_accepted_at = now
-        payment.next_retry_at = None
-        payment.last_error = None
-        _clear_claim(payment)
+        apply_accepted_state(payment, now=now)
         record_event(
             db,
             payment_id=payment.id,
@@ -563,3 +575,137 @@ def run_worker_pass(
         finally:
             request_id_var.reset(token)
     return {"recovered": recovered, "processed": processed}
+
+
+# --- manual operator acceptance (host CLI; see app.ops) --------------------
+#
+# Production incident: a downstream bot had already processed a
+# gateway-verified payment (idempotent API, customer already credited) but
+# every notification attempt kept failing with a proven side-effecting 5xx
+# (see the safe-mode comment on _SAFE_MODE_NON_RETRYABLE_HTTP_STATUSES
+# above), so safe mode correctly refused to auto-retry and the payment sat
+# in bot_notify_pending forever. Neither `review resolve` nor `review
+# resend` applies: the payment was never in manual_review, and resend
+# requires idempotent mode plus another live bot request this operator has
+# already confirmed is unnecessary. This is the explicit, single-payment
+# escape hatch for that situation: a purely local, operator-confirmed state
+# transition. It makes NO network request of any kind (no BotNotifier, no
+# CentralPayClient) and never fabricates a verification, a reference id, or
+# an HTTP outcome that did not happen.
+
+
+class ManualAcceptRefusal(enum.StrEnum):
+    """Why a manual-accept attempt refuses, re-checked fresh under the row
+    lock (see execute_manual_accept) -- never trusted from an earlier
+    non-locking read. Checked in this fixed order so a caller can tell
+    "the payment moved on" (a worker already accepted it, it went to manual
+    review, etc.) apart from the belt-and-braces case where status somehow
+    says bot_notify_pending without a recorded gateway verification (which
+    ck_payments_delivery_requires_verification should already forbid)."""
+
+    NOT_BOT_NOTIFY_PENDING = "not_bot_notify_pending"
+    NOT_GATEWAY_VERIFIED = "not_gateway_verified"
+
+
+def determine_manual_accept_refusal(payment: Payment) -> ManualAcceptRefusal | None:
+    """``None`` means eligible: exactly ``status == bot_notify_pending`` AND
+    ``gateway_verified_at IS NOT NULL``."""
+    if payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value:
+        return ManualAcceptRefusal.NOT_BOT_NOTIFY_PENDING
+    if payment.gateway_verified_at is None:
+        return ManualAcceptRefusal.NOT_GATEWAY_VERIFIED
+    return None
+
+
+@dataclass(frozen=True)
+class ManualAcceptOutcome:
+    accepted: bool
+    # Pre-attempt facts, captured under the row lock before either the
+    # mutation or the refusal rollback -- never re-read afterward, so a
+    # caller can never mistake this for the payment's current database
+    # state (the same discipline app.services.aged_out_recovery uses for
+    # its RecoverySnapshot).
+    status: str
+    gateway_verified: bool
+    refusal: ManualAcceptRefusal | None = None
+
+
+def execute_manual_accept(
+    db: Session,
+    *,
+    payment_id: int,
+    note: str,
+    now: datetime,
+) -> ManualAcceptOutcome | None:
+    """The ONLY mutating entry point for operator manual acceptance. Returns
+    ``None`` if no payment with this id exists (defensive only -- payments
+    are never deleted).
+
+    Contract:
+
+    1. Acquires ``SELECT ... FOR UPDATE`` on the payment row by primary key,
+       with ``populate_existing=True`` (the same discipline
+       ``app.services.reconcile_inspect.build_local_snapshot`` uses for its
+       own ``for_update=True`` path). The caller resolves ORDER_ID ->
+       payment_id via the repository's existing safe (ambiguity-checked)
+       lookup BEFORE calling this function, on the SAME session -- without
+       ``populate_existing``, SQLAlchemy's identity map would silently hand
+       back that earlier, non-locking read's now-stale ``Payment`` object
+       instead of the fresh, lock-ordered row, defeating the re-check below
+       entirely. That earlier read is never trusted for eligibility --
+       only ``payment_id`` is reused from it.
+    2. Re-evaluates eligibility (``determine_manual_accept_refusal``) only
+       AFTER the lock is held. If a concurrent worker or another manual
+       accept already changed the row while this call waited for the lock,
+       this refuses with ZERO mutation and ZERO audit event.
+    3. If still eligible, applies the exact same accepted-state mutation the
+       automatic HTTP 2xx path uses (``apply_accepted_state``) -- never
+       touching ``bot_last_http_status``, ``bot_last_error_code``,
+       ``bot_notify_attempts``, or any financial field -- and records a
+       DISTINCT audit event (``manual_bot_notification_accepted``), never
+       the automatic ``bot_notification_accepted`` event and never a
+       fabricated HTTP outcome.
+
+    A refusal rolls back (no row was ever changed, so there is nothing to
+    commit) and releases the lock; an acceptance commits the state
+    transition and its audit event together, atomically. Any exception
+    raised before that commit leaves neither the state transition nor a
+    partial audit event behind.
+    """
+    payment = db.execute(
+        select(Payment)
+        .where(Payment.id == payment_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if payment is None:
+        db.rollback()
+        return None
+
+    status = payment.status
+    gateway_verified = payment.gateway_verified_at is not None
+    refusal = determine_manual_accept_refusal(payment)
+    if refusal is not None:
+        db.rollback()
+        return ManualAcceptOutcome(
+            accepted=False, status=status, gateway_verified=gateway_verified, refusal=refusal
+        )
+
+    previous_reason = payment.bot_notify_reason
+    apply_accepted_state(payment, now=now)
+    record_event(
+        db,
+        payment_id=payment.id,
+        event_type="manual_bot_notification_accepted",
+        data={
+            "operator": "host-cli",
+            "note": note[:500],
+            "previous_reason": previous_reason,
+        },
+    )
+    db.commit()
+    return ManualAcceptOutcome(
+        accepted=True,
+        status=PaymentStatus.BOT_NOTIFY_ACCEPTED.value,
+        gateway_verified=gateway_verified,
+    )

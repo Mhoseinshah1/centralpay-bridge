@@ -434,6 +434,29 @@ def test_main_dispatch_routes_reconcile_to_cmd_reconcile_inspect():
     assert re.search(r'reconcile\)\s*cmd_reconcile_inspect "\$@" ;;', dispatch)
 
 
+def test_main_dispatch_routes_notification_to_cmd_notification():
+    text = MANAGEMENT.read_text()
+    dispatch = text[text.index("main() {") :]
+    assert re.search(r'notification\)\s*cmd_notification "\$@" ;;', dispatch)
+
+
+def test_notification_accept_routes_to_app_ops_and_requires_root():
+    text = MANAGEMENT.read_text()
+    body = text[text.index("cmd_notification()") : text.index("cmd_backup()")]
+    assert "require_root notification" in body
+    assert "app.ops notification accept" in body
+    # No separate shell-level prompt: app.ops itself refuses without --yes
+    # (mirrors `review resend`'s --confirm-idempotent-bot/--yes gate) --
+    # this wrapper adds no interactive confirmation of its own.
+    assert "read -r -p" not in body
+
+
+def test_usage_documents_notification_accept():
+    text = MANAGEMENT.read_text()
+    usage_block = text[text.index("Manual review (host-only") : text.index("Data:")]
+    assert "notification accept ORDER_ID --note TEXT [--yes]" in usage_block
+
+
 def test_restore_requires_confirmation():
     text = MANAGEMENT.read_text()
     assert 'Type RESTORE to continue' in text
