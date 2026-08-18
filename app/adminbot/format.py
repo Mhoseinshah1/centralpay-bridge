@@ -242,6 +242,7 @@ _ALERT_TITLES_FA = {
     "verify_invalid_reference_id": "کد پیگیری نامعتبر در تأیید پرداخت",
     "centralpay_getlink_failed": "خطا در ایجاد لینک پرداخت",
     "centralpay_verify_failed": "خطا در تأیید پرداخت",
+    "reconciliation_exhausted": "اتمام تلاش‌های تطبیق — نیازمند بررسی",
     "callback_signature_failures": "امضاهای نامعتبر مکرر در کال‌بک",
     "notification_recovered_after_restart": "بازیابی اعلان پس از راه‌اندازی مجدد",
     "backup_succeeded": "پشتیبان‌گیری موفق",
@@ -279,6 +280,12 @@ def alert_message(db: Session, settings: Settings, claimed: "ClaimedAlert") -> l
             ("count", "تعداد"),
             ("size", "حجم"),
             ("file_name", "فایل"),
+            # A fixed internal code (e.g. reconciliation's ERROR_GATEWAY_NOT_PAID
+            # / ERROR_INTERNAL, or a CentralPayError.code) -- never raw gateway
+            # or exception text. Needed for reconciliation_exhausted so the
+            # operator can tell an unpaid-gateway exhaustion from an
+            # internal/transport one without a separate CLI lookup.
+            ("error_code", "کد خطا"),
         )
         for key, label in detail_keys:
             if key in payload and payload[key] is not None:

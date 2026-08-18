@@ -65,6 +65,7 @@ select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
 "tests/test_payer_identity.py" = ["RUF001"]
 # Asserts Persian admin-bot output that mixes Persian words with ASCII counts.
 "tests/test_admin_resolved_reviews.py" = ["RUF001"]
+"tests/test_admin_commands.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.12"
