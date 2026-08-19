@@ -184,6 +184,33 @@ redundant with per-IP keying and is not added.
    > for all of those. The helper never calls `resolve_payer_identity()`
    > (which can itself create a new identity-mapping row), so the
    > limiter-exemption check itself is provably zero-mutation.
+   >
+   > **Second regression, found and fixed in a further follow-up commit**:
+   > the corrected rule above still checked "different Telegram user" only
+   > when the STORED row's identity type was `telegram_user`. But
+   > `create_payment()` calls `resolve_payer_identity()` for the REQUESTED
+   > identity BEFORE the row lock and BEFORE `_reconcile_identity()` ever
+   > runs — and that call can create and commit a brand new
+   > `CentralPayPayerIdentity` row (plus a `centralpay_payer_identity_created`
+   > audit event) even when reconciliation would go on to harmlessly
+   > "reuse" the stored identity. A stored `order_fallback` row retried
+   > with an arbitrary, never-before-seen Telegram id — or a stored
+   > `telegram_user` row retried with NO Telegram id — both hit that write
+   > path while still being wrongly exempted, letting an authenticated
+   > caller vary the identity on one live `LINK_CREATED` order repeatedly
+   > and create unbounded identity-mapping rows/audit events without ever
+   > consuming create-limiter budget. **Corrected exemption rule**: the
+   > requested identity must exactly match the *shape* the stored mapping
+   > was already resolved under, not merely fail to conflict with it —
+   > stored `telegram_user` + a Telegram id supplied that equals
+   > `payment.gateway_user_id`, OR stored `order_fallback` + NO Telegram id
+   > supplied. Both re-derive the identical `identity_key` the stored
+   > mapping already satisfies, so `resolve_payer_identity()` (or the
+   > retired-scheme shortcut) is provably a no-write lookup. Every other
+   > combination — including a legacy/untyped row with no stored identity
+   > type at all, for which the retired-scheme lookup can never match —
+   > is conservatively NOT exempt, even in cases where reconciliation would
+   > still end up "reuse".
 4. **Malformed-body floods are bounded but not rate-limited before
    parsing work begins.** Reviewed and judged acceptable, not changed:
    the work done before any auth/rate-limit check is already tightly
