@@ -181,13 +181,33 @@ def _dump(tmp_path):
     return dump_file
 
 
+def _restore(dump_file, *extra_args):
+    """Restore a custom-format archive by streaming it through stdin.
+
+    pg_restore accepts an archive on stdin when no filename is given (for
+    non-directory formats); using that here -- not just for --list -- means
+    a restore never depends on the archive file being visible at a
+    particular host filesystem path. That matters in CI: pg_dump/pg_restore
+    there run inside the postgres:16 service container via a docker-exec
+    wrapper (.github/scripts/pg-client-wrapper.sh), which has no access to
+    the runner's filesystem, only to what's piped over stdin/stdout.
+    """
+    args, env = _pg_env_and_args()
+    pg_restore = _find_pg_tool("pg_restore", _server_major())
+    with open(dump_file, "rb") as dump:
+        subprocess.run(
+            [pg_restore, *args, *extra_args],
+            env=env, stdin=dump, check=True, timeout=120,
+        )
+
+
 def test_pg_dump_restore_round_trip(populated_db, pg_engine, tmp_path):
     counts_before, payments_before = _snapshot(pg_engine)
     assert counts_before["payments"] == 2
     assert counts_before["payment_events"] > 0
 
     dump_file = _dump(tmp_path)
-    args, env = _pg_env_and_args()
+    _args, env = _pg_env_and_args()
     pg_restore = _find_pg_tool("pg_restore", _server_major())
 
     # The same validation gate scripts/backup.sh uses before a file counts
@@ -202,10 +222,7 @@ def test_pg_dump_restore_round_trip(populated_db, pg_engine, tmp_path):
     with pg_engine.begin() as connection:
         for table in _TABLES:
             connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
-    subprocess.run(
-        [pg_restore, *args, "--no-owner", str(dump_file)],
-        env=env, check=True, timeout=120,
-    )
+    _restore(dump_file, "--no-owner")
 
     counts_after, payments_after = _snapshot(pg_engine)
     assert counts_after == counts_before
@@ -419,16 +436,11 @@ def test_full_state_round_trip_and_sequence_safety(
 
     before = _financial_snapshot(pg_engine)
     dump_file = _dump(tmp_path)
-    args, env = _pg_env_and_args()
-    pg_restore = _find_pg_tool("pg_restore", _server_major())
 
     with pg_engine.begin() as connection:
         for table in (*_TABLES, "alembic_version"):
             connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
-    subprocess.run(
-        [pg_restore, *args, "--no-owner", "--exit-on-error", str(dump_file)],
-        env=env, check=True, timeout=120,
-    )
+    _restore(dump_file, "--no-owner", "--exit-on-error")
 
     assert _financial_snapshot(pg_engine) == before  # full financial fidelity
 
@@ -588,16 +600,11 @@ def test_fee_policies_survive_restore_and_stay_decoupled(
     assert len(policies_before) == 3
 
     dump_file = _dump(tmp_path)
-    args, env = _pg_env_and_args()
-    pg_restore = _find_pg_tool("pg_restore", _server_major())
 
     with pg_engine.begin() as connection:
         for table in _TABLES:
             connection.execute(text(f"DROP TABLE IF EXISTS {table} CASCADE"))
-    subprocess.run(
-        [pg_restore, *args, "--no-owner", "--exit-on-error", str(dump_file)],
-        env=env, check=True, timeout=120,
-    )
+    _restore(dump_file, "--no-owner", "--exit-on-error")
 
     with pg_engine.connect() as connection:
         policies_after = [
