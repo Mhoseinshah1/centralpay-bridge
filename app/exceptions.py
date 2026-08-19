@@ -4,6 +4,8 @@ Messages on these exceptions are returned to API callers and logged, so they
 must never contain secrets, full card numbers, or full redirect URLs.
 """
 
+import math
+
 
 class BridgeError(Exception):
     code = "internal_error"
@@ -105,6 +107,16 @@ class RateLimitedError(BridgeError):
     code = "rate_limited"
     http_status = 429
     default_message = "Too many requests"
+
+    def __init__(
+        self, message: str | None = None, *, retry_after_seconds: float | None = None
+    ) -> None:
+        super().__init__(message)
+        # Rounded up: a caller that waits the reported number of whole
+        # seconds must never arrive a fraction of a second too early.
+        self.retry_after_seconds = (
+            max(1, math.ceil(retry_after_seconds)) if retry_after_seconds is not None else None
+        )
 
 
 class GatewayOrderIdAllocationError(BridgeError):

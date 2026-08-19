@@ -146,6 +146,12 @@ def test_caddyfile_template_contents():
     assert "max_size" in text
     # Proxy-issued request IDs override any client value.
     assert "X-Request-ID" in text and "http.request.uuid" in text
+    # X-Forwarded-For is explicitly OVERWRITTEN with Caddy's own resolved
+    # peer (app.clientip trusts this header because of this line). Caddy
+    # already ignores a client-supplied value by default; this pins the
+    # trust boundary explicitly and auditably rather than relying on that
+    # implicit default.
+    assert "header_up X-Forwarded-For {remote_host}" in text
     # Only public routes are proxied; everything else 404s.
     for route in (
         "/api/custom-payment",

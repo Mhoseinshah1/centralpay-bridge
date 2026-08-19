@@ -473,11 +473,33 @@ class Settings(BaseSettings):
     first_payment_guard_enabled: bool = False
 
     # Application-level rate limiting (in-memory, per process; see
-    # app/ratelimit.py for distributed semantics).
+    # app/ratelimit.py and RATE_LIMITING_ARCHITECTURE.md for distributed
+    # semantics and the fail-open decision). The *_per_10min and
+    # *_per_minute fields below are GLOBAL ceilings shared by every
+    # caller; the *_per_ip_* fields are an additional, narrower per-client
+    # layer (app/clientip.py resolves the key) — both apply together.
     rate_limit_enabled: bool = True
     rate_limit_create_per_minute: int = Field(default=120, gt=0)
     rate_limit_invalid_key_per_10min: int = Field(default=20, gt=0)
     rate_limit_invalid_signature_per_10min: int = Field(default=100, gt=0)
+    # Per-IP burst limit on genuinely NEW payment-creation attempts (an
+    # idempotent retry of an already-created order never consults this —
+    # see app/api/payments.py). Deliberately below the global ceiling: one
+    # source should not be able to consume most of the shared budget.
+    rate_limit_create_per_ip_per_minute: int = Field(default=30, gt=0)
+    rate_limit_invalid_signature_per_ip_per_10min: int = Field(default=30, gt=0)
+    # Bounds the number of distinct per-IP buckets kept in memory at once
+    # (LRU-evicted beyond this) — caps memory under a distributed/spoofed-
+    # source flood regardless of how many distinct keys are observed.
+    rate_limit_ip_bucket_capacity: int = Field(default=10_000, gt=0)
+    # Whether to trust X-Forwarded-For for per-IP keying. Default True
+    # matches this deployment's documented single-hop-Caddy topology
+    # (deploy/caddy/Caddyfile.template overwrites the header with Caddy's
+    # own resolved peer address); set False for a topology without that
+    # guarantee, which falls back to the raw ASGI socket peer for every
+    # caller (safe, just coarser — every caller behind an untrusted proxy
+    # then shares one bucket).
+    rate_limit_trust_proxy_headers: bool = True
     # Internal (non-public) API base URL the admin bot probes for health.
     admin_bot_api_url: str = "http://api:8000"
     # Admin bot container liveness heartbeat file.

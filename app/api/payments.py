@@ -12,9 +12,11 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, StrictInt, StrictStr
 from pydantic import ValidationError as PydanticValidationError
+from sqlalchemy import select
 from starlette.datastructures import QueryParams
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
+from app.clientip import resolve_client_ip
 from app.exceptions import (
     AmountOutOfRangeError,
     InvalidApiKeyError,
@@ -22,6 +24,7 @@ from app.exceptions import (
     PaymentCreationDisabledError,
     RateLimitedError,
 )
+from app.models import Payment
 from app.security import constant_time_equals
 from app.services.payer_identity import (
     IDENTITY_TYPE_ORDER_FALLBACK,
@@ -530,10 +533,34 @@ def create_custom_payment(
         # strict limiter (credential guessing).
         logger.warning("invalid_inbound_api_key", extra={"bot_order_id": body.order_id})
         if not limiters.check(limiters.invalid_api_key, "invalid_api_key"):
-            raise RateLimitedError()
+            raise RateLimitedError(
+                retry_after_seconds=limiters.retry_after(limiters.invalid_api_key)
+            )
         raise InvalidApiKeyError()
-    if not limiters.check(limiters.create, "create_payment"):
-        raise RateLimitedError()
+    # Idempotency-aware ordering (task: an idempotent retry must never be
+    # rejected by the create limiter and fail forever because the original
+    # response was lost). This is a single indexed point lookup on the
+    # unique bot_order_id column -- no write, no lock -- never the table
+    # scan the limiter itself must avoid. An order that already has a row
+    # will be answered by create_payment()'s own existing, already-tested
+    # idempotent-return / conflict-refusal logic below; only a GENUINELY
+    # NEW order consumes limiter budget, since that is the only case that
+    # does real (gateway-calling, row-creating) work.
+    is_new_order = (
+        db.execute(select(Payment.id).where(Payment.bot_order_id == body.order_id)).first()
+        is None
+    )
+    db.rollback()  # read-only; never leave an idle transaction open
+    if is_new_order:
+        client_ip = resolve_client_ip(request, settings)
+        if not limiters.check_per_ip(limiters.create_per_ip, client_ip, "create_payment"):
+            raise RateLimitedError(
+                retry_after_seconds=limiters.retry_after_per_ip(
+                    limiters.create_per_ip, client_ip
+                )
+            )
+        if not limiters.check(limiters.create, "create_payment"):
+            raise RateLimitedError(retry_after_seconds=limiters.retry_after(limiters.create))
     # Emergency privacy containment and fail-closed payer isolation, checked
     # AFTER authentication (never expose guard state to unauthenticated
     # callers) and BEFORE any gateway work. Neither error names the missing

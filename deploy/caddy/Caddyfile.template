@@ -58,6 +58,14 @@
 			# The application trusts X-Request-ID; the proxy overwrites any
 			# client-supplied value so request IDs are always proxy-issued.
 			header_up X-Request-ID {http.request.uuid}
+			# The application's per-IP rate limiting (app/clientip.py) trusts
+			# this header because it is explicitly OVERWRITTEN here with
+			# Caddy's own resolved TCP-peer address. Caddy already ignores a
+			# client-supplied X-Forwarded-For by default (trusted_proxies is
+			# not set below), so this line is not a spoofing fix -- it makes
+			# the single-hop trust boundary explicit and auditable in this
+			# repo instead of relying on Caddy's implicit default.
+			header_up X-Forwarded-For {remote_host}
 		}
 	}
 

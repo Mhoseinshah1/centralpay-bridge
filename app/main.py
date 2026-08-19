@@ -27,9 +27,14 @@ logger = logging.getLogger("app.main")
 
 
 async def _bridge_error_handler(request: Request, exc: BridgeError) -> JSONResponse:
+    headers = None
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    if retry_after is not None:
+        headers = {"Retry-After": str(retry_after)}
     return JSONResponse(
         status_code=exc.http_status,
         content={"error": {"code": exc.code, "message": exc.message}},
+        headers=headers,
     )
 
 

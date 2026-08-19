@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
 from app.api.pages import payment_status_page
+from app.clientip import resolve_client_ip
 from app.exceptions import InvalidCallbackSignatureError, RateLimitedError
 from app.security import CALLBACK_PATH, verify_callback_signature
 from app.services.verification import process_callback
@@ -119,7 +120,20 @@ def centralpay_callback(
     if not verify_callback_signature(settings.callback_hmac_secret, order_id, ct, sig):
         logger.warning("callback_signature_invalid", extra={"gateway_order_id": order_id})
         limiters = request.app.state.rate_limiters
-        rate_ok = limiters.check(limiters.invalid_signature, "invalid_callback_signature")
+        # Per-IP layer checked first and short-circuits: once a single
+        # source is already over ITS OWN budget, its further requests must
+        # not also keep consuming the shared global ceiling that protects
+        # OTHER legitimate sources (incl. rare genuine gateway retries)
+        # from an aggregate, many-source flood.
+        client_ip = resolve_client_ip(request, settings)
+        per_ip_ok = limiters.check_per_ip(
+            limiters.invalid_signature_per_ip, client_ip, "invalid_callback_signature"
+        )
+        global_ok = (
+            limiters.check(limiters.invalid_signature, "invalid_callback_signature")
+            if per_ip_ok
+            else True
+        )
         storm_count = signature_failure_tracker.record()
         if storm_count is not None:
             # Best-effort aggregated alert; failure never affects the response.
@@ -136,8 +150,16 @@ def centralpay_callback(
                 db.commit()
             except Exception:
                 logger.exception("signature_storm_alert_failed")
-        if not rate_ok:
-            raise RateLimitedError()
+        if not per_ip_ok:
+            raise RateLimitedError(
+                retry_after_seconds=limiters.retry_after_per_ip(
+                    limiters.invalid_signature_per_ip, client_ip
+                )
+            )
+        if not global_ok:
+            raise RateLimitedError(
+                retry_after_seconds=limiters.retry_after(limiters.invalid_signature)
+            )
         raise InvalidCallbackSignatureError()
     result = process_callback(
         db, client, gateway_order_id=order_id, callback_token=ct, settings=settings
