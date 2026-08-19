@@ -17,8 +17,9 @@ import httpx
 import pytest
 from sqlalchemy import func, select
 
-from app.models import Payment, PaymentEvent, PaymentStatus
+from app.models import CentralPayPayerIdentity, Payment, PaymentEvent, PaymentStatus
 from app.ratelimit import BoundedLimiterStore, RateLimiters, SlidingWindowLimiter
+from app.services.payer_identity import IDENTITY_TYPE_ORDER_FALLBACK
 from tests.conftest import (
     DEFAULT_GATEWAY_USER_ID,
     DEFAULT_TELEGRAM_USER_ID,
@@ -26,6 +27,11 @@ from tests.conftest import (
     get_events,
     get_payment,
 )
+
+
+def _identity_row_count(session_factory) -> int:
+    with session_factory() as db:
+        return db.execute(select(func.count(CentralPayPayerIdentity.id))).scalar_one()
 
 # --- object-level: SlidingWindowLimiter / BoundedLimiterStore ---------------
 
@@ -617,6 +623,171 @@ def test_verified_or_under_review_rows_do_not_bypass_the_create_limiter(
     app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
     app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
     response = create_order(client, settings, order_id="rl-non-cache-state", amount=10000)
+    assert response.status_code == 429
+
+
+# --- regression #2: identity resolution can mutate even when
+# _reconcile_identity() would end up "reuse" ----------------------------------
+#
+# find_safe_replay_redirect_url() originally rejected the exemption only for
+# a stored telegram_user row given a DIFFERENT Telegram id. But
+# create_payment() calls resolve_payer_identity() for the REQUESTED identity
+# BEFORE the row lock and BEFORE _reconcile_identity() ever runs -- and that
+# call can create and commit a brand new CentralPayPayerIdentity row (plus a
+# centralpay_payer_identity_created audit event) even when the eventual
+# reconciliation decision is harmless "reuse". A stored order_fallback row
+# retried with an arbitrary NEW Telegram id -- or a stored telegram_user row
+# retried with NO Telegram id -- both hit that write path while still being
+# wrongly treated as a safe, limiter-exempt replay. Fixed: the exemption now
+# requires the requested identity shape to exactly match the stored one.
+
+
+def test_order_fallback_replay_with_no_telegram_id_still_bypasses_the_limiter(
+    app, client, settings, stub, session_factory
+):
+    """The true safe case for an order_fallback row: a bare retry (no
+    Telegram id) re-derives the exact identity_key this payment's mapping
+    was already resolved under -- genuinely zero gateway calls, zero new
+    identity rows, zero new events, even under an exhausted limiter."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    first = create_order(client, settings, order_id="rl-fallback-safe", telegram_user_id=None)
+    assert first.status_code == 200
+    original_url = first.json()["url"]
+    payment = get_payment(session_factory, "rl-fallback-safe")
+    assert payment.payer_identity_type == IDENTITY_TYPE_ORDER_FALLBACK
+    getlink_calls_before = len(stub.getlink_requests)
+    identities_before = _identity_row_count(session_factory)
+    events_before = len(get_events(session_factory))
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    retry = create_order(client, settings, order_id="rl-fallback-safe", telegram_user_id=None)
+    assert retry.status_code == 200
+    assert retry.json()["url"] == original_url
+    assert len(stub.getlink_requests) == getlink_calls_before
+    assert _identity_row_count(session_factory) == identities_before
+    assert len(get_events(session_factory)) == events_before
+
+
+def test_order_fallback_replay_with_new_telegram_id_does_not_bypass_the_limiter(
+    app, client, settings, stub, session_factory
+):
+    """THE REGRESSION: a stored order_fallback row retried with an
+    arbitrary, never-before-seen Telegram id must NOT be treated as a safe
+    replay -- resolve_payer_identity() would create and commit a brand new
+    identity row (plus an audit event) for that Telegram id before
+    _reconcile_identity() gets a chance to harmlessly "reuse" the stored
+    identity. Proves: rejected (429) under an exhausted limiter for THREE
+    different Telegram ids, zero new identity rows, zero new events, zero
+    gateway calls -- the mutation the bug allowed never happens."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    first = create_order(client, settings, order_id="rl-fallback-unsafe", telegram_user_id=None)
+    assert first.status_code == 200
+    getlink_calls_before = len(stub.getlink_requests)
+    identities_before = _identity_row_count(session_factory)
+    events_before = len(get_events(session_factory))
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    for candidate_id in (DEFAULT_TELEGRAM_USER_ID, DEFAULT_TELEGRAM_USER_ID + 1, 999_999_999):
+        response = create_order(
+            client, settings, order_id="rl-fallback-unsafe", telegram_user_id=candidate_id
+        )
+        assert response.status_code == 429
+
+    assert len(stub.getlink_requests) == getlink_calls_before
+    assert _identity_row_count(session_factory) == identities_before
+    assert len(get_events(session_factory)) == events_before
+
+
+def test_telegram_user_replay_with_matching_telegram_id_still_bypasses_the_limiter(
+    app, client, settings, stub, session_factory
+):
+    """The true safe case for a telegram_user row: the exact same Telegram
+    id re-derives the exact identity_key this payment's mapping was already
+    resolved under -- genuinely zero gateway calls, zero new identity rows."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    first = create_order(
+        client, settings, order_id="rl-telegram-safe",
+        telegram_user_id=DEFAULT_TELEGRAM_USER_ID,
+    )
+    assert first.status_code == 200
+    original_url = first.json()["url"]
+    getlink_calls_before = len(stub.getlink_requests)
+    identities_before = _identity_row_count(session_factory)
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    retry = create_order(
+        client, settings, order_id="rl-telegram-safe",
+        telegram_user_id=DEFAULT_TELEGRAM_USER_ID,
+    )
+    assert retry.status_code == 200
+    assert retry.json()["url"] == original_url
+    assert len(stub.getlink_requests) == getlink_calls_before
+    assert _identity_row_count(session_factory) == identities_before
+
+
+def test_telegram_user_replay_with_missing_telegram_id_does_not_bypass_the_limiter(
+    app, client, settings
+):
+    """A stored telegram_user row retried WITHOUT a Telegram id requests the
+    order_fallback identity_key instead -- a DIFFERENT identity_key than
+    what this payment's mapping was resolved under, so
+    resolve_payer_identity() is not provably a no-write lookup. Must not be
+    exempt, even though _reconcile_identity() would still "reuse" the
+    stored Telegram identity."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    first = create_order(
+        client, settings, order_id="rl-telegram-no-id",
+        telegram_user_id=DEFAULT_TELEGRAM_USER_ID,
+    )
+    assert first.status_code == 200
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    retry = create_order(client, settings, order_id="rl-telegram-no-id", telegram_user_id=None)
+    assert retry.status_code == 429
+
+
+def test_legacy_untyped_linked_row_does_not_bypass_the_create_limiter(
+    app, client, settings, session_factory
+):
+    """A pre-fix legacy row (no payer_identity_id, no stored identity type)
+    is NOT provably zero-mutation: create_payment()'s retired-scheme lookup
+    is a JOIN on payer_identity_id, which matches nothing for a NULL fk, so
+    resolve_payer_identity() always runs and can write. Documented policy:
+    NOT exempt, regardless of whether a Telegram id is supplied."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="rl-legacy-row",
+                gateway_order_id=900_003,
+                gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+                amount=10000,
+                payable_amount=10000,
+                status=PaymentStatus.LINK_CREATED.value,
+                redirect_url="https://centralpay.test.local/pay/legacy",
+                # payer_identity_id / payer_identity_type left at their NULL
+                # defaults -- a pre-fix legacy row.
+            )
+        )
+        db.commit()
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    response = create_order(client, settings, order_id="rl-legacy-row", amount=10000)
     assert response.status_code == 429
 
 

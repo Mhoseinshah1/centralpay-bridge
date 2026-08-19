@@ -240,9 +240,15 @@ def _reconcile_identity(
       one user's payment link is never returned to another (incident 2026-07).
 
     When ``has_live_link`` is True, "reject" is reachable only via the
-    Telegram-vs-Telegram different-id case; find_safe_replay_redirect_url()
-    above depends on that being the ONLY reachable "reject" case for a live
-    link -- re-derive this table there too if this logic changes.
+    Telegram-vs-Telegram different-id case. NOTE: find_safe_replay_redirect_url()
+    above does NOT rely on this function's *outcome* to decide the create-limiter
+    exemption -- resolve_payer_identity() (called by create_payment() BEFORE
+    this function ever runs) can itself write a new identity row for the
+    REQUESTED identity even when this function would go on to return
+    "reuse". The exemption instead requires the requested identity to
+    exactly match the stored one, so resolve_payer_identity() is provably a
+    no-write lookup. Re-check that helper's docstring too if this logic
+    changes.
     """
     existing_pid = payment.payer_identity_id
     if existing_pid is None:
@@ -310,16 +316,54 @@ def find_safe_replay_redirect_url(
     event) and must consume limiter budget exactly like a genuinely new
     order. Only the exact idempotent-replay case is exempt.
 
+    IMPORTANT identity subtlety (2nd regression, found and fixed after the
+    first): the LINK_CREATED-return branch and _reconcile_identity()'s final
+    "reuse" decision are NOT the only place work can happen.
+    create_payment() calls resolve_payer_identity() -- which can itself
+    CREATE AND COMMIT a new CentralPayPayerIdentity row plus a
+    centralpay_payer_identity_created audit event -- for the REQUESTED
+    identity, BEFORE the row lock is taken and BEFORE _reconcile_identity()
+    ever runs, UNLESS the "retired scheme" shortcut fires first (see
+    create_payment()'s ``matches_retired_scheme`` check). So a request whose
+    requested identity_key differs from whatever identity_key the STORED
+    row's own mapping was resolved under can still write a new identity row
+    even when _reconcile_identity() would later harmlessly "reuse" the
+    stored identity and return the same cached link. That write is real
+    state mutation -- it must not be exempt from the limiter.
+
+    A request is safe -- guaranteed to re-derive the SAME identity_key the
+    stored mapping already satisfies, so resolve_payer_identity() (or its
+    retired-scheme shortcut) is provably a no-write lookup -- ONLY when the
+    requested identity shape matches the STORED one exactly:
+
+    * stored ``telegram_user`` + a Telegram id IS supplied + it equals the
+      already-stored ``payment.gateway_user_id`` (telegram_raw_v1: that
+      column IS the raw id) -- the request re-derives the exact identity_key
+      this payment's mapping was already resolved under.
+    * stored ``order_fallback`` + NO Telegram id is supplied -- the request
+      re-derives ``order_identity_key(bot_order_id)``, deterministic and
+      identical to what this payment's mapping was already resolved under
+      (true whether that mapping is current-scheme or retired-scheme; the
+      retired-scheme shortcut compares this exact identity_key too).
+
+    Every other combination is NOT exempt, including ones where
+    _reconcile_identity() would still end up returning "reuse": a Telegram
+    id supplied against a stored ``order_fallback`` row, no Telegram id
+    supplied against a stored ``telegram_user`` row, a different Telegram id,
+    and any row with no stored type at all (``payer_identity_type`` is None
+    -- a legacy pre-fix row with no mapping, or a 0007-era row mapped under
+    the older retired customer_id scheme) -- for a NULL-typed row,
+    create_payment()'s retired-scheme lookup is a JOIN on
+    ``payer_identity_id``, which for a legacy row matches nothing at all, so
+    resolve_payer_identity() always runs and can write. Conservative by
+    design: a false negative here just means an already-safe request also
+    consumes limiter budget; a false positive would mean state mutation
+    slips past the limiter, which is the exact bug this function exists to
+    prevent.
+
     Deliberately mirrors -- and must stay in sync with -- the
-    ``LINK_CREATED`` branch of create_payment() and the ``has_live_link``
-    path of _reconcile_identity(). It never calls resolve_payer_identity()
-    (which can itself write a new identity mapping row on first use): for
-    the ``telegram_raw_v1`` scheme the gateway user id IS the raw Telegram
-    id (see app/services/payer_identity.py), so the identity check compares
-    already-stored payment columns directly -- no HMAC lookup, no write.
-    Every other stored identity shape (no mapping yet, a pre-fix legacy row,
-    an order-fallback row) always reconciles as "reuse" once a live link
-    exists, so no further check is needed for those.
+    ``LINK_CREATED`` branch of create_payment(), the retired-scheme check,
+    and _reconcile_identity(). Never calls resolve_payer_identity() itself.
 
     A single indexed point lookup on the unique bot_order_id column (the
     same query create_payment() itself starts with) -- no write, no lock.
@@ -334,12 +378,15 @@ def find_safe_replay_redirect_url(
         return None
     if payment.amount != amount:
         return None
-    if (
-        telegram_user_id is not None
-        and payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
-        and payment.gateway_user_id != telegram_user_id
-    ):
-        return None  # a different Telegram user -- create_payment() would reject
+    if telegram_user_id is not None:
+        identity_matches = (
+            payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+            and payment.gateway_user_id == telegram_user_id
+        )
+    else:
+        identity_matches = payment.payer_identity_type == IDENTITY_TYPE_ORDER_FALLBACK
+    if not identity_matches:
+        return None
     return payment.redirect_url
 
 
