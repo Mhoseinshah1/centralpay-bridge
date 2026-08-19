@@ -1,15 +1,20 @@
 """Trusted client-IP resolution.
 
-Caddy is the ONLY network path that reaches the API's public routes
-(deploy/caddy/Caddyfile.template's ``header_up X-Forwarded-For
-{remote_host}`` OVERWRITES -- never appends to -- any client-supplied
-value, exactly like the existing X-Request-ID handling in
-app/middleware.py). Given that single-hop boundary, X-Forwarded-For is
-trustworthy IF it parses as exactly one valid IPv4/IPv6 address; anything
-else (missing, multiple comma-separated values, malformed) falls back to
-the raw ASGI socket peer -- a safe, non-exploitable default that just
-means "shares one bucket with every other caller whose header did not
-resolve," never a bypass of a per-caller limit.
+Caddy is the ONLY network path that reaches the API's public routes.
+deploy/caddy/Caddyfile.template's ``header_up X-Forwarded-For
+{remote_host}`` explicitly OVERWRITES the header with Caddy's own
+resolved TCP peer, exactly like the existing X-Request-ID handling in
+app/middleware.py -- this makes the single-hop trust boundary a visible,
+auditable line in this repo rather than an implicit dependency on Caddy's
+own default (which already ignores a client-supplied X-Forwarded-For
+value to prevent spoofing unless ``trusted_proxies`` is configured; see
+RATE_LIMITING_ARCHITECTURE.md §3). Given that single-hop boundary,
+X-Forwarded-For is trustworthy IF it parses as exactly one valid IPv4/IPv6
+address; anything else (missing, multiple comma-separated values,
+malformed) falls back to the raw ASGI socket peer -- a safe,
+non-exploitable default that just means "shares one bucket with every
+other caller whose header did not resolve," never a bypass of a
+per-caller limit.
 
 ``rate_limit_trust_proxy_headers`` (default True) gates trusting the
 header at all, for a deployment that does not have this app's documented

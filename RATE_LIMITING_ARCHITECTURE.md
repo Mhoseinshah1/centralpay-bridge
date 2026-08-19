@@ -75,27 +75,48 @@ Caddy or these routes at all — nothing to accidentally rate-limit.
   regression tests for both the limiter and the signature tracker
   (`tests/test_phase5_hardening.py`, `tests/test_callback_hardening.py`).
 
-## 3. Trust boundary / client-IP handling — a real gap found
+## 3. Trust boundary / client-IP handling — explicit hardening, not a proven default vulnerability
 
 Caddy's `handle @public` block sets `X-Forwarded-Proto` and `X-Request-ID`
 explicitly (the latter **overwritten** — "the proxy overwrites any
-client-supplied value" per its own comment) but has **no explicit
-`X-Forwarded-For` directive**. Caddy's `reverse_proxy` default behavior for
-an unconfigured `X-Forwarded-For` is to **append** the resolved peer to
-whatever value the header already had — it does not replace it. A caller
-can therefore send `X-Forwarded-For: 1.2.3.4` and have Caddy hand the app
-`X-Forwarded-For: 1.2.3.4, <real-peer>`, and nothing in the app validates
-which entry is trustworthy (the app does not read this header at all
-today — `app/ratelimit.py`'s own docstring: "spoofable headers like
-X-Forwarded-For are never consulted").
+client-supplied value" per its own comment) but had **no explicit
+`X-Forwarded-For` directive**.
+
+**Correction from an earlier draft of this document**: that draft claimed
+Caddy's unconfigured `reverse_proxy` default *appends* the resolved peer
+to whatever value a client already sent in `X-Forwarded-For`, letting a
+caller prepend a spoofed first hop. That claim was verified against
+official Caddy documentation and is **wrong**. The documented default is
+the opposite: *"For these X-Forwarded-\* headers, by default, [the proxy]
+will ignore their values from incoming requests, to prevent spoofing"* —
+i.e. `reverse_proxy` already substitutes its own resolved value for the
+immediate connecting peer unless `trusted_proxies` is explicitly
+configured (which this Caddyfile does not do). So there was no proven
+pre-existing `X-Forwarded-For` spoofing vulnerability caused by Caddy's
+default behavior.
+
+What the audit *did* find missing was code-level, not a Caddy default:
+the app itself had no visible, testable statement of this trust boundary
+anywhere in the repository. `app/ratelimit.py`'s own docstring said
+"spoofable headers like X-Forwarded-For are never consulted" — the app
+didn't read the header at all, so no per-client keying was possible, and
+reasoning about the boundary would have required knowing Caddy's internal
+default rather than reading anything in this repository.
 
 This is exactly why the existing limiters are global-only: without a safe
-IP, per-client keying isn't possible. **Fix applied**: the Caddyfile gains
-one line, `header_up X-Forwarded-For {remote_host}` — a plain (overwrite,
-not append) `header_up`, using Caddy's own resolved TCP-peer placeholder,
-mirroring the exact pattern already used for `X-Request-ID`. After this
-change the app can trust `X-Forwarded-For` as a single, non-spoofable
-value **because it is the only network path that can reach the app**
+IP, per-client keying isn't possible. **Change applied** (kept, reframed
+from a "fix" to hardening): the Caddyfile gains one explicit line,
+`header_up X-Forwarded-For {remote_host}` — an *explicit* overwrite using
+Caddy's own resolved TCP-peer placeholder, mirroring the exact pattern
+already used for `X-Request-ID`. This makes the single-hop trust boundary
+a visible, auditable, test-pinned line in this repository
+(`tests/test_deployment.py`) instead of an implicit dependency on Caddy's
+internal default — which is correct today, but was not something a
+reader of this repo could verify without consulting Caddy's own docs —
+and keeps behavior deterministic even if `trusted_proxies` is added
+carelessly later or a future Caddy default changes. After this change the
+app can trust `X-Forwarded-For` as a single, non-spoofable value
+**because it is the only network path that can reach the app**
 (confirmed: `docker-compose.yml` has no other published port for the API
 service, and it carries no `deploy.replicas`/scaling config — single
 container, single trusted proxy hop). This boundary is documented in code
@@ -283,8 +304,12 @@ Full diff reviewed against every item in the task's self-review checklist.
 Findings below; everything else checked out with no action needed
 (confirmed by the tests referenced):
 
-- **IP spoofing / proxy trust**: closed via the Caddyfile overwrite fix
-  (§3) plus `resolve_client_ip`'s strict single-IP validation
+- **IP spoofing / proxy trust**: Caddy's own default already ignores a
+  client-supplied `X-Forwarded-For` value (verified against official
+  Caddy docs — see §3's correction); the explicit Caddyfile overwrite
+  (§3) makes that boundary auditable in this repo rather than fixing a
+  proven default vulnerability. `resolve_client_ip`'s strict single-IP
+  validation is defense in depth regardless
   (`tests/test_clientip.py`, `test_spoofed_forwarding_header_cannot_bypass_the_global_ceiling`).
 - **Bypass via alternate route / method**: confirmed exactly five routes
   exist (`grep -rn "@router\." app/api/*.py`), all classified in §5.
