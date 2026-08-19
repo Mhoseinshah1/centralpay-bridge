@@ -146,6 +146,52 @@ jobs:
             deploy/caddy/Caddyfile.template > /tmp/Caddyfile
           docker run --rm -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2 \
             caddy validate --config /etc/caddy/Caddyfile
+      # Real-runtime proof (not just a text/config check): ct/sig must never
+      # reach Caddy's emitted access log, including via the Referer header a
+      # subsequent /static/* request carries (the callback page's own URL,
+      # ct/sig included). Only the site address and upstream handler are
+      # adapted for this job (no real ACME/DNS or live api:8000 here) -- the
+      # log { ... } block under test is the actual rendered template output
+      # from the step above, untouched, so this proves the real production
+      # filter, not a hand-copied duplicate.
+      - name: Verify ct/sig never leak into Caddy access logs (Referer header)
+        run: |
+          cp /tmp/Caddyfile /tmp/Caddyfile.referer-check
+          python3 - <<'EOF'
+          import re
+          path = "/tmp/Caddyfile.referer-check"
+          text = open(path).read()
+          text = text.replace("pay.example.com {", ":8080 {")
+          text = re.sub(r'reverse_proxy api:8000 \{.*?\n\t\t\}', 'respond "upstream-ok" 200', text, flags=re.S)
+          open(path, "w").write(text)
+          EOF
+          docker run -d --name caddy-referer-check -p 18080:8080 \
+            -v /tmp/Caddyfile.referer-check:/etc/caddy/Caddyfile:ro caddy:2
+          trap 'docker logs caddy-referer-check; docker rm -f caddy-referer-check' EXIT
+
+          for _ in $(seq 1 30); do
+            curl -fsS -o /dev/null "http://127.0.0.1:18080/health/live" 2>/dev/null && break
+            sleep 1
+          done
+
+          REAL_CT="REAL_SECRET_CT_$(date +%s%N)"
+          REAL_SIG="REAL_SECRET_SIG_$(date +%s%N)"
+
+          curl -fsS -o /dev/null \
+            "http://127.0.0.1:18080/api/centralpay/callback?orderId=1&ct=${REAL_CT}&sig=${REAL_SIG}"
+          curl -fsS -o /dev/null \
+            -H "Referer: https://pay.example.com/api/centralpay/callback?orderId=1&ct=${REAL_CT}&sig=${REAL_SIG}" \
+            "http://127.0.0.1:18080/static/fonts/x.woff2"
+          sleep 1
+
+          LOGS=$(docker logs caddy-referer-check 2>&1)
+          echo "$LOGS" | grep -q "REDACTED" || {
+            echo "FAIL: REDACTED never appeared -- redaction did not fire at all"; exit 1; }
+          echo "$LOGS" | grep -q "$REAL_CT" && {
+            echo "FAIL: real ct value leaked into the Caddy access log"; exit 1; }
+          echo "$LOGS" | grep -q "$REAL_SIG" && {
+            echo "FAIL: real sig value leaked into the Caddy access log"; exit 1; }
+          echo "PASS: ct/sig never appear in the Caddy access log (request URI or Referer)"
 
   secret-scan:
     name: Secret scan (gitleaks)
