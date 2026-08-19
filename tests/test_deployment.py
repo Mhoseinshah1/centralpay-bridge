@@ -140,6 +140,15 @@ def test_caddyfile_template_contents():
     assert "reverse_proxy api:8000" in text
     # The callback signature must be redacted from access logs.
     assert "replace sig REDACTED" in text
+    # ct/sig must ALSO be redacted when they reach the log via the Referer
+    # header (a subsequent /static/* request carries the callback page's own
+    # URL as Referer) -- not just from the request URI itself. This is a
+    # text-level presence check only; the "docker" CI job's "Verify ct/sig
+    # never leak into Caddy access logs (Referer header)" step (see
+    # .github/workflows/ci.yml) is the real-runtime proof that the filter
+    # actually redacts, not just that the line is present.
+    assert "request>headers>Referer regexp" in text
+    assert "(?:ct|sig)=" in text
     # Security headers.
     for header in ("Strict-Transport-Security", "X-Content-Type-Options", "X-Frame-Options"):
         assert header in text

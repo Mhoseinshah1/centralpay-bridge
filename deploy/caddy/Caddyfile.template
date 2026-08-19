@@ -16,6 +16,20 @@
 	# The sig query parameter carries the callback HMAC signature and ct
 	# carries the one-time callback token; both are redacted before the log
 	# line is written.
+	#
+	# Redacting the request URI alone is not enough: the payment-status page
+	# served at /api/centralpay/callback links /static/* assets, and browsers
+	# send that page's own URL -- ct and sig included -- back as the Referer
+	# header on those subsequent requests (Caddy logs request headers,
+	# including Referer, by default). Referrer-Policy "no-referrer" below
+	# tells compliant browsers not to send it at all, but that is a
+	# client-side opt-in some clients (older embedded WebViews, non-browser
+	# fetchers) do not honor -- production logs have shown real ct/sig values
+	# reaching Caddy's access log this way. The Referer field gets the same
+	# redaction independently, as defense in depth: not "rely on
+	# Referrer-Policy alone." A single global regexp catches ct= or sig=
+	# wherever they occur in the referring URL's query string, in any order,
+	# without touching an ordinary referrer that carries no such parameter.
 	log {
 		output stdout
 		format filter {
@@ -25,6 +39,7 @@
 					replace sig REDACTED
 					replace ct REDACTED
 				}
+				request>headers>Referer regexp ([?&](?:ct|sig)=)[^&]* ${1}REDACTED
 			}
 		}
 	}
