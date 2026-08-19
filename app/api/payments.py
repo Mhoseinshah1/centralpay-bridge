@@ -12,7 +12,6 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field, StrictInt, StrictStr
 from pydantic import ValidationError as PydanticValidationError
-from sqlalchemy import select
 from starlette.datastructures import QueryParams
 
 from app.api.deps import CentralPayDep, DbDep, SettingsDep
@@ -24,7 +23,6 @@ from app.exceptions import (
     PaymentCreationDisabledError,
     RateLimitedError,
 )
-from app.models import Payment
 from app.security import constant_time_equals
 from app.services.payer_identity import (
     IDENTITY_TYPE_ORDER_FALLBACK,
@@ -34,7 +32,7 @@ from app.services.payer_identity import (
     order_identity_key,
     telegram_identity_key,
 )
-from app.services.payments import create_payment
+from app.services.payments import create_payment, find_safe_replay_redirect_url
 
 logger = logging.getLogger("app.api.payments")
 
@@ -539,19 +537,25 @@ def create_custom_payment(
         raise InvalidApiKeyError()
     # Idempotency-aware ordering (task: an idempotent retry must never be
     # rejected by the create limiter and fail forever because the original
-    # response was lost). This is a single indexed point lookup on the
-    # unique bot_order_id column -- no write, no lock -- never the table
-    # scan the limiter itself must avoid. An order that already has a row
-    # will be answered by create_payment()'s own existing, already-tested
-    # idempotent-return / conflict-refusal logic below; only a GENUINELY
-    # NEW order consumes limiter budget, since that is the only case that
-    # does real (gateway-calling, row-creating) work.
-    is_new_order = (
-        db.execute(select(Payment.id).where(Payment.bot_order_id == body.order_id)).first()
+    # response was lost). Skipping the limiter is safe ONLY for a request
+    # find_safe_replay_redirect_url() confirms create_payment() will answer
+    # by returning the existing redirect_url verbatim -- zero gateway call,
+    # zero state mutation. A "row exists" check alone is NOT enough: an
+    # existing row can still be in a state (GETLINK_FAILED retrying the
+    # gateway, CREATED with no live link, an amount/identity mismatch, an
+    # already-verified/under-review order) that does real work when
+    # create_payment() runs, so those still consume limiter budget exactly
+    # like a genuinely new order. This is still one indexed point lookup on
+    # the unique bot_order_id column -- no write, no lock, no table scan.
+    if (
+        find_safe_replay_redirect_url(
+            db,
+            bot_order_id=body.order_id,
+            amount=body.amount,
+            telegram_user_id=telegram_user_id,
+        )
         is None
-    )
-    db.rollback()  # read-only; never leave an idle transaction open
-    if is_new_order:
+    ):
         client_ip = resolve_client_ip(request, settings)
         if not limiters.check_per_ip(limiters.create_per_ip, client_ip, "create_payment"):
             raise RateLimitedError(

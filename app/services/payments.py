@@ -238,6 +238,11 @@ def _reconcile_identity(
       appears for an order.
     * ``"reject"`` — the retry resolved to a DIFFERENT Telegram user; refuse so
       one user's payment link is never returned to another (incident 2026-07).
+
+    When ``has_live_link`` is True, "reject" is reachable only via the
+    Telegram-vs-Telegram different-id case; find_safe_replay_redirect_url()
+    above depends on that being the ONLY reachable "reject" case for a live
+    link -- re-derive this table there too if this logic changes.
     """
     existing_pid = payment.payer_identity_id
     if existing_pid is None:
@@ -280,6 +285,62 @@ def _reconcile_identity(
     # Two different Telegram users (or an otherwise divergent scope) on one
     # order: never cross payer identities.
     return "reject"
+
+
+def find_safe_replay_redirect_url(
+    db: Session,
+    *,
+    bot_order_id: str,
+    amount: int,
+    telegram_user_id: int | None,
+) -> str | None:
+    """Read-only: the existing redirect_url IF a request for ``bot_order_id``
+    is a safe, work-free replay -- one create_payment() answers by returning
+    ``payment.redirect_url`` verbatim, with zero gateway call and zero state
+    mutation (see the ``LINK_CREATED`` branch below) -- else None.
+
+    Exists so the API route can decide whether a request needs to consume
+    create-rate-limit budget BEFORE calling create_payment(): an order with
+    NO row, or an existing row create_payment() would still have to act on
+    (retry a failed link on ``GETLINK_FAILED``, a ``CREATED`` row with no
+    live link yet, an amount mismatch, an identity/customer mismatch, an
+    already-verified or under-review order), must NOT get a blanket
+    exemption just because a row exists -- each of those still does real
+    work (a gateway call, a new gateway_order_id, a recorded conflict
+    event) and must consume limiter budget exactly like a genuinely new
+    order. Only the exact idempotent-replay case is exempt.
+
+    Deliberately mirrors -- and must stay in sync with -- the
+    ``LINK_CREATED`` branch of create_payment() and the ``has_live_link``
+    path of _reconcile_identity(). It never calls resolve_payer_identity()
+    (which can itself write a new identity mapping row on first use): for
+    the ``telegram_raw_v1`` scheme the gateway user id IS the raw Telegram
+    id (see app/services/payer_identity.py), so the identity check compares
+    already-stored payment columns directly -- no HMAC lookup, no write.
+    Every other stored identity shape (no mapping yet, a pre-fix legacy row,
+    an order-fallback row) always reconciles as "reuse" once a live link
+    exists, so no further check is needed for those.
+
+    A single indexed point lookup on the unique bot_order_id column (the
+    same query create_payment() itself starts with) -- no write, no lock.
+    """
+    payment = db.execute(
+        select(Payment).where(Payment.bot_order_id == bot_order_id)
+    ).scalar_one_or_none()
+    db.rollback()  # read-only; never leave an idle transaction open
+    if payment is None:
+        return None
+    if payment.status != PaymentStatus.LINK_CREATED.value or not payment.redirect_url:
+        return None
+    if payment.amount != amount:
+        return None
+    if (
+        telegram_user_id is not None
+        and payment.payer_identity_type == IDENTITY_TYPE_TELEGRAM_USER
+        and payment.gateway_user_id != telegram_user_id
+    ):
+        return None  # a different Telegram user -- create_payment() would reject
+    return payment.redirect_url
 
 
 def create_payment(
@@ -418,6 +479,9 @@ def create_payment(
         db.rollback()
         raise OrderUnderReviewError()
     if payment.status == PaymentStatus.LINK_CREATED.value and payment.redirect_url:
+        # Mirrored by find_safe_replay_redirect_url() above, which the API
+        # route uses to decide whether this request may skip the create
+        # rate limiter -- keep both in sync.
         db.rollback()
         logger.info(
             "payment_duplicate_returned",
