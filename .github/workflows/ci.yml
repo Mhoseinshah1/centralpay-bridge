@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -16,6 +20,7 @@ jobs:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:16
@@ -35,24 +40,27 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      # The backup/restore integration tests need client tools whose major
-      # version matches the postgres:16 service (pg_dump aborts on servers
-      # newer than itself; ubuntu-22.04 runners default to client 14, and
-      # their stock apt sources have no postgresql-client-16 — add the PGDG
-      # repository in that case).
-      - name: Install PostgreSQL 16 client tools
+      # The backup/restore integration tests need pg_dump/pg_restore whose
+      # major version matches the postgres:16 service (the tools abort on a
+      # server newer than themselves; ubuntu-22.04 runners default to client
+      # 14). Installing a matching client via apt/PGDG depends on external
+      # package-index network access, which repeatedly hung this step; the
+      # service container already ships version-matched client binaries, so
+      # run those directly via `docker exec` instead of installing anything.
+      # See .github/scripts/pg-client-wrapper.sh and
+      # tests/integration/test_backup_restore.py::_find_pg_tool.
+      - name: Set up PostgreSQL 16 client tools (service container, no apt/PGDG)
+        env:
+          POSTGRES_SERVICE_CONTAINER: ${{ job.services.postgres.id }}
         run: |
-          sudo apt-get update
-          if ! apt-cache show postgresql-client-16 >/dev/null 2>&1; then
-            sudo install -d /usr/share/postgresql-common/pgdg
-            sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
-              https://www.postgresql.org/media/keys/ACCC4CF8.asc
-            echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-              | sudo tee /etc/apt/sources.list.d/pgdg.list
-            sudo apt-get update
-          fi
-          sudo apt-get install -y --no-install-recommends postgresql-client-16
-          /usr/lib/postgresql/16/bin/pg_dump --version
+          bindir="${RUNNER_TEMP}/pg16-bin"
+          mkdir -p "$bindir"
+          install -m 755 .github/scripts/pg-client-wrapper.sh "$bindir/pg_dump"
+          ln -s pg_dump "$bindir/pg_restore"
+          echo "$bindir" >> "$GITHUB_PATH"
+          echo "POSTGRES_SERVICE_CONTAINER=${POSTGRES_SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+          "$bindir/pg_dump" --version
+          "$bindir/pg_restore" --version
       - name: Install
         run: pip install -e ".[dev]"
       - name: Ruff
@@ -74,8 +82,9 @@ jobs:
           bash -n install.sh
           bash -n scripts/centralpay
           bash -n scripts/backup.sh
+          bash -n .github/scripts/pg-client-wrapper.sh
       - name: ShellCheck
-        run: shellcheck install.sh scripts/centralpay scripts/backup.sh
+        run: shellcheck install.sh scripts/centralpay scripts/backup.sh .github/scripts/pg-client-wrapper.sh
 
   docker:
     name: Docker build and compose validation
