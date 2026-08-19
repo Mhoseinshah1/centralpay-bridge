@@ -155,14 +155,35 @@ redundant with per-IP keying and is not added.
    `create_payment()` itself would answer it for free (no gateway call,
    no write). Under sustained load from unrelated new-order traffic, a
    legitimate retry could be rejected with 429 instead of receiving its
-   already-issued link. **Fixed**: one cheap, indexed, read-only
-   existence check (`bot_order_id` is unique + indexed) runs before the
-   `create` limiter; an order that already has a row skips the limiter
-   entirely and proceeds straight into `create_payment()`'s existing,
-   already-tested idempotent/conflict logic. A genuinely new order (no
-   existing row) is the only case the limiter now gates. This adds one
-   indexed point lookup per request — not a table scan, not a write, not
-   a lock.
+   already-issued link. **Fixed**: one cheap, indexed, read-only lookup
+   (`bot_order_id` is unique + indexed) runs before the `create` limiter,
+   via `find_safe_replay_redirect_url()` (`app/services/payments.py`).
+   This adds one indexed point lookup per request — not a table scan, not
+   a write, not a lock.
+   >
+   > **Regression, found and fixed in a follow-up commit**: the first
+   > version of this exemption used "a row exists for this `bot_order_id`"
+   > as the entire test — which incorrectly exempted every existing row,
+   > including a `GETLINK_FAILED` one. `create_payment()` retries link
+   > creation (a real `get_link()` gateway call, a fresh
+   > `gateway_order_id`, state mutation) for `GETLINK_FAILED`, so that
+   > exemption let a caller replay one `GETLINK_FAILED` order id
+   > indefinitely and call the real gateway on every attempt while the
+   > `create` limiter was fully exhausted — defeating the limiter for
+   > exactly the traffic shape (retries against one order id) it exists to
+   > bound. **Corrected exemption rule**: the limiter is skipped ONLY when
+   > `find_safe_replay_redirect_url()` confirms the specific request is a
+   > safe, work-free replay — `bot_order_id` already has a row in
+   > `LINK_CREATED` status with a non-null `redirect_url`, the requested
+   > `amount` matches the stored one, and (when a Telegram id is supplied)
+   > it matches the stored `telegram_raw_v1` identity. Every other existing
+   > row — `CREATED`, `GETLINK_FAILED`, `MANUAL_REVIEW`, an already-verified
+   > order, an amount mismatch, or a different Telegram user — consumes
+   > limiter budget exactly like a genuinely new order, since
+   > `create_payment()` still does real work (or records a conflict event)
+   > for all of those. The helper never calls `resolve_payer_identity()`
+   > (which can itself create a new identity-mapping row), so the
+   > limiter-exemption check itself is provably zero-mutation.
 4. **Malformed-body floods are bounded but not rate-limited before
    parsing work begins.** Reviewed and judged acceptable, not changed:
    the work done before any auth/rate-limit check is already tightly

@@ -1292,7 +1292,7 @@ def test_link_created_status_assigned_in_exactly_one_place_in_app_package():
                     and isinstance(target.value, ast.Name)
                 ):
                     sites.append(f"{path.relative_to(app_dir.parent)}:{node.lineno}")
-    assert sites == ["app/services/payments.py:506"], (
+    assert sites == ["app/services/payments.py:570"], (
         f"expected exactly one status=LINK_CREATED assignment site, found: {sites}"
     )
 

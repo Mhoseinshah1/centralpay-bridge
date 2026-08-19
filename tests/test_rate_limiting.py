@@ -11,13 +11,21 @@ validation, and concurrency.
 import json
 import logging
 import threading
+from datetime import UTC, datetime
 
+import httpx
 import pytest
 from sqlalchemy import func, select
 
-from app.models import Payment, PaymentEvent
+from app.models import Payment, PaymentEvent, PaymentStatus
 from app.ratelimit import BoundedLimiterStore, RateLimiters, SlidingWindowLimiter
-from tests.conftest import create_order
+from tests.conftest import (
+    DEFAULT_GATEWAY_USER_ID,
+    DEFAULT_TELEGRAM_USER_ID,
+    create_order,
+    get_events,
+    get_payment,
+)
 
 # --- object-level: SlidingWindowLimiter / BoundedLimiterStore ---------------
 
@@ -453,13 +461,15 @@ def test_idempotent_retry_bypasses_the_create_limiter_entirely(
     assert len(stub.getlink_requests) == getlink_calls_after_first  # no new gateway call
 
 
-def test_idempotent_retry_with_mismatched_amount_still_bypasses_limiter_then_is_refused(
+def test_idempotent_retry_with_mismatched_amount_does_not_bypass_the_limiter(
     app, client, settings
 ):
-    """Even the CONFLICT path (never the success path) for an existing
-    order must reach create_payment()'s own logic rather than being
-    pre-empted by an exhausted create limiter -- proving the bypass is
-    keyed on "row exists", not on "row will succeed"."""
+    """Regression (see the GETLINK_FAILED tests below for the full story):
+    "a row exists" is NOT sufficient for the create-limiter exemption. A
+    retry with a DIFFERENT amount is not the safe cached replay -- it is
+    exactly the kind of request that would make create_payment() do real
+    work (record a duplicate_order_amount_mismatch event and commit it), so
+    it must consume limiter budget exactly like a genuinely new order."""
     from app.ratelimit import BoundedLimiterStore as _Store
 
     original = create_order(client, settings, order_id="rl-idem-mismatch", amount=10000)
@@ -469,7 +479,145 @@ def test_idempotent_retry_with_mismatched_amount_still_bypasses_limiter_then_is_
     conflicting = create_order(
         client, settings, order_id="rl-idem-mismatch", amount=99999
     )
-    assert conflicting.status_code == 409  # not 429: create_payment()'s own refusal
+    assert conflicting.status_code == 429  # the limiter gates it -- never reaches create_payment()
+
+
+# --- regression: "row exists" is not "safe cached replay" -------------------
+#
+# app/api/payments.py originally skipped the create limiter for ANY existing
+# bot_order_id row. create_payment() retries link creation -- a real
+# get_link() gateway call, a fresh gateway_order_id -- for a row stuck in
+# GETLINK_FAILED, so that blanket exemption let a caller replay one failed
+# order id forever and hit the real gateway on every attempt while the
+# create limiter was fully exhausted, defeating it for exactly the traffic
+# shape (retries against one order id) it exists to bound. Fixed by
+# find_safe_replay_redirect_url() (app/services/payments.py): the limiter is
+# skipped ONLY for a request that is provably a zero-work, zero-gateway-call
+# LINK_CREATED cached replay with matching amount and identity.
+
+
+def test_getlink_failed_row_does_not_bypass_the_create_limiter(
+    app, client, settings, stub, session_factory
+):
+    """THE REGRESSION, closed: a row existing is NOT sufficient for the
+    create-limiter exemption. Proves the retry is rejected (429, not a
+    second gateway attempt); stays rejected across REPEATED attempts while
+    the limiter is exhausted; and the rejection is a true no-op (no new
+    gateway call, no status/gateway_order_id/last_error change, no new
+    audit events)."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    stub.getlink_result = httpx.ConnectError("connection refused")
+    assert create_order(client, settings, order_id="rl-getlink-failed").status_code == 502
+    before = get_payment(session_factory, "rl-getlink-failed")
+    assert before.status == PaymentStatus.GETLINK_FAILED.value
+    events_before = len(get_events(session_factory, before.id))
+    getlink_calls_before_retries = len(stub.getlink_requests)
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+
+    for _ in range(3):  # repeated retries must all stay rejected, not just the first
+        retry = create_order(client, settings, order_id="rl-getlink-failed")
+        assert retry.status_code == 429
+
+    assert len(stub.getlink_requests) == getlink_calls_before_retries  # zero new gateway calls
+    after = get_payment(session_factory, "rl-getlink-failed")
+    assert after.gateway_order_id == before.gateway_order_id  # never re-allocated
+    assert after.status == PaymentStatus.GETLINK_FAILED.value  # never retried
+    assert after.last_error == before.last_error
+    assert len(get_events(session_factory, before.id)) == events_before  # no amplification
+
+
+def test_created_no_live_link_row_does_not_bypass_the_create_limiter(
+    app, client, settings, session_factory
+):
+    """A row can exist in CREATED status with no live link yet (the process
+    died between _ensure_payment_row committing and get_link() completing).
+    It is not a safe cached replay either and must consume limiter budget
+    on retry."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="rl-created-no-link",
+                gateway_order_id=900_001,
+                gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+                amount=10000,
+                payable_amount=10000,
+                status=PaymentStatus.CREATED.value,
+            )
+        )
+        db.commit()
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+    response = create_order(client, settings, order_id="rl-created-no-link", amount=10000)
+    assert response.status_code == 429
+
+
+def test_idempotent_retry_with_mismatched_identity_does_not_bypass_the_limiter(
+    app, client, settings
+):
+    """A retry claiming a DIFFERENT Telegram user for an existing linked
+    order is the customer-mismatch case create_payment() itself refuses
+    (incident 2026-07) -- it is not a safe exemption either."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    original = create_order(
+        client, settings, order_id="rl-idem-identity-mismatch",
+        telegram_user_id=DEFAULT_TELEGRAM_USER_ID,
+    )
+    assert original.status_code == 200
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+    conflicting = create_order(
+        client, settings, order_id="rl-idem-identity-mismatch",
+        telegram_user_id=DEFAULT_TELEGRAM_USER_ID + 1,
+    )
+    assert conflicting.status_code == 429
+
+
+@pytest.mark.parametrize(
+    ("status", "extra"),
+    [
+        (PaymentStatus.GATEWAY_VERIFIED.value, {"gateway_verified_at": datetime.now(UTC)}),
+        (PaymentStatus.MANUAL_REVIEW.value, {}),
+    ],
+)
+def test_verified_or_under_review_rows_do_not_bypass_the_create_limiter(
+    app, client, settings, session_factory, status, extra
+):
+    """Documented policy: ONLY a live LINK_CREATED replay is exempt.
+    create_payment() answers an already-verified or under-review order
+    read-only too (it just raises), but this PR does not extend the
+    exemption to those states -- the smallest correct rule is the one
+    stated by the task: same order, same amount, same identity, live
+    LINK_CREATED/redirect_url, zero gateway call, zero mutation. Nothing
+    is gained by special-casing these read-only-refusal states, and it
+    would widen the surface find_safe_replay_redirect_url() has to keep in
+    sync with create_payment()."""
+    from app.ratelimit import BoundedLimiterStore as _Store
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="rl-non-cache-state",
+                gateway_order_id=900_002,
+                gateway_user_id=DEFAULT_GATEWAY_USER_ID,
+                amount=10000,
+                payable_amount=10000,
+                status=status,
+                **extra,
+            )
+        )
+        db.commit()
+
+    app.state.rate_limiters.create = SlidingWindowLimiter(limit=0, window_seconds=60.0)
+    app.state.rate_limiters.create_per_ip = _Store(limit=0, window_seconds=60.0, capacity=10)
+    response = create_order(client, settings, order_id="rl-non-cache-state", amount=10000)
+    assert response.status_code == 429
 
 
 # --- secret / log redaction ---------------------------------------------------
