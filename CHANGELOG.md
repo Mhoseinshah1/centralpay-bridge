@@ -28,6 +28,24 @@ closed.** Release notes: `RELEASE_NOTES_0.6.0_RC1.md`.
   the initial fee percentage (default 0) and never resets an existing
   policy on rerun.
 
+### Added (cont'd)
+- Optional monitoring subsystem (`app.monitor`, `MONITOR_ENABLED=false` by
+  default): a dedicated process/container checks public readiness,
+  database, worker heartbeats, notification/manual-review backlog,
+  reconciliation health, backup freshness, disk space, DB integrity
+  (reuses `centralpay db-check`'s SQL), and gateway/bot-notification
+  failure bursts (counted as affected payments, never raw retry
+  attempts). Incident state (migration `0011`, `monitor_incidents`)
+  persists across restarts and is deduplicated with a PostgreSQL partial
+  unique index (`WHERE status = 'open'`), so two racing monitor instances
+  can never open a duplicate incident or send a duplicate alert — proven
+  under real concurrent threads on PostgreSQL. Alerts are delivered
+  through the existing admin-bot Telegram outbox exactly once per
+  open/escalate/recover transition, never per polling cycle. New
+  `centralpay monitor check [--json]` / `centralpay monitor incidents
+  [--all]` host commands and a read-only `/monitor` admin-bot command.
+  See `MONITORING.md`.
+
 ### Fixed
 - Deployment scripts (`install.sh`, `scripts/backup.sh`,
   `scripts/centralpay`) are committed with the executable bit (git mode

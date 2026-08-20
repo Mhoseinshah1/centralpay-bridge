@@ -121,6 +121,17 @@ Inspection:
   manual-review          Payments requiring administrator review
   credentials            Show the installation summary (root only)
 
+Monitoring (requires MONITOR_ENABLED=true; see "Monitor service" below):
+  monitor check [--json] Run every monitoring check now (public readiness,
+                          database, worker heartbeats, notification/manual-
+                          review backlog, reconciliation health, backup
+                          freshness, disk space, DB integrity, gateway/bot
+                          failure bursts) and report overall status.
+  monitor incidents [--all] [--json]
+                          Currently open incidents (default), or every
+                          recorded incident (--all) including resolved
+                          history. Read-only; never re-runs a check.
+
 Administrator Telegram bot:
   admin-bot status       Admin bot container state and configuration state
   admin-bot logs         Admin bot logs
@@ -128,6 +139,16 @@ Administrator Telegram bot:
   admin-bot enable       Validate configuration and start the admin bot
   admin-bot disable      Stop the admin bot (configuration preserved)
   admin-bot test-alert   Queue a clearly marked test message to administrators
+
+Monitor service (dedicated process; MONITOR_ENABLED=false by default):
+  monitor status         Monitor container state and configuration state
+  monitor logs           Monitor logs
+  monitor restart        Restart the monitor service
+  monitor enable         Start the monitor service (MONITOR_ENABLED=true)
+  monitor disable        Stop the monitor service (configuration preserved)
+  Alerts are delivered through the existing administrator Telegram bot
+  (admin-bot must also be enabled for Telegram delivery; monitor incidents
+  are tracked in the database either way -- see "monitor incidents" above).
 
 Removal:
   uninstall              Remove services (data and backups preserved by default)
@@ -144,11 +165,14 @@ require_install() {
 }
 
 compose() {
-    # The admin-bot service lives behind a Compose profile keyed off the
-    # single source of truth in the config env file.
+    # The admin-bot and monitor services each live behind their own Compose
+    # profile, keyed off the single source of truth in the config env file.
     local -a profile_args=()
     if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
-        profile_args=(--profile admin-bot)
+        profile_args+=(--profile admin-bot)
+    fi
+    if grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        profile_args+=(--profile monitor)
     fi
     docker compose --project-directory "$INSTALL_DIR" "${profile_args[@]}" "$@"
 }
@@ -1112,6 +1136,63 @@ cmd_admin_bot() {
     esac
 }
 
+cmd_monitor() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        status)
+            require_install
+            local enabled="disabled"
+            grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null && enabled="enabled"
+            echo "configuration: ${enabled}"
+            local cid
+            cid=$(compose ps -q monitor 2>/dev/null || true)
+            if [[ -n "$cid" ]]; then
+                echo "container: $(docker inspect -f '{{.State.Status}} (health: {{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}})' "$cid")"
+            else
+                echo "container: not running"
+            fi
+            ;;
+        logs)
+            require_install
+            compose logs --tail 200 -f monitor
+            ;;
+        restart)
+            require_root monitor restart
+            require_install
+            compose restart monitor
+            ;;
+        enable)
+            require_root monitor enable
+            require_install
+            sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=true/' "$ENV_FILE"
+            compose up -d --wait monitor
+            log "Monitor service enabled and started."
+            log "Telegram delivery also requires the admin bot: centralpay admin-bot enable"
+            ;;
+        disable)
+            require_root monitor disable
+            require_install
+            compose --profile monitor stop monitor 2>/dev/null || true
+            sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=false/' "$ENV_FILE"
+            log "Monitor service disabled. Configuration preserved in ${ENV_FILE}."
+            ;;
+        check | incidents)
+            require_install
+            grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null \
+                || fail "Monitoring is disabled. Enable it first: centralpay monitor enable"
+            # Routed to the monitor container specifically (never api): only
+            # it has the read-only backup-directory bind mount the
+            # backup/disk-space checks need, mirroring why "reconciliation
+            # status"/"reconcile" are routed to the worker container above.
+            compose exec -T monitor python -m app.cli monitor "$sub" "$@"
+            ;;
+        *)
+            fail "Unknown monitor subcommand: ${sub} (status|logs|restart|enable|disable|check|incidents)"
+            ;;
+    esac
+}
+
 cmd_uninstall() {
     require_root uninstall
     require_install
@@ -1191,6 +1272,7 @@ main() {
         manual-review) cmd_app_cli manual-review "$@" ;;
         credentials)   cmd_credentials "$@" ;;
         admin-bot)     cmd_admin_bot "$@" ;;
+        monitor)       cmd_monitor "$@" ;;
         ssl)           cmd_ssl "$@" ;;
         version)       cmd_version "$@" ;;
         uninstall)     cmd_uninstall "$@" ;;

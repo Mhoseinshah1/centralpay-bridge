@@ -505,6 +505,62 @@ class Settings(BaseSettings):
     # Admin bot container liveness heartbeat file.
     admin_bot_heartbeat_file: str = "/tmp/centralpay-adminbot-heartbeat"
 
+    # Backup location shared by scripts/backup.sh (host), scripts/centralpay
+    # (`backups`/`restore`), and app.monitor's backup-freshness/disk-space
+    # checks. The monitor container bind-mounts this SAME path read-only
+    # (docker-compose.yml) so both checks reuse one filesystem view instead
+    # of adding a second mount for disk space alone.
+    centralpay_backup_dir: str = "/var/backups/centralpay-bridge"
+
+    # --- Monitoring subsystem (app.monitor). Disabled by default; a
+    # dedicated process/container distinct from the worker and admin bot so
+    # a dead worker cannot also silence detection of its own death. Checks
+    # read existing tables only and never mutate financial data; incidents
+    # (app.models.MonitorIncident) persist across restarts so deduplication
+    # survives a container recreate. Delivery reuses the existing admin-bot
+    # Telegram pipeline (app.adminbot.alerts.create_alert) — the monitor
+    # process itself never talks to Telegram.
+    monitor_enabled: bool = False
+    monitor_interval_seconds: float = Field(default=60.0, gt=0)
+    # Cadence for the one expensive check (reuses app.ops's db-check SQL) —
+    # deliberately far less frequent than monitor_interval_seconds.
+    monitor_db_integrity_interval_seconds: float = Field(default=1800.0, gt=0)
+
+    monitor_worker_heartbeat_warning_seconds: int = Field(default=60, gt=0)
+    monitor_worker_heartbeat_critical_seconds: int = Field(default=180, gt=0)
+
+    monitor_notification_warning_count: int = Field(default=20, gt=0)
+    monitor_notification_critical_count: int = Field(default=100, gt=0)
+    monitor_notification_max_age_seconds: int = Field(default=1800, gt=0)
+
+    monitor_manual_review_warning_count: int = Field(default=5, gt=0)
+    monitor_manual_review_critical_count: int = Field(default=20, gt=0)
+    monitor_manual_review_max_age_seconds: int = Field(default=21600, gt=0)
+
+    monitor_backup_warning_age_seconds: int = Field(default=86400, gt=0)
+    monitor_backup_critical_age_seconds: int = Field(default=129600, gt=0)
+
+    monitor_disk_warning_percent: float = Field(default=15.0, gt=0, le=100)
+    monitor_disk_critical_percent: float = Field(default=5.0, gt=0, le=100)
+    monitor_disk_min_free_bytes: int = Field(default=1_073_741_824, gt=0)  # 1 GiB
+
+    monitor_gateway_failure_window_seconds: int = Field(default=300, gt=0)
+    monitor_gateway_failure_warning_count: int = Field(default=3, gt=0)
+    monitor_gateway_failure_critical_count: int = Field(default=10, gt=0)
+
+    monitor_bot_failure_window_seconds: int = Field(default=300, gt=0)
+    monitor_bot_failure_warning_count: int = Field(default=3, gt=0)
+    monitor_bot_failure_critical_count: int = Field(default=10, gt=0)
+
+    # Public readiness check: hits {public_base_url}/health/ready over the
+    # real internet (proving external reachability), never an internal URL.
+    monitor_public_ready_connect_timeout_seconds: float = Field(default=5.0, gt=0)
+    monitor_public_ready_read_timeout_seconds: float = Field(default=10.0, gt=0)
+
+    # Monitor container liveness heartbeat file (same convention as
+    # worker_heartbeat_file / admin_bot_heartbeat_file).
+    monitor_heartbeat_file: str = "/tmp/centralpay-monitor-heartbeat"
+
     @field_validator("centralpay_payer_id_secret")
     @classmethod
     def _validate_payer_id_secret(cls, value: str) -> str:
@@ -567,6 +623,45 @@ class Settings(BaseSettings):
                 "RECONCILIATION_SLOW_TIER_RESERVED_SLOTS must be less than "
                 "RECONCILIATION_BATCH_SIZE"
             )
+        if self.monitor_worker_heartbeat_warning_seconds >= (
+            self.monitor_worker_heartbeat_critical_seconds
+        ):
+            raise ValueError(
+                "MONITOR_WORKER_HEARTBEAT_WARNING_SECONDS must be less than "
+                "MONITOR_WORKER_HEARTBEAT_CRITICAL_SECONDS"
+            )
+        if self.monitor_notification_warning_count >= self.monitor_notification_critical_count:
+            raise ValueError(
+                "MONITOR_NOTIFICATION_WARNING_COUNT must be less than "
+                "MONITOR_NOTIFICATION_CRITICAL_COUNT"
+            )
+        if self.monitor_manual_review_warning_count >= self.monitor_manual_review_critical_count:
+            raise ValueError(
+                "MONITOR_MANUAL_REVIEW_WARNING_COUNT must be less than "
+                "MONITOR_MANUAL_REVIEW_CRITICAL_COUNT"
+            )
+        if self.monitor_backup_warning_age_seconds >= self.monitor_backup_critical_age_seconds:
+            raise ValueError(
+                "MONITOR_BACKUP_WARNING_AGE_SECONDS must be less than "
+                "MONITOR_BACKUP_CRITICAL_AGE_SECONDS"
+            )
+        if self.monitor_disk_critical_percent >= self.monitor_disk_warning_percent:
+            raise ValueError(
+                "MONITOR_DISK_CRITICAL_PERCENT must be less than MONITOR_DISK_WARNING_PERCENT"
+            )
+        if (
+            self.monitor_gateway_failure_warning_count
+            >= self.monitor_gateway_failure_critical_count
+        ):
+            raise ValueError(
+                "MONITOR_GATEWAY_FAILURE_WARNING_COUNT must be less than "
+                "MONITOR_GATEWAY_FAILURE_CRITICAL_COUNT"
+            )
+        if self.monitor_bot_failure_warning_count >= self.monitor_bot_failure_critical_count:
+            raise ValueError(
+                "MONITOR_BOT_FAILURE_WARNING_COUNT must be less than "
+                "MONITOR_BOT_FAILURE_CRITICAL_COUNT"
+            )
         return self
 
 
@@ -601,6 +696,16 @@ def parse_admin_telegram_ids(raw: str) -> tuple[int, ...]:
             )
         ids.append(int(candidate))
     return tuple(dict.fromkeys(ids))
+
+
+def validate_monitor_settings(settings: Settings) -> None:
+    """Startup validation for the monitor service only.
+
+    The API, worker, and admin bot never call this, so a disabled or
+    misconfigured monitor can never block payment processing.
+    """
+    if not settings.monitor_enabled:
+        raise ConfigurationError("MONITOR_ENABLED is false")
 
 
 def validate_admin_bot_settings(settings: Settings) -> tuple[int, ...]:

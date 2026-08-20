@@ -44,6 +44,55 @@ def count_open_manual_reviews(db: Session) -> int:
     ).scalar_one()
 
 
+def oldest_open_manual_review_age_seconds(db: Session, *, now: datetime) -> float | None:
+    """Age of the longest-open unresolved manual review, or None when there
+    is none. Shares _open_manual_review_conditions with
+    count_open_manual_reviews so the two can never disagree about which
+    rows are "open"."""
+    oldest: datetime | None = db.execute(
+        select(func.min(Payment.manual_review_at)).where(*_open_manual_review_conditions())
+    ).scalar_one()
+    if oldest is None:
+        return None
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=UTC)
+    return (now - oldest).total_seconds()
+
+
+def open_manual_review_reason_buckets(db: Session) -> dict[str, int]:
+    """Open manual-review count grouped by cause, for a monitor/dashboard
+    summary. Labels only (bot_notify_reason values, or the fixed label
+    "financial_or_verification" for the non-delivery half) — never an order
+    id or other customer-identifying data."""
+    rows = db.execute(
+        select(Payment.bot_notify_reason, func.count(Payment.id))
+        .where(*_open_manual_review_conditions())
+        .group_by(Payment.bot_notify_reason)
+    ).tuples().all()
+    buckets: dict[str, int] = {}
+    for reason, count in rows:
+        buckets[reason or "financial_or_verification"] = count
+    return buckets
+
+
+def oldest_pending_notification_age_seconds(db: Session, *, now: datetime) -> float | None:
+    """Age of the longest-waiting bot_notify_pending row (by
+    _notification_age_anchor), across the ENTIRE pending set -- not just
+    rows already past a display staleness cutoff (contrast
+    _stale_bot_notify_pending_conditions, which is scoped to /stuck's
+    display threshold). None when nothing is pending."""
+    oldest_anchor: datetime | None = db.execute(
+        select(func.min(_notification_age_anchor())).where(
+            Payment.status == "bot_notify_pending"
+        )
+    ).scalar_one()
+    if oldest_anchor is None:
+        return None
+    if oldest_anchor.tzinfo is None:
+        oldest_anchor = oldest_anchor.replace(tzinfo=UTC)
+    return (now - oldest_anchor).total_seconds()
+
+
 def event_count_since(db: Session, event_type: str, *, hours: int = 24) -> int:
     cutoff = _utcnow() - timedelta(hours=hours)
     return db.execute(
