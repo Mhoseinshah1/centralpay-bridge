@@ -186,6 +186,72 @@ centralpay credentials | uninstall
 centralpay admin-bot status | logs | restart | enable | disable | test-alert
 ```
 
+## Upgrading production
+
+`centralpay update` deploys the ref pinned by `CENTRALPAY_UPDATE_REF` in
+`/etc/centralpay-bridge/centralpay.env`. Production installs must pin a
+**release tag** (`vX.Y.Z` or `vX.Y.Z-rcN`, e.g. `v0.6.0-rc1`) — the installer
+sets this by default. For a release tag, `centralpay update`:
+
+1. Fetches the tag and resolves it to a commit.
+2. Downloads that release's `SHA256SUMS`, `SOURCE_COMMIT`, and source
+   artifact from the GitHub release (published by `.github/workflows/release.yml`,
+   see "Releasing a new version" below).
+3. Verifies the artifact and `SOURCE_COMMIT` checksums, and validates
+   `SOURCE_COMMIT`'s exact grammar (a single 40-char lowercase-hex commit).
+4. Requires the fetched tag's commit to equal the verified `SOURCE_COMMIT` —
+   if the tag was moved after the release was built, the update aborts here,
+   **before** any backup, checkout, build, migration, or restart.
+5. Only once all of the above pass: takes a pre-update backup, checks out the
+   verified commit, builds images, runs migrations, and restarts services.
+
+A plain branch (`main`, `master`, or anything else that isn't a release tag)
+is **rejected** by default — `centralpay update` fails closed with no
+checkout, matching the production requirement that every deployed commit be
+checksum- and `SOURCE_COMMIT`-verified. To point a **local development**
+install at a branch instead, set `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` in
+`centralpay.env`; this skips all verification and must never be set on a
+production host. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a separate,
+narrower escape hatch for when a release tag's assets can't be downloaded —
+also root-only and not recommended.
+
+Check what would change before updating:
+
+```bash
+sudo centralpay update --check
+sudo centralpay update
+```
+
+If the post-update health check fails, the deploy stops automatically and
+the previously working `centralpay` command is left in place. Roll the
+application files back with `sudo centralpay rollback` (interactive
+confirmation required). Database migrations are forward-only and are never
+downgraded automatically — see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md); if
+a migration is incompatible, restore the pre-update backup instead
+(`centralpay backups && centralpay restore FILE`).
+
+## Releasing a new version
+
+Release artifacts are built and checksummed entirely by
+`.github/workflows/release.yml`, gated on every quality, shell, Docker,
+secret-scan, dependency-scan, and docs job passing:
+
+1. Bump `APP_VERSION` in `app/version.py` to match the tag you're about to
+   push (CI fails the release if they disagree).
+2. Add a `CHANGELOG.md` entry and, for a new minor/major line, release notes
+   (`RELEASE_NOTES_<version>.md`).
+3. Push a signed annotated tag matching the release-tag grammar, e.g.
+   `git tag -a v0.6.0-rc2 -m "v0.6.0-rc2" && git push origin v0.6.0-rc2`.
+4. The workflow builds the source artifact, computes `SOURCE_COMMIT` (the
+   exact commit the artifact was built from), generates an SBOM, computes
+   `SHA256SUMS` over the artifact + `SOURCE_COMMIT` + SBOM, and opens a
+   **draft** GitHub release with those files attached. Publishing the draft
+   is always a separate, manual, human decision — the workflow never
+   publishes it.
+5. Once published, point production installs at the new tag by setting
+   `CENTRALPAY_UPDATE_REF=vX.Y.Z` and running `sudo centralpay update` (see
+   "Upgrading production" above).
+
 ## Requirements
 
 - Python 3.12
@@ -757,6 +823,9 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `ADMIN_BOT_TOKEN` / `ADMIN_TELEGRAM_IDS` | BotFather token + comma-separated numeric admin IDs |
 | `ADMIN_BOT_*_ALERTS` | Per-category alert toggles (payment-success off by default) |
 | `ADMIN_BOT_DAILY_REPORT_*` / `ADMIN_BOT_TIMEZONE` | Daily report time and timezone (Asia/Tehran) |
+| `CENTRALPAY_UPDATE_REF` | Update channel for `centralpay update`, in `/etc/centralpay-bridge/centralpay.env` (host-managed, not app config). Production must pin a release tag (`vX.Y.Z` / `vX.Y.Z-rcN`); a branch is rejected unless `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true`. See "Upgrading production" above |
+| `CENTRALPAY_UPDATE_ALLOW_DEV_REF` | Default `false`. Root-only, local-development-only opt-in to deploy a non-tag ref (e.g. `main`) with no checksum or `SOURCE_COMMIT` verification. Never set on production |
+| `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED` | Default `false`. Root-only escape hatch to deploy a release tag's fetched commit when its release assets aren't downloadable, skipping checksum/`SOURCE_COMMIT` verification. Not recommended |
 
 ## Security notes
 

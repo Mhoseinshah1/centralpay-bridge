@@ -645,3 +645,25 @@ the `FOR UPDATE` lock, verified-status short-circuit, the
 `reference_id` UNIQUE constraint, and the financial CHECK constraints —
 proven on real PostgreSQL); aborted-transaction continuation and
 deadlock/lock-ordering cycles (none found).
+
+## Topic 49 — production update-mode enforcement
+
+### 49. `centralpay update` silently allowed a non-release-tag ref in production — **FIXED**
+- Topic 19 closed the checksum/`SOURCE_COMMIT` binding for release-tag
+  updates, but a non-tag `CENTRALPAY_UPDATE_REF` (e.g. `main`, left over from
+  a misconfiguration or an operator typo) was still accepted unconditionally:
+  `resolve_verified_update_commit` printed a `DEVELOPMENT MODE` warning and
+  deployed the fetched branch commit anyway, with no checksum and no
+  `SOURCE_COMMIT` binding, on a production host exactly as readily as on a
+  development one.
+- **Resolution:** a non-release-tag ref now fails closed by default — before
+  any fetch result matters — unless `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` is
+  explicitly set in `centralpay.env`. That flag is documented as
+  local-development-only and is never set by the installer or the shipped
+  `deploy/centralpay.env.template` default. Covered by
+  `tests/test_update_integrity.py::test_non_release_ref_fails_closed_by_default`
+  and `::test_non_release_ref_development_mode_requires_explicit_optin`.
+- Orthogonal to, and does not change, the already-accepted
+  `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` escape hatch (topic 19/48), which
+  only applies when the ref IS a release tag but its assets can't be
+  downloaded.

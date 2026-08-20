@@ -7,6 +7,12 @@ artifact, SOURCE_COMMIT and SHA256SUMS, verifies both checksums, validates
 SOURCE_COMMIT's grammar, resolves the fetched tag to its commit, and requires
 equality — aborting BEFORE any checkout/build/migration/restart on mismatch.
 
+Production update-mode enforcement: a non-release-tag ref (a branch such as
+main/master) fails closed by default — production updates must pin a
+release tag. `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` is the explicit,
+root-operator opt-in that keeps the old unverified branch-deploy behavior
+for a local development install only.
+
 Deterministic: local temporary Git repositories and file:// "downloads".
 No GitHub, no root, no Docker, no networking.
 """
@@ -168,7 +174,17 @@ def test_is_release_tag_accepts_supported_grammar(ref):
 
 
 @pytest.mark.parametrize(
-    "ref", ["v1.2.3evil", "v1.2.3/other", "v1.2.3-rc", "main", "1.2.3", "v1.2", "v1.2.3-rcx"]
+    "ref",
+    [
+        "v1.2.3evil",
+        "v1.2.3/other",
+        "v1.2.3-rc",
+        "main",
+        "master",
+        "1.2.3",
+        "v1.2",
+        "v1.2.3-rcx",
+    ],
 )
 def test_is_release_tag_rejects_everything_else(ref):
     r = subprocess.run(
@@ -263,13 +279,39 @@ def test_artifact_checksum_mismatch_fails_closed(sandbox):
     assert result.stdout.strip() == ""
 
 
-def test_non_release_ref_is_development_mode(sandbox):
-    """A branch ref stays explicit development/unverified mode: it resolves
-    the fetched commit and warns, with no SOURCE_COMMIT binding."""
+def test_non_release_ref_fails_closed_by_default(sandbox):
+    """Production default: a non-tag ref (e.g. a branch) is rejected BEFORE
+    any checkout, with no commit printed — no CENTRALPAY_UPDATE_ALLOW_DEV_REF
+    opt-in means production-strict behavior."""
+    head_before = installed_head(sandbox)
     result = run_resolve(sandbox, "main")
+    assert result.returncode != 0
+    assert result.stdout.strip() == ""  # nothing to deploy
+    assert "not a release tag" in result.stderr.lower()
+    assert installed_head(sandbox) == head_before  # no checkout happened
+
+
+def test_non_release_ref_development_mode_requires_explicit_optin(sandbox):
+    """With the explicit CENTRALPAY_UPDATE_ALLOW_DEV_REF=true opt-in, a
+    branch ref resolves the fetched commit and warns, with no SOURCE_COMMIT
+    binding — for a local development install only."""
+    result = run_resolve(sandbox, "main", env_lines="CENTRALPAY_UPDATE_ALLOW_DEV_REF=true\n")
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == sandbox["commit_a"]
     assert "DEVELOPMENT MODE" in result.stderr
+    assert "CENTRALPAY_UPDATE_ALLOW_DEV_REF" in result.stderr
+
+
+def test_rc_tag_resolves_with_verified_binding(sandbox):
+    """An -rcN pre-release tag goes through the exact same checksum +
+    SOURCE_COMMIT verification path as a final release tag."""
+    a = sandbox["commit_a"]
+    tag(sandbox, "v1.2.3-rc1", a)
+    build_assets(sandbox, "v1.2.3-rc1", source_content=a + "\n")
+    result = run_resolve(sandbox, "v1.2.3-rc1")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == a
+    assert "SOURCE_COMMIT binding verified" in result.stderr
 
 
 def test_allow_unverified_escape_hatch_when_assets_absent(sandbox):
