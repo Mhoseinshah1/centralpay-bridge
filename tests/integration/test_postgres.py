@@ -417,6 +417,158 @@ def test_concurrent_distinct_orders_get_unique_gateway_ids(
     assert len(set(gateway_ids)) == 10
 
 
+# --- _ensure_payment_row: direct regression coverage of the insert race -----
+#
+# The tests above already prove the end-to-end HTTP flow is race-safe. These
+# call app.services.payments._ensure_payment_row directly (bypassing the row
+# lock re-select that create_payment does afterward) to pin down that the
+# *insert itself* is what's atomic: it relies on db.flush() hitting the real
+# UNIQUE index (ix_payments_bot_order_id, see alembic/versions/0001) and
+# catching IntegrityError, not on the earlier fast-path SELECT (which is only
+# an optimization to skip fee/identity work when a row obviously exists).
+
+
+def test_ensure_payment_row_concurrent_same_bot_order_id(settings, pg_session_factory):
+    """N concurrent callers racing the same bot_order_id through
+    _ensure_payment_row: exactly one creates the row and gets back a
+    PayerIdentity, every loser gets back None with no exception -- the
+    IntegrityError from the losing flush() is caught and rolled back
+    cleanly rather than propagating."""
+    from app.services.payer_identity import IDENTITY_TYPE_ORDER_FALLBACK, order_identity_key
+    from app.services.payments import _ensure_payment_row
+
+    bot_order_id = "pg-ensure-race"
+    identity_key = order_identity_key(bot_order_id)
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def attempt(_index):
+        session = pg_session_factory()
+        try:
+            barrier.wait(timeout=10)
+            return _ensure_payment_row(
+                session,
+                settings,
+                bot_order_id=bot_order_id,
+                amount=10000,
+                identity_key=identity_key,
+                identity_type=IDENTITY_TYPE_ORDER_FALLBACK,
+                telegram_user_id=None,
+            )
+        finally:
+            session.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(attempt, i) for i in range(workers)]
+        results = [future.result(timeout=30) for future in futures]
+
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1  # exactly one caller created the payment row
+    assert len(results) - len(winners) == workers - 1  # every loser returned None, none raised
+
+    with pg_session_factory() as session:
+        rows = (
+            session.execute(select(Payment).where(Payment.bot_order_id == bot_order_id))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+    assert rows[0].gateway_user_id == winners[0].gateway_user_id
+
+
+def test_ensure_payment_row_concurrent_distinct_orders_no_duplicate_gateway_ids(
+    settings, pg_session_factory
+):
+    """Distinct bot_order_ids racing through _ensure_payment_row at the same
+    instant must each create their own row with a unique gateway_order_id --
+    concurrent inserts never collide even though allocation and insert share
+    one flush()."""
+    from app.services.payer_identity import IDENTITY_TYPE_ORDER_FALLBACK, order_identity_key
+    from app.services.payments import _ensure_payment_row
+
+    workers = 8
+    barrier = threading.Barrier(workers)
+
+    def attempt(index):
+        bot_order_id = f"pg-ensure-distinct-{index}"
+        session = pg_session_factory()
+        try:
+            barrier.wait(timeout=10)
+            return _ensure_payment_row(
+                session,
+                settings,
+                bot_order_id=bot_order_id,
+                amount=5000,
+                identity_key=order_identity_key(bot_order_id),
+                identity_type=IDENTITY_TYPE_ORDER_FALLBACK,
+                telegram_user_id=None,
+            )
+        finally:
+            session.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(attempt, i) for i in range(workers)]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert all(r is not None for r in results)  # every distinct order created its own row
+
+    with pg_session_factory() as session:
+        rows = (
+            session.execute(
+                select(Payment).where(Payment.bot_order_id.like("pg-ensure-distinct-%"))
+            )
+            .scalars()
+            .all()
+        )
+    assert len(rows) == workers
+    gateway_ids = [row.gateway_order_id for row in rows]
+    assert len(set(gateway_ids)) == workers  # no duplicate gateway_order_id
+
+
+def test_ensure_payment_row_idempotent_once_row_exists(settings, pg_session_factory):
+    """Existing idempotency behavior is unchanged: once a row exists (whether
+    from a normal create or a losing race), _ensure_payment_row keeps
+    returning None on every later call for the same bot_order_id, and never
+    creates a second row."""
+    from app.services.payer_identity import IDENTITY_TYPE_ORDER_FALLBACK, order_identity_key
+    from app.services.payments import _ensure_payment_row
+
+    bot_order_id = "pg-ensure-idempotent"
+    identity_key = order_identity_key(bot_order_id)
+
+    with pg_session_factory() as session:
+        creator = _ensure_payment_row(
+            session,
+            settings,
+            bot_order_id=bot_order_id,
+            amount=7000,
+            identity_key=identity_key,
+            identity_type=IDENTITY_TYPE_ORDER_FALLBACK,
+            telegram_user_id=None,
+        )
+    assert creator is not None
+
+    with pg_session_factory() as session:
+        retry = _ensure_payment_row(
+            session,
+            settings,
+            bot_order_id=bot_order_id,
+            amount=7000,
+            identity_key=identity_key,
+            identity_type=IDENTITY_TYPE_ORDER_FALLBACK,
+            telegram_user_id=None,
+        )
+    assert retry is None
+
+    with pg_session_factory() as session:
+        rows = (
+            session.execute(select(Payment).where(Payment.bot_order_id == bot_order_id))
+            .scalars()
+            .all()
+        )
+    assert len(rows) == 1
+
+
 def test_four_workers_drain_queue_exactly_once(
     settings, pg_app, pg_session_factory, bot_stub, notifier
 ):
