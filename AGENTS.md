@@ -1,115 +1,125 @@
-# CentralPay Bridge — Master Project Contract
+# CentralPay Bridge — Engineering Contract
 
-## Mission
+This file is the authoritative engineering contract for the repository. It defines invariants and required behavior. It is intentionally more stable than audit reports, release notes, or implementation snapshots.
 
-Build a production-grade payment bridge between a Telegram bot custom gateway API and CentralPay.
+## Mission and priorities
 
-Priorities, in order:
+Build and operate a payment bridge between a Telegram selling bot custom-payment API and CentralPay.
+
+Priority order:
 
 1. Financial correctness
 2. Security
 3. Reliability
 4. Recoverability
 5. Observability
+6. Availability
 
-Availability is less important than financial correctness.
+Availability must never be improved by weakening financial correctness.
 
-## Supported deployment targets
+## Supported deployment
 
-- Ubuntu Server 22.04 LTS, 24.04 LTS, and 26.04 LTS
+- Ubuntu Server 22.04 LTS, 24.04 LTS, 26.04 LTS
 - amd64 and arm64
-- Docker Engine and Docker Compose plugin
-- One-line interactive installer
+- Docker Engine + Docker Compose plugin
+- PostgreSQL 16 production database
+- Caddy as the public TLS reverse proxy
 
-Required installation experience:
+The installer and management tooling store configuration/secrets outside the repository under `/etc/centralpay-bridge/`.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main/install.sh | sudo bash
-```
-
-## Required public endpoints
+## Public API contract
 
 ### Create payment
 
 `POST /api/custom-payment`
 
-Request from the bot:
+Canonical JSON body:
 
 ```json
 {
-  "api_key": "API",
-  "amount": 10000,
-  "order_id": "string-order-id"
+  "api_key": "...",
+  "amount": 100000,
+  "order_id": "opaque-string"
 }
 ```
 
-Response:
+Rules:
+
+- `api_key` is a secret and must never be logged or echoed.
+- `amount` is TOMAN.
+- Canonical amount representation is a JSON integer.
+- A legacy ASCII-decimal string matching exactly `[0-9]+` may be normalized before validation.
+- Floats, booleans, signs, separators, whitespace padding, exponents, and non-ASCII digits are rejected.
+- `order_id` is opaque, bounded, non-empty, and must not be silently normalized.
+- Authentication occurs before order lookup or behavior that can reveal order existence.
+- Existing-order replay may bypass creation rate limiting only if the replay is provably work-free and matches the stored amount and payer-identity shape.
+
+Successful response:
 
 ```json
-{
-  "url": "https://payment-url"
-}
+{"url": "https://..."}
 ```
 
-### CentralPay callback
+### Callback
 
-`GET /api/centralpay/callback?orderId=...&sig=...`
+`GET /api/centralpay/callback?orderId=...&ct=...&sig=...`
 
-### Health checks
+Requirements:
+
+- reject duplicated security parameters
+- validate HMAC signature before database/gateway work
+- bind the callback token (`ct`) into the signature
+- store only the token hash
+- superseded tokens fail before gateway verify
+- already verified payments never call verify again
+
+### Health
 
 - `GET /health/live`
 - `GET /health/ready`
 
-## CentralPay integration
+`/health/details` is internal-only and must not be publicly routed by Caddy.
+
+## CentralPay transport contract
+
+CentralPay calls use HTTPS only.
 
 ### getLink
 
-POST JSON to:
+Send JSON to the configured getLink endpoint with the gateway-required fields including:
 
-`https://centralapi.org/webservice/basic/getLink.php`
+- API key
+- type `deposit`
+- payable amount in TOMAN
+- isolated gateway user ID
+- unique numeric gateway order ID
+- signed return URL
 
-Fields:
-
-- `api_key`: string
-- `type`: always `deposit`
-- `amount`: integer, TOMAN
-- `userId`: integer
-- `orderId`: integer
-- `returnUrl`: string containing `orderId`
-
-Successful response contains `data.redirectUrl`.
+The returned redirect URL must satisfy the configured HTTPS/storage safety policy before it is stored or returned.
 
 ### verify
 
-POST JSON to:
+Verification is trusted only after:
 
-`https://centralapi.org/webservice/basic/verify.php`
+- an explicit accepted success marker
+- valid reference ID
+- exact amount match against `payable_amount`
+- exact user ID match against the payment's `gateway_user_id`
 
-Fields:
+Raw gateway-controlled error/message content must not escape the CentralPay client boundary into logs, audit payloads, Telegram, or API errors. Translate external failures into the repository's fixed internal reason-code vocabulary.
 
-- `api_key`: string
-- `orderId`: integer
+## Order and payer identity
 
-On success validate:
+- Preserve the original bot `order_id` exactly.
+- Use a separate unique numeric `gateway_order_id` for CentralPay.
+- `bot_order_id` and `gateway_order_id` are database-unique.
+- Gateway payer identity must be isolated per payer/order according to the current identity scheme; never fall back to a shared legacy payer ID for new flows.
+- Identity shape is part of safe-replay eligibility.
+- Identity reconciliation must never silently reinterpret a different Telegram user as the same payer.
 
-- `referenceId`
-- `amount`
-- `userId`
+## Payment states
 
-Never notify the bot before CentralPay verification succeeds.
-Never send verify again after a transaction is already marked successfully verified.
-
-## Order IDs
-
-- Bot `order_id` may be a string.
-- CentralPay `orderId` must be an integer.
-- Store both.
-- Generate a unique numeric gateway order ID.
-- Preserve the original bot order ID for notification.
-
-## Required payment states
-
-At minimum:
+The implementation may add operational detail, but the core state model includes:
 
 - `created`
 - `link_created`
@@ -119,467 +129,269 @@ At minimum:
 - `bot_notify_accepted`
 - `manual_review`
 
-## Financial safety rules
+State names are operational facts, not customer-balance claims.
 
-Financial correctness is more important than availability.
+In particular, `bot_notify_accepted` means the selling-bot API returned an accepted HTTP response. It does **not** prove that the customer balance was credited.
 
-Never:
+## Financial invariants
 
-- mark a payment successful before CentralPay verification
-- notify the bot before CentralPay verification
-- silently ignore financial errors
-- delete audit events
-- overwrite successful payment records
-- perform automatic balance changes outside the documented bot API
-- retry ambiguous bot deliveries automatically in safe mode
+The following are non-negotiable:
 
-Every financial state transition MUST be stored in `payment_events`.
+1. Never mark a payment verified before CentralPay verify succeeds.
+2. Never notify the selling bot before gateway verification is committed.
+3. Verify amount must equal the immutable `payable_amount` snapshot.
+4. Verify `userId` must equal the payment's immutable gateway payer identity.
+5. Reference IDs must satisfy the storage contract and must not overwrite another payment's reference ID.
+6. One `bot_order_id` maps to one payment row.
+7. A duplicate order with a different amount must not mutate the original payment.
+8. A successfully verified payment is never re-verified merely because callback/reconciliation repeats.
+9. Dynamic fee arithmetic uses integers only and is snapshotted once per payment.
+10. `payments.amount` remains the original selling-bot invoice amount.
+11. The selling-bot notification payload does not carry fee/payable amounts.
+12. Ambiguous delivery is never silently converted into success.
+13. In `safe` retry mode, an ambiguous send is never automatically resent.
+14. Automatic notification retries are bounded.
+15. Reconciliation retries are bounded/aged and use the same canonical verify/settle logic as callbacks.
+16. `manual_review` cannot be bypassed by ordinary callback/create/worker paths.
+17. Operator review resolution must not rewrite gateway verification facts or financial amounts.
+18. Every financial state transition is appended to `payment_events`.
+19. A failed administrator-alert side effect must not abort the financial transaction that triggered it.
+20. Backup/restore must preserve financial rows and audit history and must fail closed if restore integrity cannot be established.
 
-Successful payment records are immutable except for appending audit information.
+Detailed audit snapshots may extend this list; this contract remains the baseline.
 
-If a payment reaches `manual_review`, it must remain recoverable by an administrator.
+## Concurrency rules
 
-Use database transactions and row locking for financial state transitions.
-
-## Bot notification
-
-After successful verification, send:
-
-`POST https://BOT_DOMAIN/api/payment`
-
-Headers:
-
-```text
-Token: BOT_TOKEN
-Content-Type: application/json
-```
-
-Body:
-
-```json
-{
-  "order_id": "original-bot-order-id",
-  "actions": "custom_payment_verify"
-}
-```
-
-The bot documentation does not define a response schema or guarantee idempotency.
-
-Therefore use conservative delivery semantics:
-
-- HTTP 2xx means `bot_notify_accepted`, not guaranteed balance credit.
-- Do not automatically retry after an ambiguous timeout unless retry mode is explicitly configured as idempotent.
-- Retry safe pre-send connection failures and selected 5xx responses.
-- Move ambiguous cases to `manual_review`.
-
-## Retry policy
-
-Default mode:
-
-```env
-BOT_NOTIFY_RETRY_MODE=safe
-```
-
-Safe mode behavior:
-
-- DNS resolution failure before delivery: retry
-- connection refused before delivery: retry
-- HTTP 500, 502, 503, 504: retry with bounded backoff
-- HTTP 4xx: do not retry automatically; record exact reason and move to review when appropriate
-- ambiguous timeout after request transmission may have begun: `manual_review`
-- HTTP 2xx: `bot_notify_accepted`; never automatically resend
-
-Optional mode:
-
-```env
-BOT_NOTIFY_RETRY_MODE=idempotent
-```
-
-Only enable this when the bot developer has explicitly confirmed duplicate `order_id` delivery is idempotent.
-
-## Audit trail
-
-Create a permanent table named `payment_events`.
-
-Store:
-
-- `payment_id`
-- `event_type`
-- `level`
-- `request_id`
-- `data`
-- `created_at`
-
-Every financial state transition must be recorded.
-Audit data must not be silently deleted.
-
-## Logging and observability
-
-Use structured JSON logs and shared request IDs across reverse proxy, API, worker, and audit events.
-
-Required event names include:
-
-- `payment_created`
-- `payment_link_created`
-- `centralpay_getlink_failed`
-- `callback_received`
-- `centralpay_verify_failed`
-- `verify_amount_mismatch`
-- `verify_user_id_mismatch`
-- `gateway_payment_verified`
-- `bot_connection_failed`
-- `bot_timeout_ambiguous`
-- `bot_http_4xx`
-- `bot_http_5xx`
-- `bot_notify_accepted`
-- `manual_review_required`
-- `backup_failed`
-- `service_unhealthy`
-
-Never log:
-
-- API keys
-- bot token
-- database passwords
-- callback secret or callback signature
-- full card number
-- request bodies containing secrets
-- full payment redirect URL
-- full callback query string
-
-Only the final four card digits may be stored, if necessary.
-
-Implement:
-
-- `/health/live`
-- `/health/ready`
-- request IDs
-- permanent audit history
-- diagnostics command
-- explicit failure reasons
-
-## Security requirements
+Financial concurrency semantics are PostgreSQL semantics.
 
 Use:
 
-- HMAC callback signing
-- TLS
-- SQLAlchemy parameterized queries
-- database transactions
-- row locking where required
-- secrets outside the repository
-- constant-time secret comparison
-- least-privilege containers and service users
-- secure file permissions
+- database uniqueness constraints for identity/idempotency boundaries
+- `SELECT ... FOR UPDATE` for financial state transitions that require serialization
+- `FOR UPDATE SKIP LOCKED` for competing queue workers when appropriate
+- `populate_existing=True` or equivalent refresh discipline when SQLAlchemy identity-map staleness could defeat a lock/re-check
+- explicit re-check under the lock before committing a mutation
 
-Forbidden:
+Do not replace database-enforced correctness with process-local locks.
 
-- disabling SSL verification
-- committing `.env` files
-- committing production credentials
-- logging secrets
-- force-pushing to `main`
-- bypassing tests
-- using SQLite in production
+Tests that claim concurrency correctness must use real PostgreSQL.
 
-## Database
+## Notification delivery
 
-Required production database:
+After verified settlement, notify the selling bot using the documented order-only payload and Token header.
 
-- PostgreSQL
+Supported retry modes:
 
-Technology:
+### `safe`
 
-- SQLAlchemy 2
-- Alembic
+Default conservative mode.
 
-SQLite may only be used in isolated unit tests when the test does not depend on PostgreSQL behavior. Financial integration tests must use PostgreSQL.
+- safe pre-send/connect failures may retry
+- selected HTTP 5xx may retry within the bounded policy
+- explicit unsafe/invalid responses do not loop forever
+- ambiguous post-send timeout/outcome moves to manual review rather than automatic resend
 
-## Deployment architecture
+### `idempotent`
 
-Preferred Docker Compose services:
+May be enabled only when the selling bot is known to process duplicate `order_id` delivery idempotently.
 
-- `api`
-- `worker`
-- `db`
-- `admin-bot`
-- `caddy`
+This mode permits recovery operations that can re-deliver an already verified order. The operator must understand that re-delivery is not itself proof of balance state.
 
-Preferred TLS reverse proxy:
+## Manual review and operator recovery
 
-- Caddy with automatic certificate issuance and renewal
+`manual_review` exists to stop automation at ambiguity.
 
-The API and database must not expose unnecessary public ports.
+Allowed operator actions are explicit and audited:
 
-## Interactive installer
+- acknowledge a review
+- resolve with an allowlisted non-financial resolution
+- gated resend for a verified payment when idempotent mode is configured
+- manual notification acceptance only when the operator has independently confirmed the selling bot already processed the order
+- bounded aged-out reconciliation recovery through the canonical verification path
 
-The installer must ask for:
+No operator command may fabricate gateway verification, rewrite amount/fee snapshots, or silently delete audit history.
 
-- payment domain
-- bot API domain or complete bot payment endpoint
-- CentralPay getLink API key
-- CentralPay verify API key
-- bot `/token2`
-- Telegram bot username
-- SSL email
-- whether the optional admin Telegram bot should be enabled
-- admin bot token and allowed Telegram IDs when enabled
+## Administrator Telegram bot
 
-The installer must generate:
+The optional admin bot is an operations plane, never part of customer payment correctness.
+
+Authorization requirements:
+
+- numeric Telegram user IDs only
+- private chats only
+- unauthorized access receives a generic denial and is audited
+- usernames are never authorization identities
+
+Most commands are read-only inspection. A mutating Telegram command may exist only when:
+
+- its financial scope is explicitly constrained
+- it is strongly gated
+- it operates only on already gateway-verified records when re-delivery is involved
+- it is auditable
+- concurrency is proven safe on PostgreSQL
+- it cannot forge settlement or change financial snapshots
+
+Currently `/resend_failed confirm` is the approved mutating pattern and is allowed only in idempotent notification mode for eligible verified delivery failures.
+
+Telegram delivery outages must never block or roll back payment processing.
+
+Never send secrets, callback signatures/tokens, raw external error text, full card data, or full payment redirect URLs through Telegram.
+
+## Reconciliation
+
+The reconciliation worker exists to recover paid orders when browser callback delivery is absent/delayed.
+
+Rules:
+
+- reuse the canonical verification/settlement service
+- do not invent a second financial interpretation of gateway verify
+- normal `gateway_not_paid` is not itself an incident
+- retry scheduling is bounded and respects link age / max-age policy
+- terminal/exhausted/aged-out cases remain visible to the operator
+- already verified/manual-review payments are not re-settled
+- reconciliation must not create double notifications
+
+## Fees
+
+Fee policy is stored in PostgreSQL, not mutable environment state.
+
+- fee policies are append-only history with explicit cancellation rules
+- fee arithmetic is basis-point/integer based
+- every payment snapshots policy ID, rate, fee amount, and payable amount once
+- later fee-policy changes never alter an existing payment
+- maximum-payment enforcement applies to the final payable amount
+- changing fee policy affects new payments only
+
+## Rate limiting
+
+Rate limiting is abuse protection, not a financial correctness mechanism.
+
+- health endpoints remain reachable
+- valid callback signatures are not dropped merely to satisfy a limiter
+- payment creation keeps global and per-client protection
+- invalid callback signatures keep global and per-client protection
+- client IP trust depends on the explicit Caddy single-hop overwrite boundary
+- limiter storage must stay bounded
+- limiter internal failure should not corrupt payment state
+
+Do not introduce Redis or another stateful dependency solely for rate limiting without an explicit architecture decision.
+
+## Logging and secret handling
+
+Use structured logs with request IDs.
+
+Never log or expose:
 
 - inbound API key
+- CentralPay API key
+- selling-bot Token
+- admin-bot token
+- database password
 - callback HMAC secret
-- PostgreSQL password
+- callback `ct` token
+- callback `sig`
+- full card number
+- full redirect URL
+- raw gateway-controlled error body/text
 
-Store credentials outside the repository under:
+Caddy access logging must redact `ct` and `sig` from both the request URI and `Referer` header. Referrer policy is defense-in-depth, not a substitute for log-boundary redaction.
 
-```text
-/etc/centralpay-bridge/
-```
+## Deployment and container security
 
-Credential files must have mode `0600`.
+Only Caddy may publish public host ports.
 
-At completion print:
+Required architecture:
 
-- custom payment API URL
-- generated inbound API key
-- callback URL
-- health URL
-- status command
-- logs command
-- diagnose command
-- credentials file location
+- Caddy on edge network
+- API on edge + internal networks
+- PostgreSQL on internal network only
+- worker/admin-bot/migrate on internal network only
+- no Docker socket
+- no privileged mode
+- no host network/PID/IPC
+- application containers non-root
+- read-only root filesystem where compatible
+- all capabilities dropped for application services
+- `no-new-privileges`
+- secrets masked/omitted per service role
 
-The installer must validate:
+## Backups and restore
 
-- root privileges
-- supported Ubuntu version
-- amd64 or arm64 architecture
-- available disk space
-- required ports
-- domain format
-- DNS readiness when possible
-- Docker installation
-- service health after startup
+Backups must be validated before being declared good.
 
-If DNS is not ready, installation may finish without TLS but must clearly instruct the administrator to run `centralpay ssl` later.
+Required properties:
 
-## Management command
+- PostgreSQL custom-format dump
+- atomic creation
+- non-empty / format validation
+- `pg_restore --list` validation
+- SHA-256 manifest for current backups
+- bounded retention while retaining the newest valid backup
+- restore checksum validation
+- pre-restore backup
+- all writers stopped during destructive restore
+- `pg_restore --exit-on-error`
+- migrations and canonical DB integrity check before application restart
+- failed restore leaves writers stopped with recovery instructions
 
-Install a `centralpay` command supporting:
+Local backups are not off-site disaster recovery.
 
-- `status`
-- `logs`
-- `logs-errors`
-- `restart`
-- `update`
-- `backup`
-- `restore`
-- `diagnose`
-- `payment ORDER_ID`
-- `recent`
-- `credentials`
-- `ssl`
-- `uninstall`
+## Production update integrity
 
-Destructive commands must ask for confirmation unless explicitly passed a documented non-interactive flag.
+Normal production updates use release tags matching:
 
-## Backups
+- `vX.Y.Z`
+- `vX.Y.Z-rcN`
 
-Implement automatic PostgreSQL backups with configurable retention.
+For release-tag updates, the updater must verify the release artifact and `SOURCE_COMMIT` through `SHA256SUMS`, then require the fetched tag commit to equal the verified `SOURCE_COMMIT` before deployment work begins.
 
-Required capabilities:
+A non-release branch ref fails closed by default. Development branch updates require explicit `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` and must not be presented as verified production updates.
 
-- create backup
-- list backups
-- verify backup readability
-- restore to a new database first
-- documented production restore procedure
+`CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is an emergency escape hatch and must never be the normal documented production path.
 
-Never overwrite the production database without an explicit confirmation step.
+Database migrations are forward-only. Application rollback must not pretend to downgrade the database schema.
 
-## Optional administrator Telegram bot
+## Testing and CI
 
-The project must include an optional administrator-only Telegram bot as a separate service.
+Required validation categories:
 
-Purpose:
-
-- payment alerts
-- stuck transaction alerts
-- health notifications
-- backup notifications
-- operational reports
-
-Authentication rules:
-
-- allow only configured numeric Telegram user IDs
-- never trust Telegram usernames for authorization
-- support multiple administrators
-
-Environment variables:
-
-```env
-ADMIN_BOT_ENABLED=false
-ADMIN_BOT_TOKEN=
-ADMIN_TELEGRAM_IDS=
-```
-
-Initial read-only commands:
-
-- `/start`
-- `/status`
-- `/health`
-- `/recent`
-- `/stuck`
-- `/errors`
-- `/payment ORDER_ID`
-- `/backup_status`
-- `/retry_queue`
-- `/manual_review`
-
-Initial alerts:
-
-- payment verified
-- manual review required
-- ambiguous bot timeout
-- repeated bot delivery failure
-- callback signature failures above a threshold
-- backup failure
-- service unhealthy
-
-The first production version of the admin bot must be read-only.
-
-Do not implement a Telegram `/retry` command until retry safety and authorization are separately reviewed.
-
-Never send through Telegram:
-
-- API keys
-- database passwords
-- callback secrets
-- callback signatures
-- bot tokens
-- full card numbers
-- full redirect URLs
-
-## Testing requirements
-
-Tests must cover at minimum:
-
-- invalid inbound API key
-- duplicate order ID
-- duplicate order with different amount
-- getLink success and rejection
-- network and timeout failures
-- invalid callback signature
-- verify success
-- amount mismatch
-- user ID mismatch
-- missing reference ID
-- repeated callback after successful verification
-- concurrent callback handling
-- bot HTTP 2xx semantics
-- bot HTTP 4xx handling
-- bot HTTP 5xx handling
-- ambiguous timeout handling in safe mode
-- idempotent retry mode
-- audit event creation
-- secret redaction in logs
-- readiness health check
-
-## CI/CD quality gates
-
-GitHub Actions must run:
-
-- pytest unit tests
-- PostgreSQL integration tests
-- linting with Ruff
-- type checking with mypy or pyright
-- ShellCheck
-- Docker image build
-- dependency vulnerability scan
+- unit tests
+- real PostgreSQL integration/concurrency tests
+- financial fault-injection tests
+- backup/restore tests
+- migration tests
+- admin-bot authorization and mutation-gate tests
+- rate-limit and proxy-boundary tests
+- secret/log-redaction tests
+- Ruff
+- mypy
+- ShellCheck + `bash -n`
+- Docker build and compose validation
 - secret scan
+- dependency vulnerability scan
 
-Nothing may merge while required checks fail.
+Do not weaken, skip, or delete a required test merely to obtain green CI.
 
-No production secret may be committed.
+Infrastructure CI hangs may be retried once when plausibly transient; repeated infrastructure failure must be fixed rather than rerun indefinitely.
 
-## Development policy
+## Documentation policy
 
-DO NOT IMPLEMENT EVERYTHING AT ONCE.
+- `README.md`, `README_FA.md`, this file, `SECURITY.md`, and operational runbooks are living documentation.
+- Audit/review/release-validation files are evidence snapshots and may intentionally describe an older commit.
+- Historical snapshots must not be treated as the current implementation contract.
+- [DOCUMENTATION.md](DOCUMENTATION.md) is the map of document ownership/status.
 
-Implementation order:
+## Change policy
 
-### Phase 1 — Core payment API
+Prefer small, reviewable changes.
 
-- FastAPI structure
-- configuration
-- PostgreSQL models
-- Alembic migrations
-- payment creation
-- CentralPay getLink
-- signed callback
-- CentralPay verify
-- amount and user ID validation
-- health endpoints
-- tests
+Before merging a behavior change:
 
-### Phase 2 — Bot notification and reliability
+1. identify financial/security invariants affected
+2. add/adjust the smallest authoritative tests
+3. run real PostgreSQL tests when DB locking/uniqueness matters
+4. inspect the complete diff
+5. ensure no secret or generated local tooling artifact is included
+6. require current-head CI to be green
 
-- bot notification
-- conservative delivery states
-- retry policy
-- worker
-- permanent audit events
-- manual review flow
-- tests
-
-### Phase 3 — Deployment and operations
-
-- Docker images
-- Docker Compose
-- Caddy
-- interactive installer
-- management command
-- backups
-- update, restore, diagnose, and uninstall
-- tests
-
-### Phase 4 — Admin Telegram bot
-
-- read-only admin bot
-- alerts
-- reporting
-- stuck and manual-review inspection
-- tests
-
-### Phase 5 — CI/CD, hardening, and documentation
-
-- complete workflows
-- security review
-- English and Persian documentation
-- architecture diagram
-- troubleshooting guide
-- end-to-end installation test
-
-Do not start the next phase until the previous phase passes its tests and review.
-
-Prefer small reviewable pull requests over large direct changes.
-
-## Completion criteria
-
-The project is not complete until:
-
-- unit tests pass
-- PostgreSQL integration tests pass
-- lint passes
-- type checking passes
-- ShellCheck passes
-- Docker images build
-- documentation is current
-- no secrets are committed
-- installer has been tested on supported Ubuntu targets
-- payment flow has been tested end-to-end
-- ambiguous bot delivery cannot silently be marked as credited
-- every financial state transition is present in `payment_events`
-
-Do not claim completion while any required check is failing.
+Graph/navigation tools may help find code, but source and real database behavior remain authoritative.

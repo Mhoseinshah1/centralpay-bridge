@@ -1,109 +1,204 @@
-# چک‌لیست استقرار تولید (Production) — نسخهٔ 0.6.0-rc1
+# چک‌لیست Production — CentralPay Bridge 0.6.0-rc1
 
-> **هشدار:** این نسخه یک «نامزد انتشار» (Release Candidate) است و تا
-> بسته‌شدن همهٔ موارد مسدودکننده در `RELEASE_RISK_REGISTER.md` **نباید
-> برای پرداخت واقعی استفاده شود.**
+<div dir="rtl">
 
-هر مورد را قبل از فعال‌سازی پرداخت واقعی تیک بزنید. مواردی که با
-**[مسدودکننده]** علامت خورده‌اند بدون استثنا الزامی‌اند.
+این فایل یک **چک‌لیست عملیاتی جاری** است؛ auditهای قدیمی ممکن است blockerهایی را نشان دهند که فقط مربوط به snapshot همان زمان بوده‌اند. برای تاریخچهٔ ریسک‌ها به `RELEASE_RISK_REGISTER.md` و برای دسته‌بندی مستندات به [DOCUMENTATION.md](DOCUMENTATION.md) مراجعه کنید.
 
-## ۱. پیش‌نیازهای انتشار
+نسخهٔ `0.6.0-rc1` هنوز Release Candidate است؛ قبل از هر deployment یا تغییر مهم، وضعیت واقعی source/CI/سرور را بررسی کنید.
 
-- [ ] **[مسدودکننده]** نصب کامل روی سرور واقعی Ubuntu 22.04 یا 24.04
-      انجام و در `REAL_HOST_VALIDATION.md` ثبت شده است.
-- [ ] **[مسدودکننده]** یک پرداخت آزمایشی کامل با درگاه CentralPay
-      (اعتبارنامهٔ آزمایشی) طبق `STAGING_VALIDATION.md` انجام و ثبت شده
-      است.
-- [ ] **[مسدودکننده]** بازبینی خصمانهٔ چندعاملی (adversarial review)
-      تکمیل و نتایج آن رسیدگی شده است.
-- [ ] **[مسدودکننده]** گردش‌کار انتشار (GitHub Actions → Release) سبز
-      است و برچسب نسخه فقط پس از تأیید انسانی زده شده است.
-- [ ] در صورت استفاده از ربات مدیریتی تلگرام: اعتبارسنجی
-      `ADMIN_BOT_VALIDATION.md` انجام شده است.
+## ۱) نسخه و update source
 
-## ۲. سرور و شبکه
+- [ ] `centralpay version` نسخهٔ مورد انتظار را نشان می‌دهد.
+- [ ] `CENTRALPAY_UPDATE_REF` روی release tag معتبر (`vX.Y.Z` یا `vX.Y.Z-rcN`) است.
+- [ ] `CENTRALPAY_UPDATE_ALLOW_DEV_REF` روی production فعال نیست.
+- [ ] `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED` در عملیات عادی production فعال نیست.
+- [ ] پیش از update از `centralpay update --check` استفاده شده است.
+- [ ] release artifact / `SOURCE_COMMIT` / `SHA256SUMS` مسیر normal update هستند.
 
-- [ ] دامنه به IP سرور اشاره می‌کند و پورت‌های 80 و 443 باز هستند.
-- [ ] گواهی TLS توسط Caddy با موفقیت صادر شده است
-      (`centralpay ssl`).
-- [ ] فایروال UFW فعال است و فقط SSH و 80/443 باز هستند.
-- [ ] `docker ps` فقط برای Caddy پورت منتشرشده نشان می‌دهد
-      (API/DB/worker/ربات مدیر هیچ پورتی روی سرور ندارند).
-- [ ] ساعت سرور با NTP همگام است.
+## ۲) container و network
 
-## ۳. پیکربندی (`/etc/centralpay-bridge/centralpay.env`)
+- [ ] `centralpay status` همهٔ سرویس‌های لازم را healthy نشان می‌دهد.
+- [ ] فقط Caddy پورت‌های host را publish می‌کند.
+- [ ] PostgreSQL public port ندارد.
+- [ ] API public port مستقیم ندارد.
+- [ ] worker public port ندارد.
+- [ ] admin-bot در صورت فعال بودن public port ندارد.
+- [ ] Caddy فقط روی edge network است و route مستقیم به DB ندارد.
+- [ ] API روی edge + internal است؛ DB/worker/admin-bot روی internal هستند.
 
-- [ ] همهٔ کلیدها و رمزها تولید تصادفی شده‌اند و هیچ‌کدام مقدار
-      نمونه/پیش‌فرض نیستند.
-- [ ] `BOT_NOTIFY_RETRY_MODE=safe` است، مگر آنکه توسعه‌دهندهٔ ربات
-      **کتباً** تأیید کرده باشد که دریافت تکراری `order_id` بی‌خطر
-      (idempotent) است.
-- [ ] `MIN_PAYMENT_AMOUNT_TOMAN` و `MAX_PAYMENT_AMOUNT_TOMAN` مطابق
-      سیاست فروشگاه تنظیم شده‌اند.
-- [ ] `CENTRALPAY_UPDATE_REF` روی برچسب انتشار (مثل `v0.6.0-rc1`)
-      تنظیم است، نه روی شاخهٔ `main`.
-- [ ] `FIRST_PAYMENT_GUARD_ENABLED=true` تنظیم شده است (پس از اولین
-      پرداخت موفق می‌توانید آن را خاموش کنید).
-- [ ] مجوز فایل‌ها: پوشهٔ تنظیمات 0700 و فایل env برابر 0600 است.
+## ۳) TLS و دامنه
 
-## ۴. پایگاه داده و پشتیبان‌گیری
+- [ ] DNS دامنه به سرور درست اشاره می‌کند.
+- [ ] پورت‌های 80/443 از اینترنت قابل دسترسی‌اند.
+- [ ] `centralpay ssl` خطای unresolved ندارد.
+- [ ] `https://DOMAIN/health/ready` پاسخ HTTP 200 می‌دهد.
+- [ ] Caddy admin API public نشده است.
 
-- [ ] مهاجرت‌ها اعمال شده‌اند (`centralpay migrate` بدون تغییر جدید).
-- [ ] `centralpay backup` با موفقیت اجرا و فایل‌های `.ok` و `.manifest`
-      (با SHA-256) ساخته شده‌اند.
-- [ ] `centralpay db-check` بدون خطا اجرا می‌شود.
-- [ ] برنامهٔ انتقال بکاپ به خارج از سرور مشخص است — **بکاپ محلی روی
-      همان سرور، بازیابی از فاجعه نیست.**
-- [ ] تایمر پشتیبان‌گیری فعال است (ساعت ۰۳:۱۵، نگهداری ۱۴ روز).
-- [ ] یک بازیابی آزمایشی (`centralpay restore`) روی سرور آزمایشی انجام
-      شده است.
-- [ ] برنامهٔ نسخه‌برداری خارج از سرور (off-site) مشخص شده است.
+## ۴) secretها و permissionها
 
-## ۵. سلامت و پایش
+- [ ] secret واقعی داخل git نیست.
+- [ ] `/etc/centralpay-bridge/` فقط برای root قابل دسترسی است.
+- [ ] فایل‌های secret/config permission محدود دارند.
+- [ ] CentralPay key، inbound API key، callback secret، bot Token و DB password مقدار sample/default ندارند.
+- [ ] containerها فقط secretهای لازم برای نقش خودشان را می‌گیرند.
 
-- [ ] `centralpay status` همهٔ سرویس‌ها را سالم نشان می‌دهد.
-- [ ] `centralpay status` و `centralpay diagnose` و `GET /health/details` (داخلی) پاسخ سالم
-      می‌دهند و `migration_revision` برابر 0004 است.
-- [ ] ضربان worker تازه است (`worker_heartbeat_age_seconds` کوچک).
-- [ ] در صورت فعال‌بودن ربات مدیر: `/health` و `/status` پاسخ می‌دهند و
-      هشدار آزمایشی (`centralpay admin-bot test-alert`) دریافت شد.
+## ۵) دیتابیس و migration
 
-## ۶. آزمون پرداخت اول (با مبلغ کم)
+- [ ] `centralpay migrate current` revision مورد انتظار را نشان می‌دهد.
+- [ ] برای main فعلی، Alembic head برابر **0010** است.
+- [ ] `centralpay db-check --details --json` با `status: ok` و `failures: []` تمام می‌شود.
+- [ ] هیچ sequence مهمی `behind: true` نیست.
+- [ ] هیچ duplicate bot/gateway/reference ID گزارش نمی‌شود.
+- [ ] هیچ payable/fee invariant failure گزارش نمی‌شود.
+- [ ] هیچ orphan audit row گزارش نمی‌شود.
 
-- [ ] یک پرداخت واقعی با کمترین مبلغ مجاز انجام شد.
-- [ ] در صورت فعال‌بودن کارمزد: صفحهٔ درگاه مبلغ قابل‌پرداخت
-      (اصلی + کارمزد) را نشان داد، تأیید با همان مبلغ انجام شد و ربات
-      همان مبلغ **اصلی** فاکتور را شارژ کرد (`centralpay payment
-      ORDER_ID` هر سه رقم را جدا نشان می‌دهد).
-- [ ] کارمزد پیش از پرداخت در روند خرید ربات به مشتری اعلام می‌شود
-      (الزام بهره‌بردار؛ سامانه این را اجبار نمی‌کند).
-- [ ] هشدار بحرانی «اولین پرداخت» دریافت و صحت مبلغ/شناسه بررسی شد.
-- [ ] وضعیت پرداخت به `bot_notify_accepted` رسید و ربات فروشگاه شارژ
-      را ثبت کرد.
-- [ ] صف بررسی دستی خالی است (`centralpay review list`).
+بعد از هر release که migration جدید دارد، عدد head این چک‌لیست را با source همان release تطبیق دهید؛ به عدد 0010 برای همیشه تکیه نکنید.
 
-## ۶‌الف. بازیابی خودکار پرداخت‌های معلق (Reconciliation)
+## ۶) بکاپ
 
-- [ ] `RECONCILIATION_ENABLED=true` است (پیش‌فرض) و worker پس از استقرار
-      ری‌استارت شده است.
-- [ ] مهاجرت 0010 اجرا شده است (`alembic upgrade head`؛ بدون نیاز به
-      مهاجرت داده — پرداخت‌های معلق موجود خودبه‌خود در صف بررسی قرار
-      می‌گیرند).
-- [ ] آزمون: یک پرداخت انجام شد ولی به صفحهٔ بازگشت مرورگر نرسید
-      (بستن تب پس از پرداخت). حداکثر پس از حدود ۱۵ تا ۲۰ ثانیه
-      (`RECONCILIATION_MIN_AGE_SECONDS` پیش‌فرض ۱۰ ثانیه + فاصلهٔ اسکن)
-      رویداد `reconciliation_verified` ثبت و ربات شارژ را دریافت کرد.
-      زمان‌بندی پیش‌فرض: تا ۱۰ دقیقهٔ اولِ عمر لینک هر ۱۰ ثانیه یک
-      بررسی؛ پس از آن هر ۵ دقیقه؛ با تأیید پرداخت بلافاصله متوقف
-      می‌شود (حداکثر ۱۰۰۰ تلاش — حدود ۳ روز پوشش).
-- [ ] پرداخت‌های `reconciliation_exhausted` (در صورت وجود) به‌صورت دستی
-      بررسی می‌شوند — این پرداخت‌ها در وضعیت `link_created` می‌مانند و
-      هرگز خودکار «ناموفق» یا «موفق» نمی‌شوند.
+- [ ] `centralpay backups` حداقل یک backup معتبر نشان می‌دهد.
+- [ ] backup جدید manifest/checksum دارد.
+- [ ] backup file غیرصفر و `pg_restore --list`-valid است.
+- [ ] backup timer فعال است.
+- [ ] فضای دیسک برای DB + backup + build کافی است.
+- [ ] یک برنامهٔ **off-site** برای backup وجود دارد؛ backup روی همان host به‌تنهایی DR نیست.
+- [ ] restore drill دوره‌ای روی محیط/سرور جدا انجام می‌شود.
 
-## ۷. رسیدگی روزانه
+## ۷) selling-bot notification mode
 
-- [ ] `centralpay review list` روزانه بررسی می‌شود؛ هر مورد با
-      `acknowledge`/`resolve` و یادداشت رسیدگی می‌شود.
-- [ ] گزارش روزانهٔ ربات مدیر (در صورت فعال‌بودن) بررسی می‌شود.
-- [ ] به‌روزرسانی فقط با `centralpay update` (با تأیید checksum) انجام
-      می‌شود؛ هرگز `git pull` دستی روی سرور اجرا نکنید.
+- [ ] اگر `BOT_NOTIFY_RETRY_MODE=safe` است، تیم عملیات می‌داند ambiguous delivery خودکار resend نمی‌شود.
+- [ ] اگر `BOT_NOTIFY_RETRY_MODE=idempotent` است، downstream bot واقعاً duplicate `order_id` را idempotent پردازش می‌کند.
+- [ ] mode فقط برای راحتی عملیات تغییر نکرده است.
+- [ ] `centralpay retry-queue` backlog غیرعادی ندارد.
+
+## ۸) Manual review
+
+- [ ] `centralpay review list` بررسی شده است.
+- [ ] reviewهای unresolved دلیل قابل فهم دارند.
+- [ ] برای reviewهای resolveشده از history استفاده می‌شود و با SQL دستی status پاک نمی‌شود.
+- [ ] اپراتورها تفاوت `notification accept` با `review resolve` را می‌دانند.
+
+**یادآوری:** عدد `manual review` در `centralpay status` می‌تواند historical resolved rows را هم دربر بگیرد. برای actionable unresolved items از `centralpay review list` استفاده کنید.
+
+## ۹) Reconciliation
+
+- [ ] `centralpay reconciliation status` runtime/config را سالم نشان می‌دهد.
+- [ ] worker heartbeat تازه است.
+- [ ] backlog eligible قدیمی غیرعادی وجود ندارد.
+- [ ] `reconciliation_exhausted`/aged-out موارد ناشناخته بررسی شده‌اند.
+- [ ] `gateway_not_paid` معمولی به‌اشتباه outage تلقی نمی‌شود.
+- [ ] `recover-aged-out` فقط برای یک payment مشخص و با preview/confirm استفاده می‌شود.
+
+## ۱۰) Fee policy
+
+- [ ] `centralpay fee status` rate مورد انتظار را نشان می‌دهد.
+- [ ] هر تغییر fee note معنادار دارد.
+- [ ] fee policy فقط روی paymentهای جدید اثر می‌گذارد.
+- [ ] سقف `MAX_PAYMENT_AMOUNT_TOMAN` با final payable amount سازگار است.
+- [ ] روند خرید downstream قبل از هدایت به درگاه مبلغ نهایی/کارمزد را به مشتری شفاف نشان می‌دهد (مسئولیت محصول/اپراتور).
+
+## ۱۱) Callback و logging security
+
+- [ ] callback URL با HMAC/token فعلی ساخته می‌شود.
+- [ ] Uvicorn access logging query-bearing ناامن در production فعال نیست.
+- [ ] Caddy access log مقدار واقعی `ct`/`sig` را در request URI نشان نمی‌دهد.
+- [ ] Caddy access log مقدار واقعی `ct`/`sig` را داخل `Referer` static requests نشان نمی‌دهد.
+- [ ] log sharing/support قبل از ارسال از نظر secret بررسی می‌شود.
+
+## ۱۲) Admin Bot
+
+در صورت فعال بودن:
+
+- [ ] `centralpay admin-bot status` healthy است.
+- [ ] `centralpay admin-bot test-alert` به مدیر مجاز می‌رسد.
+- [ ] `ADMIN_TELEGRAM_IDS` فقط numeric IDs مجاز است.
+- [ ] `/status`, `/health`, `/version`, `/fee` کار می‌کنند.
+- [ ] اپراتورها می‌دانند بیشتر commandها read-only هستند اما `/resend_failed confirm` mutating/gated است.
+- [ ] `/resend_failed` در safe mode عمداً رد می‌شود.
+
+## ۱۳) اولین/نمونه پرداخت بعد از تغییر مهم
+
+پس از نصب جدید، تغییر gateway integration، تغییر payer identity، تغییر fee یا release مهم:
+
+- [ ] یک payment کم‌مبلغ کنترل‌شده ساخته شد.
+- [ ] amount اصلی با invoice downstream bot برابر است.
+- [ ] fee snapshot صحیح است.
+- [ ] payable amount صفحهٔ درگاه با `amount + fee_amount` برابر است.
+- [ ] `gateway_user_id` همان payer identity مورد انتظار است.
+- [ ] verify reference ID معتبر ثبت شده است.
+- [ ] payment فقط بعد از verify به notification flow رفته است.
+- [ ] downstream bot همان order را یک بار منطقی پردازش کرده است.
+- [ ] audit history payment قابل توضیح است.
+
+## ۱۴) Rate limiting / abuse protection
+
+- [ ] Caddy تنها مسیر public به API است.
+- [ ] `X-Forwarded-For` overwrite صریح Caddy حذف نشده است.
+- [ ] rate limiter enabled است مگر تصمیم عملیاتی مستندی برای خاموش‌کردن وجود داشته باشد.
+- [ ] create per-IP/global limits با traffic واقعی سازگارند.
+- [ ] valid signed callback به‌خاطر limiter drop نمی‌شود.
+
+## ۱۵) Load smoke test
+
+Production smoke test فقط controlled و غیرمخرب باشد.
+
+- [ ] `/health/ready` تحت concurrency محدود بدون error غیرعادی پاسخ می‌دهد.
+- [ ] CPU/RAM/DB تحت smoke test به saturation نمی‌رسند.
+- [ ] بعد از smoke test `centralpay status` همچنان healthy است.
+- [ ] برای payment/gateway load سنگین از staging/mock استفاده می‌شود؛ production محل ساخت هزاران payment مصنوعی نیست.
+
+## ۱۶) Monitoring / alerting
+
+main فعلی health/alert primitives دارد، از جمله API/DB/worker/retry/backup/admin-alert queue checks در admin-bot health monitor.
+
+- [ ] health alerts در صورت فعال بودن admin bot تست شده‌اند.
+- [ ] worker heartbeat قابل مشاهده است.
+- [ ] backup failure alert path شناخته شده است.
+- [ ] اپراتور می‌داند built-in health monitor فعلی incident counterها را در memory نگه می‌دارد و restart آن counterها را reset می‌کند؛ تا زمانی که persistent monitor جدید merge نشده، این محدودیت باید در runbook در نظر گرفته شود.
+
+## ۱۷) Release/CI
+
+قبل از tag/publish:
+
+- [ ] pytest required suites سبز هستند.
+- [ ] PostgreSQL integration/concurrency suite سبز است.
+- [ ] Ruff سبز است.
+- [ ] mypy سبز است.
+- [ ] ShellCheck / `bash -n` سبز است.
+- [ ] Docker build/compose validation سبز است.
+- [ ] secret scan سبز است.
+- [ ] dependency scan سبز است.
+- [ ] release workflow برای tag موردنظر سبز است.
+- [ ] release draft قبل از publish انسانی بررسی شده است.
+
+## ۱۸) بعد از update
+
+<div dir="ltr">
+
+```bash
+centralpay status
+centralpay db-check --details --json
+centralpay reconciliation status
+centralpay review list
+```
+
+</div>
+
+- [ ] public health 200 است.
+- [ ] container restart loop وجود ندارد.
+- [ ] migration head مورد انتظار است.
+- [ ] integrity failure وجود ندارد.
+- [ ] notification backlog قابل توضیح است.
+- [ ] manual-review جدید ناشناخته ایجاد نشده است.
+- [ ] logهای Caddy/API/worker خطای جدید سیستماتیک ندارند.
+
+## ۱۹) قواعد اضطراری
+
+- [ ] برای incident مالی ابتدا payment row + audit history بررسی می‌شود.
+- [ ] verification fact با SQL دستی جعل نمی‌شود.
+- [ ] manual review با delete/update مستقیم پاک نمی‌شود.
+- [ ] restore وسط failure با روشن‌کردن اجباری writerها دور زده نمی‌شود.
+- [ ] برای رفع incident از `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED` بدون تحلیل ریسک استفاده نمی‌شود.
+- [ ] secret واقعی داخل chat/ticket عمومی paste نمی‌شود.
+
+</div>

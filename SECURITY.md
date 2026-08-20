@@ -1,216 +1,253 @@
 # Security Policy
 
-## Reporting a vulnerability
+## Reporting vulnerabilities
 
-Please report suspected vulnerabilities privately via GitHub Security
-Advisories on this repository (Security → Report a vulnerability). Do not
-open public issues for security reports. Include reproduction steps and
-affected versions; you should receive an initial response within 7 days.
+Report suspected vulnerabilities privately through GitHub Security Advisories for this repository. Do not publish secrets, production credentials, callback tokens/signatures, or payment data in public issues.
 
-## Scope and priorities
+## Security priority
 
-This project moves money. Financial correctness outranks availability:
-a report that shows a payment can be credited twice, marked verified without
-CentralPay confirmation, or lost silently is always critical.
+CentralPay Bridge handles payment state. Financial correctness outranks availability. A bug that can create false verification, duplicate credit, overwrite payment identity, hide an ambiguous delivery, or corrupt recovery state is treated as a security issue even if no classic remote-code-execution primitive exists.
 
-## Security posture (current)
+The engineering baseline is [AGENTS.md](AGENTS.md). Historical security reviews are listed in [DOCUMENTATION.md](DOCUMENTATION.md).
 
-- **Fee integrity (dynamic fee):** the service fee is snapshotted
-  immutably at payment creation (`fee_amount = (amount * rate_bps +
-  5000) // 10000`, integer-only); the gateway is asked to charge
-  `payable_amount = amount + fee` and verification requires the gateway to
-  report exactly that payable amount — a fee that was not actually
-  collected freezes the payment for manual review
-  (`verify_payable_amount_mismatch`), it is never silently accepted.
-  Fee policies can be changed only by root on the host via
-  `centralpay fee` (typed Python delegation, strict 0–100 two-decimal
-  rate grammar, no shell-generated SQL); the admin Telegram bot is
-  read-only; history is append-only and permanently audited. The bot
-  notification payload carries no amounts, so a compromised transport
-  could not be used to alter what the bot credits.
-- **Verification before trust:** payments are only marked verified after
-  CentralPay `verify` succeeds AND amount / userId / referenceId match our
-  records; anomalies freeze the payment for manual review.
-- **Conservative delivery:** HTTP 2xx from the bot API is recorded as
-  "accepted", never as proof of balance credit; ambiguous deliveries are
-  never retried automatically in the default `safe` mode.
-- **Authentication:** constant-time comparison for the inbound API key and
-  for HMAC-SHA256 callback signatures; signatures are validated before any
-  database or gateway work.
-- **Strict creation schema (audit):** `POST /api/custom-payment` accepts
-  only a string `api_key`, a JSON-integer `amount` (booleans, floats, and
-  numeric strings are rejected, never coerced; absolute schema backstop
-  10¹² TOMAN below BIGINT), and an opaque `order_id` (≤128 chars, no
-  control characters or NUL — NUL previously reached PostgreSQL and caused
-  a 500). Malformed requests are rejected with a generic
-  `validation_error` that never echoes field contents, and create no
-  payment rows, no audit rows, and no gateway traffic. `order_id` is never
-  trimmed, case-folded, or Unicode-normalized. Authentication runs before
-  any order lookup, so unauthenticated callers cannot enumerate orders,
-  and the `payment_create_requested` log event is emitted only after
-  authentication.
-- **Callback replay protection (0.5.0-rc1):** every payment link embeds a
-  one-time token covered by the HMAC signature; only the token's SHA-256
-  hash is stored, superseded tokens are rejected under the row lock before
-  the gateway is contacted, and verified payments short-circuit to their
-  final result without re-verification.
-- **Strict gateway parsing (0.5.0-rc1):** CentralPay responses are accepted
-  only on an explicit success marker; financial fields are parsed with
-  typed coercion and malformed values route to manual review with explicit
-  reason codes — success is never inferred from truthy values.
-- **Gateway-controlled data policy (audit):** every byte of a gateway
-  response body (message text, HTML, JSON values) is treated as
-  attacker-influenceable content. It is classified inside
-  `app/centralpay.py` into a fixed internal reason-code vocabulary
-  (`gateway_rejected`, `gateway_response_invalid`, `gateway_missing_data`,
-  `gateway_invalid_redirect_url`, `gateway_invalid_reference_id`,
-  `gateway_invalid_amount`, `gateway_invalid_user_id`) and then discarded —
-  raw gateway text never reaches logs, exceptions, audit events, stored
-  errors, or API responses. Gateway logs carry only the endpoint name, the
-  order id, the HTTP status, the internal reason code, and a fixed-value
-  marker naming which failure signal was present.
-- **Outbound transport (fix/outbound-url-transport-security):**
-  CentralPay transport is always HTTPS — `CENTRALPAY_BASE_URL` rejects
-  cleartext `http://` with no exception, because getLink/verify carry the
-  API key in POST bodies. Bot notification transport is HTTPS by
-  default; cleartext `http://` requires the explicit opt-in
-  `ALLOW_INSECURE_BOT_NOTIFY_URL=true` **and** a syntactically
-  private/internal destination (localhost, loopback/private/link-local
-  IP literals, single-label service names, `*.internal`/`*.local`) —
-  intended only for a mock bot on an isolated network. The opt-in
-  transmits the `Token` header without TLS and must never be used over a
-  public or untrusted network; public hostnames and public IP literals
-  are rejected even with the flag. No DNS resolution is performed during
-  validation, and validation errors never echo the submitted URL, the
-  Token, or the API keys.
-- **PUBLIC_BASE_URL contract (fix/public-base-url-security-validation):**
-  the callback base URL is an HTTPS origin only — scheme, host, and
-  optional port (`https://host[:port]`). Paths, queries, fragments,
-  userinfo, whitespace, control characters, backslashes, and cleartext
-  HTTP are rejected at startup by the shared Settings model (API, worker,
-  admin bot, and CLI alike), with a fixed error that never echoes the
-  submitted value. Accepted values are canonicalized (lower-cased
-  scheme/host, lone trailing slash dropped) — never silently repaired —
-  so the generated CentralPay return URL (which carries the one-time
-  callback token and HMAC signature) is always
-  `https://host[:port]/api/centralpay/callback` with exactly the
-  application-generated `orderId`, `ct`, and `sig` parameters. (No claim
-  is made about DNS, TLS issuance, or real callback delivery — those
-  remain real-host validation gates.)
-- **Reference-ID storage boundary (fix/centralpay-reference-id-validation):**
-  gateway-reported reference IDs are validated against the exact database
-  storage contract (max 128 characters, no NUL/control characters) before
-  any query, assignment, audit event, or log use. Invalid values are never
-  truncated and route the payment to manual review without bot
-  notification; the raw invalid value never leaves the CentralPay client
-  module. (No claim is made that real CentralPay has returned such a
-  value — this is defense at the trust boundary.)
-- **Redirect URL validation policy (audit):** the `redirectUrl` returned by
-  getLink is parsed with `urllib.parse.urlsplit` (never substring checks)
-  and accepted only when it is HTTPS with a non-empty hostname, carries no
-  userinfo credentials, contains no whitespace or control characters, has
-  a well-formed port, and is at most 2048 characters. HTTPS-only is a
-  deliberate decision: CentralPay serves its payment pages over HTTPS, and
-  an `http://` redirect would downgrade the payer to cleartext.
-- **Rate limiting (0.5.0-rc1):** application-level sliding windows for
-  invalid API keys, invalid callback signatures, and payment-create bursts;
-  `X-Forwarded-For` is never trusted for limiter identity. Limiters are
-  per-process and in-memory (documented limitation).
-- **Update integrity (0.5.0-rc1):** `centralpay update` pins a release tag
-  by default and verifies the published `SHA256SUMS` before deploying;
-  rollback is application-only — the database schema is never downgraded.
-- **Backup integrity (audit):** backups are created atomically
-  (`.partial` → validate → rename), validated before the `.ok` marker
-  exists (non-empty, `PGDMP` magic, `pg_restore --list`), and carry an
-  atomically-written SHA-256 manifest sidecar (no secrets, no payment
-  data). Restores refuse symlinks, verify the checksum before any
-  destructive action (legacy files need an explicit `RESTORE-LEGACY`
-  confirmation that `--yes` cannot bypass), hold an exclusive lock shared
-  with the backup job, stop every writer including the admin bot, run
-  `pg_restore --exit-on-error`, and gate service startup behind a
-  post-restore integrity check (`centralpay db-check`) with sequence
-  repair. A mid-restore failure leaves services stopped with exact
-  recovery instructions — never running against a half-restored database.
-  Backup files and manifests are 0600 in a 0700 directory; the backup
-  script never reads or logs database credentials.
-- **Secret handling:** secrets live in `/etc/centralpay-bridge/` (0700
-  directory, 0600 files), outside the Git checkout; `.env` files are
-  git-ignored; a log-redaction backstop strips every configured secret from
-  all log output; access logs redact callback signatures; only the final
-  four card digits are ever stored.
-- **Network exposure:** only Caddy publishes ports 80/443; the API and
-  PostgreSQL are reachable solely on internal Docker networks; TLS is
-  automatic; the Caddy admin API is disabled; only the four public routes
-  are proxied. Since the deployment audit the networks are split: Caddy
-  sits on an **edge** network that reaches only the API, and PostgreSQL
-  sits on the **internal** network that Caddy cannot reach at all.
-- **Runtime:** non-root containers (fixed UID/GID 10001), pinned-bounded
-  dependencies, log rotation, health-gated deployments (API/worker never
-  start on a failed migration). The api, worker, migrate, and admin-bot
-  services all run with a read-only root filesystem, tmpfs `/tmp`,
-  `cap_drop: ALL`, and `no-new-privileges`; db and caddy keep the vendor
-  capabilities they require but also run with `no-new-privileges`.
-- **Container trust boundary (audit):** no Docker socket, no privileged
-  containers, no host network/PID/IPC, no broad host mounts anywhere.
-  Per-service secrets follow an explicit allowlist, enforced by a policy
-  matrix test (each service's Compose `environment:` overrides mask
-  everything outside its role): **API** — payment ingress and CentralPay
-  credentials (database URL, inbound API key, callback HMAC secret,
-  CentralPay keys; the bot and Telegram delivery tokens are blanked);
-  **worker** — the customer-bot notification credential plus the database
-  URL only; **admin bot** — the Telegram administration credential and
-  admin IDs plus the database URL only; **migrate** — the database URL
-  only; **Caddy** — no application env file and no application secrets.
-  **Impact of a compromised container:** Caddy → can reach only the API's
-  public routes (no DB route, no secrets); worker → can read/write the
-  database and the bot token but cannot forge callbacks, talk to
-  CentralPay, or message Telegram admins; API → the widest (DB + gateway
-  keys + HMAC, but no delivery tokens), which is why the
-  callback/creation paths carry the strictest validation; none of
-  them can touch Docker, the host filesystem, deployment configuration,
-  or the backups directory. Access logs redact both the callback
-  signature (`sig`) and the one-time token (`ct`).
-- **Update trust model:** production updates pin a release tag (strict
-  `vX.Y.Z` / `vX.Y.Z-rcN` grammar). The updater downloads the artifact, a
-  `SOURCE_COMMIT` release asset, and `SHA256SUMS`; verifies the checksums
-  of both the artifact and `SOURCE_COMMIT`; validates `SOURCE_COMMIT`'s
-  grammar; resolves the fetched tag to its commit (annotated-tag aware);
-  and **requires the deployed commit to equal the verified
-  `SOURCE_COMMIT`** before any checkout, build, migration, or restart. The
-  deploy is then a `git checkout` of that exact verified commit over
-  HTTPS — no archive is ever extracted, so archive path-traversal/symlink
-  attacks have no surface, and a tag moved after the release was built is
-  rejected (the checksum alone never proved what git deploys). This is
-  commit binding, not GPG signature verification; signed tags remain
-  pre-1.0 backlog. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a root-only
-  escape hatch that warns unmistakably and never claims verification it did
-  not perform. Rollback reuses the previously recorded local version, never
-  touches configuration or secrets, and never downgrades the schema.
-- **Audit:** every financial state transition is recorded in the permanent
-  append-only `payment_events` table; migrations refuse to drop it.
-- **Admin Telegram bot (optional, off by default):** read-only; authorizes
-  by numeric Telegram ID only (usernames never trusted), private chats
-  only; unauthorized attempts get a generic denial and are audited. Alerts
-  flow through a database outbox so Telegram can never block payments. The
-  container is hardened (no ports, read-only filesystem, all capabilities
-  dropped, no privilege escalation, no Docker socket). API keys, tokens,
-  secrets, signatures, full card numbers, redirect URLs, raw external
-  error text, and backup paths are never sent to Telegram.
+## Current security posture
 
-## Known gaps
+### Verification before trust
 
-Every deferred review topic has been triaged in
-[RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md) (fixed / accepted
-risk / release blocker / backlog), with the original list preserved in
-[DEFERRED_REVIEW.md](DEFERRED_REVIEW.md). The multi-agent adversarial
-review has not been completed; production deployment is blocked until it
-is. Other open blockers: real-host installer validation, staging
-validation of the real CentralPay response schema, and live Telegram
-validation for the optional admin bot. Notable accepted risks: proxy-level
-rate limiting absent (app-level limits added in 0.5.0-rc1), base images
-tag-pinned rather than digest-pinned.
+A payment is not trusted merely because the payer returned to the callback URL.
+
+The callback path requires:
+
+1. non-duplicated security parameters
+2. valid HMAC signature
+3. current one-time callback token
+4. CentralPay `verify` success using the strict response parser
+5. exact `payable_amount` match
+6. exact payment `gateway_user_id` match
+7. valid, non-conflicting `referenceId`
+
+Only then can the payment enter the verified/notification flow.
+
+Already verified payments short-circuit under the financial lock and are not sent to CentralPay verify again merely because callback/reconciliation repeats.
+
+### Callback replay protection
+
+Each payment link contains a callback token (`ct`) covered by the callback HMAC signature (`sig`). Only the token hash is stored. Regenerating a link supersedes the previous token, and a stale token is rejected before gateway verification.
+
+Successful payment state remains replay-safe: a later return can render the final result without re-settlement.
+
+### Strict gateway parsing
+
+CentralPay response bodies are attacker-influenceable external data.
+
+The client layer accepts success only through the explicit supported success vocabulary and converts gateway data to typed internal values. Raw gateway error/message text does not propagate into logs, stored errors, audit events, Telegram alerts, or API responses; callers receive fixed internal reason codes.
+
+Invalid/missing financial fields fail closed or route to manual review.
+
+### Amount and fee integrity
+
+Money uses integer TOMAN arithmetic.
+
+For each new payment, the active fee policy is snapshotted into immutable per-payment fields:
+
+- `fee_policy_id`
+- `fee_rate_bps`
+- `fee_amount`
+- `payable_amount`
+
+`payable_amount = amount + fee_amount` is enforced by application logic and database constraints. CentralPay is asked to charge the payable amount, and verify must report that same value.
+
+The original `payments.amount` remains the selling bot's original invoice. The selling-bot notification payload contains no fee or amount fields.
+
+Fee policy changes are explicit host-CLI operations and affect new payments only.
+
+### Payer identity isolation
+
+New payment flows use the repository's payer-identity scheme rather than a shared gateway user ID. The gateway user ID stored on the payment is reused for link retry and verification.
+
+Safe replay of an existing payment is allowed to bypass create limiting only when the request's identity shape exactly matches the stored identity. Changing Telegram-user presence/value is conservatively treated as real work and remains rate-limited.
+
+### Request validation
+
+`POST /api/custom-payment` has a bounded body and a strict normalized contract.
+
+Canonical `amount` is a JSON integer. A legacy ASCII-decimal string matching `[0-9]+` may be normalized before validation. Other numeric-looking forms are rejected, including floats, booleans, signed strings, whitespace-padded strings, separators, exponents, and non-ASCII digits.
+
+`order_id` is opaque, bounded, and not silently normalized.
+
+Authentication occurs before order lookup so unauthenticated requests cannot use response differences to enumerate existing orders.
+
+Legacy body compatibility is bounded by body size, parser depth, and form-field count; it does not weaken authentication, amount checks, idempotency, fee handling, or gateway validation.
+
+### Reference ID boundary
+
+Gateway `referenceId` is validated before query/assignment/log/audit use. The parser and database storage contract share the same maximum length. NUL/control characters and invalid shapes are rejected; invalid data is never silently truncated.
+
+Non-null reference IDs are unique. A collision routes to manual review rather than overwriting another payment.
+
+### Redirect URL policy
+
+Gateway payment redirects must pass URL validation before being stored/returned. HTTPS is required, userinfo is rejected, malformed ports/hosts are rejected, control characters/whitespace are rejected, and length is bounded.
+
+### Outbound transport
+
+CentralPay transport is HTTPS-only; TLS verification is never disabled.
+
+Selling-bot notification is HTTPS by default. Cleartext HTTP is permitted only through the explicit insecure-notify opt-in and only for syntactically private/internal destinations intended for isolated development/test networks. Public cleartext destinations remain rejected.
+
+### Rate limiting and proxy trust
+
+The application uses bounded in-memory sliding-window rate limiting.
+
+Current dimensions include:
+
+- payment creation: per-IP + global
+- invalid callback signatures: per-IP + global
+- invalid API-key attempts: global
+
+Caddy explicitly overwrites `X-Forwarded-For` with the resolved immediate peer. The application accepts only a single syntactically valid IP value; malformed/multiple values fall back rather than becoming attacker-selected identity.
+
+Valid signed callbacks are not rate-limited merely because they repeat. Health endpoints remain unthrottled for orchestration.
+
+The limiter is intentionally process-local for the current single-API-container topology. Redis is not part of the current architecture.
+
+### Bot-notification ambiguity
+
+HTTP 2xx from the selling-bot API means `bot_notify_accepted`; it does not prove customer balance credit.
+
+In `BOT_NOTIFY_RETRY_MODE=safe`, ambiguous post-send outcomes are not automatically resent. They are surfaced for operator review.
+
+`idempotent` mode may be used only when duplicate `order_id` delivery is known to be safe on the selling bot.
+
+Manual/gated resend operations never fabricate CentralPay verification and may only operate on already gateway-verified eligible records.
+
+### Reconciliation
+
+The worker can reconcile `link_created` payments when browser callback delivery is absent/delayed. Reconciliation calls the same canonical verification/settlement service used by callback processing and does not implement a second financial decision path.
+
+Ordinary `gateway_not_paid` results are retryable operational states, not proof of an outage. Reconciliation is bounded by configured aging/max-age semantics and does not retry forever.
+
+### SQL and transaction safety
+
+Production uses PostgreSQL with SQLAlchemy parameterized queries.
+
+Financial state transitions use database transactions, row locking, uniqueness constraints, and check constraints. Queue consumers use row locks/`SKIP LOCKED` where appropriate. SQLAlchemy identity-map refresh discipline is used where a locked re-read must defeat stale cached state.
+
+Process-local synchronization is never accepted as the only protection for a financial invariant.
+
+### Audit trail
+
+`payment_events` is the permanent append-only financial audit history. Financial state changes must produce explicit events and reason codes. Ordinary application operations do not delete payment audit history.
+
+Administrator alert creation is isolated with a database savepoint so a failed non-financial alert side effect cannot abort the outer payment transaction.
+
+### Admin Telegram bot
+
+The admin bot is optional and isolated from the customer payment path.
+
+Authorization uses configured numeric Telegram user IDs and private chats; usernames are never authorization credentials. Unauthorized attempts receive generic denial and are audited.
+
+Most commands are read-only. The current approved mutating Telegram operation is `/resend_failed confirm`, which is strongly gated: it can only requeue eligible already gateway-verified delivery failures and only when notification mode is `idempotent`. It cannot modify gateway verification facts or financial snapshots.
+
+Telegram outage/failure must never block or roll back customer payment processing.
+
+Never send secrets, callback token/signature, raw gateway text, full card data, or full redirect URLs to Telegram.
+
+### Secret handling
+
+Secrets live outside git under `/etc/centralpay-bridge/` with restrictive permissions.
+
+The repository must never contain production:
+
+- CentralPay API keys
+- inbound API key
+- callback HMAC secret
+- selling-bot Token
+- admin-bot Token
+- database password
+
+Per-service Compose overrides mask secrets a service does not need.
+
+### Logging and callback-secret redaction
+
+Application logs are structured and must not include request query strings or raw secret-bearing request bodies.
+
+Caddy access logging redacts callback `ct` and `sig` in both locations where they can appear:
+
+- request URI query string
+- `Referer` header on follow-up static-asset requests
+
+This logging-boundary redaction is required even though callback responses use restrictive Referrer Policy; client behavior must not be trusted to protect log secrecy.
+
+Uvicorn must not be run with a callback-leaking access-log configuration in environments that handle real callback URLs.
+
+### Container/network isolation
+
+Only Caddy publishes host ports.
+
+Current trust zones:
+
+- `edge`: Caddy + API
+- `internal`: API + PostgreSQL + worker + migrate + optional admin-bot
+
+Caddy has no database route and no application secrets. PostgreSQL has no published host port.
+
+Application services run non-root and use a read-only root filesystem, tmpfs for required temporary/heartbeat files, `cap_drop: ALL`, and `no-new-privileges`. The deployment does not mount the Docker socket, use privileged containers, host networking, or host PID/IPC namespaces.
+
+### Backup/restore safety
+
+Current backups use PostgreSQL custom format, atomic creation, archive validation, and SHA-256 manifest metadata.
+
+Restore rejects unsafe inputs, verifies the selected backup, obtains the backup/restore lock, creates a pre-restore backup, stops writers, restores with `--exit-on-error`, runs migrations and the canonical DB integrity checker, and restarts services only after those checks pass.
+
+A failed restore intentionally leaves writers stopped rather than serving against a half-restored database.
+
+Backups stored only on the same host do not constitute full disaster recovery.
+
+### Production update integrity
+
+Production update refs are release tags by default (`vX.Y.Z` or `vX.Y.Z-rcN`).
+
+For a release tag, the updater downloads the source artifact, `SOURCE_COMMIT`, and `SHA256SUMS`; verifies checksums; validates the commit grammar; resolves the fetched tag; and requires tag commit == verified `SOURCE_COMMIT` before checkout/deploy/migration/restart.
+
+Non-release branch refs fail closed by default. `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` explicitly restores unverified branch-update behavior for development and must not be presented as normal production operation.
+
+`CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a separate emergency release-asset escape hatch, not the standard production path.
+
+Database migrations are forward-only. Application rollback does not downgrade the schema.
+
+## CI/security gates
+
+CI includes the project's test suites and security/quality gates such as:
+
+- unit/integration tests
+- PostgreSQL financial/concurrency tests
+- Ruff
+- mypy
+- ShellCheck
+- Docker build/compose validation
+- secret scanning
+- dependency vulnerability scanning
+- release-flow checks
+- runtime Caddy redaction verification for callback secrets
+
+A required failing check must be fixed, not bypassed.
+
+## Known/accepted architectural limitations
+
+These are not equivalent to confirmed vulnerabilities:
+
+- rate limiting is process-local and assumes the current single API-container topology
+- off-site backup replication is not part of the built-in backup job
+- release trust binds artifacts to a commit through checksums/`SOURCE_COMMIT`; this is not the same thing as a complete signed-artifact provenance system
+- some audit/review documents in the repository are historical snapshots and intentionally retain the findings/status of their original commit
+
+The current risk register is [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md). Do not derive current risk status solely from an older audit snapshot.
+
+## Historical reviews
+
+The repository retains security/adversarial audit reports as evidence. They are not rewritten after every later PR. [DOCUMENTATION.md](DOCUMENTATION.md) identifies which files are current policy and which are historical snapshots.
 
 ## Supported versions
 
-Pre-release (`0.x`) versions receive fixes on `main` only. There is no
-stable release yet.
+The project is currently pre-1.0. Security fixes are developed on `main` and shipped through the release-tag workflow.
