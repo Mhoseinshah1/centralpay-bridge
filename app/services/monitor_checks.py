@@ -144,11 +144,22 @@ def check_worker_heartbeat(
             key, STATUS_CRITICAL, "no_heartbeat_recorded", {"worker_name": worker_name}
         )
     age_seconds = (now - _as_utc(heartbeat.last_heartbeat_at)).total_seconds()
-    details = {"worker_name": worker_name, "age_seconds": round(age_seconds, 1)}
+    details = {
+        "worker_name": worker_name,
+        "age_seconds": round(age_seconds, 1),
+        "last_error_code": heartbeat.last_error_code,
+    }
     if age_seconds >= settings.monitor_worker_heartbeat_critical_seconds:
         return CheckResult(key, STATUS_CRITICAL, "heartbeat_stale", details)
     if age_seconds >= settings.monitor_worker_heartbeat_warning_seconds:
         return CheckResult(key, STATUS_WARNING, "heartbeat_aging", details)
+    if heartbeat.last_error_code is not None:
+        # The loop is alive (fresh heartbeat) but its most recent pass
+        # failed -- record_worker_heartbeat clears last_error_code to None
+        # on every SUCCESSFUL cycle, so a set value here means the latest
+        # attempt did not complete cleanly. Age alone would report this
+        # worker "ok" forever if every pass keeps failing.
+        return CheckResult(key, STATUS_WARNING, "last_cycle_failed", details)
     return CheckResult(key, STATUS_OK, "healthy", details)
 
 

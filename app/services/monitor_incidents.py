@@ -44,6 +44,10 @@ TRANSITION_CLOSED = "closed"
 TRANSITION_ESCALATED = "escalated"
 TRANSITION_UNCHANGED_UNHEALTHY = "unchanged_unhealthy"
 TRANSITION_UNCHANGED_HEALTHY = "unchanged_healthy"
+# An already-open incident that had never been alerted (alerting was
+# disabled when it opened) got its catch-up alert now that alerting is
+# available -- distinct from TRANSITION_OPENED (a brand-new row).
+TRANSITION_ALERT_CAUGHT_UP = "alert_caught_up"
 
 _SEVERITY_RANK = {"warning": 1, "critical": 2}
 
@@ -186,7 +190,20 @@ def _handle_unhealthy(
                 db,
                 alert_type="monitor_incident_escalated",
                 severity=result.status,
-                deduplication_key=f"monitor:{result.key}:{incident.id}:escalated:{result.status}",
+                # Includes `now`, unlike the opened/resolved keys below: the
+                # SAME incident.id can escalate more than once over its
+                # lifetime (warning -> critical -> warning -> critical
+                # again), and each such escalation is a genuinely NEW,
+                # alert-worthy transition -- a key without a
+                # time-varying component would let create_alert's own
+                # 30-minute dedup window incorrectly SUPPRESS a real
+                # second escalation as if it were a duplicate of the
+                # first. A literal duplicate call for the very same
+                # transition (identical `now`) still collapses correctly.
+                deduplication_key=(
+                    f"monitor:{result.key}:{incident.id}:escalated:"
+                    f"{result.status}:{now.isoformat()}"
+                ),
                 payload=_alert_payload(result),
                 now=now,
             )
@@ -196,6 +213,29 @@ def _handle_unhealthy(
         # A de-escalation that is still unhealthy (critical -> warning):
         # update severity silently, never a duplicate alert.
         incident.severity = result.status
+
+    if incident.last_alerted_at is None and _alerts_enabled(settings):
+        # This incident has been open (possibly for a while: created while
+        # alerting was disabled, or the loser of an open-race whose winner
+        # ran with alerting disabled) but has NEVER actually been queued
+        # for delivery. Now that alerting is available, catch up with one
+        # opening alert at the incident's CURRENT severity -- otherwise an
+        # admin enabling the admin bot after `monitor enable` (the exact
+        # order MONITORING.md documents) would never hear about an
+        # incident that opened before that point.
+        incident.last_alerted_at = now
+        db.flush()
+        create_alert(
+            db,
+            alert_type="monitor_incident_opened",
+            severity=incident.severity,
+            deduplication_key=f"monitor:{result.key}:{incident.id}",
+            payload=_alert_payload(result),
+            now=now,
+        )
+        db.commit()
+        return IncidentTransition(result.key, TRANSITION_ALERT_CAUGHT_UP, incident.id)
+
     db.commit()
     return IncidentTransition(result.key, TRANSITION_UNCHANGED_UNHEALTHY, incident.id)
 

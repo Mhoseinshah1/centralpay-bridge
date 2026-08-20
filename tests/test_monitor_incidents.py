@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.models import AdminAlert, MonitorIncident, MonitorIncidentStatus
 from app.services.monitor_checks import CheckResult
 from app.services.monitor_incidents import (
+    TRANSITION_ALERT_CAUGHT_UP,
     TRANSITION_CLOSED,
     TRANSITION_ESCALATED,
     TRANSITION_OPENED,
@@ -250,3 +251,68 @@ def test_alert_payload_never_leaks_beyond_the_safe_allowlist(session_factory, ad
     incidents = _incidents(session_factory)
     incident_details = incidents[0].details or {}
     assert incident_details["free_percent"] == 1.0
+
+
+def test_incident_opened_while_disabled_is_alerted_once_delivery_becomes_available(
+    session_factory, settings, admin_settings
+):
+    """An incident that opens while ADMIN_BOT_ENABLED=false is persisted but
+    never queued for delivery; the very next cycle that observes it still
+    open, with delivery now available, must send exactly one catch-up
+    "opened" alert -- never silently drop the notification just because the
+    state transition itself happened earlier (this is the exact sequence
+    `centralpay monitor enable` then `centralpay admin-bot enable`
+    produces)."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        opened = record_check_result(db, settings, _critical(), now=now)
+    assert opened.transition == TRANSITION_OPENED
+    assert _alerts(session_factory) == []  # nothing queued yet -- alerts disabled
+
+    with session_factory() as db:
+        caught_up = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=1)
+        )
+    assert caught_up.transition == TRANSITION_ALERT_CAUGHT_UP
+    assert caught_up.incident_id == opened.incident_id
+
+    incidents = _incidents(session_factory)
+    assert len(incidents) == 1  # same row, never duplicated
+    opened_alerts = _alerts(session_factory, "monitor_incident_opened")
+    assert len(opened_alerts) == 1
+
+    # And it never re-fires on a further still-unhealthy cycle.
+    with session_factory() as db:
+        again = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=2)
+        )
+    assert again.transition == TRANSITION_UNCHANGED_UNHEALTHY
+    assert len(_alerts(session_factory, "monitor_incident_opened")) == 1
+
+
+def test_escalation_flap_within_dedup_window_alerts_on_every_worsening(
+    session_factory, admin_settings
+):
+    """warning -> critical -> warning -> critical, all within
+    create_alert's 30-minute rolling dedup window: each worsening
+    transition is a genuinely distinct, alert-worthy event and must not be
+    silently swallowed as a "duplicate" of the earlier escalation just
+    because they'd otherwise share one dedup key."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        record_check_result(db, admin_settings, _warning(), now=now)
+    with session_factory() as db:
+        first_escalation = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=1)
+        )
+    with session_factory() as db:
+        record_check_result(db, admin_settings, _warning(), now=now + timedelta(minutes=2))
+    with session_factory() as db:
+        second_escalation = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=3)
+        )
+    assert first_escalation.transition == TRANSITION_ESCALATED
+    assert second_escalation.transition == TRANSITION_ESCALATED
+
+    escalation_alerts = _alerts(session_factory, "monitor_incident_escalated")
+    assert len(escalation_alerts) == 2  # neither suppressed as a false duplicate

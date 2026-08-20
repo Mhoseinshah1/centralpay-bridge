@@ -358,6 +358,7 @@ _SEQUENCE_TABLES = (
     "admin_alerts",
     "worker_heartbeats",
     "fee_policies",
+    "monitor_incidents",
 )
 
 

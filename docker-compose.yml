@@ -184,6 +184,12 @@ services:
       BOT_NOTIFY_TOKEN: ""
       INBOUND_API_KEY: not-used-by-admin-bot-x
       CALLBACK_HMAC_SECRET: not-used-by-admin-bot-x
+      # Fixed to the bind mount's CONTAINER-side target below, independent
+      # of whatever host path CENTRALPAY_BACKUP_DIR names in centralpay.env
+      # (that value only controls scripts/backup.sh and this mount's HOST
+      # source) -- so the /monitor command's backup/disk lines can never
+      # look in the wrong place after an operator changes the host path.
+      CENTRALPAY_BACKUP_DIR: /var/backups/centralpay-bridge
     # Only started when the admin-bot profile is enabled (the centralpay
     # command adds --profile admin-bot when ADMIN_BOT_ENABLED=true).
     profiles: ["admin-bot"]
@@ -245,6 +251,12 @@ services:
       BOT_NOTIFY_TOKEN: ""
       ADMIN_BOT_TOKEN: ""
       ADMIN_TELEGRAM_IDS: ""
+      # Fixed to the bind mount's CONTAINER-side target below, independent
+      # of whatever host path CENTRALPAY_BACKUP_DIR names in centralpay.env
+      # (that value only controls scripts/backup.sh and this mount's HOST
+      # source) -- so the backup/disk checks can never look in the wrong
+      # place after an operator changes the host path.
+      CENTRALPAY_BACKUP_DIR: /var/backups/centralpay-bridge
     # Only started when the monitor profile is enabled (the centralpay
     # command adds --profile monitor when MONITOR_ENABLED=true) — a fresh
     # install never runs this service until an operator opts in.
@@ -264,6 +276,12 @@ services:
       - ${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}:/var/backups/centralpay-bridge:ro
     healthcheck:
       # Liveness: the monitor touches this file after every completed pass.
+      # The freshness bound is DERIVED from MONITOR_INTERVAL_SECONDS
+      # (same "interval * 6, floor 180s" shape
+      # app.services.reconciliation_status uses for its own worker-
+      # heartbeat freshness) rather than a bare constant, so raising the
+      # poll interval past a fixed threshold can never make a perfectly
+      # healthy monitor flap unhealthy and restart-loop.
       test:
         - CMD
         - python
@@ -271,7 +289,9 @@ services:
         - |
           import os, sys, time
           path = os.environ.get("MONITOR_HEARTBEAT_FILE", "/tmp/centralpay-monitor-heartbeat")
-          fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < 180
+          interval = float(os.environ.get("MONITOR_INTERVAL_SECONDS", "60") or 60)
+          bound = max(interval * 6, 180)
+          fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < bound
           sys.exit(0 if fresh else 1)
       interval: 30s
       timeout: 5s

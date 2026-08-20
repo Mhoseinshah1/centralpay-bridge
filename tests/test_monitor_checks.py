@@ -201,6 +201,29 @@ def test_worker_heartbeat_missing(session_factory, settings):
     assert result.reason == "no_heartbeat_recorded"
 
 
+def test_worker_heartbeat_fresh_but_last_cycle_failed(session_factory, settings):
+    """The loop is alive (a heartbeat was just written) but its most recent
+    pass raised -- record_worker_heartbeat only clears last_error_code on a
+    SUCCESSFUL cycle, so a fresh-but-failing worker must not report "ok"
+    forever just because age alone looks healthy."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        db.add(
+            WorkerHeartbeat(
+                worker_name="notification-worker",
+                instance_id="w1",
+                last_heartbeat_at=now,
+                last_error_code="RuntimeError",
+            )
+        )
+        db.commit()
+        result = monitor_checks.check_worker_heartbeat(
+            db, settings, worker_name="notification-worker", now=now
+        )
+    assert result.status == "warning"
+    assert result.reason == "last_cycle_failed"
+
+
 # --- notification backlog ---------------------------------------------------
 
 

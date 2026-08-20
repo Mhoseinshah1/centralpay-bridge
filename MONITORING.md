@@ -145,6 +145,17 @@ A de-escalation that is still unhealthy (critical → warning) updates the
 incident's recorded severity silently — only a *worsening* condition is an
 escalation event worth a new message.
 
+**Catch-up delivery:** an incident can open while Telegram delivery is
+unavailable (`ADMIN_BOT_ENABLED=false`, or the loser of an open-race that
+ran with delivery disabled at that moment) — its row is still persisted,
+just never queued for delivery (`last_alerted_at` stays `None`). The very
+next cycle that observes the incident still open, with delivery now
+available, queues exactly one catch-up "opened" alert at the incident's
+*current* severity — this is what makes the documented `monitor enable`
+then `admin-bot enable` order (or the reverse) always end with an
+administrator actually hearing about anything still open, never silently
+dropping it because the transition itself happened earlier.
+
 **Durability and concurrency**, precisely:
 
 - `MonitorIncident` rows survive a container restart — dedup state is
@@ -193,20 +204,28 @@ Persian summary with per-check status and an overall line. It can only
 **read** monitoring state; it can never acknowledge, resolve, or silence
 an incident — that stays a host-CLI-only operation.
 
-**Host CLI** (`scripts/centralpay`, routed to the `monitor` container —
-never `api` — because only `monitor` has the read-only backup-directory
-bind mount the backup/disk checks need; the same reasoning
-`reconciliation status`/`reconcile` are routed to `worker`, never `api`):
+**Host CLI** (`scripts/centralpay`):
 
 ```
 centralpay monitor check [--json]        # run every check now
 centralpay monitor incidents [--all] [--json]   # open (default) or all incidents
 ```
 
-`monitor check` exits `0` when every check is `ok`, `1` otherwise —
-suitable for a cron/alerting wrapper on top of the built-in Telegram
-delivery. `monitor incidents` never re-runs a check; it only reads
-persisted `MonitorIncident` rows.
+Each subcommand is routed to whichever container actually satisfies its
+dependencies, never blindly to `monitor`:
+
+- `monitor check` requires `MONITOR_ENABLED=true` and runs inside the
+  `monitor` container specifically — it's the only one with the read-only
+  backup-directory bind mount the backup/disk checks need (the same
+  reasoning `reconciliation status`/`reconcile` are routed to `worker`,
+  never `api`). Exits `0` when every check is `ok`, `1` otherwise —
+  suitable for a cron/alerting wrapper on top of the built-in Telegram
+  delivery.
+- `monitor incidents` is a pure database read with no filesystem
+  dependency, so it runs inside the always-on `api` container instead —
+  never gated on `MONITOR_ENABLED` and never requiring the `monitor`
+  container to be running. It only reads persisted `MonitorIncident` rows;
+  it never re-runs a check.
 
 ## Configuration
 
@@ -269,11 +288,39 @@ test_monitoring_reads_never_mutate_financial_state`).
   status` (delivery requires the admin bot enabled too) and
   `centralpay monitor incidents` (proves whether incidents are even being
   detected, independent of delivery).
-- **`backup`/`disk_space` always show as unreadable/critical** — the
-  `monitor` (and `admin-bot`, for `/monitor`) container must have the
-  `CENTRALPAY_BACKUP_DIR` bind mount; confirm it with
-  `centralpay monitor logs` and that `CENTRALPAY_BACKUP_DIR` in the env
-  file matches the actual host backup path.
+- **`backup`/`disk_space` always show as unreadable/critical** — two
+  independent causes:
+  1. The `monitor` (and `admin-bot`, for `/monitor`) container's read-only
+     bind mount is missing or points at the wrong HOST directory — confirm
+     with `centralpay monitor logs` that `CENTRALPAY_BACKUP_DIR` in the env
+     file matches the actual host backup path (the container always looks
+     at the fixed in-container path `/var/backups/centralpay-bridge`,
+     regardless of that variable — only the bind mount's host side moves).
+  2. **Permissions on an installation from before this feature existed**:
+     `install.sh` now creates the backup directory `0750`, group-owned by
+     the fixed GID `10001` baked into the application image, so the
+     monitor/admin-bot containers (which run as that same non-root user)
+     can list backup filenames/timestamps — never read a backup's
+     contents, which stay `0600` root-owned per file. An installation from
+     before this change keeps its old `0700` mode until fixed; on such a
+     host, run once as root:
+     `chgrp 10001 /var/backups/centralpay-bridge && chmod 0750 /var/backups/centralpay-bridge`
+     (adjust the path if `CENTRALPAY_BACKUP_DIR` was customized).
+- **The database itself is fully unreachable** — this is the one scenario
+  Telegram alerting cannot cover: an open incident and its alert both need
+  to be written to the very PostgreSQL instance that is down, so a genuine
+  full outage can be detected (`database`/`public_ready` go critical in
+  the monitor's own logs) but not delivered as a durable incident or a
+  Telegram message until PostgreSQL is back — and once it is, the very
+  next healthy cycle just closes out as "was never open," with no
+  after-the-fact alert for the outage window. The monitor's OWN heartbeat
+  file is deliberately NOT touched on a failed pass (see `app/monitor.py`),
+  so its Docker healthcheck goes unhealthy independently of Postgres
+  within `max(MONITOR_INTERVAL_SECONDS * 6, 180)` seconds — `docker
+  inspect`/`centralpay status`/`centralpay monitor status` remain a valid,
+  Postgres-independent liveness signal for exactly this case. Treat a
+  genuine "is Postgres up at all" alert as a job for host/infrastructure-
+  level monitoring outside this application, not this subsystem.
 - **Two monitor containers somehow both running** — by design this is
   safe (see "Incident lifecycle and deduplication" above): at most one
   open incident and one alert per condition regardless. It is still not a

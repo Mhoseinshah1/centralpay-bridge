@@ -1165,7 +1165,11 @@ cmd_monitor() {
         enable)
             require_root monitor enable
             require_install
-            sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=true/' "$ENV_FILE"
+            if grep -qE '^MONITOR_ENABLED=' "$ENV_FILE" 2>/dev/null; then
+                sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=true/' "$ENV_FILE"
+            else
+                printf 'MONITOR_ENABLED=true\n' >> "$ENV_FILE"
+            fi
             compose up -d --wait monitor
             log "Monitor service enabled and started."
             log "Telegram delivery also requires the admin bot: centralpay admin-bot enable"
@@ -1174,10 +1178,14 @@ cmd_monitor() {
             require_root monitor disable
             require_install
             compose --profile monitor stop monitor 2>/dev/null || true
-            sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=false/' "$ENV_FILE"
+            if grep -qE '^MONITOR_ENABLED=' "$ENV_FILE" 2>/dev/null; then
+                sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=false/' "$ENV_FILE"
+            else
+                printf 'MONITOR_ENABLED=false\n' >> "$ENV_FILE"
+            fi
             log "Monitor service disabled. Configuration preserved in ${ENV_FILE}."
             ;;
-        check | incidents)
+        check)
             require_install
             grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null \
                 || fail "Monitoring is disabled. Enable it first: centralpay monitor enable"
@@ -1185,7 +1193,17 @@ cmd_monitor() {
             # it has the read-only backup-directory bind mount the
             # backup/disk-space checks need, mirroring why "reconciliation
             # status"/"reconcile" are routed to the worker container above.
-            compose exec -T monitor python -m app.cli monitor "$sub" "$@"
+            compose exec -T monitor python -m app.cli monitor check "$@"
+            ;;
+        incidents)
+            require_install
+            # A pure database read with no filesystem dependency -- routed
+            # through the always-running api container (never gated on
+            # MONITOR_ENABLED and never requiring the monitor container to
+            # be up), so incident HISTORY stays inspectable even while
+            # monitoring itself is disabled/stopped (see MONITORING.md,
+            # "Disabling monitoring safely").
+            compose exec -T api python -m app.cli monitor incidents "$@"
             ;;
         *)
             fail "Unknown monitor subcommand: ${sub} (status|logs|restart|enable|disable|check|incidents)"

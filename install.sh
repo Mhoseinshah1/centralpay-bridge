@@ -564,7 +564,13 @@ render_template() {
 write_configuration() {
     log "Writing configuration to ${CONFIG_DIR} (secrets never printed)..."
     install -d -m 0700 "$CONFIG_DIR"
-    install -d -m 0700 "$BACKUP_DIR"
+    # Group-readable (listing/stat only) by GID 10001 -- the fixed,
+    # non-root "centralpay" group baked into the application image
+    # (Dockerfile) -- so the monitor/admin-bot containers can list backup
+    # filenames and mtimes for their freshness checks via a read-only bind
+    # mount. Each backup FILE stays 0600 root:root (scripts/backup.sh), so
+    # this never exposes backup contents, only metadata.
+    install -d -m 0750 -g 10001 "$BACKUP_DIR"
 
     umask 077
     render_template "${INSTALL_DIR}/deploy/centralpay.env.template" "$ENV_FILE"
