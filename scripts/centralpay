@@ -424,6 +424,11 @@ resolve_verified_update_commit() {
     # assets were produced is rejected BEFORE any checkout/build/migration/
     # restart. A checksum alone (over the discarded tarball) never proved
     # what git actually deploys.
+    #
+    # A non-tag ref (a branch such as main/master) fails closed by default —
+    # production updates must pin a release tag. CENTRALPAY_UPDATE_ALLOW_DEV_REF=true
+    # is the explicit, root-operator opt-in for a LOCAL DEVELOPMENT install to
+    # deploy a branch instead; it must never be set on a production host.
     local ref="$1" tmp base artifact fetched source_commit allow_unverified=false
     grep -qE '^CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true$' "$ENV_FILE" 2>/dev/null \
         && allow_unverified=true
@@ -435,7 +440,13 @@ resolve_verified_update_commit() {
         || fail "Cannot resolve fetched ref ${ref} to a commit."
 
     if ! is_release_tag "$ref"; then
-        warn "Update ref '${ref}' is not a release tag (DEVELOPMENT MODE): NO checksum and NO SOURCE_COMMIT binding. Pin CENTRALPAY_UPDATE_REF to a release tag (vX.Y.Z or vX.Y.Z-rcN) for production."
+        local allow_dev_ref=false
+        grep -qE '^CENTRALPAY_UPDATE_ALLOW_DEV_REF=true$' "$ENV_FILE" 2>/dev/null \
+            && allow_dev_ref=true
+        if [[ "$allow_dev_ref" != "true" ]]; then
+            fail "Update ref '${ref}' is not a release tag. Production updates must pin CENTRALPAY_UPDATE_REF to a release tag (vX.Y.Z or vX.Y.Z-rcN) so the update can be checksum- and SOURCE_COMMIT-verified. To deploy a branch on a LOCAL DEVELOPMENT install only, set CENTRALPAY_UPDATE_ALLOW_DEV_REF=true in ${ENV_FILE} (never on a production host)."
+        fi
+        warn "Update ref '${ref}' is not a release tag (DEVELOPMENT MODE, CENTRALPAY_UPDATE_ALLOW_DEV_REF=true): NO checksum and NO SOURCE_COMMIT binding."
         printf '%s\n' "$fetched"
         return 0
     fi

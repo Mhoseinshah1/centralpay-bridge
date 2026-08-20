@@ -253,6 +253,12 @@ def deploy_sandbox(tmp_path):
     management_bin.write_text(OLD_WRAPPER)
     management_bin.chmod(0o755)
 
+    # These tests deploy a plain "main" branch commit on purpose (they
+    # exercise wrapper self-replacement / rollback plumbing, not release-tag
+    # checksum verification), so they need the explicit local-development
+    # opt-in that production installs must never set.
+    (config / "centralpay.env").write_text("CENTRALPAY_UPDATE_ALLOW_DEV_REF=true\n")
+
     return {
         "origin": origin,
         "work": work,

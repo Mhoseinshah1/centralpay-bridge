@@ -35,6 +35,13 @@ closed.** Release notes: `RELEASE_NOTES_0.6.0_RC1.md`.
   root:root, centralpay 0755) — a plain clone previously produced a
   non-executable backup.sh, breaking the systemd backup timer with
   "Permission denied" on real hosts.
+- `centralpay update` now rejects a non-release-tag `CENTRALPAY_UPDATE_REF`
+  (e.g. `main`/`master`) by default instead of silently deploying it
+  unverified with a warning. Production updates must pin a release tag
+  (`vX.Y.Z` / `vX.Y.Z-rcN`), which is already checksum- and
+  `SOURCE_COMMIT`-verified before deploy; the previous unverified-branch
+  behavior is preserved only for local development, behind the new explicit
+  opt-in `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true`.
 
 ## [0.5.0-rc1] — 2026-07-18 (release candidate — NOT production-ready)
 
