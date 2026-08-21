@@ -20,8 +20,20 @@ REPO_URL="${CENTRALPAY_REPO_URL:-https://github.com/Mhoseinshah1/centralpay-brid
 GIT_REF="${CENTRALPAY_REF:-main}"
 INSTALL_DIR="${CENTRALPAY_INSTALL_DIR:-/opt/centralpay-bridge}"
 CONFIG_DIR="${CENTRALPAY_CONFIG_DIR:-/etc/centralpay-bridge}"
-BACKUP_DIR="${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}"
 ENV_FILE="${CONFIG_DIR}/centralpay.env"
+# On a FRESH install ENV_FILE does not exist yet, so this can only come
+# from the process environment (the pre-install default below). On a
+# RERUN against an existing installation, an operator's customized
+# CENTRALPAY_BACKUP_DIR already lives inside centralpay.env (see
+# deploy/centralpay.env.template) -- read and export it here too, so
+# deploy_stack's `docker compose up` (which brings the monitor/admin-bot
+# containers back up on a rerun) resolves the SAME host path for its
+# ${CENTRALPAY_BACKUP_DIR:-...} bind-mount interpolation that
+# scripts/centralpay and centralpay-backup.service already use.
+_configured_backup_dir=$(grep -E '^CENTRALPAY_BACKUP_DIR=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)
+BACKUP_DIR="${_configured_backup_dir:-${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}}"
+export CENTRALPAY_BACKUP_DIR="$BACKUP_DIR"
+unset _configured_backup_dir
 CADDYFILE="${CONFIG_DIR}/Caddyfile"
 DB_PASSWORD_FILE="${CONFIG_DIR}/db_password"
 CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
@@ -670,6 +682,9 @@ deploy_stack() {
     local -a profile_args=()
     if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
         profile_args+=(--profile admin-bot)
+    fi
+    if grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        profile_args+=(--profile monitor)
     fi
     docker compose "${profile_args[@]}" build --quiet
     if ! docker compose "${profile_args[@]}" up -d --wait; then

@@ -159,6 +159,12 @@ def test_verify_payable_amount_mismatch_moves_to_manual_review(
     payment = get_payment(session_factory, "cb-amount")
     assert payment.status == PaymentStatus.MANUAL_REVIEW.value
     assert payment.reference_id is None
+    # A financial-mismatch manual review must be timestamped like any
+    # other, so the monitor's manual_review age check
+    # (oldest_open_manual_review_age_seconds -> MIN(manual_review_at))
+    # can actually see it -- the most severe reviews were previously
+    # invisible to that check because this column stayed NULL.
+    assert payment.manual_review_at is not None
 
     types = event_types(get_events(session_factory, payment.id))
     assert "verify_payable_amount_mismatch" in types

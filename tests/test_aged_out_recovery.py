@@ -1255,7 +1255,7 @@ def test_gateway_verified_at_assigned_in_exactly_one_place_in_app_package():
                     and isinstance(target.value, ast.Name)
                 ):
                     sites.append(f"{path.relative_to(app_dir.parent)}:{node.lineno}")
-    assert sites == ["app/services/verification.py:185"], (
+    assert sites == ["app/services/verification.py:186"], (
         f"expected exactly one gateway_verified_at assignment site, found: {sites}"
     )
 
