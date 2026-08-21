@@ -35,7 +35,7 @@ def test_failed_integrity_cycle_retries_next_tick(settings, monkeypatch, tmp_pat
 
     monitor_module.run_forever(
         monitor_settings,
-        lambda: contextlib.nullcontext(None),
+        lambda: contextlib.nullcontext(None),  # type: ignore[arg-type]
         stop_event=stop_event,
         instance_id="test-instance",
     )
