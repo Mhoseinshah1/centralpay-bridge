@@ -79,7 +79,7 @@ once the previous one has fully returned.
 | `worker_heartbeat:reconciliation-worker` | Same, only when `RECONCILIATION_ENABLED=true` | same |
 | `notification_backlog` | Count of `bot_notify_pending` payments + oldest one's age (excludes `manual_review` and every resolved/accepted row) | `count_by_status`, `oldest_pending_notification_age_seconds` |
 | `manual_review` | Count of genuinely **unresolved** manual reviews + oldest age + reason buckets (a row resolved via `centralpay review resolve` is never counted) | `count_open_manual_reviews`, `oldest_open_manual_review_age_seconds`, `open_manual_review_reason_buckets` |
-| `reconciliation` | Reconciliation-exhausted count + backlog age approaching the hard lifetime. Ordinary `gateway_not_paid` + `reconciliation_retry_scheduled` activity is never itself an incident | `app.services.reconciliation_status.build_reconciliation_status_snapshot` |
+| `reconciliation` | Reconciliation-exhausted count + how long the oldest due row has waited since becoming eligible (not payment-link age, so a slow-paying customer alone never trips it). Ordinary `gateway_not_paid` + `reconciliation_retry_scheduled` activity is never itself an incident | `app.services.reconciliation_status.build_reconciliation_status_snapshot` |
 | `backup` | Newest `*.dump` under `CENTRALPAY_BACKUP_DIR` with a validated `.ok` sidecar, and its age | plain, bounded directory listing (read-only bind mount) |
 | `disk_space` | Free space (percent + absolute floor) of the filesystem backing `CENTRALPAY_BACKUP_DIR` — the one filesystem this project's single-host topology shares between PostgreSQL data, backups, and the application runtime | `shutil.disk_usage` |
 | `gateway_failure_burst` | Distinct payments affected by `centralpay_getlink_failed`/`centralpay_verify_failed` in a rolling window — genuine transport/server failures, never `gateway_not_paid` | bounded `COUNT(DISTINCT payment_id)` |
@@ -97,8 +97,11 @@ checks rather than becoming their own line: disk space is checked once
 backup directory, and application runtime normally share one host
 filesystem — checking it twice would be a duplicate, not extra coverage.
 "Abnormally old eligible work" for reconciliation is the same
-`oldest_due_age_seconds` value the `reconciliation` check already reports,
-not a second independent check.
+`oldest_overdue_seconds` value the `reconciliation` check already reports
+— how long the oldest due row has been waiting since it became eligible
+for an attempt (`reconciliation_next_at`), never how old its payment link
+is, so an ordinary slow-paying customer never trips it — not a second
+independent check.
 
 ## Severities and thresholds
 

@@ -336,6 +336,45 @@ def test_reconciliation_gateway_not_paid_is_not_an_incident(session_factory, set
     assert result.status == "ok"
 
 
+def test_reconciliation_old_link_alone_is_not_a_backlog(session_factory, settings):
+    """A payer who simply hasn't paid in a while must never trip the
+    backlog warning on its own -- only actual failure to drain the queue
+    (a due row waiting long past when it became eligible) should. This
+    payment's LINK is old (past 80% of the old link-age threshold this
+    check used to key off) but it just became due THIS instant, so it has
+    not been waiting at all."""
+    now = datetime.now(UTC)
+    _make_payment(
+        session_factory,
+        status="link_created",
+        reconciliation_attempts=1,
+        reconciliation_next_at=now,
+        callback_token_issued_at=now - timedelta(minutes=100),
+    )
+    with session_factory() as db:
+        result = monitor_checks.check_reconciliation(db, settings, now=now)
+    assert result.status == "ok"
+
+
+def test_reconciliation_stalled_due_row_is_a_backlog(session_factory, settings):
+    """A due row that has been waiting since well before it became
+    eligible -- the worker is falling behind its own schedule -- IS a
+    real backlog, independent of how old the underlying link happens to
+    be."""
+    now = datetime.now(UTC)
+    _make_payment(
+        session_factory,
+        status="link_created",
+        reconciliation_attempts=1,
+        reconciliation_next_at=now - timedelta(minutes=30),
+        callback_token_issued_at=now - timedelta(minutes=60),
+    )
+    with session_factory() as db:
+        result = monitor_checks.check_reconciliation(db, settings, now=now)
+    assert result.status == "warning"
+    assert result.reason == "backlog_aging"
+
+
 def test_reconciliation_disabled_is_healthy(session_factory, settings):
     disabled = settings.model_copy(update={"reconciliation_enabled": False})
     with session_factory() as db:

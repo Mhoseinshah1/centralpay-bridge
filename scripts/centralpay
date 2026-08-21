@@ -854,10 +854,19 @@ cmd_restore() {
         || fail "Pre-restore backup failed; restore aborted (database untouched)."
     log "pre_restore_backup_completed"
 
-    log "Stopping API, worker, and admin bot..."
+    log "Stopping API, worker, admin bot, and monitor..."
     compose stop api worker
     if grep -qE '^ADMIN_BOT_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
         compose stop admin-bot
+    fi
+    if grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
+        # Otherwise a live monitor keeps polling through the drop/restore
+        # window (every MONITOR_INTERVAL_SECONDS, reconnecting each pass)
+        # and can insert incident/alert/audit rows while pg_restore is
+        # still loading the dump, corrupting the just-restored dataset or
+        # colliding with restored primary keys. It comes back up with
+        # everything else below.
+        compose stop monitor
     fi
 
     log "restore_started: ${file}"

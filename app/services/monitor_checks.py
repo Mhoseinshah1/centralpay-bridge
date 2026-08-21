@@ -211,20 +211,25 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
         return CheckResult("reconciliation", STATUS_OK, "disabled", {"enabled": False})
     snapshot = build_reconciliation_status_snapshot(db, settings, now_fn=lambda: now)
     exhausted = snapshot.queue.exhausted_not_aged_out
-    oldest_due = snapshot.queue.oldest_due_age_seconds
+    oldest_overdue = snapshot.queue.oldest_overdue_seconds
     details = {
         "exhausted_not_aged_out": exhausted,
-        "oldest_due_age_seconds": _round_or_none(oldest_due),
+        "oldest_overdue_seconds": _round_or_none(oldest_overdue),
     }
     if exhausted > 0:
         return CheckResult(
             "reconciliation", STATUS_CRITICAL, "reconciliation_exhausted", details
         )
-    # Backlog approaching the hard reconciliation lifetime without being
-    # drained — "cannot be drained" per the roadmap, not "users haven't
-    # paid yet."
-    warn_threshold = settings.reconciliation_max_age_seconds * 0.8
-    if oldest_due is not None and oldest_due >= warn_threshold:
+    # A due row waiting this long since it became eligible (NOT how old its
+    # link is -- a payer simply not having paid yet never grows this value)
+    # means the worker is falling behind its own schedule and the queue is
+    # failing to drain, which is the actual "cannot be drained" condition
+    # the roadmap asks for. Scaled off the slow tier's re-poll interval
+    # (the larger of the two, so it dominates oldest_overdue_seconds) with
+    # the same floor app.services.reconciliation_status._runtime already
+    # uses for "is polling keeping up".
+    warn_threshold = max(settings.reconciliation_slow_interval_seconds * 5, 300)
+    if oldest_overdue is not None and oldest_overdue >= warn_threshold:
         return CheckResult("reconciliation", STATUS_WARNING, "backlog_aging", details)
     return CheckResult("reconciliation", STATUS_OK, "healthy", details)
 

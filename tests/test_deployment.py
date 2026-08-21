@@ -627,9 +627,13 @@ def test_restore_preflight_and_failure_safety():
     # Exclusive lock shared with the backup script.
     assert "flock -n 9" in restore_body
     assert "CENTRALPAY_BACKUP_LOCK_HELD=1" in restore_body
-    # All writers stopped, including the admin bot when enabled.
+    # All writers stopped, including the admin bot and monitor when enabled
+    # (an unstopped monitor would keep polling -- and reconnecting -- right
+    # through the drop/restore window).
     assert "compose stop api worker" in restore_body
     assert "compose stop admin-bot" in restore_body
+    assert "compose stop monitor" in restore_body
+    assert restore_body.index("compose stop monitor") < restore_body.index("restore_started")
     # Partial-restore detection and explicit recovery guidance.
     assert "--exit-on-error" in restore_body
     assert "restore_failure_instructions" in restore_body
