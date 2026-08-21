@@ -9,6 +9,7 @@ the fixed safe allowlist.
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from sqlalchemy import select
 
 from app.models import AdminAlert, MonitorIncident, MonitorIncidentStatus
@@ -206,6 +207,46 @@ def test_alerts_disabled_still_persists_incident_but_never_queues_an_alert(
     assert opened.transition == TRANSITION_OPENED
     assert len(_incidents(session_factory)) == 1
     assert _alerts(session_factory) == []
+
+
+@pytest.mark.parametrize(
+    ("toggle", "check_key"),
+    [
+        ("admin_bot_health_alerts", "disk_space"),
+        ("admin_bot_backup_alerts", "backup"),
+        ("admin_bot_manual_review_alerts", "manual_review"),
+        ("admin_bot_error_alerts", "notification_backlog"),
+    ],
+)
+def test_category_alert_toggle_suppresses_only_its_own_category(
+    session_factory, admin_settings, toggle, check_key
+):
+    """Each ADMIN_BOT_*_ALERTS toggle gates only checks in its own category
+    -- the incident still opens and is fully persisted (`/monitor` and
+    `centralpay monitor incidents` stay accurate) but no outbox row is
+    queued for a category the operator turned off."""
+    disabled = admin_settings.model_copy(update={toggle: False})
+    now = datetime.now(UTC)
+    result = CheckResult(check_key, "critical", "unhealthy", {})
+    with session_factory() as db:
+        transition = record_check_result(db, disabled, result, now=now)
+    assert transition.transition == TRANSITION_OPENED
+    assert len(_incidents(session_factory)) == 1
+    assert _alerts(session_factory) == []
+
+
+def test_category_alert_toggle_does_not_suppress_other_categories(
+    session_factory, admin_settings
+):
+    """Turning off manual-review alerts must not silence an unrelated
+    health check -- the toggles are independent, not a single global
+    switch."""
+    disabled = admin_settings.model_copy(update={"admin_bot_manual_review_alerts": False})
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        transition = record_check_result(db, disabled, _critical(), now=now)
+    assert transition.transition == TRANSITION_OPENED
+    assert len(_alerts(session_factory, "monitor_incident_opened")) == 1
 
 
 def test_no_open_incident_before_first_failure_is_a_true_no_op(session_factory, admin_settings):

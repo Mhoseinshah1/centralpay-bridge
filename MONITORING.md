@@ -156,6 +156,14 @@ then `admin-bot enable` order (or the reverse) always end with an
 administrator actually hearing about anything still open, never silently
 dropping it because the transition itself happened earlier.
 
+`ADMIN_BOT_*` settings (including `ADMIN_BOT_ENABLED` and the per-category
+alert toggles) are read once at container start, same as every
+`MONITOR_*` setting. To avoid requiring a separate manual restart every
+time, `centralpay admin-bot enable`/`centralpay admin-bot disable`
+automatically restart an already-running `monitor` container so it picks
+up the change immediately — a no-op if the monitor isn't currently
+running.
+
 **Durability and concurrency**, precisely:
 
 - `MonitorIncident` rows survive a container restart — dedup state is
@@ -179,6 +187,15 @@ dropping it because the transition itself happened earlier.
   incident lifecycle still runs and stays fully accurate — it simply never
   queues an `admin_alerts` row (which would otherwise pile up
   permanently undelivered).
+- Each check key maps to one of the admin bot's per-category alert toggles
+  — `ADMIN_BOT_HEALTH_ALERTS` (`public_ready`, `database`,
+  `worker_heartbeat:*`, `reconciliation`, `disk_space`, `db_integrity`),
+  `ADMIN_BOT_BACKUP_ALERTS` (`backup`), `ADMIN_BOT_MANUAL_REVIEW_ALERTS`
+  (`manual_review`), `ADMIN_BOT_ERROR_ALERTS` (`notification_backlog`,
+  `gateway_failure_burst`, `bot_failure_burst`) — the same categories
+  `app.adminbot.alerts` already applies to non-monitor events. Turning one
+  category off never affects another, and the incident itself is still
+  always persisted regardless.
 
 **Alert payload safety:** only a fixed, small subset of a check's details
 (`check`, `detail`, `count`) is ever forwarded into the Telegram-bound
@@ -208,7 +225,7 @@ an incident — that stays a host-CLI-only operation.
 
 ```
 centralpay monitor check [--json]        # run every check now
-centralpay monitor incidents [--all] [--json]   # open (default) or all incidents
+centralpay monitor incidents [--all] [--limit N] [--json]   # open (default) or all incidents
 ```
 
 Each subcommand is routed to whichever container actually satisfies its
@@ -225,7 +242,9 @@ dependencies, never blindly to `monitor`:
   dependency, so it runs inside the always-on `api` container instead —
   never gated on `MONITOR_ENABLED` and never requiring the `monitor`
   container to be running. It only reads persisted `MonitorIncident` rows;
-  it never re-runs a check.
+  it never re-runs a check. `--limit` (default 50) caps how many rows are
+  returned, most recently opened first; raise it (or pass `--all --limit`
+  with a larger value) to see further back than the default page.
 
 ## Configuration
 
@@ -243,10 +262,16 @@ Nothing here has a floating hardcoded default outside `Settings`.
   expensive-check cadence, deliberately far slower.
 - Every `MONITOR_*_WARNING_*` / `MONITOR_*_CRITICAL_*` pair — see the
   table above and `.env.example`.
-- `CENTRALPAY_BACKUP_DIR` — shared with `scripts/backup.sh`; must match
-  the host path if you change it from the default
-  (`/var/backups/centralpay-bridge`), since the `monitor` and `admin-bot`
-  containers bind-mount this exact path read-only.
+- `CENTRALPAY_BACKUP_DIR` — shared with `scripts/backup.sh`; set it inside
+  `centralpay.env` (see `deploy/centralpay.env.template`) if you change it
+  from the default (`/var/backups/centralpay-bridge`). `scripts/centralpay`
+  reads it from `centralpay.env` and exports it into its own process
+  environment before invoking Docker Compose, because Compose's
+  `${CENTRALPAY_BACKUP_DIR:-...}` bind-mount interpolation in
+  `docker-compose.yml` reads the invoking shell's environment, never
+  `env_file:` — without that export the `monitor`/`admin-bot` containers'
+  read-only bind mount would silently fall back to the default host path
+  regardless of what `centralpay.env` says.
 
 ## Disabling monitoring safely
 

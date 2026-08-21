@@ -149,6 +149,24 @@ def test_monitor_incidents_json_lists_open_incident(cli_env, session_factory, ca
     assert payload["status"] == "open"
 
 
+def test_monitor_incidents_limit_caps_results(cli_env, session_factory, capsys):
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        for i in range(3):
+            result = CheckResult(f"disk_space:{i}", "critical", "low_disk_space", {})
+            record_check_result(db, cli_env, result, now=now)
+
+    exit_code = cli_main(["monitor", "incidents", "--json", "--limit", "2"])
+    assert exit_code == 0
+    limited = [line for line in capsys.readouterr().out.strip().splitlines() if line]
+    assert len(limited) == 2
+
+    exit_code = cli_main(["monitor", "incidents", "--json"])
+    assert exit_code == 0
+    unlimited = [line for line in capsys.readouterr().out.strip().splitlines() if line]
+    assert len(unlimited) == 3
+
+
 def test_monitor_incidents_human_output_no_incidents(cli_env, capsys):
     exit_code = cli_main(["monitor", "incidents"])
     assert exit_code == 0

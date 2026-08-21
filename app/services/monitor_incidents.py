@@ -59,14 +59,48 @@ class IncidentTransition:
     incident_id: int | None
 
 
-def _alerts_enabled(settings: Settings) -> bool:
+# Every check key maps to exactly one of the admin bot's per-category alert
+# toggles (ADMIN_BOT_*_ALERTS) so an operator who wants manual-review pings
+# but not routine health noise (or vice versa) can say so -- the same
+# categories app.adminbot.alerts._map_event already applies to non-monitor
+# events. worker_heartbeat's key carries a ":{worker_name}" suffix, so it
+# is matched by prefix rather than equality.
+_BACKUP_CHECK_KEYS = frozenset({"backup"})
+_MANUAL_REVIEW_CHECK_KEYS = frozenset({"manual_review"})
+_ERROR_CHECK_KEYS = frozenset(
+    {"notification_backlog", "gateway_failure_burst", "bot_failure_burst"}
+)
+
+
+def _alert_category(check_key: str) -> str:
+    if check_key in _BACKUP_CHECK_KEYS:
+        return "backup"
+    if check_key in _MANUAL_REVIEW_CHECK_KEYS:
+        return "manual_review"
+    if check_key in _ERROR_CHECK_KEYS:
+        return "error"
+    # public_ready, database, worker_heartbeat:*, reconciliation,
+    # disk_space, db_integrity: all report on core service health.
+    return "health"
+
+
+def _alerts_enabled(settings: Settings, check_key: str) -> bool:
     # An incident is always persisted regardless of this flag (`/monitor`
     # and `centralpay monitor incidents` stay accurate even with Telegram
     # off); this only decides whether a row is ALSO queued for delivery,
     # mirroring app.adminbot.alerts.configure_alert_creation's own gate so
     # a fully-disabled admin bot never accumulates permanently-undelivered
     # outbox rows.
-    return settings.admin_bot_enabled and settings.admin_bot_alerts_enabled
+    if not (settings.admin_bot_enabled and settings.admin_bot_alerts_enabled):
+        return False
+    category = _alert_category(check_key)
+    if category == "backup":
+        return settings.admin_bot_backup_alerts
+    if category == "manual_review":
+        return settings.admin_bot_manual_review_alerts
+    if category == "error":
+        return settings.admin_bot_error_alerts
+    return settings.admin_bot_health_alerts
 
 
 def _alert_payload(result: CheckResult) -> dict[str, object]:
@@ -113,7 +147,7 @@ def _handle_healthy(
     incident.status = MonitorIncidentStatus.RESOLVED.value
     incident.resolved_at = now
     incident.last_seen_at = now
-    if _alerts_enabled(settings):
+    if _alerts_enabled(settings, result.key):
         incident.last_alerted_at = now
         db.flush()
         duration_seconds = int((now - _as_utc(incident.opened_at)).total_seconds())
@@ -160,7 +194,7 @@ def _handle_unhealthy(
                 # risk fabricating a duplicate alert.
                 return IncidentTransition(result.key, TRANSITION_UNCHANGED_UNHEALTHY, None)
         else:
-            if _alerts_enabled(settings):
+            if _alerts_enabled(settings, result.key):
                 candidate.last_alerted_at = now
                 db.flush()
                 create_alert(
@@ -183,7 +217,7 @@ def _handle_unhealthy(
         and _SEVERITY_RANK[result.status] > _SEVERITY_RANK[incident.severity]
     ):
         incident.severity = result.status
-        if _alerts_enabled(settings):
+        if _alerts_enabled(settings, result.key):
             incident.last_alerted_at = now
             db.flush()
             create_alert(
@@ -214,7 +248,7 @@ def _handle_unhealthy(
         # update severity silently, never a duplicate alert.
         incident.severity = result.status
 
-    if incident.last_alerted_at is None and _alerts_enabled(settings):
+    if incident.last_alerted_at is None and _alerts_enabled(settings, result.key):
         # This incident has been open (possibly for a while: created while
         # alerting was disabled, or the loser of an open-race whose winner
         # ran with alerting disabled) but has NEVER actually been queued

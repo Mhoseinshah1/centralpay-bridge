@@ -623,45 +623,6 @@ class Settings(BaseSettings):
                 "RECONCILIATION_SLOW_TIER_RESERVED_SLOTS must be less than "
                 "RECONCILIATION_BATCH_SIZE"
             )
-        if self.monitor_worker_heartbeat_warning_seconds >= (
-            self.monitor_worker_heartbeat_critical_seconds
-        ):
-            raise ValueError(
-                "MONITOR_WORKER_HEARTBEAT_WARNING_SECONDS must be less than "
-                "MONITOR_WORKER_HEARTBEAT_CRITICAL_SECONDS"
-            )
-        if self.monitor_notification_warning_count >= self.monitor_notification_critical_count:
-            raise ValueError(
-                "MONITOR_NOTIFICATION_WARNING_COUNT must be less than "
-                "MONITOR_NOTIFICATION_CRITICAL_COUNT"
-            )
-        if self.monitor_manual_review_warning_count >= self.monitor_manual_review_critical_count:
-            raise ValueError(
-                "MONITOR_MANUAL_REVIEW_WARNING_COUNT must be less than "
-                "MONITOR_MANUAL_REVIEW_CRITICAL_COUNT"
-            )
-        if self.monitor_backup_warning_age_seconds >= self.monitor_backup_critical_age_seconds:
-            raise ValueError(
-                "MONITOR_BACKUP_WARNING_AGE_SECONDS must be less than "
-                "MONITOR_BACKUP_CRITICAL_AGE_SECONDS"
-            )
-        if self.monitor_disk_critical_percent >= self.monitor_disk_warning_percent:
-            raise ValueError(
-                "MONITOR_DISK_CRITICAL_PERCENT must be less than MONITOR_DISK_WARNING_PERCENT"
-            )
-        if (
-            self.monitor_gateway_failure_warning_count
-            >= self.monitor_gateway_failure_critical_count
-        ):
-            raise ValueError(
-                "MONITOR_GATEWAY_FAILURE_WARNING_COUNT must be less than "
-                "MONITOR_GATEWAY_FAILURE_CRITICAL_COUNT"
-            )
-        if self.monitor_bot_failure_warning_count >= self.monitor_bot_failure_critical_count:
-            raise ValueError(
-                "MONITOR_BOT_FAILURE_WARNING_COUNT must be less than "
-                "MONITOR_BOT_FAILURE_CRITICAL_COUNT"
-            )
         return self
 
 
@@ -702,10 +663,57 @@ def validate_monitor_settings(settings: Settings) -> None:
     """Startup validation for the monitor service only.
 
     The API, worker, and admin bot never call this, so a disabled or
-    misconfigured monitor can never block payment processing.
+    misconfigured monitor can never block payment processing. The
+    warning/critical threshold ordering checks below live here (rather than
+    in the shared ``_validate_bot_settings`` model validator) for the same
+    reason: a typo in a MONITOR_* threshold must only ever break the
+    optional monitor service, never crash Settings() construction for the
+    API or worker.
     """
     if not settings.monitor_enabled:
         raise ConfigurationError("MONITOR_ENABLED is false")
+    if settings.monitor_worker_heartbeat_warning_seconds >= (
+        settings.monitor_worker_heartbeat_critical_seconds
+    ):
+        raise ConfigurationError(
+            "MONITOR_WORKER_HEARTBEAT_WARNING_SECONDS must be less than "
+            "MONITOR_WORKER_HEARTBEAT_CRITICAL_SECONDS"
+        )
+    if settings.monitor_notification_warning_count >= settings.monitor_notification_critical_count:
+        raise ConfigurationError(
+            "MONITOR_NOTIFICATION_WARNING_COUNT must be less than "
+            "MONITOR_NOTIFICATION_CRITICAL_COUNT"
+        )
+    if (
+        settings.monitor_manual_review_warning_count
+        >= settings.monitor_manual_review_critical_count
+    ):
+        raise ConfigurationError(
+            "MONITOR_MANUAL_REVIEW_WARNING_COUNT must be less than "
+            "MONITOR_MANUAL_REVIEW_CRITICAL_COUNT"
+        )
+    if settings.monitor_backup_warning_age_seconds >= settings.monitor_backup_critical_age_seconds:
+        raise ConfigurationError(
+            "MONITOR_BACKUP_WARNING_AGE_SECONDS must be less than "
+            "MONITOR_BACKUP_CRITICAL_AGE_SECONDS"
+        )
+    if settings.monitor_disk_critical_percent >= settings.monitor_disk_warning_percent:
+        raise ConfigurationError(
+            "MONITOR_DISK_CRITICAL_PERCENT must be less than MONITOR_DISK_WARNING_PERCENT"
+        )
+    if (
+        settings.monitor_gateway_failure_warning_count
+        >= settings.monitor_gateway_failure_critical_count
+    ):
+        raise ConfigurationError(
+            "MONITOR_GATEWAY_FAILURE_WARNING_COUNT must be less than "
+            "MONITOR_GATEWAY_FAILURE_CRITICAL_COUNT"
+        )
+    if settings.monitor_bot_failure_warning_count >= settings.monitor_bot_failure_critical_count:
+        raise ConfigurationError(
+            "MONITOR_BOT_FAILURE_WARNING_COUNT must be less than "
+            "MONITOR_BOT_FAILURE_CRITICAL_COUNT"
+        )
 
 
 def validate_admin_bot_settings(settings: Settings) -> tuple[int, ...]:

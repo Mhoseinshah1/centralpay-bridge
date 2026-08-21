@@ -1210,8 +1210,10 @@ def _cmd_monitor_check(db: Session, settings: Settings, *, as_json: bool) -> int
     return 0 if status == "ok" else 1
 
 
-def _cmd_monitor_incidents(db: Session, *, as_json: bool, include_resolved: bool) -> int:
-    incidents = list_incidents(db, include_resolved=include_resolved)
+def _cmd_monitor_incidents(
+    db: Session, *, as_json: bool, include_resolved: bool, limit: int
+) -> int:
+    incidents = list_incidents(db, include_resolved=include_resolved, limit=limit)
     if as_json:
         for incident in incidents:
             _print(
@@ -1341,6 +1343,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", help="include resolved incidents (default: open only)"
     )
     monitor_incidents.add_argument(
+        "--limit", type=int, default=50, help="max incidents to show (default: 50)"
+    )
+    monitor_incidents.add_argument(
         "--json", action="store_true", dest="as_json", help="one JSON object per line"
     )
     return parser
@@ -1383,7 +1388,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.monitor_command == "check":
                 return _cmd_monitor_check(db, settings, as_json=args.as_json)
             return _cmd_monitor_incidents(
-                db, as_json=args.as_json, include_resolved=args.all
+                db, as_json=args.as_json, include_resolved=args.all, limit=args.limit
             )
         return _cmd_stuck(db, settings, limit=args.limit, as_json=args.as_json)
     except BrokenPipeError:
