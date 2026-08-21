@@ -61,7 +61,10 @@ bot:**
 synchronous Python loop. Cheap checks run every `MONITOR_INTERVAL_SECONDS`
 (default 60s); the one expensive check (`db_integrity`, reusing
 `centralpay db-check`'s SQL) runs on its own far slower cadence
-(`MONITOR_DB_INTEGRITY_INTERVAL_SECONDS`, default 30 minutes). Every query
+(`MONITOR_DB_INTEGRITY_INTERVAL_SECONDS`, default 30 minutes) — tracked as
+"cycles since it last actually completed", not a raw tick count, so a
+transient failure during its slot retries on the very next cycle instead of
+silently waiting a full cadence period before trying again. Every query
 is bounded (a handful of `COUNT`/`MIN` statements against indexed columns,
 or a small rolling-window `COUNT(DISTINCT payment_id)`) — no full-table
 scans, no per-healthy-cycle writes (a healthy check writes nothing at
@@ -77,9 +80,10 @@ once the previous one has fully returned.
 | `database` | `SELECT 1` | `app.adminbot.queries.database_ok` |
 | `worker_heartbeat:notification-worker` | Age of the newest heartbeat row | `app.adminbot.queries.latest_worker_heartbeat` |
 | `worker_heartbeat:reconciliation-worker` | Same, only when `RECONCILIATION_ENABLED=true` | same |
+| `worker_heartbeat:admin-bot-delivery` | Same, only when `ADMIN_BOT_ENABLED=true` — the admin bot's own alert-delivery loop (`app.adminbot.runner`) writes this row itself, since its container-liveness heartbeat file lives in its own tmpfs and is otherwise invisible to the dedicated monitor | same |
 | `notification_backlog` | Count of `bot_notify_pending` payments + oldest one's age (excludes `manual_review` and every resolved/accepted row) | `count_by_status`, `oldest_pending_notification_age_seconds` |
 | `manual_review` | Count of genuinely **unresolved** manual reviews + oldest age + reason buckets (a row resolved via `centralpay review resolve` is never counted) | `count_open_manual_reviews`, `oldest_open_manual_review_age_seconds`, `open_manual_review_reason_buckets` |
-| `reconciliation` | Reconciliation-exhausted count + how long the oldest due row has waited since becoming eligible (not payment-link age, so a slow-paying customer alone never trips it). Ordinary `gateway_not_paid` + `reconciliation_retry_scheduled` activity is never itself an incident | `app.services.reconciliation_status.build_reconciliation_status_snapshot` |
+| `reconciliation` | Reconciliation-exhausted count (stays counted even after a payment ALSO ages out — it never silently "recovers" just because more time passed) + how long the oldest due row has waited since becoming eligible (not payment-link age, so a slow-paying customer alone never trips it). Ordinary `gateway_not_paid` + `reconciliation_retry_scheduled` activity is never itself an incident | `app.services.reconciliation_status.build_reconciliation_status_snapshot` |
 | `backup` | Newest `*.dump` under `CENTRALPAY_BACKUP_DIR` with a validated `.ok` sidecar, and its age | plain, bounded directory listing (read-only bind mount) |
 | `disk_space` | Free space (percent + absolute floor) of the filesystem backing `CENTRALPAY_BACKUP_DIR` — the one filesystem this project's single-host topology shares between PostgreSQL data, backups, and the application runtime | `shutil.disk_usage` |
 | `gateway_failure_burst` | Distinct payments affected by `centralpay_getlink_failed`/`centralpay_verify_failed` in a rolling window — genuine transport/server failures, never `gateway_not_paid` | bounded `COUNT(DISTINCT payment_id)` |
@@ -157,7 +161,13 @@ available, queues exactly one catch-up "opened" alert at the incident's
 *current* severity — this is what makes the documented `monitor enable`
 then `admin-bot enable` order (or the reverse) always end with an
 administrator actually hearing about anything still open, never silently
-dropping it because the transition itself happened earlier.
+dropping it because the transition itself happened earlier. The same
+applies if an already-alerted incident ESCALATES further while delivery is
+unavailable: the escalation branch resets `last_alerted_at` back to `None`
+(the earlier alert was for a since-superseded, lower severity), so this
+same catch-up path fires once delivery resumes — an administrator is never
+left believing an incident is still at whatever severity it was last
+actually told about.
 
 `ADMIN_BOT_*` settings (including `ADMIN_BOT_ENABLED` and the per-category
 alert toggles) are read once at container start, same as every

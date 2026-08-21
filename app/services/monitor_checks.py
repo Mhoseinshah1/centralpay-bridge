@@ -210,10 +210,15 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
     if not settings.reconciliation_enabled:
         return CheckResult("reconciliation", STATUS_OK, "disabled", {"enabled": False})
     snapshot = build_reconciliation_status_snapshot(db, settings, now_fn=lambda: now)
-    exhausted = snapshot.queue.exhausted_not_aged_out
+    # INCLUDING already-aged-out rows -- unlike the operator-facing
+    # exhausted_not_aged_out bucket, this must never drop a payment reconciliation
+    # already gave up on just because more time also passed and it crossed
+    # the age boundary too; otherwise the incident would falsely "resolve"
+    # for a payment that got MORE stuck, not less.
+    exhausted = snapshot.queue.exhausted_including_aged_out
     oldest_overdue = snapshot.queue.oldest_overdue_seconds
     details = {
-        "exhausted_not_aged_out": exhausted,
+        "exhausted": exhausted,
         "oldest_overdue_seconds": _round_or_none(oldest_overdue),
     }
     if exhausted > 0:
@@ -401,6 +406,17 @@ def run_all_checks(
     if settings.reconciliation_enabled:
         results.append(
             check_worker_heartbeat(db, settings, worker_name="reconciliation-worker", now=now)
+        )
+    if settings.admin_bot_enabled:
+        # The admin bot's own delivery loop (app.adminbot.runner) has no
+        # OTHER visibility to this dedicated monitor -- its container
+        # liveness heartbeat file lives in its own tmpfs, and it writes no
+        # database row unless it heartbeats here. Enabled-only, exactly
+        # like reconciliation-worker above: when the admin bot is
+        # disabled, no delivery loop runs at all, so "no heartbeat" would
+        # be a false critical rather than a real signal.
+        results.append(
+            check_worker_heartbeat(db, settings, worker_name="admin-bot-delivery", now=now)
         )
     if include_db_integrity:
         results.append(check_db_integrity(db))

@@ -86,7 +86,15 @@ def run_forever(
         1, round(settings.monitor_db_integrity_interval_seconds / interval)
     )
     heartbeat_file = Path(settings.monitor_heartbeat_file)
-    tick = 0
+    # Cycles since db_integrity last actually completed -- NOT a raw tick
+    # counter. Starts due (>= db_integrity_every) so the very first pass
+    # includes it. Advances by one on every ordinary tick, exactly like a
+    # tick counter would, EXCEPT it is only reset back to zero once a pass
+    # that included db_integrity actually finished without raising; a pass
+    # that failed before/during db_integrity leaves it due, so the very
+    # next tick retries it instead of waiting a full db_integrity_every
+    # cycles for the next scheduled slot.
+    cycles_since_integrity = db_integrity_every
     logger.info(
         "monitor_started",
         extra={
@@ -97,7 +105,7 @@ def run_forever(
     )
     while not stop_event.is_set():
         started = time.monotonic()
-        include_db_integrity = tick % db_integrity_every == 0
+        include_db_integrity = cycles_since_integrity >= db_integrity_every
         cycle_completed = False
         error_code: str | None = None
         try:
@@ -126,7 +134,10 @@ def run_forever(
                 )
         except Exception:
             logger.warning("monitor_db_heartbeat_failed")
-        tick += 1
+        if include_db_integrity and cycle_completed:
+            cycles_since_integrity = 0
+        else:
+            cycles_since_integrity += 1
         elapsed = time.monotonic() - started
         # Never a negative sleep: a pass that overran its interval starts
         # the next one immediately, but still strictly after this one

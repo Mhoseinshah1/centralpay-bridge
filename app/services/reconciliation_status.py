@@ -39,6 +39,7 @@ from app.services.reconciliation import (
     expiring_tier_due_conditions,
     link_age_anchor,
     reconciliation_exhausted_conditions,
+    reconciliation_exhausted_ever_conditions,
 )
 
 NowFn = Callable[[], datetime]
@@ -179,6 +180,12 @@ class QueueHealth:
     # scheduled due times does. See app.services.monitor_checks.
     # check_reconciliation, the sole consumer of this field.
     oldest_overdue_seconds: float | None
+    # Attempts-exhausted payments, INCLUDING ones that have also since aged
+    # out -- unlike exhausted_not_aged_out above, this never drops a
+    # payment just because more time passed. See
+    # reconciliation.reconciliation_exhausted_ever_conditions and
+    # app.services.monitor_checks.check_reconciliation, the sole consumer.
+    exhausted_including_aged_out: int
 
 
 @dataclass(frozen=True)
@@ -289,6 +296,7 @@ def _queue(db: Session, settings: Settings, now: datetime) -> QueueHealth:
     active_conditions = active_tier_due_conditions(settings, now=now)
     expiring_conditions = expiring_tier_due_conditions(settings, now=now)
     exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
+    exhausted_ever_conditions = reconciliation_exhausted_ever_conditions(settings, now=now)
 
     oldest_active = oldest_by(anchor, active_conditions)
     oldest_expiring = oldest_by(anchor, expiring_conditions)
@@ -298,6 +306,7 @@ def _queue(db: Session, settings: Settings, now: datetime) -> QueueHealth:
         active_due=count(active_conditions),
         expiring_due=count(expiring_conditions),
         exhausted_not_aged_out=count(exhausted_conditions),
+        exhausted_including_aged_out=count(exhausted_ever_conditions),
         oldest_active_due_age_seconds=oldest_active,
         oldest_expiring_due_age_seconds=oldest_expiring,
         oldest_due_age_seconds=_oldest_age(oldest_active, oldest_expiring),

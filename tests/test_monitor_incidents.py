@@ -357,3 +357,45 @@ def test_escalation_flap_within_dedup_window_alerts_on_every_worsening(
 
     escalation_alerts = _alerts(session_factory, "monitor_incident_escalated")
     assert len(escalation_alerts) == 2  # neither suppressed as a false duplicate
+
+
+def test_escalation_while_disabled_is_caught_up_once_delivery_resumes(
+    session_factory, settings, admin_settings
+):
+    """An incident opens (and is alerted) at warning, then escalates to
+    critical while delivery is unavailable -- the escalation itself must
+    not be silently lost forever just because SOME alert (for the old,
+    lower severity) already went out for this incident. The next cycle
+    that observes it still critical, with delivery available again, must
+    send exactly one catch-up alert -- and that alert must not collide
+    with the original opening alert's deduplication key and get itself
+    silently marked suppressed."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        opened = record_check_result(db, admin_settings, _warning(), now=now)
+    assert opened.transition == TRANSITION_OPENED
+    assert len(_alerts(session_factory, "monitor_incident_opened")) == 1
+
+    # Delivery goes away, then the condition worsens to critical.
+    with session_factory() as db:
+        escalated = record_check_result(db, settings, _critical(), now=now + timedelta(minutes=1))
+    assert escalated.transition == TRANSITION_ESCALATED
+    assert _alerts(session_factory, "monitor_incident_escalated") == []  # never queued
+
+    # Delivery comes back; the very next cycle must catch up.
+    with session_factory() as db:
+        caught_up = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=2)
+        )
+    assert caught_up.transition == TRANSITION_ALERT_CAUGHT_UP
+    assert caught_up.incident_id == opened.incident_id
+
+    incidents = _incidents(session_factory)
+    assert len(incidents) == 1
+    assert incidents[0].severity == "critical"
+
+    opened_alerts = _alerts(session_factory, "monitor_incident_opened")
+    # The original warning-severity alert, PLUS the critical catch-up --
+    # neither suppressed as a false duplicate of the other.
+    assert len(opened_alerts) == 2
+    assert {a.status for a in opened_alerts} == {"pending"}

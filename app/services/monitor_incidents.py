@@ -44,9 +44,11 @@ TRANSITION_CLOSED = "closed"
 TRANSITION_ESCALATED = "escalated"
 TRANSITION_UNCHANGED_UNHEALTHY = "unchanged_unhealthy"
 TRANSITION_UNCHANGED_HEALTHY = "unchanged_healthy"
-# An already-open incident that had never been alerted (alerting was
-# disabled when it opened) got its catch-up alert now that alerting is
-# available -- distinct from TRANSITION_OPENED (a brand-new row).
+# An already-open incident that had never been alerted for its CURRENT
+# severity -- either because alerting was disabled when it opened, or it
+# escalated further while alerting was disabled (see the escalation
+# branch's last_alerted_at reset below) -- got its catch-up alert now that
+# alerting is available. Distinct from TRANSITION_OPENED (a brand-new row).
 TRANSITION_ALERT_CAUGHT_UP = "alert_caught_up"
 
 _SEVERITY_RANK = {"warning": 1, "critical": 2}
@@ -241,6 +243,17 @@ def _handle_unhealthy(
                 payload=_alert_payload(result),
                 now=now,
             )
+        else:
+            # Alerting is unavailable right now (admin bot/category
+            # disabled), but the severity just got WORSE than whatever
+            # last_alerted_at reflects (an earlier open/escalation, or
+            # nothing at all). Clear it so this incident reads as
+            # never-alerted-for-its-current-state -- the catch-up branch
+            # below then sends exactly one fresh alert at the new,
+            # correct severity the moment alerting resumes, instead of
+            # staying silent forever because SOME alert was sent once,
+            # long ago, for a since-superseded lower severity.
+            incident.last_alerted_at = None
         db.commit()
         return IncidentTransition(result.key, TRANSITION_ESCALATED, incident.id)
     if result.status != incident.severity:
@@ -249,21 +262,35 @@ def _handle_unhealthy(
         incident.severity = result.status
 
     if incident.last_alerted_at is None and _alerts_enabled(settings, result.key):
-        # This incident has been open (possibly for a while: created while
-        # alerting was disabled, or the loser of an open-race whose winner
-        # ran with alerting disabled) but has NEVER actually been queued
-        # for delivery. Now that alerting is available, catch up with one
-        # opening alert at the incident's CURRENT severity -- otherwise an
-        # admin enabling the admin bot after `monitor enable` (the exact
+        # This incident has never actually been queued for delivery at its
+        # CURRENT severity -- either it opened while alerting was disabled
+        # (the loser of an open-race whose winner ran with alerting
+        # disabled counts too), or it escalated further while disabled
+        # AFTER an earlier severity's alert already went out (see the
+        # escalation branch above, which resets last_alerted_at to None
+        # for exactly this reason). Now that alerting is available, catch
+        # up with one alert at the incident's CURRENT severity -- otherwise
+        # an admin enabling the admin bot after `monitor enable` (the exact
         # order MONITORING.md documents) would never hear about an
-        # incident that opened before that point.
+        # incident that opened or worsened before that point.
         incident.last_alerted_at = now
         db.flush()
         create_alert(
             db,
             alert_type="monitor_incident_opened",
             severity=incident.severity,
-            deduplication_key=f"monitor:{result.key}:{incident.id}",
+            # Time-varying (like the escalation key above), never just
+            # f"monitor:{result.key}:{incident.id}" -- that exact key may
+            # already belong to a REAL, already-delivered alert (the
+            # incident's original opening alert, if this catch-up follows
+            # a since-cleared escalation rather than a from-birth one),
+            # and colliding with it would get this genuinely new alert
+            # silently marked "suppressed" by create_alert's own
+            # dedup-window check instead of actually queued.
+            deduplication_key=(
+                f"monitor:{result.key}:{incident.id}:catchup:"
+                f"{incident.severity}:{now.isoformat()}"
+            ),
             payload=_alert_payload(result),
             now=now,
         )

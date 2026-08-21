@@ -321,6 +321,28 @@ def test_reconciliation_exhaustion_detected(session_factory, settings):
     assert result.reason == "reconciliation_exhausted"
 
 
+def test_reconciliation_exhausted_stays_critical_after_aging_out(session_factory, settings):
+    """An exhausted payment must not silently "recover" just because more
+    time also passed and it crossed the age boundary too -- it is now
+    MORE stuck (permanently excluded from automatic reconciliation, since
+    aged-out rows are dropped from every due tier), not less, and must
+    stay a critical incident until an operator resolves it."""
+    now = datetime.now(UTC)
+    recon = settings.model_copy(update={"reconciliation_max_attempts": 3})
+    _make_payment(
+        session_factory,
+        status="link_created",
+        reconciliation_attempts=3,
+        reconciliation_next_at=None,
+        callback_token_issued_at=now
+        - timedelta(seconds=recon.reconciliation_max_age_seconds + 100),
+    )
+    with session_factory() as db:
+        result = monitor_checks.check_reconciliation(db, recon, now=now)
+    assert result.status == "critical"
+    assert result.reason == "reconciliation_exhausted"
+
+
 def test_reconciliation_gateway_not_paid_is_not_an_incident(session_factory, settings):
     now = datetime.now(UTC)
     _make_payment(
@@ -664,3 +686,28 @@ def test_run_all_checks_omits_reconciliation_worker_heartbeat_when_disabled(
     keys = {r.key for r in results}
     assert "worker_heartbeat:notification-worker" in keys
     assert "worker_heartbeat:reconciliation-worker" not in keys
+
+
+def test_run_all_checks_includes_admin_bot_delivery_heartbeat_when_enabled(
+    session_factory, settings, monkeypatch
+):
+    """The admin bot's own delivery loop has no other visibility to this
+    dedicated monitor -- its container liveness heartbeat file lives in its
+    own tmpfs, never a database row, unless run_all_checks observes it."""
+    _patch_httpx_client(monkeypatch, _FakeClient(exc=httpx.ConnectError("down")))
+    enabled = settings.model_copy(update={"admin_bot_enabled": True})
+    with session_factory() as db:
+        results = monitor_checks.run_all_checks(db, enabled, include_db_integrity=False)
+    keys = {r.key for r in results}
+    assert "worker_heartbeat:admin-bot-delivery" in keys
+
+
+def test_run_all_checks_omits_admin_bot_delivery_heartbeat_when_disabled(
+    session_factory, settings, monkeypatch
+):
+    _patch_httpx_client(monkeypatch, _FakeClient(exc=httpx.ConnectError("down")))
+    disabled = settings.model_copy(update={"admin_bot_enabled": False})
+    with session_factory() as db:
+        results = monitor_checks.run_all_checks(db, disabled, include_db_integrity=False)
+    keys = {r.key for r in results}
+    assert "worker_heartbeat:admin-bot-delivery" not in keys

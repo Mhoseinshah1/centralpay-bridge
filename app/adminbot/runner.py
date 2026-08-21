@@ -8,6 +8,9 @@ heartbeat file is touched every loop for the container liveness check.
 
 import asyncio
 import logging
+import os
+import socket
+import uuid
 from pathlib import Path
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -22,8 +25,15 @@ from app.adminbot.reply_delivery import deliver_reply_chunks
 from app.adminbot.reports import maybe_queue_daily_report
 from app.adminbot.telegram import TelegramAlertSender
 from app.config import Settings
+from app.services.heartbeat import record_worker_heartbeat
+from app.services.notification import utcnow
 
 logger = logging.getLogger("app.adminbot.runner")
+
+# The check_worker_heartbeat name the dedicated monitor uses to observe this
+# loop's liveness -- see app.services.monitor_checks.run_all_checks, which
+# includes it only while ADMIN_BOT_ENABLED=true.
+DELIVERY_WORKER_NAME = "admin-bot-delivery"
 
 
 def parse_command(text: str) -> tuple[str, list[str]] | None:
@@ -65,6 +75,9 @@ class AdminBotService:
         self.sender = TelegramAlertSender(settings.admin_bot_token)
         self.monitor = HealthMonitor(settings, session_factory, default_api_probe(settings))
         self.stop_event = asyncio.Event()
+        # Same construction as app.monitor.build_instance_id -- unique per
+        # process so a restart never fights the previous instance's row.
+        self.instance_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -90,6 +103,8 @@ class AdminBotService:
         )
         tick = 0
         while not self.stop_event.is_set():
+            cycle_completed = False
+            error_code: str | None = None
             try:
                 await alert_delivery_pass(
                     self.session_factory, self.sender, self.settings, self.admin_ids
@@ -102,12 +117,35 @@ class AdminBotService:
                             maybe_queue_daily_report(db, self.settings)
 
                     await asyncio.to_thread(_report)
+                cycle_completed = True
                 try:
                     heartbeat.touch()
                 except OSError:
                     logger.warning("admin_heartbeat_write_failed")
-            except Exception:
+            except Exception as exc:
+                error_code = type(exc).__name__
                 logger.exception("admin_background_pass_failed")
+            # Database heartbeat for the dedicated monitor's visibility
+            # (see app.services.monitor_checks.run_all_checks and
+            # DELIVERY_WORKER_NAME above) -- best-effort, mirroring
+            # app.monitor's own heartbeat write; never stops the loop.
+            def _heartbeat(
+                cycle_completed: bool = cycle_completed, error_code: str | None = error_code
+            ) -> None:
+                with self.session_factory() as hb_db:
+                    record_worker_heartbeat(
+                        hb_db,
+                        worker_name=DELIVERY_WORKER_NAME,
+                        instance_id=self.instance_id,
+                        now=utcnow(),
+                        cycle_completed=cycle_completed,
+                        error_code=error_code,
+                    )
+
+            try:
+                await asyncio.to_thread(_heartbeat)
+            except Exception:
+                logger.warning("admin_db_heartbeat_failed")
             tick += 1
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=interval)
