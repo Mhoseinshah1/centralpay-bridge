@@ -55,6 +55,17 @@ def _write_docker_stub(bindir: Path, *, call_log: Path, monitor_running: bool) -
     (bindir / "docker").chmod(0o755)
 
 
+def _write_id_stub(bindir: Path) -> None:
+    # require_root shells out to `id -u`; these tests exercise the
+    # root-gated enable/disable subcommands without actually running as
+    # root (the CI runner is an unprivileged user), so this stub reports
+    # uid 0 the same way an operator's `sudo centralpay ...` invocation
+    # would. Not needed for any other purpose in this script (`id` is
+    # used exactly once, in require_root).
+    (bindir / "id").write_text("#!/usr/bin/env bash\necho 0\n")
+    (bindir / "id").chmod(0o755)
+
+
 @pytest.fixture
 def admin_bot_sandbox(tmp_path):
     install = tmp_path / "install"
@@ -76,6 +87,7 @@ def admin_bot_sandbox(tmp_path):
 def _env_for(sandbox, *, monitor_running: bool) -> dict[str, str]:
     call_log = sandbox["bindir"] / "docker_calls.log"
     _write_docker_stub(sandbox["bindir"], call_log=call_log, monitor_running=monitor_running)
+    _write_id_stub(sandbox["bindir"])
     return {
         "PATH": f"{sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
         "CENTRALPAY_INSTALL_DIR": str(sandbox["install"]),
