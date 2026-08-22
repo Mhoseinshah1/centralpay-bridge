@@ -267,15 +267,28 @@ every DB-dependent check that had to be skipped gets a
 "database"`) instead of being silently reported healthy or making the
 whole pass crash.
 
-This means `centralpay monitor check` and the admin bot's `/monitor`
-command stay fully usable DURING an outage — they show `public_ready`,
-`backup`, and `disk_space` at their real status and every DB-dependent
-check as `database_unavailable`, rather than raising an unhandled
-exception. app.monitor's own background loop already tolerated a raised
-pass (it logs `monitor_pass_failed` and retries next cycle) — this makes
-that tolerance produce a structured, useful snapshot instead of nothing,
-for the two on-demand, human-triggered surfaces that don't go through the
-incident-recording pipeline at all.
+This means `centralpay monitor check` stays fully usable DURING an
+outage — it shows `public_ready`, `backup`, and `disk_space` at their
+real status and every DB-dependent check as `database_unavailable`,
+rather than raising an unhandled exception. app.monitor's own background
+loop already tolerated a raised pass (it logs `monitor_pass_failed` and
+retries next cycle) — this makes that tolerance produce a structured,
+useful snapshot instead of nothing, for the CLI's on-demand,
+human-triggered surface that doesn't go through the incident-recording
+pipeline at all.
+
+**The admin bot's `/monitor` is NOT covered by this**, even though it
+calls the same `run_all_checks`: `CommandHandlers.handle`
+(`app/adminbot/commands.py`) unconditionally records and commits an
+`admin_command_received` audit event *before* invoking any command
+handler, on every command including `/monitor` — that commit itself
+requires a working database and raises first, so `/monitor` never even
+reaches `run_all_checks` during a full outage. Making every admin-bot
+command's audit trail best-effort during a database outage is a
+separate, broader change to the command-dispatch path (touching every
+command, not just this one diagnostic), out of scope here — during a
+genuine full PostgreSQL outage, use the host CLI's `centralpay monitor
+check` instead.
 
 **What this does NOT fix:** app.monitor's own loop still cannot durably
 record a "PostgreSQL is down" incident or Telegram alert, because
@@ -418,11 +431,22 @@ test_monitoring_reads_never_mutate_financial_state`).
      host, run once as root:
      `chgrp 10001 /var/backups/centralpay-bridge && chmod 0750 /var/backups/centralpay-bridge`
      (adjust the path if `CENTRALPAY_BACKUP_DIR` was customized).
+  3. **`backup_manifest_invalid` on a real backup**: `scripts/backup.sh`'s
+     `write_manifest()` makes each `.manifest` sidecar (non-secret
+     metadata — never the dump itself) group-readable by GID `10001` so
+     the monitor can parse it; a manifest written before this change
+     stays `0600` root-owned until the next backup rotation overwrites it
+     (daily by default). To fix an existing one without waiting, run once
+     as root: `chgrp 10001 /var/backups/centralpay-bridge/*.manifest &&
+     chmod 640 /var/backups/centralpay-bridge/*.manifest`.
 - **The database itself is fully unreachable** — `run_all_checks` itself
   degrades gracefully (see "Behavior during a database outage" above):
-  `centralpay monitor check` and `/monitor` keep working, showing
+  `centralpay monitor check` keeps working, showing
   `public_ready`/`backup`/`disk_space` at their real status and every
-  DB-dependent check as `database_unavailable`. What remains the one
+  DB-dependent check as `database_unavailable`. The admin bot's
+  `/monitor` does NOT share this — its own mandatory command-audit write
+  fails first (see "Behavior during a database outage" above), so use
+  the host CLI during a genuine full outage. What remains the one
   scenario Telegram alerting genuinely cannot cover is DURABLE,
   PROACTIVE notification: an open incident and its alert both need to be
   written to the very PostgreSQL instance that is down, so app.monitor's

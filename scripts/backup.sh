@@ -76,7 +76,9 @@ validate_archive() {
 
 write_manifest() {
     # Non-secret metadata sidecar, written atomically. Verified by
-    # "centralpay restore" before any destructive action.
+    # "centralpay restore" before any destructive action, and (metadata
+    # only -- see app.services.monitor_checks._backup_manifest_issue) by
+    # the monitor/admin-bot's periodic backup check.
     local f="$1" sha size app_version server_version revision tmp
     sha=$(sha256sum -- "$f" | cut -d' ' -f1)
     size=$(stat -c%s -- "$f")
@@ -97,7 +99,15 @@ write_manifest() {
         echo "alembic_revision=${revision:-unknown}"
         echo "validation=passed"
     } > "$tmp"
-    chmod 600 "$tmp"
+    # Group-readable (content, not just listing/stat) by GID 10001 -- the
+    # fixed, non-root UID/GID the application image runs the monitor and
+    # admin-bot containers as (see install.sh's own BACKUP_DIR permissions
+    # comment). Unlike the dump file itself (kept 0600, root-only -- it
+    # contains actual database contents), this sidecar is explicitly
+    # documented as non-secret metadata, and the monitor's backup check
+    # must be able to read its CONTENTS, not just confirm it exists.
+    chmod 640 "$tmp"
+    chgrp 10001 "$tmp" 2>/dev/null || true
     mv "$tmp" "${f}.manifest"
     log "backup_manifest_written sha256=${sha:0:12}... size=${size}"
 }

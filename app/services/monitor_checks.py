@@ -23,6 +23,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.adminbot import queries
@@ -49,29 +50,55 @@ _SEVERITY_RANK = {STATUS_OK: 0, STATUS_WARNING: 1, STATUS_CRITICAL: 2}
 #
 # centralpay_verify_failed is different: app.services.verification.
 # verify_and_settle records it for TWO semantically different outcomes
-# under the SAME event type, distinguished only by data.stage --
+# under the SAME event type, distinguished by data.stage --
 # stage="transport" is a real CentralPayError (connection/protocol/HTTP
-# failure calling verify.php), an infrastructure signal; stage="gateway" is
-# CentralPay explicitly answering that one specific payment was not
-# successful (the payer simply didn't complete or abandoned it) -- an
-# ordinary, expected, high-frequency business outcome that must never feed
-# a gateway-outage burst count, no matter how many payers it happens to at
-# once. A row with no/other stage value is treated the same as
-# stage="gateway": excluded rather than risk a misleading alert.
+# failure calling verify.php), always an infrastructure signal.
+#
+# stage="gateway" means CentralPay answered with gateway_success=False, but
+# that itself covers TWO different cases -- see app.centralpay.
+# gateway_reason_code / CentralPayClient.verify, whose fixed-vocabulary
+# `failure_reason` is recorded verbatim as data.reason:
+#   - "gateway_rejected" (GATEWAY_REJECTED): an EXPLICIT rejection marker
+#     (success=false / a failure status value / an error field) -- CentralPay
+#     unambiguously said "this payment wasn't successful". The payer simply
+#     didn't complete or abandoned it -- an ordinary, expected,
+#     high-frequency business outcome, never a gateway outage, no matter how
+#     many payers it happens to at once.
+#   - "gateway_response_invalid" / "gateway_missing_data"
+#     (GATEWAY_RESPONSE_INVALID / GATEWAY_MISSING_DATA): CentralPay's
+#     response had NEITHER a clear success NOR a clear failure marker --
+#     unlike an explicit rejection, this is CentralPay's verify API itself
+#     behaving abnormally (e.g. serving a malformed/incomplete body), a
+#     genuine protocol-level infrastructure signal that must keep counting
+#     -- otherwise a systemic verify-API outage that returns HTTP 200 with a
+#     broken body for every payment would produce zero burst incidents.
+# Any other/missing reason for stage="gateway" is ambiguous and excluded,
+# same as a row with no stage value at all.
 _GATEWAY_FAILURE_TRANSPORT_STAGE = "transport"
+_GATEWAY_FAILURE_GATEWAY_STAGE = "gateway"
+_GATEWAY_FAILURE_AMBIGUOUS_REASONS = ("gateway_response_invalid", "gateway_missing_data")
 _GATEWAY_FAILURE_RELIABLE_PREDICATE = or_(
     PaymentEvent.event_type == "centralpay_getlink_failed",
     and_(
         PaymentEvent.event_type == "centralpay_verify_failed",
-        PaymentEvent.data["stage"].as_string() == _GATEWAY_FAILURE_TRANSPORT_STAGE,
+        or_(
+            PaymentEvent.data["stage"].as_string() == _GATEWAY_FAILURE_TRANSPORT_STAGE,
+            and_(
+                PaymentEvent.data["stage"].as_string() == _GATEWAY_FAILURE_GATEWAY_STAGE,
+                PaymentEvent.data["reason"].as_string().in_(_GATEWAY_FAILURE_AMBIGUOUS_REASONS),
+            ),
+        ),
     ),
 )
 _BOT_FAILURE_EVENT_TYPE = "bot_notification_failed"
 _BACKUP_GLOB = "centralpay-*.dump"
-# scripts/backup.sh's write_manifest() always writes exactly these keys
-# for a successfully validated backup. Any manifest missing one is either
-# truncated, corrupted, or was never produced by that tooling at all.
-_BACKUP_MANIFEST_REQUIRED_KEYS = ("backup_file", "sha256", "size_bytes")
+# scripts/backup.sh's write_manifest() always writes exactly these keys,
+# in this order, for a successfully validated backup -- including
+# "validation" LAST, so a manifest truncated partway through writing (a
+# crash/kill between lines) is missing it even though every key written
+# before it is present. Any manifest missing one is either truncated,
+# corrupted, or was never produced by that tooling at all.
+_BACKUP_MANIFEST_REQUIRED_KEYS = ("backup_file", "sha256", "size_bytes", "validation")
 _BACKUP_MANIFEST_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Check keys that always run every cheap cycle (everything except
@@ -349,8 +376,7 @@ def _backup_manifest_issue(dump: Path, dump_size: int) -> str | None:
         return "manifest_malformed"
     if manifest_size != dump_size:
         return "manifest_size_mismatch"
-    validation = fields.get("validation")
-    if validation is not None and validation != "passed":
+    if fields["validation"] != "passed":
         return "manifest_malformed"
     return None
 
@@ -623,14 +649,19 @@ def run_all_checks(
     even when PostgreSQL itself is unavailable — they read one outbound
     HTTPS URL and the filesystem, never this function's `db` session.
     Every other check is DB-DEPENDENT. If the initial `database` probe
-    already reports critical, or if a later DB-dependent check raises
-    (the connection dies mid-pass, e.g. a real OperationalError), no
-    further SQL is attempted on this session for the rest of this pass —
-    every check that had to be skipped gets a critical/
-    database_unavailable placeholder instead. A PostgreSQL outage must
-    never make this function raise: every caller (the CLI, the admin
-    bot's /monitor command, and app.monitor's own loop) always gets back
-    a complete, structured result list, even mid-outage."""
+    already reports critical, or if a later DB-dependent check raises a
+    SQLAlchemyError (the connection dies mid-pass, e.g. a real
+    OperationalError), no further SQL is attempted on this session for the
+    rest of this pass — every check that had to be skipped gets a
+    critical/database_unavailable placeholder instead. Only database
+    connectivity failures degrade this way: a non-database bug in a
+    check (e.g. a ValueError) is deliberately NOT caught here and
+    propagates normally, so it is never mislabeled as a fabricated
+    PostgreSQL outage — see app.monitor.run_forever's own
+    monitor_pass_failed handling for that case. A genuine PostgreSQL
+    outage must never make this function raise: every caller (the CLI,
+    the admin bot's /monitor command, and app.monitor's own loop) always
+    gets back a complete, structured result list, even mid-outage."""
     now = now_fn()
     results = [check_public_ready(settings), check_backup(settings, now=now), check_disk(settings)]
 
@@ -649,7 +680,7 @@ def run_all_checks(
     for index, (key, thunk) in enumerate(db_dependent):
         try:
             results.append(thunk())
-        except Exception as exc:
+        except SQLAlchemyError as exc:
             logger.warning(
                 "monitor_check_query_failed", extra={"check": key, "error": type(exc).__name__}
             )

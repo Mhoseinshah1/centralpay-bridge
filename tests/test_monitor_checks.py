@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
+import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
@@ -561,6 +562,35 @@ def test_backup_manifest_missing_required_key_is_not_healthy(settings, tmp_path)
     assert result.details["manifest_issue"] == "manifest_malformed"
 
 
+def test_backup_manifest_truncated_before_validation_marker_is_not_healthy(settings, tmp_path):
+    """write_manifest() writes "validation=passed" LAST -- a manifest
+    truncated partway through writing (a crash/kill between lines) can
+    have every OTHER field present and consistent, but be missing that
+    final marker. That must still be rejected: it's incomplete evidence
+    that the archive actually passed validation, not just an unrelated
+    missing field."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    fields = {
+        "backup_file": dump.name,
+        "sha256": "a" * 64,
+        "size_bytes": str(dump.stat().st_size),
+        "created_at": "2026-01-01T00:00:00Z",
+        "app_version": "0.6.0",
+        "postgres_version": "16.0",
+        "alembic_revision": "0012",
+        # "validation=passed" deliberately omitted -- truncated write.
+    }
+    (tmp_path / (dump.name + ".manifest")).write_text(
+        "\n".join(f"{key}={value}" for key, value in fields.items()) + "\n"
+    )
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
 def test_backup_manifest_wrong_dump_filename_is_not_healthy(settings, tmp_path):
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")
@@ -759,11 +789,12 @@ def test_gateway_failure_burst_counts_affected_payments_not_attempts(session_fac
     assert result.details["affected_payments"] == 1
 
 
-def test_gateway_failure_burst_excludes_verify_failed_ordinary_payer_outcome(
+def test_gateway_failure_burst_excludes_verify_failed_explicit_rejection(
     session_factory, settings
 ):
-    """centralpay_verify_failed stage="gateway" is CentralPay explicitly
-    answering "not successful" for one specific payment during a callback
+    """centralpay_verify_failed stage="gateway" reason="gateway_rejected"
+    (app.centralpay.GATEWAY_REJECTED) is CentralPay EXPLICITLY answering
+    "not successful" for one specific payment during a callback
     (app.services.verification.verify_and_settle) -- an ordinary, expected
     outcome (the payer didn't complete/abandoned), never a gateway
     infrastructure failure. Several payers failing around the same time
@@ -776,12 +807,65 @@ def test_gateway_failure_burst_excludes_verify_failed_ordinary_payer_outcome(
                 db,
                 payment_id=payment.id,
                 event_type="centralpay_verify_failed",
-                data={"stage": "gateway", "reason": "verify not successful"},
+                data={"stage": "gateway", "reason": "gateway_rejected"},
             )
         db.commit()
         result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
     assert result.status == "ok"
     assert result.details["affected_payments"] == 0
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_response_invalid(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_response_invalid"
+    (app.centralpay.GATEWAY_RESPONSE_INVALID) means CentralPay's response
+    had NEITHER a clear success NOR a clear failure marker -- unlike an
+    explicit rejection, this is the verify API itself behaving abnormally,
+    a genuine protocol-level infra signal that must still count. Otherwise
+    a systemic verify-API outage returning HTTP 200 with a broken body for
+    every payment would produce zero burst incidents."""
+    payments = [_make_payment(session_factory, status="link_created") for _ in range(3)]
+    low = settings.model_copy(
+        update={
+            "monitor_gateway_failure_warning_count": 1,
+            "monitor_gateway_failure_critical_count": 3,
+        }
+    )
+    with session_factory() as db:
+        for payment in payments:
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                data={"stage": "gateway", "reason": "gateway_response_invalid"},
+            )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["affected_payments"] == 3
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_missing_data(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_missing_data"
+    (app.centralpay.GATEWAY_MISSING_DATA) -- same reasoning as
+    gateway_response_invalid above: a protocol-level anomaly, not an
+    ordinary payer-declined outcome, so it must still count."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway", "reason": "gateway_missing_data"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "warning"
+    assert result.details["affected_payments"] == 1
 
 
 def test_gateway_failure_burst_excludes_verify_failed_missing_stage(session_factory, settings):
@@ -792,6 +876,27 @@ def test_gateway_failure_burst_excludes_verify_failed_missing_stage(session_fact
     with session_factory() as db:
         record_event(
             db, payment_id=payment.id, event_type="centralpay_verify_failed", data={}
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "ok"
+    assert result.details["affected_payments"] == 0
+
+
+def test_gateway_failure_burst_excludes_verify_failed_gateway_stage_missing_reason(
+    session_factory, settings
+):
+    """stage="gateway" with no reason field at all (or an unrecognized one)
+    is ambiguous -- excluded rather than risk a misleading alert, same as
+    a missing stage."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway"},
         )
         db.commit()
         result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
@@ -1155,6 +1260,25 @@ def test_run_all_checks_degrades_gracefully_when_a_later_query_fails_mid_pass(
     for key in remaining_keys:
         assert by_key[key].status == "critical", key
         assert by_key[key].reason == "database_unavailable", key
+
+
+def test_run_all_checks_does_not_mislabel_a_non_database_bug(
+    session_factory, settings, monkeypatch
+):
+    """A bug in a check that has nothing to do with database connectivity
+    (here: a plain ValueError, as if run_db_checks had a real defect) must
+    propagate normally, not get silently absorbed and reported as a
+    fabricated `database_unavailable` -- that would hide the actual
+    failure behind a misleading "PostgreSQL is down" story. Only
+    SQLAlchemyError triggers the outage-degradation path."""
+
+    def _buggy(db, status):
+        raise ValueError("not a database problem")
+
+    monkeypatch.setattr(queries, "count_by_status", _buggy)
+
+    with session_factory() as db, pytest.raises(ValueError, match="not a database problem"):
+        monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
 
 
 def test_run_all_checks_healthy_path_unaffected_by_outage_handling(
