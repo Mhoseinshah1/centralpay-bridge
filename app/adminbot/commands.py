@@ -44,6 +44,7 @@ from app.services.bulk_resend import (
     preview_bulk_resend,
     requeue_failed_deliveries,
 )
+from app.services.monitor_checks import CheckResult, overall_status, run_all_checks
 from app.services.payment_lookup import AmbiguousOrderIdError
 from app.version import APP_VERSION
 
@@ -78,6 +79,44 @@ BULK_RESEND_SAFE_MODE_MESSAGE = (
 
 # check_api_health() -> {"live": bool, "ready": bool}
 ApiProbe = Callable[[], dict[str, bool]]
+
+_MONITOR_ICON = {"ok": OK, "warning": WARN, "critical": FAIL}
+
+_MONITOR_LABELS_FA = {
+    "public_ready": "API عمومی",
+    "database": "پایگاه‌داده",
+    "worker_heartbeat:notification-worker": "ورکر اعلان",
+    "worker_heartbeat:reconciliation-worker": "ورکر تطبیق",
+    "notification_backlog": "صف اعلان",
+    "manual_review": "بررسی دستی",
+    "reconciliation": "تطبیق",
+    "backup": "پشتیبان‌گیری",
+    "disk_space": "فضای دیسک",
+    "gateway_failure_burst": "خطای درگاه",
+    "bot_failure_burst": "خطای تحویل به ربات",
+    "db_integrity": "یکپارچگی پایگاه‌داده",
+}
+
+
+def _monitor_detail_fa(result: CheckResult) -> str:
+    """A short, informative suffix per check — never the full details dict
+    (that stays in MonitorIncident/`centralpay monitor check --json`)."""
+    d = result.details
+    if result.key == "public_ready" and "latency_ms" in d:
+        return f" — {d['latency_ms']} ms"
+    if result.key.startswith("worker_heartbeat:") and "age_seconds" in d:
+        return f" — {int(d['age_seconds'])} ثانیه پیش"
+    if result.key in ("notification_backlog", "manual_review") and "count" in d:
+        return f" — {d['count']}"
+    if result.key == "reconciliation" and "exhausted_not_aged_out" in d:
+        return f" — اتمام‌یافته: {d['exhausted_not_aged_out']}"
+    if result.key == "backup" and "age_seconds" in d:
+        return f" — {int(d['age_seconds'] // 3600)} ساعت پیش"
+    if result.key == "disk_space" and "free_percent" in d:
+        return f" — {d['free_percent']}% آزاد"
+    if result.key in ("gateway_failure_burst", "bot_failure_burst") and "affected_payments" in d:
+        return f" — {d['affected_payments']} پرداخت"
+    return ""
 
 
 def _mark(ok: bool) -> str:
@@ -204,6 +243,7 @@ class CommandHandlers:
             "backup_status": self.cmd_backup_status,
             "version": self.cmd_version,
             "fee": self.cmd_fee,
+            "monitor": self.cmd_monitor,
         }
         # resend_failed is the only mutating command; it needs the authorized
         # caller's numeric id for the audit trail, threaded explicitly (never
@@ -227,7 +267,7 @@ class CommandHandlers:
                 f"محیط: {esc(self._settings.environment)}",
                 f"نسخه: {esc(APP_VERSION)}",
                 "",
-                "دستورها: /status /health /recent /stuck /waiting /expired",
+                "دستورها: /status /health /monitor /recent /stuck /waiting /expired",
                 "/manual_review /resolved_reviews /errors /payment /retry_queue",
                 "/resend_failed /backup_status /version /fee /help",
                 "",
@@ -244,6 +284,7 @@ class CommandHandlers:
                 "",
                 "/status — وضعیت کلی سرویس‌ها و صف‌ها",
                 "/health — جزئیات سلامت اجزا",
+                "/monitor — گزارش کامل پایش سیستم",
                 "/recent [n] — آخرین پرداخت‌ها (حداکثر ۵۰)",
                 "/stuck — خطاهای تحویل به ربات فروش",
                 "/waiting [n] — پرداخت‌های در انتظار تأیید درگاه (حداکثر ۵۰)",
@@ -807,6 +848,30 @@ class CommandHandlers:
         if failed is not None:
             lines.append(f"{FAIL} آخرین خطا: {fmt_time(failed.created_at, tz)}")
         lines.append("زمان‌بندی: هر شب ساعت ۰۳:۱۵ به وقت سرور")
+        return self._split("\n".join(lines))
+
+    def cmd_monitor(self, db: Session, args: list[str]) -> list[str]:
+        """Read-only aggregate monitoring snapshot: reuses the EXACT same
+        checks app.monitor's background loop and `centralpay monitor check`
+        use (app.services.monitor_checks.run_all_checks) — never a
+        separately maintained copy, so this can never quietly disagree with
+        either. Always includes db_integrity: unlike the automatic loop,
+        this command is human-triggered and infrequent, so running the one
+        expensive check on demand is acceptable (same reasoning as
+        `centralpay db-check` itself already being on-demand).
+
+        This bot can only READ monitoring state — it can never acknowledge,
+        resolve, or silence an incident; that remains the host CLI's job
+        (`centralpay monitor incidents`)."""
+        results = run_all_checks(db, self._settings)
+        status = overall_status(results)
+        lines = [f"{_MONITOR_ICON.get(status, '⚪')} <b>پایش CentralPay</b>", ""]
+        for result in results:
+            label = _MONITOR_LABELS_FA.get(result.key, result.key)
+            icon = _MONITOR_ICON.get(result.status, "⚪")
+            lines.append(f"{icon} {label}{_monitor_detail_fa(result)}")
+        lines.append("")
+        lines.append(f"وضعیت کلی: <b>{status.upper()}</b>")
         return self._split("\n".join(lines))
 
     def cmd_version(self, db: Session, args: list[str]) -> list[str]:

@@ -13,6 +13,7 @@ Role allowlist:
 - Worker: customer-bot notification credential
 - Admin bot: Telegram administration credential
 - Migrate: database only
+- Monitor: database only (alert delivery goes through the admin bot)
 - Caddy: no application credentials
 """
 
@@ -79,6 +80,10 @@ SERVICE_ALLOWLIST: dict[str, set[str]] = {
     # Migrations need the database and nothing else (alembic/env.py reads
     # DATABASE_URL only).
     "migrate": {"DATABASE_URL"},
+    # The monitor only reads existing tables and writes MonitorIncident /
+    # admin_alerts rows — it never calls CentralPay and never talks to
+    # Telegram itself (delivery is the admin-bot's job).
+    "monitor": {"DATABASE_URL"},
 }
 
 # Masks must be visibly non-production: empty, or a fixed
@@ -262,6 +267,21 @@ def test_migrate_settings_construction_under_masking(compose):
     assert settings.inbound_api_key == "not-used-by-migrate-x"
     assert settings.callback_hmac_secret == "not-used-by-migrate-x"
     assert settings.centralpay_getlink_api_key == "not-used-by-migrate"
+    assert settings.bot_notify_token == ""
+    assert settings.admin_bot_token == ""
+    assert settings.admin_telegram_ids == ""
+
+
+def test_monitor_settings_construction_under_masking(compose):
+    """The monitor reads DATABASE_URL and PUBLIC_BASE_URL (its public-
+    readiness check target, never a secret) and nothing else."""
+    settings = settings_for(compose, "monitor")
+    assert settings.database_url == _ENV_FILE_SIMULATION["DATABASE_URL"]
+    assert settings.public_base_url == "https://pay.example.com"
+    assert settings.inbound_api_key == "not-used-by-monitor-x"
+    assert settings.callback_hmac_secret == "not-used-by-monitor-x"
+    assert settings.centralpay_getlink_api_key == "not-used-by-monitor"
+    assert settings.centralpay_verify_api_key == "not-used-by-monitor"
     assert settings.bot_notify_token == ""
     assert settings.admin_bot_token == ""
     assert settings.admin_telegram_ids == ""

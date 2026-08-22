@@ -39,6 +39,7 @@ from app.services.reconciliation import (
     expiring_tier_due_conditions,
     link_age_anchor,
     reconciliation_exhausted_conditions,
+    reconciliation_exhausted_ever_conditions,
 )
 
 NowFn = Callable[[], datetime]
@@ -171,6 +172,20 @@ class QueueHealth:
     oldest_active_due_age_seconds: float | None
     oldest_expiring_due_age_seconds: float | None
     oldest_due_age_seconds: float | None
+    # How long the single oldest due row has been WAITING since it became
+    # eligible for an attempt (COALESCE(reconciliation_next_at, created_at)
+    # -- the same due-ordering anchor _claim_in_age_range uses), never how
+    # old its payment LINK is. A payer who simply hasn't paid yet does not
+    # grow this value; only the worker actually falling behind its own
+    # scheduled due times does. See app.services.monitor_checks.
+    # check_reconciliation, the sole consumer of this field.
+    oldest_overdue_seconds: float | None
+    # Attempts-exhausted payments, INCLUDING ones that have also since aged
+    # out -- unlike exhausted_not_aged_out above, this never drops a
+    # payment just because more time passed. See
+    # reconciliation.reconciliation_exhausted_ever_conditions and
+    # app.services.monitor_checks.check_reconciliation, the sole consumer.
+    exhausted_including_aged_out: int
 
 
 @dataclass(frozen=True)
@@ -267,27 +282,35 @@ def _buckets(db: Session, settings: Settings, now: datetime) -> PaymentBuckets:
 
 def _queue(db: Session, settings: Settings, now: datetime) -> QueueHealth:
     anchor = link_age_anchor()
+    # The same COALESCE ordering _claim_in_age_range uses to pick which due
+    # row to attempt next -- "became due at", not "link created at".
+    due_since_anchor = func.coalesce(Payment.reconciliation_next_at, Payment.created_at)
 
     def count(conditions: tuple[Any, ...]) -> int:
         return db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
 
-    def oldest_age(conditions: tuple[Any, ...]) -> float | None:
-        oldest_anchor = db.execute(select(func.min(anchor)).where(*conditions)).scalar_one()
+    def oldest_by(anchor_expr: Any, conditions: tuple[Any, ...]) -> float | None:
+        oldest_anchor = db.execute(select(func.min(anchor_expr)).where(*conditions)).scalar_one()
         return _age_seconds(oldest_anchor, now)
 
     active_conditions = active_tier_due_conditions(settings, now=now)
     expiring_conditions = expiring_tier_due_conditions(settings, now=now)
     exhausted_conditions = reconciliation_exhausted_conditions(settings, now=now)
+    exhausted_ever_conditions = reconciliation_exhausted_ever_conditions(settings, now=now)
 
-    oldest_active = oldest_age(active_conditions)
-    oldest_expiring = oldest_age(expiring_conditions)
+    oldest_active = oldest_by(anchor, active_conditions)
+    oldest_expiring = oldest_by(anchor, expiring_conditions)
+    oldest_active_overdue = oldest_by(due_since_anchor, active_conditions)
+    oldest_expiring_overdue = oldest_by(due_since_anchor, expiring_conditions)
     return QueueHealth(
         active_due=count(active_conditions),
         expiring_due=count(expiring_conditions),
         exhausted_not_aged_out=count(exhausted_conditions),
+        exhausted_including_aged_out=count(exhausted_ever_conditions),
         oldest_active_due_age_seconds=oldest_active,
         oldest_expiring_due_age_seconds=oldest_expiring,
         oldest_due_age_seconds=_oldest_age(oldest_active, oldest_expiring),
+        oldest_overdue_seconds=_oldest_age(oldest_active_overdue, oldest_expiring_overdue),
     )
 
 

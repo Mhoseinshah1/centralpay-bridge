@@ -83,6 +83,7 @@ def _move_to_manual_review(
 ) -> None:
     record_event(db, payment_id=payment.id, event_type=mismatch_event, level="error", data=data)
     payment.status = PaymentStatus.MANUAL_REVIEW.value
+    payment.manual_review_at = utcnow()
     payment.last_error = mismatch_event
     record_event(
         db,

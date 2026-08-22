@@ -385,7 +385,7 @@ def test_migration_0010_from_production_0008(settings, pg_engine):
         )
 
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0010"
+    assert _alembic_version(pg_engine) == "0012"
     assert _column_names(pg_engine, "payments") >= _RECON_COLUMNS
     assert "ix_payments_reconciliation_due" in _index_names(pg_engine, "payments")
     with pg_engine.connect() as conn:
@@ -401,12 +401,12 @@ def test_migration_0010_from_production_0008(settings, pg_engine):
     # downgrade both no-op destructively.
     _alembic("stamp", "0009")
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0010"
+    assert _alembic_version(pg_engine) == "0012"
     _alembic("downgrade", "0009")
     assert _alembic_version(pg_engine) == "0009"
     assert _column_names(pg_engine, "payments") >= _RECON_COLUMNS  # preserved
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0010"
+    assert _alembic_version(pg_engine) == "0012"
 
     # The previously stuck payment now reconciles through the normal path.
     stub = CentralPayStub()

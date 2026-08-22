@@ -184,6 +184,12 @@ services:
       BOT_NOTIFY_TOKEN: ""
       INBOUND_API_KEY: not-used-by-admin-bot-x
       CALLBACK_HMAC_SECRET: not-used-by-admin-bot-x
+      # Fixed to the bind mount's CONTAINER-side target below, independent
+      # of whatever host path CENTRALPAY_BACKUP_DIR names in centralpay.env
+      # (that value only controls scripts/backup.sh and this mount's HOST
+      # source) -- so the /monitor command's backup/disk lines can never
+      # look in the wrong place after an operator changes the host path.
+      CENTRALPAY_BACKUP_DIR: /var/backups/centralpay-bridge
     # Only started when the admin-bot profile is enabled (the centralpay
     # command adds --profile admin-bot when ADMIN_BOT_ENABLED=true).
     profiles: ["admin-bot"]
@@ -195,6 +201,11 @@ services:
         condition: service_completed_successfully
     networks:
       - internal
+    volumes:
+      # Read-only: lets the /monitor command's backup-freshness/disk-space
+      # lines report real data instead of "unreadable" — the same mount
+      # (and the same never-write contract) the monitor service uses.
+      - ${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}:/var/backups/centralpay-bridge:ro
     # No published ports; outbound Telegram only. Hardened: read-only root
     # filesystem, tmpfs for the heartbeat file, no capabilities, no
     # privilege escalation, no Docker socket, non-root user from the image.
@@ -214,6 +225,73 @@ services:
           import os, sys, time
           path = os.environ.get("ADMIN_BOT_HEARTBEAT_FILE", "/tmp/centralpay-adminbot-heartbeat")
           fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < 180
+          sys.exit(0 if fresh else 1)
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 45s
+    logging: *default-logging
+
+  monitor:
+    <<: [*app-image, *app-env, *app-hardening]
+    command: ["python", "-m", "app.monitor"]
+    # Least privilege: the monitor only READS existing tables (via
+    # app.services.monitor_checks) and writes MonitorIncident /
+    # admin_alerts rows (app.services.monitor_incidents). It never creates
+    # payment links, never calls CentralPay, and never talks to Telegram
+    # itself (delivery is the admin-bot's job), so every credential it
+    # doesn't need stays masked with placeholders (environment: entries
+    # override env_file values) — identical masking to the worker service.
+    environment:
+      CENTRALPAY_GETLINK_API_KEY: not-used-by-monitor
+      CENTRALPAY_VERIFY_API_KEY: not-used-by-monitor
+      CENTRALPAY_PAYER_ID_SECRET: not-used-by-monitor
+      INBOUND_API_KEY: not-used-by-monitor-x
+      CALLBACK_HMAC_SECRET: not-used-by-monitor-x
+      BOT_NOTIFY_TOKEN: ""
+      ADMIN_BOT_TOKEN: ""
+      ADMIN_TELEGRAM_IDS: ""
+      # Fixed to the bind mount's CONTAINER-side target below, independent
+      # of whatever host path CENTRALPAY_BACKUP_DIR names in centralpay.env
+      # (that value only controls scripts/backup.sh and this mount's HOST
+      # source) -- so the backup/disk checks can never look in the wrong
+      # place after an operator changes the host path.
+      CENTRALPAY_BACKUP_DIR: /var/backups/centralpay-bridge
+    # Only started when the monitor profile is enabled (the centralpay
+    # command adds --profile monitor when MONITOR_ENABLED=true) — a fresh
+    # install never runs this service until an operator opts in.
+    profiles: ["monitor"]
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    volumes:
+      # Read-only: the backup-freshness and disk-space checks need to see
+      # this directory (same host path scripts/backup.sh writes to). The
+      # monitor never creates, modifies, or deletes a backup.
+      - ${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}:/var/backups/centralpay-bridge:ro
+    healthcheck:
+      # Liveness: the monitor touches this file after every completed pass.
+      # The freshness bound is DERIVED from MONITOR_INTERVAL_SECONDS
+      # (same "interval * 6, floor 180s" shape
+      # app.services.reconciliation_status uses for its own worker-
+      # heartbeat freshness) rather than a bare constant, so raising the
+      # poll interval past a fixed threshold can never make a perfectly
+      # healthy monitor flap unhealthy and restart-loop.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import os, sys, time
+          path = os.environ.get("MONITOR_HEARTBEAT_FILE", "/tmp/centralpay-monitor-heartbeat")
+          interval = float(os.environ.get("MONITOR_INTERVAL_SECONDS", "60") or 60)
+          bound = max(interval * 6, 180)
+          fresh = os.path.exists(path) and time.time() - os.path.getmtime(path) < bound
           sys.exit(0 if fresh else 1)
       interval: 30s
       timeout: 5s

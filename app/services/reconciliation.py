@@ -328,6 +328,34 @@ def reconciliation_exhausted_conditions(settings: Settings, *, now: datetime) ->
     )
 
 
+def reconciliation_exhausted_ever_conditions(
+    settings: Settings, *, now: datetime
+) -> tuple[Any, ...]:
+    """Same population as :func:`reconciliation_exhausted_conditions`, minus
+    its "NOT aged out" restriction: every ``link_created`` payment whose
+    reconciliation attempts hit the cap, regardless of whether it has ALSO
+    since aged out.
+
+    Operator-facing bucket display (``reconciliation_status.py``,
+    ``stuck_payments.py``) deliberately wants "exhausted" and "aged out" as
+    mutually exclusive categories, which is exactly what
+    :func:`reconciliation_exhausted_conditions` gives it. Monitoring needs
+    the opposite: a payment reconciliation gave up on due to repeated
+    failures must stay visible as a critical condition even after it also
+    crosses the age boundary later -- otherwise the SAME stuck payment
+    aging out would silently "resolve" the monitor's incident, reporting a
+    false recovery for something that got MORE stuck, not less. See
+    ``app.services.monitor_checks.check_reconciliation``, the sole
+    consumer of this condition.
+    """
+    return (
+        Payment.status == PaymentStatus.LINK_CREATED.value,
+        Payment.gateway_verified_at.is_(None),
+        Payment.reconciliation_next_at.is_(None),
+        Payment.reconciliation_attempts >= settings.reconciliation_max_attempts,
+    )
+
+
 def _claim_in_age_range(
     db: Session,
     settings: Settings,

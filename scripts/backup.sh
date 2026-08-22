@@ -22,8 +22,16 @@ umask 077
 
 INSTALL_DIR="${CENTRALPAY_INSTALL_DIR:-/opt/centralpay-bridge}"
 CONFIG_DIR="${CENTRALPAY_CONFIG_DIR:-/etc/centralpay-bridge}"
-BACKUP_DIR="${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}"
 ENV_FILE="${CONFIG_DIR}/centralpay.env"
+# CENTRALPAY_BACKUP_DIR is normally set inside centralpay.env (see
+# deploy/centralpay.env.template). This script runs both interactively
+# (via `centralpay backup`, already inside a shell where scripts/centralpay
+# exports it) and directly from centralpay-backup.service (systemd, with no
+# such export), so it must resolve the configured value itself rather than
+# assume the caller already exported it.
+_configured_backup_dir=$(grep -E '^CENTRALPAY_BACKUP_DIR=' "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true)
+BACKUP_DIR="${_configured_backup_dir:-${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}}"
+unset _configured_backup_dir
 DRY_RUN="${BACKUP_DRY_RUN:-0}"
 LOCK_FILE="${BACKUP_DIR}/.backup.lock"
 

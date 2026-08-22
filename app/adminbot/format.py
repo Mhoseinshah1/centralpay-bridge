@@ -249,6 +249,9 @@ _ALERT_TITLES_FA = {
     "backup_failed": "خطا در پشتیبان‌گیری",
     "service_unhealthy": "اختلال در سرویس",
     "service_recovered": "سرویس به حالت عادی بازگشت",
+    "monitor_incident_opened": "هشدار پایش: شروع اختلال",
+    "monitor_incident_escalated": "هشدار پایش: تشدید اختلال",
+    "monitor_incident_resolved": "پایش: رفع اختلال",
     "admin_test_alert": "پیام آزمایشی",
     "daily_report": "گزارش روزانه",
 }

@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -354,6 +355,82 @@ class WorkerHeartbeat(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MonitorIncidentStatus(enum.StrEnum):
+    OPEN = "open"
+    RESOLVED = "resolved"
+
+
+class MonitorIncident(Base):
+    """Durable, cross-restart incident state for app.monitor's checks.
+
+    Rows are created/updated by app.services.monitor_incidents, never by a
+    check itself. At most one OPEN row can exist per ``check_key`` — the
+    partial unique index below is the atomic guarantee that stops two
+    racing monitor instances from opening duplicate incidents (and firing
+    duplicate Telegram alerts) for the same condition; the caller inserts
+    optimistically and treats a resulting IntegrityError as "someone else
+    just opened it," the same idiom app.services.payments already uses for
+    bot_order_id races. A resolved incident's row is kept as history — a
+    check that flaps open/resolved repeatedly accumulates one row per
+    episode, never overwrites the previous one.
+    """
+
+    __tablename__ = "monitor_incidents"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    # Stable machine identifier for the failing condition, e.g.
+    # "worker_heartbeat:notification-worker", "disk_space". Never a
+    # free-text message.
+    check_key: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # "warning" | "critical" — the severity AT THE MOST RECENT check cycle
+    # that touched this row (escalation/de-escalation updates it in place).
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=MonitorIncidentStatus.OPEN.value
+    )
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # Advanced on every cycle the condition is still observed unhealthy —
+    # distinguishes "still failing, no new alert" from a stale/abandoned row.
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # When an admin_alerts row was last created for this incident (open or
+    # an escalation) — never set for a silent severity de-escalation.
+    last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The admin_alerts row that last_alerted_at refers to. Lets
+    # app.services.monitor_incidents distinguish "genuinely delivered (or
+    # still pending)" from "permanently failed after every Telegram retry
+    # was exhausted" -- in the latter case last_alerted_at alone would
+    # otherwise leave the incident looking "already alerted" forever even
+    # though no administrator ever actually received it.
+    last_alert_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admin_alerts.id", ondelete="RESTRICT"), nullable=True
+    )
+    # Safe, non-secret metadata only (counts, ages, check-specific labels) —
+    # same contract as AdminAlert.payload; never customer/card/credential data.
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONColumn)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_monitor_incidents_check_key_status", "check_key", "status"),
+        Index(
+            "uq_monitor_incidents_open_check_key",
+            "check_key",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
     )
 
 

@@ -760,6 +760,26 @@ concurrent reruns are serialized by a database advisory lock.
 must be told the final payable amount before paying. Disclose the fee in
 the bot's purchase flow before issuing the payment link.
 
+## Monitoring
+
+Optional, dedicated monitoring process (`MONITOR_ENABLED=false` by
+default): public readiness, database, worker heartbeats,
+notification/manual-review backlog, reconciliation health, backup
+freshness, disk space, DB integrity, and gateway/bot failure bursts, with
+durable (cross-restart) incident deduplication and exactly-once
+open/escalation/recovery alerts delivered through the existing admin-bot
+Telegram pipeline.
+
+```bash
+centralpay monitor enable            # start the monitor service
+centralpay monitor check --json      # run every check now
+centralpay monitor incidents         # currently open incidents
+```
+
+An admin can also run `/monitor` in Telegram for the same live snapshot.
+See [MONITORING.md](MONITORING.md) for the full architecture, check/
+threshold reference, incident-lifecycle design, and operator runbook.
+
 ## Tests
 
 Unit tests (SQLite in-memory, CentralPay mocked at the HTTP transport layer):
@@ -826,6 +846,10 @@ See [.env.example](.env.example) for the full list. Notable values:
 | `CENTRALPAY_UPDATE_REF` | Update channel for `centralpay update`, in `/etc/centralpay-bridge/centralpay.env` (host-managed, not app config). Production must pin a release tag (`vX.Y.Z` / `vX.Y.Z-rcN`); a branch is rejected unless `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true`. See "Upgrading production" above |
 | `CENTRALPAY_UPDATE_ALLOW_DEV_REF` | Default `false`. Root-only, local-development-only opt-in to deploy a non-tag ref (e.g. `main`) with no checksum or `SOURCE_COMMIT` verification. Never set on production |
 | `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED` | Default `false`. Root-only escape hatch to deploy a release tag's fetched commit when its release assets aren't downloadable, skipping checksum/`SOURCE_COMMIT` verification. Not recommended |
+| `MONITOR_ENABLED` | Optional dedicated monitoring service (default `false`); see [MONITORING.md](MONITORING.md) |
+| `MONITOR_INTERVAL_SECONDS` / `MONITOR_DB_INTEGRITY_INTERVAL_SECONDS` | Cheap-check / expensive-check cadence (defaults 60 / 1800) |
+| `MONITOR_*_WARNING_*` / `MONITOR_*_CRITICAL_*` | Per-check thresholds (notification/manual-review backlog, backup age, disk space, gateway/bot failure bursts, worker heartbeat age) — full list with defaults in [.env.example](.env.example) |
+| `CENTRALPAY_BACKUP_DIR` | Host backup directory; shared by `scripts/backup.sh` and the monitor's read-only bind mount (default `/var/backups/centralpay-bridge`) |
 
 ## Security notes
 

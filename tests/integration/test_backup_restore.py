@@ -56,6 +56,7 @@ _TABLES = (
     "payments",
     "centralpay_payer_identities",
     "fee_policies",
+    "monitor_incidents",
 )
 
 

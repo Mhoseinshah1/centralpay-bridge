@@ -358,6 +358,7 @@ _SEQUENCE_TABLES = (
     "admin_alerts",
     "worker_heartbeats",
     "fee_policies",
+    "monitor_incidents",
 )
 
 
@@ -553,186 +554,199 @@ def _build_db_check_details(
     return details
 
 
-def _cmd_db_check(args: argparse.Namespace) -> int:
-    """Database integrity checks used after a restore (and on demand).
+def run_db_checks(
+    db: Session, *, repair_sequences: bool = False, details: bool = False
+) -> dict[str, object]:
+    """Database integrity checks used after a restore, on demand, and by
+    app.monitor's db_integrity check -- the single source of this SQL so
+    `centralpay db-check` and the monitor can never quietly drift apart.
 
-    Read-only by default. --repair-sequences advances any PostgreSQL
-    sequence that fell behind its table maximum (safe: setval to MAX(id),
-    schema-qualified names taken from pg_get_serial_sequence itself).
-    Never touches financial data.
+    Read-only by default. repair_sequences advances any PostgreSQL sequence
+    that fell behind its table maximum (safe: setval to MAX(id),
+    schema-qualified names taken from pg_get_serial_sequence itself). Never
+    touches financial data. Takes an already-open session; never opens or
+    closes one itself, so a caller (CLI or monitor) controls the session
+    lifecycle and commit/rollback boundary.
     """
-    settings = Settings()
-    configure_logging(settings)
-    session_factory = create_session_factory(settings.database_url)
     failures: list[str] = []
     report: dict[str, object] = {}
 
-    with session_factory() as db:
-        from app.models import PaymentEvent
+    from app.models import PaymentEvent
 
-        try:
-            revision = db.execute(
-                text("SELECT version_num FROM alembic_version")
-            ).scalar_one_or_none()
-        except Exception:
-            # Clear the aborted transaction so the remaining checks run.
-            db.rollback()
-            revision = None
-        report["alembic_revision"] = revision
-        if revision is None:
-            failures.append("alembic_version_missing")
+    try:
+        revision = db.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one_or_none()
+    except Exception:
+        # Clear the aborted transaction so the remaining checks run.
+        db.rollback()
+        revision = None
+    report["alembic_revision"] = revision
+    if revision is None:
+        failures.append("alembic_version_missing")
 
-        def dup_count(column: Any) -> int:
-            sub = (
-                select(column)
-                .where(column.is_not(None))
-                .group_by(column)
-                .having(func.count() > 1)
-                .subquery()
-            )
-            return int(db.execute(select(func.count()).select_from(sub)).scalar_one())
-
-        # Reused verbatim (same expression object) by --details below, so the
-        # detail rows are guaranteed to match this exact predicate -- never a
-        # separately maintained copy that could silently drift from it.
-        invalid_status_condition = Payment.status.not_in(
-            [status.value for status in PaymentStatus]
+    def dup_count(column: Any) -> int:
+        sub = (
+            select(column)
+            .where(column.is_not(None))
+            .group_by(column)
+            .having(func.count() > 1)
+            .subquery()
         )
+        return int(db.execute(select(func.count()).select_from(sub)).scalar_one())
 
-        checks: dict[str, int] = {
-            "invalid_payment_status": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(invalid_status_condition)
-                ).scalar_one()
-            ),
-            "duplicate_bot_order_id": dup_count(Payment.bot_order_id),
-            "duplicate_gateway_order_id": dup_count(Payment.gateway_order_id),
-            "duplicate_reference_id": dup_count(Payment.reference_id),
-            "orphan_payment_events": int(
-                db.execute(
-                    select(func.count(PaymentEvent.id)).where(
-                        PaymentEvent.payment_id.is_not(None),
-                        PaymentEvent.payment_id.not_in(select(Payment.id)),
-                    )
-                ).scalar_one()
-            ),
-            "claims_on_non_pending_payments": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(
-                        Payment.notification_claimed_at.is_not(None),
-                        Payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value,
-                    )
-                ).scalar_one()
-            ),
-            # Fee snapshot integrity. db-check REPORTS corruption; it never
-            # recalculates or overwrites historical financial snapshots.
-            "invalid_fee_rate": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(
-                        (Payment.fee_rate_bps < 0) | (Payment.fee_rate_bps > 10000)
-                    )
-                ).scalar_one()
-            ),
-            "negative_fee_amount": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(Payment.fee_amount < 0)
-                ).scalar_one()
-            ),
-            "payable_amount_mismatch": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(
-                        Payment.payable_amount != Payment.amount + Payment.fee_amount
-                    )
-                ).scalar_one()
-            ),
-            "missing_payable_amount": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(Payment.payable_amount.is_(None))
-                ).scalar_one()
-            ),
-            "orphan_fee_policy_reference": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(
-                        Payment.fee_policy_id.is_not(None),
-                        Payment.fee_policy_id.not_in(select(FeePolicy.id)),
-                    )
-                ).scalar_one()
-            ),
-            # Legacy backfill / policy-less payments must be zero-fee.
-            "policyless_payment_with_fee": int(
-                db.execute(
-                    select(func.count(Payment.id)).where(
-                        Payment.fee_policy_id.is_(None),
-                        (Payment.fee_rate_bps != 0) | (Payment.fee_amount != 0),
-                    )
-                ).scalar_one()
-            ),
-            "invalid_fee_policy_rows": int(
-                db.execute(
-                    select(func.count(FeePolicy.id)).where(
-                        (FeePolicy.rate_bps < 0)
-                        | (FeePolicy.rate_bps > 10000)
-                        | (FeePolicy.note == "")
-                        | (
-                            FeePolicy.cancelled_at.is_not(None)
-                            & (
-                                FeePolicy.cancelled_by.is_(None)
-                                | FeePolicy.cancellation_note.is_(None)
-                            )
+    # Reused verbatim (same expression object) by --details below, so the
+    # detail rows are guaranteed to match this exact predicate -- never a
+    # separately maintained copy that could silently drift from it.
+    invalid_status_condition = Payment.status.not_in(
+        [status.value for status in PaymentStatus]
+    )
+
+    checks: dict[str, int] = {
+        "invalid_payment_status": int(
+            db.execute(
+                select(func.count(Payment.id)).where(invalid_status_condition)
+            ).scalar_one()
+        ),
+        "duplicate_bot_order_id": dup_count(Payment.bot_order_id),
+        "duplicate_gateway_order_id": dup_count(Payment.gateway_order_id),
+        "duplicate_reference_id": dup_count(Payment.reference_id),
+        "orphan_payment_events": int(
+            db.execute(
+                select(func.count(PaymentEvent.id)).where(
+                    PaymentEvent.payment_id.is_not(None),
+                    PaymentEvent.payment_id.not_in(select(Payment.id)),
+                )
+            ).scalar_one()
+        ),
+        "claims_on_non_pending_payments": int(
+            db.execute(
+                select(func.count(Payment.id)).where(
+                    Payment.notification_claimed_at.is_not(None),
+                    Payment.status != PaymentStatus.BOT_NOTIFY_PENDING.value,
+                )
+            ).scalar_one()
+        ),
+        # Fee snapshot integrity. db-check REPORTS corruption; it never
+        # recalculates or overwrites historical financial snapshots.
+        "invalid_fee_rate": int(
+            db.execute(
+                select(func.count(Payment.id)).where(
+                    (Payment.fee_rate_bps < 0) | (Payment.fee_rate_bps > 10000)
+                )
+            ).scalar_one()
+        ),
+        "negative_fee_amount": int(
+            db.execute(
+                select(func.count(Payment.id)).where(Payment.fee_amount < 0)
+            ).scalar_one()
+        ),
+        "payable_amount_mismatch": int(
+            db.execute(
+                select(func.count(Payment.id)).where(
+                    Payment.payable_amount != Payment.amount + Payment.fee_amount
+                )
+            ).scalar_one()
+        ),
+        "missing_payable_amount": int(
+            db.execute(
+                select(func.count(Payment.id)).where(Payment.payable_amount.is_(None))
+            ).scalar_one()
+        ),
+        "orphan_fee_policy_reference": int(
+            db.execute(
+                select(func.count(Payment.id)).where(
+                    Payment.fee_policy_id.is_not(None),
+                    Payment.fee_policy_id.not_in(select(FeePolicy.id)),
+                )
+            ).scalar_one()
+        ),
+        # Legacy backfill / policy-less payments must be zero-fee.
+        "policyless_payment_with_fee": int(
+            db.execute(
+                select(func.count(Payment.id)).where(
+                    Payment.fee_policy_id.is_(None),
+                    (Payment.fee_rate_bps != 0) | (Payment.fee_amount != 0),
+                )
+            ).scalar_one()
+        ),
+        "invalid_fee_policy_rows": int(
+            db.execute(
+                select(func.count(FeePolicy.id)).where(
+                    (FeePolicy.rate_bps < 0)
+                    | (FeePolicy.rate_bps > 10000)
+                    | (FeePolicy.note == "")
+                    | (
+                        FeePolicy.cancelled_at.is_not(None)
+                        & (
+                            FeePolicy.cancelled_by.is_(None)
+                            | FeePolicy.cancellation_note.is_(None)
                         )
                     )
-                ).scalar_one()
-            ),
-        }
-        report["checks"] = checks
-        failures.extend(name for name, value in checks.items() if value != 0)
-
-        sequences: dict[str, dict[str, object]] = {}
-        if db.get_bind().dialect.name == "postgresql":
-            repaired: list[str] = []
-            for table in _SEQUENCE_TABLES:
-                seq_name = db.execute(
-                    text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table}
-                ).scalar_one_or_none()
-                if seq_name is None:
-                    continue
-                max_id = int(
-                    db.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {table}")).scalar_one()
                 )
-                # seq_name comes from PostgreSQL itself (schema-qualified),
-                # never from user input.
-                last_value, is_called = db.execute(
-                    text(f"SELECT last_value, is_called FROM {seq_name}")
-                ).one()
-                behind = max_id > 0 and (
-                    int(last_value) < max_id or (int(last_value) == max_id and not is_called)
-                )
-                sequences[table] = {
-                    "sequence": seq_name,
-                    "max_id": max_id,
-                    "last_value": int(last_value),
-                    "behind": behind,
-                }
-                if behind and args.repair_sequences:
-                    db.execute(text(f"SELECT setval('{seq_name}', {max_id})"))
-                    repaired.append(table)
-                elif behind:
-                    failures.append(f"sequence_behind:{table}")
-            if repaired:
-                db.commit()
-                report["repaired_sequences"] = repaired
-        report["sequences"] = sequences
+            ).scalar_one()
+        ),
+    }
+    report["checks"] = checks
+    failures.extend(name for name, value in checks.items() if value != 0)
 
-        if args.details:
-            report["details"] = _build_db_check_details(db, checks, invalid_status_condition)
+    sequences: dict[str, dict[str, object]] = {}
+    if db.get_bind().dialect.name == "postgresql":
+        repaired: list[str] = []
+        for table in _SEQUENCE_TABLES:
+            seq_name = db.execute(
+                text("SELECT pg_get_serial_sequence(:t, 'id')"), {"t": table}
+            ).scalar_one_or_none()
+            if seq_name is None:
+                continue
+            max_id = int(
+                db.execute(text(f"SELECT COALESCE(MAX(id), 0) FROM {table}")).scalar_one()
+            )
+            # seq_name comes from PostgreSQL itself (schema-qualified),
+            # never from user input.
+            last_value, is_called = db.execute(
+                text(f"SELECT last_value, is_called FROM {seq_name}")
+            ).one()
+            behind = max_id > 0 and (
+                int(last_value) < max_id or (int(last_value) == max_id and not is_called)
+            )
+            sequences[table] = {
+                "sequence": seq_name,
+                "max_id": max_id,
+                "last_value": int(last_value),
+                "behind": behind,
+            }
+            if behind and repair_sequences:
+                db.execute(text(f"SELECT setval('{seq_name}', {max_id})"))
+                repaired.append(table)
+            elif behind:
+                failures.append(f"sequence_behind:{table}")
+        if repaired:
+            db.commit()
+            report["repaired_sequences"] = repaired
+    report["sequences"] = sequences
+
+    if details:
+        report["details"] = _build_db_check_details(db, checks, invalid_status_condition)
 
     report["status"] = "ok" if not failures else "failed"
     report["failures"] = failures
+    return report
+
+
+def _cmd_db_check(args: argparse.Namespace) -> int:
+    settings = Settings()
+    configure_logging(settings)
+    session_factory = create_session_factory(settings.database_url)
+    with session_factory() as db:
+        report = run_db_checks(
+            db, repair_sequences=args.repair_sequences, details=args.details
+        )
     if args.details and args.details_json:
         print(json.dumps(report, ensure_ascii=False, default=str))
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-    return 0 if not failures else 1
+    return 0 if report["status"] == "ok" else 1
 
 
 def _cmd_privacy_audit(args: argparse.Namespace) -> int:

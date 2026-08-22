@@ -108,6 +108,8 @@ from app.services.aged_out_recovery import (
     build_preview,
     execute_confirmed_recovery,
 )
+from app.services.monitor_checks import CheckResult, overall_status, run_all_checks
+from app.services.monitor_incidents import list_incidents
 
 # AmbiguousOrderIdError is self-aliased for explicit re-export: app.ops
 # imports it from here (`from app.cli import AmbiguousOrderIdError`), a
@@ -1170,6 +1172,78 @@ def _cmd_recover_aged_out(
     return 1 if outcome.kind is RecoveryOutcomeKind.TRANSPORT_FAILED else 0
 
 
+# --- monitor: live checks and incident history -----------------------------
+
+_MONITOR_STATUS_ICON = {"ok": "🟢", "warning": "🟠", "critical": "🔴"}
+
+
+def _check_result_dict(result: CheckResult) -> dict[str, Any]:
+    return {
+        "key": result.key,
+        "status": result.status,
+        "reason": result.reason,
+        "details": result.details,
+    }
+
+
+def _cmd_monitor_check(db: Session, settings: Settings, *, as_json: bool) -> int:
+    results = run_all_checks(db, settings)
+    status = overall_status(results)
+    if as_json:
+        _print(
+            {
+                "status": status,
+                "checks": {result.key: _check_result_dict(result) for result in results},
+                "failures": [result.key for result in results if result.status != "ok"],
+            }
+        )
+        return 0 if status == "ok" else 1
+
+    icon = _MONITOR_STATUS_ICON.get(status, "⚪")
+    print(f"{icon} CentralPay Monitor — overall: {status.upper()}")
+    print()
+    for result in results:
+        icon = _MONITOR_STATUS_ICON.get(result.status, "⚪")
+        print(f"{icon} {result.key}: {result.status} — {result.reason}")
+        for key, value in result.details.items():
+            print(f"    {key}: {value}")
+    return 0 if status == "ok" else 1
+
+
+def _cmd_monitor_incidents(
+    db: Session, *, as_json: bool, include_resolved: bool, limit: int
+) -> int:
+    incidents = list_incidents(db, include_resolved=include_resolved, limit=limit)
+    if as_json:
+        for incident in incidents:
+            _print(
+                {
+                    "id": incident.id,
+                    "check_key": incident.check_key,
+                    "severity": incident.severity,
+                    "status": incident.status,
+                    "opened_at": _iso(incident.opened_at),
+                    "last_seen_at": _iso(incident.last_seen_at),
+                    "resolved_at": _iso(incident.resolved_at),
+                    "last_alerted_at": _iso(incident.last_alerted_at),
+                    "details": incident.details,
+                }
+            )
+        return 0
+    if not incidents:
+        print("No open incidents." if not include_resolved else "No incidents recorded.")
+        return 0
+    for incident in incidents:
+        icon = _MONITOR_STATUS_ICON.get(incident.severity, "⚪")
+        print(f"{icon} [{incident.status.upper()}] {incident.check_key} ({incident.severity})")
+        print(f"    opened:    {_iso(incident.opened_at)}")
+        print(f"    last seen: {_iso(incident.last_seen_at)}")
+        if incident.resolved_at:
+            print(f"    resolved:  {_iso(incident.resolved_at)}")
+        print()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m app.cli", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1252,6 +1326,28 @@ def build_parser() -> argparse.ArgumentParser:
         dest="as_json",
         help="single JSON object instead of the report",
     )
+    monitor = subparsers.add_parser(
+        "monitor", help="monitoring checks and incident history (read-only)"
+    )
+    monitor_sub = monitor.add_subparsers(dest="monitor_command", required=True)
+    monitor_check = monitor_sub.add_parser(
+        "check", help="run every monitoring check now and report overall status"
+    )
+    monitor_check.add_argument(
+        "--json", action="store_true", dest="as_json", help="one JSON object"
+    )
+    monitor_incidents = monitor_sub.add_parser(
+        "incidents", help="currently open (default) or all recorded incidents"
+    )
+    monitor_incidents.add_argument(
+        "--all", action="store_true", help="include resolved incidents (default: open only)"
+    )
+    monitor_incidents.add_argument(
+        "--limit", type=int, default=50, help="max incidents to show (default: 50)"
+    )
+    monitor_incidents.add_argument(
+        "--json", action="store_true", dest="as_json", help="one JSON object per line"
+    )
     return parser
 
 
@@ -1287,6 +1383,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.order_id,
                 confirm=args.confirm,
                 as_json=args.as_json,
+            )
+        if args.command == "monitor":
+            if args.monitor_command == "check":
+                return _cmd_monitor_check(db, settings, as_json=args.as_json)
+            return _cmd_monitor_incidents(
+                db, as_json=args.as_json, include_resolved=args.all, limit=args.limit
             )
         return _cmd_stuck(db, settings, limit=args.limit, as_json=args.as_json)
     except BrokenPipeError:
