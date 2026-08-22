@@ -40,7 +40,11 @@ from app.config import ConfigurationError, Settings, validate_monitor_settings
 from app.db import create_session_factory
 from app.logging_setup import configure_logging
 from app.services.heartbeat import record_worker_heartbeat
-from app.services.monitor_checks import run_all_checks
+from app.services.monitor_checks import (
+    DB_INTEGRITY_CHECK_KEY,
+    DB_UNAVAILABLE_REASON,
+    run_all_checks,
+)
 from app.services.monitor_incidents import record_check_result
 from app.services.notification import utcnow
 
@@ -55,7 +59,7 @@ def build_instance_id() -> str:
 
 def run_one_pass(
     session_factory: sessionmaker[Session], settings: Settings, *, include_db_integrity: bool
-) -> None:
+) -> bool:
     """One full check-and-record cycle, in one session.
 
     The checks are all read-only and finish first; only then does each
@@ -64,6 +68,15 @@ def run_one_pass(
     rest of this codebase's read-then-record style (e.g. app.cli's status
     commands) -- there is no financial-transaction boundary here to keep
     atomic.
+
+    Returns whether db_integrity ACTUALLY EXECUTED this pass -- always
+    False when include_db_integrity is False, and also False when it was
+    due but run_all_checks placeholdered it as database_unavailable (a
+    transient outage during this pass, even one that recovers before the
+    record_check_result calls below run and lets this whole function
+    return normally). run_forever's cycles_since_integrity cadence must
+    only reset on a genuine result, never merely because the pass as a
+    whole didn't raise.
     """
     now = utcnow()
     with session_factory() as db:
@@ -72,6 +85,12 @@ def run_one_pass(
         )
         for result in results:
             record_check_result(db, settings, result, now=now)
+        if not include_db_integrity:
+            return False
+        return not any(
+            r.key == DB_INTEGRITY_CHECK_KEY and r.reason == DB_UNAVAILABLE_REASON
+            for r in results
+        )
 
 
 def run_forever(
@@ -89,11 +108,18 @@ def run_forever(
     # Cycles since db_integrity last actually completed -- NOT a raw tick
     # counter. Starts due (>= db_integrity_every) so the very first pass
     # includes it. Advances by one on every ordinary tick, exactly like a
-    # tick counter would, EXCEPT it is only reset back to zero once a pass
-    # that included db_integrity actually finished without raising; a pass
-    # that failed before/during db_integrity leaves it due, so the very
-    # next tick retries it instead of waiting a full db_integrity_every
-    # cycles for the next scheduled slot.
+    # tick counter would, EXCEPT it is only reset back to zero once
+    # db_integrity itself genuinely ran (run_one_pass's return value, not
+    # merely "the pass didn't raise"): a database outage during a due
+    # cycle degrades gracefully rather than raising (see run_all_checks),
+    # so a pass that persisted a database_unavailable placeholder for
+    # db_integrity still "completes" successfully -- without this
+    # distinction, a transient outage that happens to recover before the
+    # record_check_result calls finish would wrongly reset the cadence and
+    # defer the real retry by a full db_integrity_every cycles. A pass
+    # that failed before/during db_integrity (raised) also leaves it due,
+    # so the very next tick retries it instead of waiting for the next
+    # scheduled slot.
     cycles_since_integrity = db_integrity_every
     logger.info(
         "monitor_started",
@@ -107,9 +133,12 @@ def run_forever(
         started = time.monotonic()
         include_db_integrity = cycles_since_integrity >= db_integrity_every
         cycle_completed = False
+        db_integrity_completed = False
         error_code: str | None = None
         try:
-            run_one_pass(session_factory, settings, include_db_integrity=include_db_integrity)
+            db_integrity_completed = run_one_pass(
+                session_factory, settings, include_db_integrity=include_db_integrity
+            )
             cycle_completed = True
             # Liveness heartbeat: container health checks verify this file
             # stays fresh (same convention as worker/admin-bot).
@@ -134,7 +163,7 @@ def run_forever(
                 )
         except Exception:
             logger.warning("monitor_db_heartbeat_failed")
-        if include_db_integrity and cycle_completed:
+        if db_integrity_completed:
             cycles_since_integrity = 0
         else:
             cycles_since_integrity += 1

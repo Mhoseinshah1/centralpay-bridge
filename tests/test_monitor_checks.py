@@ -756,6 +756,73 @@ def test_backup_check_never_reads_dump_contents(settings, tmp_path, monkeypatch)
     assert result.status == "ok"
 
 
+def test_backup_oversized_manifest_is_not_healthy(settings, tmp_path):
+    """A real write_manifest() sidecar is well under 300 bytes. A manifest
+    file far larger than that -- corrupted, accidentally replaced, or
+    deliberately huge -- must be rejected as malformed rather than
+    accepted after being read in full."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    manifest = tmp_path / (dump.name + ".manifest")
+    # Otherwise well-formed content, just padded far past the size bound.
+    manifest.write_text(f"backup_file={dump.name}\n" + ("x" * 10_000) + "\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_parse_never_reads_more_than_the_size_bound(
+    settings, tmp_path, monkeypatch
+):
+    """Metadata-only proof for the manifest sidecar itself: even when the
+    file on disk is deliberately huge (here, a 200MB sparse file), the
+    parser must never read more than a few KB of it into memory. A guard
+    on the underlying file object's .read() raises if ever asked to read
+    past the documented bound."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    manifest = tmp_path / (dump.name + ".manifest")
+    with open(manifest, "wb") as handle:
+        handle.write(f"backup_file={dump.name}\n".encode())
+        handle.seek(200 * 1024 * 1024)  # 200MB sparse file: near-instant, no real disk usage
+        handle.write(b"x")
+
+    # _io.BufferedReader is an immutable C type -- its .read method can't be
+    # monkeypatched directly. Instead wrap Path.open itself so every read
+    # against the manifest file goes through a size-bound guard.
+    class _BoundedReadGuard:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            max_size = monitor_checks._BACKUP_MANIFEST_MAX_BYTES + 1
+            if size is None or size < 0 or size > max_size:
+                raise AssertionError(f"manifest read must be bounded, got size={size}")
+            return self._handle.read(size)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._handle.__exit__(*exc_info)
+
+    real_open = Path.open
+
+    def _guarded_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        return _BoundedReadGuard(handle) if self.suffix == ".manifest" else handle
+
+    monkeypatch.setattr(Path, "open", _guarded_open)
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
 # --- disk space ------------------------------------------------------------
 
 _Usage = namedtuple("_Usage", ["total", "used", "free"])

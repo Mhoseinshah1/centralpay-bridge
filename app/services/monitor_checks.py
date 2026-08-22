@@ -107,6 +107,12 @@ _BACKUP_GLOB = "centralpay-*.dump"
 # corrupted, or was never produced by that tooling at all.
 _BACKUP_MANIFEST_REQUIRED_KEYS = ("backup_file", "sha256", "size_bytes", "validation")
 _BACKUP_MANIFEST_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# A real write_manifest() sidecar is well under 300 bytes; this is generous
+# headroom, not a realistic size. This check runs every monitoring pass
+# specifically for backups it may already suspect are malformed/corrupted
+# -- an accidentally (or deliberately) huge file placed at this path must
+# never be read into memory in full.
+_BACKUP_MANIFEST_MAX_BYTES = 4096
 
 # Check keys that always run every cheap cycle (everything except
 # db_integrity, which app.monitor gates on its own slower cadence).
@@ -114,7 +120,10 @@ DB_INTEGRITY_CHECK_KEY = "db_integrity"
 # CheckResult.reason for a DB-dependent check that could not run because
 # check_database (or an earlier DB-dependent check this same pass) already
 # found PostgreSQL unavailable -- never itself the result of a query.
-_DB_UNAVAILABLE_REASON = "database_unavailable"
+# Public (not underscore-prefixed): app.monitor.run_one_pass compares
+# against this to tell whether db_integrity actually executed this pass,
+# as opposed to being placeholdered by an outage -- see its docstring.
+DB_UNAVAILABLE_REASON = "database_unavailable"
 
 
 @dataclass(frozen=True)
@@ -344,9 +353,19 @@ def _parse_backup_manifest(path: Path) -> dict[str, str] | None:
     corruption or a forged second value, and -- since restore reads only
     the FIRST occurrence -- silently picking either the first or the last
     here could make this check disagree with what restore would actually
-    accept. Rejected outright instead."""
+    accept. Rejected outright instead.
+
+    Reads at most ``_BACKUP_MANIFEST_MAX_BYTES`` regardless of the file's
+    actual size -- this check runs every monitoring pass specifically for
+    backups it may already suspect are malformed, so an accidentally (or
+    deliberately) huge file at this path must never be loaded into memory
+    in full; it is simply rejected as malformed instead."""
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open("rb") as handle:
+            raw = handle.read(_BACKUP_MANIFEST_MAX_BYTES + 1)
+        if len(raw) > _BACKUP_MANIFEST_MAX_BYTES:
+            return None
+        text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     fields: dict[str, str] = {}
@@ -582,7 +601,7 @@ def _db_unavailable_result(key: str) -> CheckResult:
     every existing caller (the CLI, the admin bot's /monitor command, and
     app.monitor's own incident-recording loop) keeps working against the
     same three-state CheckResult contract."""
-    return CheckResult(key, STATUS_CRITICAL, _DB_UNAVAILABLE_REASON, {"dependency": "database"})
+    return CheckResult(key, STATUS_CRITICAL, DB_UNAVAILABLE_REASON, {"dependency": "database"})
 
 
 def _rollback_after_db_failure(db: Session) -> None:
