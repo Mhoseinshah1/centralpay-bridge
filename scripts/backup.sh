@@ -147,7 +147,15 @@ main() {
 
     [[ -f "${INSTALL_DIR}/docker-compose.yml" ]] || fail "No installation in ${INSTALL_DIR}."
     mkdir -p "$BACKUP_DIR"
-    chmod 700 "$BACKUP_DIR"
+    # 0750/GID 10001, matching install.sh's own setup exactly -- group
+    # execute+read lets the monitor/admin-bot (UID 10001) list filenames,
+    # stat mtimes, and read .manifest sidecars; dump/.ok files stay 0600
+    # (write_manifest sets that) so their CONTENTS remain root-only. A bare
+    # `chmod 700` here would silently undo install.sh's setup on every
+    # single backup run, breaking the monitor's backup/disk checks (and
+    # this manifest check) after the very first scheduled backup.
+    chmod 0750 "$BACKUP_DIR"
+    chgrp 10001 "$BACKUP_DIR" 2>/dev/null || true
 
     # Exclusive lock: no concurrent backups, and mutual exclusion with
     # "centralpay restore" (which holds the same lock and exports

@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.adminbot import queries
@@ -650,18 +650,22 @@ def run_all_checks(
     HTTPS URL and the filesystem, never this function's `db` session.
     Every other check is DB-DEPENDENT. If the initial `database` probe
     already reports critical, or if a later DB-dependent check raises a
-    SQLAlchemyError (the connection dies mid-pass, e.g. a real
-    OperationalError), no further SQL is attempted on this session for the
-    rest of this pass — every check that had to be skipped gets a
-    critical/database_unavailable placeholder instead. Only database
-    connectivity failures degrade this way: a non-database bug in a
-    check (e.g. a ValueError) is deliberately NOT caught here and
-    propagates normally, so it is never mislabeled as a fabricated
-    PostgreSQL outage — see app.monitor.run_forever's own
-    monitor_pass_failed handling for that case. A genuine PostgreSQL
-    outage must never make this function raise: every caller (the CLI,
-    the admin bot's /monitor command, and app.monitor's own loop) always
-    gets back a complete, structured result list, even mid-outage."""
+    genuine connectivity failure mid-pass (a DBAPIError whose
+    connection_invalidated flag is True — SQLAlchemy's own signal that the
+    underlying connection itself is dead, e.g. a real disconnect/
+    OperationalError, not just any query error), no further SQL is
+    attempted on this session for the rest of this pass — every check that
+    had to be skipped gets a critical/database_unavailable placeholder
+    instead. Only that specific class of failure degrades this way: a
+    query/schema-level defect on an otherwise-live connection (e.g. a
+    ProgrammingError from a genuine bug) or a non-database bug (e.g. a
+    ValueError) is deliberately NOT caught here and propagates normally,
+    so it is never mislabeled as a fabricated PostgreSQL outage — see
+    app.monitor.run_forever's own monitor_pass_failed handling for that
+    case. A genuine PostgreSQL outage must never make this function raise:
+    every caller (the CLI, the admin bot's /monitor command, and
+    app.monitor's own loop) always gets back a complete, structured result
+    list, even mid-outage."""
     now = now_fn()
     results = [check_public_ready(settings), check_backup(settings, now=now), check_disk(settings)]
 
@@ -680,7 +684,15 @@ def run_all_checks(
     for index, (key, thunk) in enumerate(db_dependent):
         try:
             results.append(thunk())
-        except SQLAlchemyError as exc:
+        except DBAPIError as exc:
+            if not exc.connection_invalidated:
+                # A real SQL/schema-level defect (e.g. ProgrammingError from
+                # a bad query) on an otherwise-live connection -- NOT a
+                # connectivity failure. Propagate normally so it is never
+                # mislabeled a fabricated PostgreSQL outage; app.monitor's
+                # own monitor_pass_failed handling (or the CLI/admin-bot
+                # caller) sees the real exception.
+                raise
             logger.warning(
                 "monitor_check_query_failed", extra={"check": key, "error": type(exc).__name__}
             )

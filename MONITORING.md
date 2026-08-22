@@ -268,14 +268,29 @@ every DB-dependent check that had to be skipped gets a
 whole pass crash.
 
 This means `centralpay monitor check` stays fully usable DURING an
-outage — it shows `public_ready`, `backup`, and `disk_space` at their
-real status and every DB-dependent check as `database_unavailable`,
-rather than raising an unhandled exception. app.monitor's own background
-loop already tolerated a raised pass (it logs `monitor_pass_failed` and
-retries next cycle) — this makes that tolerance produce a structured,
-useful snapshot instead of nothing, for the CLI's on-demand,
-human-triggered surface that doesn't go through the incident-recording
-pipeline at all.
+outage, PROVIDED the `monitor` container is already running — it shows
+`public_ready`, `backup`, and `disk_space` at their real status and every
+DB-dependent check as `database_unavailable`, rather than raising an
+unhandled exception. app.monitor's own background loop already tolerated
+a raised pass (it logs `monitor_pass_failed` and retries next cycle) —
+this makes that tolerance produce a structured, useful snapshot instead
+of nothing, for the CLI's on-demand, human-triggered surface that doesn't
+go through the incident-recording pipeline at all.
+
+**The "already running" qualifier matters**: `centralpay monitor check`
+runs `docker compose exec monitor ...` (`scripts/centralpay`), which
+requires an existing, running `monitor` container — it never starts a new
+one. `docker-compose.yml`'s `monitor` service declares `depends_on: db:
+condition: service_healthy`, so Compose refuses to (re)start it while
+PostgreSQL is unhealthy. If the monitor container was already up when the
+outage began, it keeps running and `monitor check` keeps working exactly
+as described above. If it needs to (re)start DURING the outage — a host
+reboot, or the container being recreated for an unrelated reason — it
+cannot come up until PostgreSQL recovers, and `monitor check` is
+unavailable for that window too. In that specific case, fall back to the
+same signals documented for a fully unreachable database below: the
+monitor's own Docker healthcheck, host-level container monitoring, or an
+external uptime probe.
 
 **The admin bot's `/monitor` is NOT covered by this**, even though it
 calls the same `run_all_checks`: `CommandHandlers.handle`

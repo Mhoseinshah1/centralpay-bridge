@@ -11,7 +11,7 @@ from pathlib import Path
 import httpx
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import sessionmaker
 
 from app.adminbot import queries
@@ -1225,14 +1225,19 @@ def test_run_all_checks_degrades_gracefully_when_a_later_query_fails_mid_pass(
     session_factory, settings, monkeypatch
 ):
     """The initial `database` probe (SELECT 1) succeeds, but a LATER
-    DB-dependent check's own query raises a real OperationalError -- the
-    connection dying partway through a pass, not at the very start. Every
-    check already run stays as-is, the failing check and everything after
-    it in the list becomes database_unavailable, and nothing raises."""
+    DB-dependent check's own query raises a real OperationalError with
+    connection_invalidated=True -- SQLAlchemy's own signal (set by its
+    dialect-level is_disconnect() check) that the connection itself died,
+    not just that one statement was bad. Every check already run stays
+    as-is, the failing check and everything after it in the list becomes
+    database_unavailable, and nothing raises."""
 
     def _boom(db, status):
         raise OperationalError(
-            "SELECT ...", {}, Exception("server closed the connection unexpectedly")
+            "SELECT ...",
+            {},
+            Exception("server closed the connection unexpectedly"),
+            connection_invalidated=True,
         )
 
     monkeypatch.setattr(queries, "count_by_status", _boom)
@@ -1269,8 +1274,9 @@ def test_run_all_checks_does_not_mislabel_a_non_database_bug(
     (here: a plain ValueError, as if run_db_checks had a real defect) must
     propagate normally, not get silently absorbed and reported as a
     fabricated `database_unavailable` -- that would hide the actual
-    failure behind a misleading "PostgreSQL is down" story. Only
-    SQLAlchemyError triggers the outage-degradation path."""
+    failure behind a misleading "PostgreSQL is down" story. Only a
+    DBAPIError with connection_invalidated=True triggers the
+    outage-degradation path."""
 
     def _buggy(db, status):
         raise ValueError("not a database problem")
@@ -1278,6 +1284,27 @@ def test_run_all_checks_does_not_mislabel_a_non_database_bug(
     monkeypatch.setattr(queries, "count_by_status", _buggy)
 
     with session_factory() as db, pytest.raises(ValueError, match="not a database problem"):
+        monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
+
+
+def test_run_all_checks_does_not_mislabel_a_non_connectivity_dbapi_error(
+    session_factory, settings, monkeypatch
+):
+    """A DBAPIError that is NOT a connectivity failure (connection_
+    invalidated=False -- e.g. a real ProgrammingError from a bad query on
+    an otherwise-live connection) must also propagate normally, not be
+    treated as a PostgreSQL outage. Distinguishing this from the test
+    above is the whole point: not every SQLAlchemyError means the database
+    is unreachable."""
+
+    def _buggy(db, status):
+        raise ProgrammingError(
+            "SELECT ...", {}, Exception("column does not exist"), connection_invalidated=False
+        )
+
+    monkeypatch.setattr(queries, "count_by_status", _buggy)
+
+    with session_factory() as db, pytest.raises(ProgrammingError, match="column does not exist"):
         monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
 
 
