@@ -153,6 +153,14 @@ Telegram outage/failure must never block or roll back customer payment processin
 
 Never send secrets, callback token/signature, raw gateway text, full card data, or full redirect URLs to Telegram.
 
+### Monitoring
+
+The optional monitor service (`MONITOR_ENABLED=false` by default) is isolated from the customer payment path, exactly like the admin bot. It only reads existing tables and the filesystem: it never writes a payment row, never resolves a manual review, and never mutates financial state. It introduces no new secrets and delivers alerts through the existing admin-bot Telegram pipeline rather than a separate channel.
+
+If PostgreSQL itself is unreachable, database-independent checks (public readiness, backup, disk space) keep running and database-dependent checks degrade to a `database_unavailable` result instead of raising — a real, unrelated code bug in a check is not mislabeled as a database outage. Backup manifest validation reads only the small `.manifest` sidecar, never the dump file's own bytes, so it does not need read access to backup contents to certify recoverability metadata. Gateway/bot failure-burst counting only counts genuine transport/protocol-level failures; an ordinary payer declining or abandoning a payment never trips it.
+
+Disabling the monitor (the default) cannot change payment, notification, or reconciliation behavior in any way.
+
 ### Secret handling
 
 Secrets live outside git under `/etc/centralpay-bridge/` with restrictive permissions.
@@ -188,7 +196,7 @@ Only Caddy publishes host ports.
 Current trust zones:
 
 - `edge`: Caddy + API
-- `internal`: API + PostgreSQL + worker + migrate + optional admin-bot
+- `internal`: API + PostgreSQL + worker + migrate + optional admin-bot + optional monitor
 
 Caddy has no database route and no application secrets. PostgreSQL has no published host port.
 
@@ -239,6 +247,7 @@ These are not equivalent to confirmed vulnerabilities:
 
 - rate limiting is process-local and assumes the current single API-container topology
 - off-site backup replication is not part of the built-in backup job
+- during a full PostgreSQL outage, the monitor cannot durably record its own "database is down" incident or Telegram alert (persisting either requires the very database that is unreachable), and the admin bot's `/monitor` command cannot run at all (its command-audit commit needs the database before any handler runs); `centralpay monitor check` stays usable through the CLI, but only if the `monitor` container was already running before the outage started — see [MONITORING.md](MONITORING.md)
 - release trust binds artifacts to a commit through checksums/`SOURCE_COMMIT`; this is not the same thing as a complete signed-artifact provenance system
 - some audit/review documents in the repository are historical snapshots and intentionally retain the findings/status of their original commit
 

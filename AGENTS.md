@@ -336,6 +336,20 @@ Required properties:
 
 Local backups are not off-site disaster recovery.
 
+## Monitoring
+
+An optional, dedicated monitoring process (`app.monitor`, `MONITOR_ENABLED=false` by default) runs read-only checks against the database and filesystem. It never writes a payment row, never resolves a manual review, and never mutates financial state.
+
+Non-negotiable invariants:
+
+- Checks are classified DB-independent (public readiness, backup, disk space) versus DB-dependent. If PostgreSQL is unreachable, DB-independent checks must keep running; DB-dependent checks degrade to a `critical`/`database_unavailable` result instead of raising and aborting the rest of the pass.
+- `gateway_failure_burst` counts only genuine transport/protocol-level gateway failures (a real `CentralPayError`, or a response shaped like a service/protocol anomaly). An ordinary payer declining or abandoning a payment (`gateway_rejected`) must never count — it is expected, high-frequency, and not an infrastructure signal.
+- Backup validation is metadata-only: it checks the `.manifest` sidecar (filename, size, checksum shape, a required `validation=passed` marker) and never reads or hashes the full dump file's bytes. A missing or malformed manifest is `critical` regardless of the backup's age.
+- Incident state is durable (the `monitor_incidents` table, migrations `0011`/`0012`), deduplicated per `check_key`, and delivers exactly-once open/escalation/recovery alerts through the existing admin-bot Telegram pipeline.
+- The monitor is additive and optional: disabling it (`MONITOR_ENABLED=false`, the default) must not change payment, notification, or reconciliation behavior in any way.
+
+See [MONITORING.md](MONITORING.md) for the full check/threshold reference and known limitations (including PostgreSQL-outage behavior for the CLI and admin bot).
+
 ## Production update integrity
 
 Normal production updates use release tags matching:

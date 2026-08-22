@@ -56,6 +56,7 @@ centralpay admin-bot test-alert
 | `/help` | read-only | راهنمای دستورها |
 | `/status` | read-only | خلاصهٔ وضعیت عملیاتی |
 | `/health` | read-only | سلامت API/DB/worker/queue |
+| `/monitor` | read-only | گزارش کامل پایش سیستم (همان checkهای `app.monitor`/`centralpay monitor check`) |
 | `/recent [n]` | read-only | آخرین پرداخت‌ها |
 | `/stuck` | read-only | delivery failureهای نیازمند توجه |
 | `/waiting [n]` | read-only | paymentهای منتظر تأیید درگاه |
@@ -86,9 +87,11 @@ Health فعلی می‌تواند مواردی مثل این‌ها را بسن�
 - backup freshness از دید alert history
 - stuck admin-alert delivery queue
 
-Health monitor موجود از consecutive-failure / recovery threshold استفاده می‌کند.
+Health monitor موجود (همین `/health`، بخشی از خود admin-bot) از consecutive-failure / recovery threshold استفاده می‌کند.
 
-**محدودیت فعلی main:** counterهای failure/success و مجموعهٔ `alerted` در حافظهٔ process هستند؛ restart آن‌ها را reset می‌کند. بنابراین built-in health monitor فعلی persistent incident engine کامل نیست. این محدودیت را با «عدم وجود health monitoring» اشتباه نگیرید؛ health checks/alerts وجود دارند، ولی incident state آن‌ها هنوز کاملاً restart-persistent نیست.
+**محدودیت فعلی main:** counterهای failure/success این health monitor سبک داخلی در حافظهٔ process هستند؛ restart آن‌ها را reset می‌کند. این محدودیت مختص همین چک سبک `/health` است و همچنان برقرار است.
+
+این محدودیت را با نبود پایش جدی اشتباه نگیرید: سرویس اختیاری و جداگانهٔ `app.monitor` (`MONITOR_ENABLED`، پیش‌فرض `false`) مجموعهٔ کامل‌تری از checkها (readiness عمومی، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot) را اجرا می‌کند و incident state آن در جدول دائمی `monitor_incidents` نگه‌داری می‌شود — یعنی restart آن را پاک نمی‌کند. دستور `/monitor` بالا و `centralpay monitor check`/`centralpay monitor incidents` دقیقاً همین سیستم دائمی را می‌خوانند. جزئیات کامل در [MONITORING.md](MONITORING.md).
 
 ## `/manual_review` و `/resolved_reviews`
 

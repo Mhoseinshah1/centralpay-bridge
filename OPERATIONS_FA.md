@@ -281,6 +281,28 @@ centralpay db-check --details --json
 
 راهنمای restore: [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md)
 
+## پایش (Monitoring)
+
+سرویس اختیاری و جداگانهٔ پایش (`MONITOR_ENABLED`، پیش‌فرض `false`) readiness عمومی، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی/اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس و burst شکست gateway/bot را بررسی می‌کند. incident state آن در جدول دائمی نگه‌داری می‌شود (restart آن را پاک نمی‌کند) و alertها از همان مسیر Telegram admin-bot ارسال می‌شوند.
+
+<div dir="ltr">
+
+```bash
+centralpay monitor enable
+centralpay monitor check --json
+centralpay monitor incidents
+centralpay monitor status
+centralpay monitor logs
+centralpay monitor restart
+centralpay monitor disable
+```
+
+</div>
+
+در Telegram، دستور `/monitor` همین snapshot را به‌صورت read-only نمایش می‌دهد.
+
+اگر PostgreSQL کاملاً در دسترس نباشد: checkهای مستقل از دیتابیس (readiness، backup، disk space) همچنان کار می‌کنند و checkهای وابسته به دیتابیس به‌جای crash، نتیجهٔ `database_unavailable` برمی‌گردانند — به شرطی که container مربوط به `monitor` از قبل در حال اجرا بوده باشد (چون Compose آن را در حین outage دیتابیس (re)start نمی‌کند). ثبت دائمی خود incident «دیتابیس در دسترس نیست» و ارسال alert آن نیز به همان دیتابیس غیرقابل‌دسترس نیاز دارد و در این حالت ممکن نیست؛ برای آن پنجرهٔ زمانی به healthcheck داخلی Docker یا پایش host-level تکیه کنید. جزئیات کامل و محدودیت‌ها: [MONITORING.md](MONITORING.md).
+
 ## Update production
 
 Production باید به release tag اشاره کند:

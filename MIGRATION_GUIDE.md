@@ -3,7 +3,7 @@
 CentralPay Bridge migrations are designed for a financial system: **forward-only by default**, non-destructive where practical, and gated by backup + integrity checks.
 
 Current application version: **0.6.0-rc1**.  
-Current Alembic head in this branch: **0010**.
+Current Alembic head in this branch: **0012**.
 
 ## General rules
 
@@ -29,6 +29,8 @@ Current Alembic head in this branch: **0010**.
 | `0008` | explicit `payments.payer_identity_type` (`telegram_user` / `order_fallback`) with historical NULL support |
 | `0009` | explicit payer mapping `identity_scheme` (`telegram_raw_v1`, `order_hmac_v1`, `historical_hmac_v1`) |
 | `0010` | server-side reconciliation bookkeeping/index for recovering paid `link_created` payments when browser callback is missed |
+| `0011` | durable `monitor_incidents` table for the optional monitoring subsystem's cross-restart incident lifecycle |
+| `0012` | `monitor_incidents.last_alert_id` so a permanently failed alert delivery can be detected and re-queued instead of looking "already alerted" forever |
 
 Run:
 
@@ -126,6 +128,20 @@ There is no financial-data rewrite. Existing eligible `link_created` rows natura
 The worker uses the same canonical verification/settlement service as callback handling; the migration adds bookkeeping, not a second settlement model.
 
 Downgrade is non-destructive by default. Explicit removal requires `CENTRALPAY_DROP_RECONCILIATION=1`.
+
+## 0011 — monitor incidents
+
+Migration `0011` adds `monitor_incidents`: durable, cross-restart incident state for the optional monitoring subsystem (`app.monitor`). A check transitioning from healthy to warning/critical opens a row; the same condition staying unhealthy across polling cycles never opens a second row; recovery resolves it. At most one open row can exist per `check_key` at a time, enforced by a partial unique index rather than application logic alone, so two racing monitor instances can never both open the same incident.
+
+No existing table or financial data is touched. The monitoring subsystem itself is disabled by default (`MONITOR_ENABLED=false`).
+
+Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_DROP_MONITOR_INCIDENTS=1`.
+
+## 0012 — monitor incident alert-delivery tracking
+
+Migration `0012` adds `monitor_incidents.last_alert_id`, a foreign key to `admin_alerts.id` recording which outbox row an incident's `last_alerted_at` refers to. Without it, an incident whose opening/escalation alert permanently failed delivery (every Telegram retry exhausted) would look "already alerted" forever; this column lets the catch-up path check the referenced alert's actual delivery status and re-queue a fresh one if it failed.
+
+Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_DROP_MONITOR_INCIDENT_LAST_ALERT=1`.
 
 ## Production update procedure
 

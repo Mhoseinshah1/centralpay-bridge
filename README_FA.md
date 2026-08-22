@@ -3,7 +3,7 @@
 <div dir="rtl">
 
 CentralPay Bridge یک پل پرداخت بین «درگاه سفارشی» ربات فروش و CentralPay است.
-نسخهٔ فعلی برنامه **0.6.0-rc1** و head فعلی Alembic در این شاخه **0010** است.
+نسخهٔ فعلی برنامه **0.6.0-rc1** و head فعلی Alembic در این شاخه **0012** است.
 
 اولویت‌های پروژه به‌ترتیب: **صحت مالی، امنیت، پایداری، قابلیت بازیابی، مشاهده‌پذیری، سپس دسترس‌پذیری**. هرجا سامانه نتواند با اطمینان مالی تصمیم بگیرد، به‌جای حدس‌زدن fail-closed می‌کند یا پرداخت را به `manual_review` می‌برد.
 
@@ -47,11 +47,11 @@ Caddy :80/:443
 API :8000 --------> PostgreSQL 16
                        ^
                        |
-          +------------+-------------+
-          |                          |
-        Worker                    Admin bot
-   notification +                 Telegram ops
-   reconciliation
+          +------------+----+----------+
+          |                 |          |
+        Worker            Admin bot   Monitor (اختیاری)
+   notification +         Telegram    بررسی سلامت/incident،
+   reconciliation         ops         هشدار Telegram
 ```
 
 </div>
@@ -59,6 +59,8 @@ API :8000 --------> PostgreSQL 16
 فقط Caddy روی host پورت منتشر می‌کند. PostgreSQL فقط روی شبکهٔ داخلی Docker است و Caddy هیچ route مستقیمی به DB ندارد. سرویس‌های برنامه non-root، با root filesystem فقط‌خواندنی، `cap_drop: ALL` و `no-new-privileges` اجرا می‌شوند و هر سرویس فقط secretهای موردنیاز نقش خودش را می‌بیند.
 
 ربات مدیریتی اختیاری است. تقریباً همهٔ فرمان‌های تلگرام فقط‌خواندنی‌اند. تنها عملیات mutating فعلی `/resend_failed confirm` است که شدیداً محدود شده و فقط برای پرداخت‌های از قبل تأییدشدهٔ درگاه و فقط در `BOT_NOTIFY_RETRY_MODE=idempotent` می‌تواند اعلان‌های واجدشرایط را دوباره در صف بگذارد.
+
+سرویس پایش (`monitor`) نیز اختیاری است (`MONITOR_ENABLED=false` پیش‌فرض). فقط‌خواندنی است و هیچ‌گاه ردیف پرداخت نمی‌نویسد؛ هشدارها را از همان مسیر Telegram admin-bot ارسال می‌کند. جزئیات در بخش «پایش» پایین‌تر.
 
 ## تضمین‌های مالی مهم
 
@@ -175,6 +177,14 @@ centralpay fee schedule RATE --at ISO --note TEXT
 centralpay fee history
 centralpay fee cancel POLICY_ID --note TEXT
 
+centralpay monitor enable
+centralpay monitor disable
+centralpay monitor check --json
+centralpay monitor incidents
+centralpay monitor status
+centralpay monitor logs
+centralpay monitor restart
+
 centralpay backup
 centralpay backups
 centralpay restore FILE
@@ -217,6 +227,24 @@ CENTRALPAY_UPDATE_ALLOW_DEV_REF=true
 بکاپ‌ها `pg_dump --format=custom` هستند، با `pg_restore --list` اعتبارسنجی می‌شوند و manifest شامل SHA-256 دارند. restore قبل از تغییر DB فایل را بررسی می‌کند، بکاپ پیشابازیابی می‌سازد، writerها را متوقف می‌کند، با `--exit-on-error` restore می‌کند، migration و `db-check` را اجرا می‌کند و فقط بعد از سلامت کامل سرویس‌ها را بالا می‌آورد.
 
 بکاپ روی همان سرور **Disaster Recovery کامل نیست**؛ off-site copy همچنان مسئولیت اپراتور است مگر مکانیزم جداگانه‌ای برای آن اضافه شود.
+
+## پایش
+
+سرویس اختیاری و جداگانهٔ پایش (`MONITOR_ENABLED=false` پیش‌فرض، جدا از worker) این موارد را بررسی می‌کند: readiness عمومی، اتصال دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot. incident state آن دائمی است (در جدول `monitor_incidents`، restart آن را پاک نمی‌کند) و هشدارهای open/escalation/recovery با dedupe و exactly-once از همان مسیر Telegram admin-bot ارسال می‌شوند.
+
+<div dir="ltr">
+
+```bash
+centralpay monitor enable            # فعال‌سازی سرویس
+centralpay monitor check --json      # اجرای فوری همهٔ checkها
+centralpay monitor incidents         # incidentهای باز فعلی
+```
+
+</div>
+
+در Telegram هم دستور `/monitor` همین snapshot زنده را به‌صورت read-only نشان می‌دهد. burst شکست gateway/bot فقط شکست‌های واقعی transport/protocol را می‌شمارد؛ انصراف یا رهاسازی معمول یک پرداخت توسط کاربر هرگز آن را trigger نمی‌کند. اعتبارسنجی بکاپ فقط metadata فایل manifest را بررسی می‌کند و هیچ‌گاه کل فایل dump را hash نمی‌کند. اگر PostgreSQL کاملاً در دسترس نباشد، checkهای مستقل از دیتابیس همچنان اجرا می‌شوند و checkهای وابسته به دیتابیس به‌جای crash، `database_unavailable` برمی‌گردانند.
+
+جزئیات کامل معماری، جدول threshold، طراحی incident lifecycle، راهنمای عملیاتی و محدودیت‌های شناخته‌شده (ازجمله رفتار در outage کامل PostgreSQL): [MONITORING.md](MONITORING.md).
 
 ## امنیت
 

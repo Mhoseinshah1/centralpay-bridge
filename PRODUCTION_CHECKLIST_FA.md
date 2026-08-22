@@ -45,7 +45,7 @@
 ## ۵) دیتابیس و migration
 
 - [ ] `centralpay migrate current` revision مورد انتظار را نشان می‌دهد.
-- [ ] برای main فعلی، Alembic head برابر **0010** است.
+- [ ] برای main فعلی، Alembic head برابر **0012** است.
 - [ ] `centralpay db-check --details --json` با `status: ok` و `failures: []` تمام می‌شود.
 - [ ] هیچ sequence مهمی `behind: true` نیست.
 - [ ] هیچ duplicate bot/gateway/reference ID گزارش نمی‌شود.
@@ -149,12 +149,16 @@ Production smoke test فقط controlled و غیرمخرب باشد.
 
 ## ۱۶) Monitoring / alerting
 
-main فعلی health/alert primitives دارد، از جمله API/DB/worker/retry/backup/admin-alert queue checks در admin-bot health monitor.
+main فعلی دو لایهٔ health/alert دارد:
+
+1. health check سبک داخلی admin-bot (`/health`، `/status`) — همیشه همراه admin-bot فعال است؛ counterهای consecutive-failure/recovery آن در حافظهٔ process هستند و restart آن‌ها را reset می‌کند (محدودیت شناخته‌شده و بدون تغییر).
+2. سرویس اختیاری و جداگانهٔ پایش (`app.monitor`، `MONITOR_ENABLED`، پیش‌فرض `false`) با مجموعهٔ کامل‌تری از checkها (public readiness، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی/اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، burst شکست gateway/bot) که incident state آن در جدول دائمی `monitor_incidents` نگه‌داری می‌شود و **restart آن را پاک نمی‌کند**. جزئیات کامل در [MONITORING.md](MONITORING.md).
 
 - [ ] health alerts در صورت فعال بودن admin bot تست شده‌اند.
 - [ ] worker heartbeat قابل مشاهده است.
 - [ ] backup failure alert path شناخته شده است.
-- [ ] اپراتور می‌داند built-in health monitor فعلی incident counterها را در memory نگه می‌دارد و restart آن counterها را reset می‌کند؛ تا زمانی که persistent monitor جدید merge نشده، این محدودیت باید در runbook در نظر گرفته شود.
+- [ ] اپراتور می‌داند لایهٔ سبک داخلی admin-bot (`/health`) همچنان process-memory است؛ برای پایش تولیدی جدی‌تر با incident lifecycle دائمی، سرویس اختیاری `app.monitor` باید با `centralpay monitor enable` فعال شود.
+- [ ] در صورت فعال بودن `app.monitor`: خروجی `centralpay monitor check --json` و `centralpay monitor incidents` بررسی شده و alert Telegram آن تست شده است.
 
 ## ۱۷) Release/CI
 

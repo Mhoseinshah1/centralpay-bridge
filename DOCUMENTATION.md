@@ -14,6 +14,7 @@ For the current implementation, start here:
 4. [OPERATIONS_FA.md](OPERATIONS_FA.md) — current operator runbook
 5. [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md) — current production checklist
 6. [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) — current migration chain/procedure
+7. [MONITORING.md](MONITORING.md) — current monitoring/alerting architecture and operator runbook
 
 When a historical audit conflicts with current source or one of the living documents above, **current source + current tests + living contract win**. The old audit remains valuable as historical evidence.
 
@@ -33,6 +34,7 @@ These files are expected to stay synchronized with current code:
 | `ADMIN_BOT_FA.md` | Current administrator Telegram-bot behavior and command contract |
 | `PRODUCTION_CHECKLIST_FA.md` | Current production/release operational checklist |
 | `MIGRATION_GUIDE.md` | Current Alembic migration chain and upgrade/rollback guidance |
+| `MONITORING.md` | Current monitoring/alerting architecture, check/threshold reference, incident lifecycle, and operator runbook |
 | `CENTRALPAY_CONTRACT_ASSUMPTIONS.md` | Current external CentralPay contract/risk assumptions and fail-closed behavior |
 | `CHANGELOG.md` | Version/change history; append/update as release work lands |
 
@@ -125,10 +127,10 @@ Their Git history remains available permanently, so deleting them from the curre
 At the time this map was added, important current facts include:
 
 - application version `0.6.0-rc1`
-- Alembic head `0010`
+- Alembic head `0012`
 - production update refs fail closed unless they are release tags, unless the explicit development opt-in is enabled
 - admin bot is no longer accurately described as blanket read-only because `/resend_failed confirm` is a narrowly gated mutation
-- current built-in admin-bot health monitoring exists, but its consecutive-failure incident counters are process-memory state; persistent incident lifecycle is separate future/ongoing monitoring work unless/until source changes
+- the admin bot's own lightweight built-in health checks (`app/adminbot/health.py`) still keep consecutive-failure/recovery counters in process memory (a restart resets them) — that specific limitation is unchanged and not overclaimed as solved; separately, an optional, dedicated monitoring process (`app.monitor`, `MONITOR_ENABLED=false` by default) now exists with its own, more thorough check set, and its incident state lives in the durable `monitor_incidents` table (migration `0011`/`0012`) and survives a restart — do not describe *all* monitoring/incident state as process-memory-only, and do not describe persistent incident lifecycle as nonexistent
 - Caddy access logging must redact callback `ct`/`sig` from both URI and `Referer`
 
 If source changes any of those facts, update the living docs and this section in the same change.
