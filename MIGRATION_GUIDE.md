@@ -1,147 +1,219 @@
 # Migration guide
 
-How to move an existing installation between versions. General rules:
+CentralPay Bridge migrations are designed for a financial system: **forward-only by default**, non-destructive where practical, and gated by backup + integrity checks.
 
-> **Migration `0005` (final financial audit):** adds three CHECK
-> constraints to `payments` (`amount > 0`, `bot_notify_attempts >= 0`,
-> and delivery-states-require-`gateway_verified_at`). All constraints are
-> valid for every state the application can have produced, so the
-> migration is safe on existing data; adding a CHECK takes a brief
-> table-scan lock (negligible at this system's row counts). Applied
-> automatically by the `migrate` service.
+Current application version: **0.6.0-rc1**.  
+Current Alembic head in this branch: **0012**.
 
-- **Migrations are forward-only.** Audit and financial data are never
-  rewritten; the database schema is **never downgraded**.
-  `centralpay rollback` rolls back the *application* only.
-- **Always back up first.** `centralpay update` creates a pre-update
-  backup automatically; `centralpay backup` does it on demand.
-- Migrations run automatically: the `migrate` service applies
-  `alembic upgrade head` before api/worker start (compose gating).
+## General rules
 
-## 0.5.0-rc1 → 0.6.0-rc1
+- `centralpay update` creates a validated pre-update backup before deployment work.
+- The Compose `migrate` service runs `alembic upgrade head` before API/worker start.
+- API/worker startup is health-gated behind migration success.
+- `centralpay rollback` rolls back application files only; it does **not** automatically downgrade the database schema.
+- If an application rollback is incompatible with the already-applied schema, roll forward or restore the pre-update backup as an explicit disaster-recovery decision.
+- Never edit an already-deployed migration revision to add production schema changes. Add a new revision.
+- PostgreSQL behavior is authoritative for financial migrations/tests.
 
-### Schema (migration `0006`)
+## Current migration chain
 
-Applied automatically by the `migrate` service. Creates the append-only
-`fee_policies` table and adds four snapshot columns to `payments`:
-`fee_policy_id` (FK RESTRICT, nullable), `fee_rate_bps`, `fee_amount`,
-`payable_amount`. Every existing payment is backfilled as fee-less:
+| Revision | Purpose |
+| --- | --- |
+| `0001` | initial payment/audit schema |
+| `0002` | bot-notification delivery state |
+| `0003` | administrator alerts / worker heartbeats |
+| `0004` | release hardening: callback token + manual-review fields + reference uniqueness |
+| `0005` | financial CHECK constraints |
+| `0006` | dynamic fee policies and immutable per-payment fee/payable snapshot |
+| `0007` | per-customer/payer CentralPay identity mapping + payment identity snapshot |
+| `0008` | explicit `payments.payer_identity_type` (`telegram_user` / `order_fallback`) with historical NULL support |
+| `0009` | explicit payer mapping `identity_scheme` (`telegram_raw_v1`, `order_hmac_v1`, `historical_hmac_v1`) |
+| `0010` | server-side reconciliation bookkeeping/index for recovering paid `link_created` payments when browser callback is missed |
+| `0011` | durable `monitor_incidents` table for the optional monitoring subsystem's cross-restart incident lifecycle |
+| `0012` | `monitor_incidents.last_alert_id` so a permanently failed alert delivery can be detected and re-queued instead of looking "already alerted" forever |
 
+Run:
+
+```bash
+centralpay migrate current
+centralpay migrate history
 ```
-fee_policy_id  = NULL
-fee_rate_bps   = 0
-fee_amount     = 0
+
+or, for the canonical production integrity view:
+
+```bash
+centralpay db-check --details --json
+```
+
+## 0006 — dynamic fee
+
+Migration `0006` creates the append-only `fee_policies` table and adds the immutable payment snapshot fields:
+
+- `fee_policy_id`
+- `fee_rate_bps`
+- `fee_amount`
+- `payable_amount`
+
+Existing payments are backfilled as fee-less so their original financial meaning does not change:
+
+```text
+fee_policy_id = NULL
+fee_rate_bps = 0
+fee_amount = 0
 payable_amount = amount
 ```
 
-so its financial meaning is unchanged. CHECK constraints then bind
-`payable_amount = amount + fee_amount`, the rate range (0..10000 bps),
-non-negative fees, and fee-policy row consistency at the storage layer.
-The backfill is a single UPDATE plus CHECK validation — a brief
-table-scan lock, negligible at this system's row counts, and valid for
-every state 0.5.0-rc1 can have produced (proven by the
-populated-database migration test).
+Database constraints enforce rate bounds, non-negative fees, positive payable amount, and `payable_amount = amount + fee_amount`.
 
-### Behavior
+After `0006`, older application code that does not populate the new NOT NULL fields may no longer be able to create payments. Treat rollback across this boundary as a compatibility decision, not a routine schema downgrade.
 
-- With no fee policy configured (the default after upgrade), behavior is
-  identical to 0.5.0-rc1: getLink is asked for the original amount and
-  verify is compared against it (payable == amount when the fee is 0).
-- Enabling a fee is an explicit operator action:
-  `centralpay fee set RATE --note "..."` (root). Fee changes affect NEW
-  orders only. The installer's fee question (default 0) only applies on
-  fresh installs; `--ensure-initial` never overwrites an existing
-  policy on a rerun.
-- `MAX_PAYMENT_AMOUNT_TOMAN` now bounds the FINAL payable amount; with
-  a non-zero fee, orders whose `amount + fee` exceeds it are rejected
-  with `payable_amount_out_of_range`.
+## 0007 — payer identity isolation
 
-### Rollback limitation (important)
+Migration `0007` responds to the 2026-07 payer/card-suggestion incident by introducing `centralpay_payer_identities` and payment snapshot links to the chosen gateway payer mapping.
 
-The schema is never downgraded. **After 0006 is applied, the 0.5.0-rc1
-application can no longer create payments** — it does not populate the
-NOT NULL `payable_amount` column. `centralpay rollback` across this
-boundary is therefore NOT a routine path: roll forward, or restore the
-pre-update backup (losing post-upgrade payments) as disaster recovery.
+It is non-destructive for existing rows:
 
-## 0.4.0-dev → 0.5.0-rc1
+- existing `gateway_user_id` values remain unchanged
+- existing active payment links continue verifying against their stored snapshot
+- old rows have `payer_identity_id = NULL` as the historical marker
 
-### Schema (migration `0004`)
+New code can therefore isolate future payer identities without rewriting old financial history.
 
-Applied automatically. Adds to `payments`:
+## 0008 — hybrid identity scope
 
-- `callback_token_hash`, `callback_token_issued_at` — one-time callback
-  token (hash only; plaintext exists only inside the signed link URL)
-- `review_acknowledged_at`, `review_resolved_at`, `review_resolution`
-  — manual-review bookkeeping for the new `centralpay review` commands
-- unique constraint `uq_payments_reference_id` on `reference_id`
-  (PostgreSQL permits multiple NULLs; existing NULL rows are unaffected)
+Migration `0008` adds `payments.payer_identity_type`.
 
-**Pre-check for the unique constraint:** duplicate non-NULL
-`reference_id` values would fail the migration. Verify before upgrading:
+Allowed new scopes:
 
-```sql
-SELECT reference_id, count(*) FROM payments
-WHERE reference_id IS NOT NULL
-GROUP BY reference_id HAVING count(*) > 1;
+- `telegram_user`
+- `order_fallback`
+
+Historical rows remain NULL because their original raw identity scope cannot be reconstructed safely. The migration deliberately does **not** guess a scope.
+
+The downgrade path is non-destructive by default; explicit schema drop requires `CENTRALPAY_DROP_PAYER_IDENTITY=1`.
+
+## 0009 — explicit identity derivation scheme
+
+Migration `0009` adds `centralpay_payer_identities.identity_scheme` so the origin of every mapping is explicit rather than inferred from the numeric value.
+
+Supported schemes:
+
+- `telegram_raw_v1` — gateway user ID is the exact Telegram user ID
+- `order_hmac_v1` — order fallback derived in the reserved fallback range
+- `historical_hmac_v1` — pre-0009 mapping created by the retired derivation schemes
+
+Existing mapping IDs and payment snapshots are preserved exactly.
+
+Downgrade is non-destructive by default; explicit removal again requires `CENTRALPAY_DROP_PAYER_IDENTITY=1`.
+
+## 0010 — reconciliation
+
+Migration `0010` adds operational fields used by the worker to recover a payment that is still `link_created` because the payer's browser callback was not delivered.
+
+Fields include:
+
+- `reconciliation_attempts`
+- `reconciliation_next_at`
+- `reconciliation_last_at`
+- `reconciliation_last_error_code`
+- `reconciliation_claimed_at`
+- `reconciliation_claimed_by`
+
+and index:
+
+- `ix_payments_reconciliation_due (status, reconciliation_next_at)`
+
+There is no financial-data rewrite. Existing eligible `link_created` rows naturally enter reconciliation once they meet the configured age rules.
+
+The worker uses the same canonical verification/settlement service as callback handling; the migration adds bookkeeping, not a second settlement model.
+
+Downgrade is non-destructive by default. Explicit removal requires `CENTRALPAY_DROP_RECONCILIATION=1`.
+
+## 0011 — monitor incidents
+
+Migration `0011` adds `monitor_incidents`: durable, cross-restart incident state for the optional monitoring subsystem (`app.monitor`). A check transitioning from healthy to warning/critical opens a row; the same condition staying unhealthy across polling cycles never opens a second row; recovery resolves it. At most one open row can exist per `check_key` at a time, enforced by a partial unique index rather than application logic alone, so two racing monitor instances can never both open the same incident.
+
+No existing table or financial data is touched. The monitoring subsystem itself is disabled by default (`MONITOR_ENABLED=false`).
+
+Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_DROP_MONITOR_INCIDENTS=1`.
+
+## 0012 — monitor incident alert-delivery tracking
+
+Migration `0012` adds `monitor_incidents.last_alert_id`, a foreign key to `admin_alerts.id` recording which outbox row an incident's `last_alerted_at` refers to. Without it, an incident whose opening/escalation alert permanently failed delivery (every Telegram retry exhausted) would look "already alerted" forever; this column lets the catch-up path check the referenced alert's actual delivery status and re-queue a fresh one if it failed.
+
+Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_DROP_MONITOR_INCIDENT_LAST_ALERT=1`.
+
+## Production update procedure
+
+Production updates should use a release tag configured in `/etc/centralpay-bridge/centralpay.env`:
+
+```env
+CENTRALPAY_UPDATE_REF=v0.6.0-rc1
 ```
 
-Any duplicates indicate a serious pre-existing anomaly: stop, resolve
-via manual review (with audit trail), then upgrade.
-
-### Behavior changes
-
-1. **Callback links now carry a one-time token (`ct`).** Links issued
-   by 0.4.0 (signed over `orderId` only) are **no longer valid** after
-   the upgrade. Impact: a payer holding an unpaid pre-upgrade link gets
-   a signature error; the bot re-requesting the same `order_id`
-   regenerates a fresh valid link. Upgrade during a quiet window; treat
-   in-flight unpaid links as expired.
-2. **Stricter CentralPay response parsing.** Responses without an
-   explicit success marker are now rejected (previously: heuristic).
-   Malformed financial fields route to manual review with explicit
-   reason codes. Watch manual-review volume right after upgrading — a
-   sudden spike would mean the real gateway schema disagrees with the
-   allowlist (see `STAGING_VALIDATION.md`).
-3. **Application rate limiting is on by default** (`RATE_LIMIT_*`
-   vars). Defaults are generous; tune in
-   `/etc/centralpay-bridge/centralpay.env` if the bot legitimately
-   bursts above 120 creates/minute per API process.
-4. **`centralpay update` now verifies release checksums** when
-   `CENTRALPAY_UPDATE_REF` is a release tag (the new default —
-   `v0.5.0-rc1`). Branch refs remain development mode with no
-   verification.
-5. New optional env vars (all with safe defaults):
-   `RATE_LIMIT_ENABLED`, `RATE_LIMIT_CREATE_PER_MINUTE`,
-   `RATE_LIMIT_INVALID_KEY_PER_10MIN`,
-   `RATE_LIMIT_INVALID_SIGNATURE_PER_10MIN`,
-   `FIRST_PAYMENT_GUARD_ENABLED` (recommended `true` for go-live).
-
-### Procedure
+Normal flow:
 
 ```bash
-centralpay backup
-centralpay update --check   # shows current vs target, checksum status
-centralpay update           # pre-update backup, checksum verify, deploy, migrate
-centralpay status && centralpay diagnose
+centralpay update --check
+centralpay update
+centralpay status
+centralpay db-check --details --json
 ```
 
-Rollback (application only — schema stays at 0004):
+For a release tag, the updater verifies the release artifact, `SOURCE_COMMIT`, and `SHA256SUMS`, and binds the fetched tag commit to the verified `SOURCE_COMMIT` before deployment work proceeds.
+
+A branch ref such as `main` is rejected by default. Development-only branch updates require:
+
+```env
+CENTRALPAY_UPDATE_ALLOW_DEV_REF=true
+```
+
+Do not set that on a normal production installation.
+
+`CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a separate emergency escape hatch for release-tag asset verification problems and should not be part of routine operations.
+
+## Before any upgrade
+
+1. Read the target release notes and changelog.
+2. Confirm current DB integrity:
+
+   ```bash
+   centralpay db-check --details --json
+   ```
+
+3. Create or confirm a recent validated backup.
+4. Confirm disk space.
+5. Confirm the target update ref is the intended release tag.
+6. Run `centralpay update --check`.
+7. Avoid manual schema edits.
+
+## After any upgrade
+
+Verify:
 
 ```bash
-centralpay rollback         # typed ROLLBACK confirmation, pre-rollback backup
+centralpay status
+centralpay db-check --details --json
+centralpay migrate current
 ```
 
-0.4.0 code runs against the 0004 schema (new columns are nullable and
-unused by it), but new-format callback links stop being issued —
-payments created *after* the upgrade keep working because their tokens
-were already stored. Links created by 0.5.0 remain verifiable only by
-0.5.0; roll forward again as soon as possible.
+Confirm:
 
-## Earlier versions
+- API/worker/db/caddy are healthy
+- public `/health/ready` is HTTP 200
+- migration revision is the expected head
+- sequence checks are not behind
+- no financial-integrity check fails
+- pending/manual-review queues are understood
 
-- **0.3.0-dev → 0.4.0-dev**: migration `0003` (admin_alerts,
-  worker_heartbeats). Admin bot optional/off by default.
-- **0.2.x → 0.3.0-dev**: first dockerized deployment; use the installer
-  on a fresh host and restore a backup rather than migrating in place.
-- **0.1.x → 0.2.x**: migration `0002` (notification delivery tracking).
+If the optional admin bot is enabled, verify its service and `/version`/health views as applicable.
+
+## Restore instead of downgrade
+
+If the new schema is incompatible with the old application and a roll-forward fix is not possible, the safe rollback mechanism is an explicit restore of the pre-update backup, understanding that this discards transactions created after that backup.
+
+Use [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md) and never improvise destructive SQL against the production database.
+
+## Historical version notes
+
+Older release notes and audit documents in this repository are snapshots. Their migration-head/status text may intentionally reflect their original commit. Use this guide plus the actual `alembic/versions/` chain for the current schema.

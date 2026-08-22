@@ -1,774 +1,205 @@
 # CentralPay Bridge
 
-Production-grade payment bridge between a Telegram bot custom gateway API and
-[CentralPay]. Priorities, in order: financial correctness, security,
-reliability, recoverability, observability.
+Production-grade payment bridge between a Telegram bot custom-payment API and CentralPay.
 
-The authoritative project contract is [AGENTS.md](AGENTS.md). The delivery
-roadmap is GitHub issue #1.
+Current application version: **0.6.0-rc1**. Current Alembic head on this branch: **0012**.
 
-## Verification status
+The project is intentionally conservative: **financial correctness > security > reliability > recoverability > observability > availability**. If the system cannot prove that a payment is safe to continue, it fails closed or moves the payment to manual review instead of guessing.
 
-> Automated adversarial verification has not yet been completed. This
-> implementation must not be considered production-ready until that review
-> and the remaining checks are completed.
+The authoritative engineering contract is [AGENTS.md](AGENTS.md). The documentation map is [DOCUMENTATION.md](DOCUMENTATION.md).
 
-The full test suite (unit + PostgreSQL integration + fault injection +
-backup/restore round-trip), lint, type checking, and migration validation
-pass; the multi-agent adversarial review remains outstanding. Every
-deferred topic has been triaged for 0.6.0-rc1 in
-[RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md) — **open release
-blockers**: real-host installer validation
-([REAL_HOST_VALIDATION.md](REAL_HOST_VALIDATION.md)), staging validation
-against the real gateway ([STAGING_VALIDATION.md](STAGING_VALIDATION.md)),
-live Telegram validation ([ADMIN_BOT_VALIDATION.md](ADMIN_BOT_VALIDATION.md)),
-the adversarial review, and a green release workflow. Original topics:
-[DEFERRED_REVIEW.md](DEFERRED_REVIEW.md).
+## What the bridge does
 
-## Status
+1. The selling bot calls `POST /api/custom-payment` with an API key, amount, and `order_id`.
+2. CentralPay Bridge validates the request, snapshots the active fee policy, creates an idempotent payment record, derives an isolated gateway payer identity, and requests a CentralPay payment link.
+3. CentralPay returns the payer to the signed callback URL.
+4. The bridge verifies the callback HMAC/token, calls CentralPay `verify`, and validates the gateway-reported amount, payer identity, and reference ID.
+5. Only after successful verification does the bridge queue the notification to the selling bot.
+6. Delivery, retries, reconciliation, manual review, audit history, backups, and administrator alerts remain recoverable from PostgreSQL.
 
-**Phase 1 — Core payment API:**
+The selling-bot notification payload intentionally contains no amount or fee fields; the bot continues to credit its own original invoice.
 
-- `POST /api/custom-payment` — payment creation for the bot, idempotent by
-  `order_id`, authenticated with a constant-time API key comparison
-- CentralPay `getLink` integration
-- `GET /api/centralpay/callback` — HMAC-signed return URL, row-locked
-  processing, CentralPay `verify` with amount / userId / referenceId
-  validation
-- `GET /health/live` and `GET /health/ready`
-- Permanent `payment_events` audit trail
-- Structured JSON logs with request IDs and secret redaction
+## Public surface
 
-**Phase 2 — Bot notification and recovery:**
+Caddy exposes only the intended public routes:
 
-- Safe delivery of verified payments to the bot API with explicit reason
-  codes for every non-success state (no generic "stuck")
-- Notification worker (`python -m app.worker`) with `FOR UPDATE SKIP LOCKED`
-  claims, bounded exponential backoff with jitter, and stale-claim recovery
-- `safe` (default) and `idempotent` retry modes
-- Payer-facing callback status pages (verified+accepted / verified+pending /
-  under review)
-- Read-only inspection CLI (`python -m app.cli`)
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/custom-payment` | create or safely replay a payment link |
+| `GET` | `/api/centralpay/callback` | signed CentralPay callback |
+| `GET` | `/health/live` | liveness |
+| `GET` | `/health/ready` | readiness + database connectivity |
+| `GET` | `/static/*` | callback-page static assets |
 
-**Phase 3 — Deployment and operations** (this code):
+`/health/details` is application-internal and is deliberately not routed by public Caddy configuration.
 
-- Production Dockerfile (multi-stage, non-root fixed UID, amd64/arm64) and
-  Docker Compose stack: `caddy` (TLS) → `api` → `db`, plus `worker` and a
-  one-shot `migrate` service that gates API/worker startup on successful
-  migrations. Since the deployment audit: split edge/internal networks
-  (Caddy has no route to PostgreSQL), read-only hardened app containers
-  (`cap_drop: ALL`, `no-new-privileges`, tmpfs), per-service secret
-  masking, and `sig`+`ct` redaction in access logs
-- One-line interactive installer for Ubuntu 22.04 / 24.04 / 26.04
-- `centralpay` management command (status, logs, diagnose, backup, restore,
-  update, ssl, uninstall, …)
-- Validated daily PostgreSQL backups via a host systemd timer — atomic
-  creation, SHA-256 manifest sidecars, checksum-verified restores with a
-  post-restore integrity check (`centralpay db-check`; `--details` adds a
-  bounded, read-only drill-down into the rows behind any failed check)
-- Configurable payment amount bounds; application version in `/health/live`
-- GitHub Actions CI (tests, lint, types, ShellCheck, Docker build, compose
-  validation, secret and dependency scanning)
+## Current architecture
 
-**Phase 4 — Administrator Telegram bot** (this code):
+```text
+Internet
+   |
+   v
+Caddy :80/:443
+   |
+   v
+API :8000 --------> PostgreSQL 16
+                       ^
+                       |
+          +------------+----+----------+
+          |                 |          |
+        Worker            Admin bot   Monitor (optional)
+   notification +         Telegram    health/incident checks,
+   reconciliation         ops         Telegram alerts
+```
 
-- Optional, read-only, admin-only Telegram bot (`admin-bot` Compose
-  service behind a profile — never started unless explicitly enabled)
-- Authorization by numeric Telegram ID only, private chats only; generic
-  denial for everyone else
-- 12 inspection commands (`/status`, `/health`, `/recent`, `/stuck`,
-  `/manual_review`, `/errors`, `/payment`, `/retry_queue`,
-  `/backup_status`, `/version`, `/start`, `/help`)
-- Durable alert outbox (`admin_alerts` table): alert rows are created
-  inside payment transactions — but inside a database SAVEPOINT, so a
-  failed alert INSERT rolls back only the savepoint and can never abort
-  the financial transaction; the admin-bot service delivers them
-  best-effort with bounded retries, dedup windows, and stale-claim
-  recovery — a Telegram outage can never block payment processing.
-  Delivery results carry claim ownership: a result is persisted only
-  while the alert row still holds the same worker ID and attempt number
-  (checked under the row lock), so late results from released or
-  superseded claims are discarded and audited
-  (`admin_alert_result_discarded`) without modifying the successor's
-  claim. Telegram delivery itself stays at-least-once: a stale worker
-  may already have sent a duplicate operational message — ownership
-  prevents stale database-result overwrites, not duplicate sends
-- Health monitor with consecutive-failure thresholds and recovery alerts;
-  optional daily report (Asia/Tehran default, restart-safe dedup);
-  worker heartbeats recorded in the database
-- Persian message formatting (Jalali timestamps) with HTML escaping of
-  every dynamic value
+Only Caddy publishes host ports. PostgreSQL is on the internal network only. Caddy has no route to PostgreSQL. Application containers run non-root with a read-only root filesystem, dropped capabilities, `no-new-privileges`, and per-service secret masking.
 
-**Phase 5 — Release-candidate hardening (0.5.0-rc1)**:
+The `admin-bot` service is optional and profile-gated. Most Telegram commands are read-only. The only currently supported mutating Telegram operation is the heavily gated `/resend_failed confirm`, which can only requeue already gateway-verified delivery failures when `BOT_NOTIFY_RETRY_MODE=idempotent` is configured.
 
-- One-time callback tokens bound into the HMAC signature (hash-only
-  storage, durable consumption, no hard expiration — legitimate late
-  returns still resolve)
-- Strict CentralPay response parsing: explicit success allowlist and
-  typed field parsing with explicit reason codes (success is never
-  guessed from truthy values)
-- Reference-ID uniqueness; collisions route to manual review with a
-  critical `reference_id_collision` alert and never overwrite
-- Application-level rate limiting (invalid API keys, invalid callback
-  signatures, create bursts)
-- `centralpay review` host CLI (acknowledge/resolve with non-financial
-  resolutions only; gated resend), `centralpay update --check` with
-  release-checksum verification, application-only `centralpay rollback`
-- `GET /health/details` (internal), first-payment guard
-  (`FIRST_PAYMENT_GUARD_ENABLED`), fault-injection and backup/restore
-  integration tests, gated release workflow producing draft-only
-  releases with SBOM and SHA256SUMS
-- Release docs: [CHANGELOG.md](CHANGELOG.md),
-  [RELEASE_NOTES_0.5.0_RC1.md](RELEASE_NOTES_0.5.0_RC1.md),
-  [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md),
-  [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md),
-  [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md)
+The `monitor` service is also optional and profile-gated (`MONITOR_ENABLED=false` by default). It runs read-only checks against the database and filesystem and never writes payment rows; it delivers alerts through the same admin-bot Telegram pipeline. See [Monitoring](#monitoring) below.
 
-**Phase 6 — Dynamic percentage fee (0.6.0-rc1)** (this code):
+## Financial safety guarantees
 
-- Percentage service fee paid by the payer through CentralPay, invisible
-  to the selling bot: original invoice preserved, immutable per-payment
-  fee snapshot, integer round-half-up arithmetic, getLink charges the
-  payable amount, verify enforces it, and the bot notification payload
-  is unchanged (exact JSON object and field set) — see
-  [Dynamic service fee](#dynamic-service-fee-percentage)
-- Append-only audited `fee_policies` with deterministic selection and
-  restart-free scheduled changes; `centralpay fee` host CLI (root-only
-  mutations) and read-only admin-bot `/fee`; installer fee question with
-  `--ensure-initial`
-- Migration `0006` (zero-fee backfill + CHECK constraints binding
-  `payable = amount + fee`); fee-aware db-check, backups, and reporting
-- Real-host fix: deployment scripts committed executable (100755) and
-  installed with explicit modes (backup.sh 0750 root:root)
-- Release docs: [RELEASE_NOTES_0.6.0_RC1.md](RELEASE_NOTES_0.6.0_RC1.md)
+- A payment is never marked verified before CentralPay verification succeeds.
+- Gateway amount must match the snapshotted `payable_amount` exactly.
+- Gateway `userId` must match the payment's isolated payer identity.
+- Reference IDs are validated against the storage contract and must be unique when present.
+- `bot_order_id` and `gateway_order_id` are unique at the database layer.
+- Successful verification is row-locked and duplicate callbacks do not re-verify an already verified payment.
+- Ambiguous bot delivery is not silently treated as credit.
+- In `safe` notification mode, ambiguous delivery is never automatically resent.
+- `manual_review` is sticky until an explicit operator action resolves or safely requeues it.
+- Financial state transitions are permanently appended to `payment_events`.
+- Dynamic fee arithmetic is integer-only and snapshotted once per payment.
+- Reconciliation only uses the canonical verification/settlement path and ages out rather than retrying forever.
+- Monitoring is strictly read-only: no check writes a payment row, resolves a manual review, or mutates financial state.
 
-Persian documentation: [README_FA.md](README_FA.md),
-[INSTALL_FA.md](INSTALL_FA.md), [OPERATIONS_FA.md](OPERATIONS_FA.md),
-[BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md),
-[ADMIN_BOT_FA.md](ADMIN_BOT_FA.md),
-[PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md). Security
-policy: [SECURITY.md](SECURITY.md).
+See [FINANCIAL_INVARIANTS.md](FINANCIAL_INVARIANTS.md) and [FINANCIAL_TEST_MATRIX.md](FINANCIAL_TEST_MATRIX.md) for detailed audit/test snapshots.
+
+## Request contract
+
+`POST /api/custom-payment` accepts the canonical JSON object:
+
+```json
+{
+  "api_key": "...",
+  "amount": 100000,
+  "order_id": "opaque-string"
+}
+```
+
+`amount` is TOMAN. A JSON integer is canonical; a legacy ASCII-decimal string matching exactly `[0-9]+` is also normalized before validation. Floats, booleans, signed strings, whitespace-padded strings, separators, exponents, and non-ASCII digits are rejected.
+
+`order_id` is an opaque, non-empty string with a bounded length. It is not trimmed, case-folded, or Unicode-normalized.
+
+Legacy clients using `application/x-www-form-urlencoded`, `text/plain`, or one extra JSON-string wrapper are supported only through bounded normalization; authentication, amount rules, idempotency, fee handling, and gateway validation remain identical.
+
+## Rate limiting and client IP
+
+The application uses bounded in-process sliding-window limiters. Payment creation has both per-IP and global ceilings; invalid callback signatures have per-IP and global ceilings; invalid API-key attempts retain a global ceiling. Caddy explicitly overwrites `X-Forwarded-For` with its resolved peer address, and the application accepts only one syntactically valid IP value before using it for limiter identity.
+
+Safe, work-free replay of an already linked order may bypass the creation limiter only when amount and payer-identity shape exactly match the stored payment. Any request that could create data, call the gateway, mutate state, or represent an identity mismatch consumes limiter budget.
+
+See [RATE_LIMITING_ARCHITECTURE.md](RATE_LIMITING_ARCHITECTURE.md).
+
+## Administrator operations
+
+Installations expose the host command `centralpay` for service lifecycle, backups, migration, review, reconciliation, fee policy, inspection, monitoring, and admin-bot control.
+
+Common commands:
+
+```text
+centralpay status
+centralpay logs [api|worker|db|caddy]
+centralpay logs-errors [COMPONENT]
+centralpay diagnose
+centralpay version
+
+centralpay payment ORDER_ID
+centralpay recent
+centralpay stuck
+centralpay retry-queue
+centralpay manual-review
+
+centralpay review list
+centralpay review show ORDER_ID
+centralpay review acknowledge ORDER_ID --note TEXT
+centralpay review resolve ORDER_ID --resolution VALUE --note TEXT
+centralpay review resend ORDER_ID --confirm-idempotent-bot --yes
+centralpay notification accept ORDER_ID --note TEXT --yes
+
+centralpay reconciliation status
+centralpay reconcile ORDER_ID
+centralpay recover-aged-out ORDER_ID
+
+centralpay fee status
+centralpay fee set RATE --note TEXT
+centralpay fee schedule RATE --at ISO --note TEXT
+centralpay fee history
+centralpay fee cancel POLICY_ID --note TEXT
+
+centralpay monitor enable
+centralpay monitor disable
+centralpay monitor check --json
+centralpay monitor incidents
+centralpay monitor status
+centralpay monitor logs
+centralpay monitor restart
+
+centralpay backup
+centralpay backups
+centralpay restore FILE
+centralpay db-check --details --json
+
+centralpay update --check
+centralpay update
+centralpay rollback
+```
+
+Detailed Persian runbooks: [OPERATIONS_FA.md](OPERATIONS_FA.md), [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md), and [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md).
 
 ## Production installation
 
-On a fresh Ubuntu 22.04/24.04/26.04 server (amd64 or arm64) with DNS for
-your payment domain pointed at it:
+Supported targets:
+
+- Ubuntu Server 22.04 LTS, 24.04 LTS, or 26.04 LTS
+- amd64 or arm64
+- Docker Engine + Docker Compose plugin
+- PostgreSQL 16 container
+
+One-line installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Mhoseinshah1/centralpay-bridge/main/install.sh | sudo bash
 ```
 
-The installer asks for domains, CentralPay keys, the bot token, TLS email,
-amount bounds, and the retry mode; generates the inbound API key, callback
-HMAC secret, and database password; deploys the Docker Compose stack; and
-prints the URLs and generated API token at the end. Configuration and
-secrets live in `/etc/centralpay-bridge/` (mode 0700/0600), never in the
-Git checkout. Backups go to `/var/backups/centralpay-bridge/` daily at
-03:15 with 14-day retention.
+Secrets and generated credentials are stored outside the repository under `/etc/centralpay-bridge/` with restrictive permissions. Backups default to `/var/backups/centralpay-bridge/`.
 
-Architecture:
+See [INSTALL_FA.md](INSTALL_FA.md) and [PRODUCTION_CHECKLIST_FA.md](PRODUCTION_CHECKLIST_FA.md).
 
-```text
-Internet ──► Caddy :80/:443 (automatic TLS) ──► API :8000 ──► PostgreSQL :5432
-                                                     ▲
-             Worker ── PostgreSQL ── Bot API ────────┘   (internal network only;
-                                                          only Caddy publishes ports)
+## Production update policy
+
+Production updates are **release-tag only by default**.
+
+`CENTRALPAY_UPDATE_REF` must normally be a release tag matching `vX.Y.Z` or `vX.Y.Z-rcN`. For a release tag, the updater verifies the release artifact, `SOURCE_COMMIT`, and `SHA256SUMS`, and requires the fetched tag commit to equal the verified `SOURCE_COMMIT` before checkout, backup/deploy, migration, or restart.
+
+Plain branch refs such as `main` are rejected unless the operator explicitly sets:
+
+```env
+CENTRALPAY_UPDATE_ALLOW_DEV_REF=true
 ```
 
-Manage the installation with `centralpay`:
+That setting is for local/development use and disables release integrity binding for the selected branch ref. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a separate emergency escape hatch for a release tag whose verification assets are unavailable; it is not the normal production path.
 
-```text
-centralpay status | logs [api|worker|db|caddy] | logs-errors | diagnose
-centralpay restart | stop | start | update | migrate | ssl | version
-centralpay backup | backups | restore FILE
-centralpay payment ORDER_ID | recent | retry-queue | manual-review
-centralpay credentials | uninstall
-centralpay admin-bot status | logs | restart | enable | disable | test-alert
-```
+## Backups and restore
 
-## Upgrading production
+The host backup job creates PostgreSQL custom-format dumps, validates them with `pg_restore --list`, writes SHA-256 manifest metadata, and applies retention while always keeping the newest valid backup. Restore verifies the selected file/manifest, creates a pre-restore backup, stops writers, restores with `--exit-on-error`, runs migrations and the canonical integrity checker, and only then restarts application services.
 
-`centralpay update` deploys the ref pinned by `CENTRALPAY_UPDATE_REF` in
-`/etc/centralpay-bridge/centralpay.env`. Production installs must pin a
-**release tag** (`vX.Y.Z` or `vX.Y.Z-rcN`, e.g. `v0.6.0-rc1`) — the installer
-sets this by default. For a release tag, `centralpay update`:
-
-1. Fetches the tag and resolves it to a commit.
-2. Downloads that release's `SHA256SUMS`, `SOURCE_COMMIT`, and source
-   artifact from the GitHub release (published by `.github/workflows/release.yml`,
-   see "Releasing a new version" below).
-3. Verifies the artifact and `SOURCE_COMMIT` checksums, and validates
-   `SOURCE_COMMIT`'s exact grammar (a single 40-char lowercase-hex commit).
-4. Requires the fetched tag's commit to equal the verified `SOURCE_COMMIT` —
-   if the tag was moved after the release was built, the update aborts here,
-   **before** any backup, checkout, build, migration, or restart.
-5. Only once all of the above pass: takes a pre-update backup, checks out the
-   verified commit, builds images, runs migrations, and restarts services.
-
-A plain branch (`main`, `master`, or anything else that isn't a release tag)
-is **rejected** by default — `centralpay update` fails closed with no
-checkout, matching the production requirement that every deployed commit be
-checksum- and `SOURCE_COMMIT`-verified. To point a **local development**
-install at a branch instead, set `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true` in
-`centralpay.env`; this skips all verification and must never be set on a
-production host. `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` is a separate,
-narrower escape hatch for when a release tag's assets can't be downloaded —
-also root-only and not recommended.
-
-Check what would change before updating:
-
-```bash
-sudo centralpay update --check
-sudo centralpay update
-```
-
-If the post-update health check fails, the deploy stops automatically and
-the previously working `centralpay` command is left in place. Roll the
-application files back with `sudo centralpay rollback` (interactive
-confirmation required). Database migrations are forward-only and are never
-downgraded automatically — see [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md); if
-a migration is incompatible, restore the pre-update backup instead
-(`centralpay backups && centralpay restore FILE`).
-
-## Releasing a new version
-
-Release artifacts are built and checksummed entirely by
-`.github/workflows/release.yml`, gated on every quality, shell, Docker,
-secret-scan, dependency-scan, and docs job passing:
-
-1. Bump `APP_VERSION` in `app/version.py` to match the tag you're about to
-   push (CI fails the release if they disagree).
-2. Add a `CHANGELOG.md` entry and, for a new minor/major line, release notes
-   (`RELEASE_NOTES_<version>.md`).
-3. Push a signed annotated tag matching the release-tag grammar, e.g.
-   `git tag -a v0.6.0-rc2 -m "v0.6.0-rc2" && git push origin v0.6.0-rc2`.
-4. The workflow builds the source artifact, computes `SOURCE_COMMIT` (the
-   exact commit the artifact was built from), generates an SBOM, computes
-   `SHA256SUMS` over the artifact + `SOURCE_COMMIT` + SBOM, and opens a
-   **draft** GitHub release with those files attached. Publishing the draft
-   is always a separate, manual, human decision — the workflow never
-   publishes it.
-5. Once published, point production installs at the new tag by setting
-   `CENTRALPAY_UPDATE_REF=vX.Y.Z` and running `sudo centralpay update` (see
-   "Upgrading production" above).
-
-## Requirements
-
-- Python 3.12
-- PostgreSQL (production and integration tests; SQLite is used only for
-  isolated unit tests)
-
-## Development setup
-
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-Create a local PostgreSQL database, e.g.:
-
-```bash
-sudo -u postgres psql \
-  -c "CREATE USER centralpay WITH PASSWORD 'devpassword' CREATEDB;" \
-  -c "CREATE DATABASE centralpay OWNER centralpay;"
-```
-
-Configure the environment:
-
-```bash
-cp .env.example .env
-# edit .env — every CHANGE_ME value must be replaced
-```
-
-`.env` is git-ignored. Never commit real credentials.
-
-## Database migrations
-
-Migrations read the database URL from `DATABASE_URL`:
-
-```bash
-export DATABASE_URL='postgresql+psycopg://centralpay:devpassword@localhost:5432/centralpay'
-alembic upgrade head
-```
-
-## Running the API
-
-```bash
-uvicorn app.asgi:app --host 127.0.0.1 --port 8000 --no-access-log
-```
-
-`--no-access-log` is required in every environment that handles real
-callbacks: uvicorn's access log prints full request lines including query
-strings, which would leak callback signatures. The application logs each
-request itself (method, path, status, request id — never the query string).
-
-### Endpoints
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /api/custom-payment` | Create a payment; body `{"api_key", "amount", "order_id"}`; returns `{"url": "..."}` |
-| `GET /api/centralpay/callback?orderId=...&ct=...&sig=...` | Signed CentralPay return URL; triggers verification and returns a payer-facing status page |
-| `GET /health/live` | Liveness probe |
-| `GET /health/ready` | Readiness probe with a real database connectivity check |
-
-### Payment-creation request contract (strict)
-
-The request schema rejects anything outside this contract with a generic
-`422 validation_error` (field contents are never echoed back):
-
-- `api_key` — string. Compared in constant time; never logged, never
-  included in errors.
-- `amount` — a JSON **integer**, TOMAN. For legacy-client compatibility a
-  plain ASCII-decimal **string** matching exactly `[0-9]+` (e.g. `"50000"`)
-  is also accepted and converted to that integer before validation.
-  Everything else is rejected, never coerced: floats, booleans, and any
-  other string shape — a sign (`+50000`, `-100`), separators (`50,000`,
-  `50_000`), surrounding whitespace, exponents (`1e4`), non-ASCII digits
-  (Persian/Arabic `۵۰۰۰۰`), or empty. Policy bounds are
-  `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` (checked after
-  authentication, error `amount_out_of_range`); the schema additionally
-  enforces an absolute backstop of 10¹² TOMAN.
-- `order_id` — opaque non-empty string, at most 128 characters, no
-  control characters, no NUL. Passed through unchanged: never trimmed,
-  case-folded, or Unicode-normalized.
-
-### Legacy request-body compatibility
-
-The canonical request is an `application/json` object, and that is what new
-clients should send. To accommodate an older selling bot that could not be
-changed, the endpoint additionally normalizes a small, explicitly allowed
-set of body encodings into that same strict contract before validating —
-nothing about authentication, idempotency, fees, or gateway handling is
-relaxed. Accepted representations:
-
-- **`application/json`** — a JSON object, **or** a JSON *string* whose
-  content is exactly one JSON object (at most one extra decode layer; a
-  string-in-a-string is **not** unwrapped recursively).
-- **`application/x-www-form-urlencoded`** — the three fields `api_key`,
-  `amount`, `order_id`, each present **exactly once**; a duplicated or
-  missing required field is rejected, unrelated extra fields are ignored
-  (never validated, stored, or logged), and at most 32 form pairs are
-  accepted. If the body is **not urlencoded syntax at all** (the legacy
-  sales bot declares this content type while sending JSON), the parser
-  falls back to the same one-extra-layer JSON decoder above — a validly
-  parsed form that fails a semantic rule never falls back.
-- **`text/plain`** — one JSON object, or one JSON string containing one
-  JSON object (same one-layer rule).
-- A missing `Content-Type` is treated as JSON (the historical default).
-
-Every other content type — including `multipart/form-data` — and every
-malformed body is rejected with the same generic `422 validation_error`;
-oversized bodies (beyond the 64 KB edge limit) are refused before any
-parsing. Rejections never echo field contents, and no field value (in
-particular `order_id`) is logged for an unauthenticated request. The body
-size is bounded before decoding, and a sanitized
-`custom_payment_body_normalized` log event (representation, content type,
-and byte length only) records each accepted request.
-
-### Idempotency contract
-
-Creation is idempotent by `order_id`, serialized with a database row
-lock (the lock is held across the CentralPay getLink call — model A —
-so two concurrent requests can never both call getLink for one order):
-
-- Same `order_id` + same `amount` with a live link → the **same URL** is
-  returned (`payment_duplicate_returned` log event); no new gateway
-  call, no new callback token.
-- Same `order_id` + **different amount** → `409
-  duplicate_order_amount_mismatch` (audited); the stored payment is
-  never modified.
-- Already gateway-verified order → `409 order_already_verified`; a new
-  link is **never** issued for a verified payment (this also covers
-  verified payments later moved to manual review).
-- Never-verified order under manual review → `409 order_under_review`;
-  state is never silently reset.
-- After a getLink failure (including ambiguous timeouts) → the retry
-  issues a fresh gateway order id and a fresh one-time callback token;
-  the possibly-half-registered previous id is abandoned, and tokens from
-  superseded attempts are rejected at callback time. **Link refresh is
-  driven by the bot re-requesting the same `order_id`** — an unpaid
-  link's token stays valid until a retry durably commits its
-  replacement (token and redirect URL always commit atomically).
-- Gateway order ids are random 12-digit integers under a database
-  unique index — guess-resistant, no sequence to drift or reset after a
-  backup restore.
-
-A crash between a successful getLink and our commit loses the invoice
-reference atomically (neither token nor URL is stored); the orphaned
-CentralPay invoice is unreachable (its URL was never returned to
-anyone), and the bot's retry recovers with a fresh link.
-
-## Bot notification (Phase 2)
-
-### gateway_verified vs bot_notify_accepted
-
-These are different facts and must never be conflated:
-
-- **Gateway verified** (`gateway_verified_at` set): CentralPay confirmed the
-  money movement, and amount / userId / referenceId matched our records.
-- **`bot_notify_accepted`**: the bot API answered HTTP 2xx to our
-  notification. The bot API defines no response schema and no idempotency
-  guarantee, so **HTTP 2xx only means the request was accepted — it is not
-  proof the user balance was credited.** The bridge never records a
-  "balance_credited" state, because it cannot know that.
-
-### Payment states
-
-`created` → `link_created` (→ `getlink_failed`) → `bot_notify_pending`
-→ `bot_notify_accepted`, with `manual_review` reachable from verification
-mismatches and delivery failures. `gateway_verified` exists as a transient /
-legacy state: since Phase 2, verification commits straight to
-`bot_notify_pending` (the durable verification fact is
-`gateway_verified_at`).
-
-Every non-success state carries an explicit machine-readable reason code in
-`bot_notify_reason`, stored separately from human-readable `last_error` text.
-
-### Reason codes
-
-| Code | Meaning | Effect (safe mode) |
-| --- | --- | --- |
-| `bot_notify_accepted` | Bot API returned 2xx | terminal success |
-| `bot_dns_failed` | DNS resolution failed before connecting | retry with backoff |
-| `bot_connection_refused` | Connection refused | retry with backoff |
-| `bot_connection_failed` | Connection could not be established | retry with backoff |
-| `bot_http_500` / `502` / `503` / `504` | Bot server error | retry with backoff |
-| `bot_http_429` | Rate limited | retry (honors integer `Retry-After`) |
-| `bot_timeout_ambiguous` | Timeout after the request may have been transmitted | `manual_review` |
-| `bot_http_400/401/403/404/409/422` | Client-side rejection | `manual_review` |
-| `bot_http_other` | Unexpected status (3xx, 418, 501, …) | `manual_review` |
-| `bot_invalid_configuration` | Notification URL/token missing | `manual_review` |
-| `retry_limit_reached` | `BOT_NOTIFY_MAX_ATTEMPTS` exhausted | `manual_review` |
-| `manual_review_required` | Generic review marker on audit events | — |
-
-### Retry modes
-
-- **`BOT_NOTIFY_RETRY_MODE=safe` (default):** only failures that clearly
-  happened before the bot could have processed the request are retried
-  (DNS, connection refused/failed, 5xx listed above, 429). An ambiguous
-  read/write timeout — where the bot may already have credited the user —
-  is **never** retried automatically; the payment moves to `manual_review`
-  with reason `bot_timeout_ambiguous` and a critical audit event.
-- **`BOT_NOTIFY_RETRY_MODE=idempotent`:** ambiguous timeouts are retried
-  too. Enable this **only** when the bot developer has explicitly confirmed
-  that duplicate `order_id` deliveries are idempotent.
-
-Backoff schedule: 1, 2, 5, 10, 30, 60 minutes (±15% jitter), then
-`manual_review` with `retry_limit_reached` after `BOT_NOTIFY_MAX_ATTEMPTS`
-attempts (default 6). Retries and recovery survive process restarts.
-
-### What manual_review means
-
-The bridge could not safely decide the outcome on its own (verification
-mismatch, ambiguous delivery, non-retryable bot rejection, retry limit).
-The payment is frozen — never auto-retried, never overwritten — and its
-full attempt history is preserved in `payment_events`. An administrator
-must inspect it (`python -m app.cli manual-review`) and resolve it
-manually. Administrator tooling for resolution arrives in later phases.
-
-### Manual acceptance of a stuck notification
-
-Rare escape hatch for a payment stuck in `bot_notify_pending` even though
-the operator has independently confirmed (with the downstream bot, outside
-this system) that the bot already processed it — for example a proven
-side-effecting `bot_http_500` (see [Retry modes](#retry-modes)) where safe
-mode correctly stopped auto-retrying. `centralpay review resolve`/`resend`
-do not apply: the payment was never in `manual_review`.
-
-```bash
-centralpay notification accept ORDER_ID --note "VPN bot operator confirmed the order was already processed" --yes
-```
-
-Requires `status == bot_notify_pending` AND a recorded gateway
-verification, re-checked fresh under a row lock (refuses safely if the
-worker or another operator already moved the payment). It makes **zero**
-bot or gateway HTTP requests, never fabricates a verification fact or a
-reference id, and never touches an amount, `bot_notify_attempts`, or the
-historical `bot_last_http_status`/`bot_last_error_code` diagnostics.
-Records a distinct `manual_bot_notification_accepted` audit event (never
-the automatic `bot_notification_accepted` event) and permanently stops
-retries for that one payment (`next_retry_at` cleared). Without `--yes` it
-refuses and prints exactly what the command will and will not do.
-
-### Worker lifecycle and recovery guarantees (audit)
-
-The delivery pipeline is a strict four-step sequence designed around
-crash windows (documented model; every step below is regression-tested):
-
-1. The **callback transaction** commits the verified fact together with
-   `bot_notify_pending` and the queue timestamp — atomically.
-2. A worker **claims** one due payment (`FOR UPDATE SKIP LOCKED`,
-   attempt counter incremented, `bot_notification_started` audit event)
-   and **commits the claim**.
-3. The HTTP request to the bot runs with **no database transaction
-   open** — locks are never held across external I/O in the worker.
-4. The classified result is recorded in a **new transaction**, and only
-   if the row still carries **this worker's claim at this attempt
-   number** — a straggler whose attempt outlived its claim can never
-   record a result against a successor's claim (the discard itself is
-   audited as `bot_notification_result_discarded`).
-
-Recovery guarantees:
-
-- **Nothing lives in process memory.** Queue state, retry schedule, and
-  attempt history are all in PostgreSQL; any worker restart (SIGTERM,
-  SIGINT, container kill, crash) resumes from the database.
-- **Stale claims** (a worker died mid-attempt) are recovered on every
-  pass, in bounded batches: the interrupted attempt's outcome is
-  unknown, so safe mode routes it to manual review as an ambiguous
-  delivery; idempotent mode requeues it with backoff.
-- **Retries are bounded in every path**: failed attempts AND interrupted
-  attempts count against `BOT_NOTIFY_MAX_ATTEMPTS`; when the limit is
-  reached — including via repeated stale-claim recovery — the payment
-  moves to manual review with `retry_limit_reached`. Nothing retries
-  forever, and nothing is silently dropped.
-- **Manual review is terminal for the worker**: passes never select
-  `manual_review` payments, callbacks never reset them, and duplicate
-  create requests never reset them.
-- Multiple workers are safe: `SKIP LOCKED` guarantees a payment is
-  claimed by at most one worker; ordering is deterministic
-  (`next_retry_at` ascending — oldest due first, so retries and new
-  payments share one fair queue and neither starves); batches are
-  bounded (20 per pass).
-
-### Running the worker locally
-
-```bash
-python -m app.worker
-```
-
-The worker validates `BOT_PAYMENT_NOTIFY_URL` and `BOT_NOTIFY_TOKEN` at
-startup (refusing to run without them, without ever logging their values),
-polls every `BOT_NOTIFY_WORKER_INTERVAL_SECONDS`, claims due payments with
-`FOR UPDATE SKIP LOCKED` (safe with multiple workers), sends each
-notification with **no database transaction open**, and records the
-classified result in a new transaction. Claims older than
-`BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` (a worker crashed mid-attempt) are
-recovered on every pass: manual review in safe mode, requeue in idempotent
-mode.
-
-### Inspecting payments and the retry queue
-
-```bash
-python -m app.cli recent --limit 20   # newest payments
-python -m app.cli payment ORDER_ID    # one payment + full audit history
-python -m app.cli retry-queue         # pending deliveries with next_retry_at
-python -m app.cli manual-review       # payments waiting for an administrator
-```
-
-All commands are read-only and print one JSON object per line with order
-IDs, verification status, delivery status, reason code, attempt count, last
-HTTP status, next retry time, reference ID, and timestamps.
-
-### Server-side payment reconciliation
-
-Some payers complete payment on CentralPay but never return to the browser
-callback (closed tab, network drop, in-app browser). Without intervention the
-payment stays in `link_created` forever and the customer is never credited —
-this happened in production. The worker therefore reconciles stuck payments
-server-side:
-
-- **The browser callback stays the fast primary path.** Its URL format, HMAC
-  signature, and one-time callback token validation are completely unchanged;
-  reconciliation never fakes or reconstructs any of them — it is pure
-  server-to-server verification.
-- **One settlement path.** Reconciliation calls the exact same internal
-  verify-and-settle function the callback uses (`verify_and_settle` in
-  `app/services/verification.py`): explicit gateway success, referenceId
-  validity and uniqueness, amount == `payable_amount`, userId == the stored
-  `gateway_user_id` snapshot, mismatches → `manual_review`, and atomic
-  bot-notification queueing. There is no parallel payment path to audit.
-- **Dedicated thread — notifications never wait.** Reconciliation runs in its
-  own thread inside the worker process, with its own CentralPay HTTP client
-  and its own short-lived database sessions (nothing is shared across
-  threads). Bot-notification delivery keeps its exact cadence even while a
-  reconciliation verify call is slow or timing out: the two loops only meet
-  at the database, where row locks (below) keep them correct. The thread is
-  exception-isolated and shuts down with the worker; an in-flight verify
-  cannot be interrupted, so shutdown waits at most one gateway timeout for
-  it.
-- **Selection.** Every `RECONCILIATION_INTERVAL_SECONDS` (default 5 s) the
-  thread picks up to `RECONCILIATION_BATCH_SIZE` payments in `link_created`
-  that are at least `RECONCILIATION_MIN_AGE_SECONDS` old (default 10 s,
-  measured from link issuance, so the normal callback gets the first chance),
-  younger than `RECONCILIATION_MAX_AGE_SECONDS` (default 7200 s = 2 h — the
-  hard reconciliation lifetime; older payments are excluded from selection
-  entirely, never deleted or mutated, left in `link_created` for
-  audit/operator inspection), and due for a check. Verified, notification,
-  `manual_review`, and pre-link states are never selected.
-- **Two-tier fairness.** Due payments split into an ACTIVE tier (age <
-  `RECONCILIATION_FAST_WINDOW_SECONDS`, the still-payable link) and an
-  EXPIRING tier (fast window ≤ age < max age, a safety window for late
-  payment/delayed gateway propagation/dropped callbacks), each ordered
-  oldest-due-first. A naive single priority ordering would let sustained
-  active-tier traffic starve the expiring tier completely, so every pass
-  reserves `RECONCILIATION_SLOW_TIER_RESERVED_SLOTS` (default 1) of its
-  batch for the expiring tier first; any slot whose preferred tier has
-  nothing due spills to the other tier, and total claims per pass never
-  exceed `RECONCILIATION_BATCH_SIZE`. This guarantees a historical backlog
-  can never delay a newly-created payment by more than a scan interval or
-  two, while the expiring tier still makes steady progress.
-- **Two-stage age-based retry schedule.** The retry stage comes from the REAL
-  age of the payment link (`callback_token_issued_at`, falling back to
-  `created_at`) — never from the attempt count, so stopping or restarting the
-  worker cannot restart the fast window:
-  - first server-side check ≈ 10 seconds after the link is issued (plus up to
-    one scan interval of alignment delay);
-  - link age < `RECONCILIATION_FAST_WINDOW_SECONDS` (default 900 = the
-    15-minute CentralPay link lifetime): one verify every
-    `RECONCILIATION_FAST_INTERVAL_SECONDS` (default 10);
-  - link age ≥ the window: one verify every
-    `RECONCILIATION_SLOW_INTERVAL_SECONDS` (default 300);
-  - reconciliation stops immediately once the payment is verified, leaves
-    `link_created`, or moves to `manual_review`.
-- **Outcomes.** Gateway success settles and queues the bot notification
-  exactly once (`reconciliation_verified` event). "Not paid yet" and
-  transport errors schedule the next check on the two-stage schedule above
-  (`reconciliation_gateway_not_paid` / `reconciliation_transport_failed` +
-  `reconciliation_retry_scheduled`). After `RECONCILIATION_MAX_ATTEMPTS`
-  (default 1000 — a SECONDARY safety guard; `RECONCILIATION_MAX_AGE_SECONDS`
-  is the primary lifetime limit) the payment is left in `link_created` for
-  operators (`reconciliation_exhausted`) — never auto-failed, never
-  auto-paid. Financial mismatches keep the existing `manual_review` behavior
-  and never notify the bot.
-- **Concurrency.** Payments are claimed with `FOR UPDATE SKIP LOCKED` and the
-  row lock is held across the verify call — exactly how the callback
-  serializes — so two workers can never settle one payment twice, a
-  callback racing reconciliation waits and takes the duplicate path, and a
-  callback arriving after reconciliation is answered as a duplicate.
-- **Gateway load.** `BATCH_SIZE / INTERVAL` (defaults: 2 verifies/second) is
-  an **average** upper bound, not a burst bound — one pass may issue its
-  whole batch of up to `RECONCILIATION_BATCH_SIZE` verify calls back-to-back
-  before waiting out the scan interval. Per stuck payment the schedule costs
-  ~6 verifies/minute for its first 10 minutes, then one every 5 minutes.
-- **Disable.** Set `RECONCILIATION_ENABLED=false` and restart the worker.
-  Only the polling stops; callbacks, verification, and notification delivery
-  are unaffected.
-
-Inspecting reconciliation:
-
-```bash
-python -m app.cli payment ORDER_ID    # includes reconciliation_* events
-python -m app.cli manual-review       # financial mismatches land here
-# stuck payments the poller gave up on (operator follow-up):
-docker compose exec db psql -U centralpay -c \
-  "SELECT bot_order_id, gateway_order_id, reconciliation_attempts, \
-          reconciliation_last_error_code, reconciliation_last_at \
-     FROM payments \
-    WHERE status = 'link_created' \
-      AND reconciliation_attempts >= 60 \
-      AND reconciliation_next_at IS NULL;"
-```
-
-**Rollout:** deploy the build, run `alembic upgrade head` (migration 0010 —
-adds nullable bookkeeping columns and an index; no data migration, existing
-stuck payments become due automatically), restart the worker, then watch for
-`reconciliation_*` events. **Rollback:** either set
-`RECONCILIATION_ENABLED=false` (worker restart, schema untouched) or roll the
-application back — migration 0010's downgrade is non-destructive (pointer
-only) and the previous application ignores the extra columns, so no schema
-downgrade is required.
-
-## Dynamic service fee (percentage)
-
-The bridge can add a percentage service fee on top of the bot's invoice.
-The fee is **paid by the payer through the gateway** and is invisible to
-the selling bot: the bot's request, the bot's credited amount, and the bot
-notification payload are all unchanged.
-
-### Money model
-
-| Field | Meaning |
-| --- | --- |
-| `payments.amount` | The ORIGINAL bot invoice — exactly what the bot sent and what the bot credits. Never includes the fee. |
-| `payments.fee_rate_bps` | Fee percentage snapshot in basis points (10% = 1000 bps). |
-| `payments.fee_amount` | Fee in TOMAN: `(amount * fee_rate_bps + 5000) // 10000` — pure integer arithmetic, round half up. Floats are never used for money. |
-| `payments.payable_amount` | `amount + fee_amount` — what CentralPay is asked to charge (`getLink` amount) and what `verify` must report back. |
-| `payments.fee_policy_id` | The `fee_policies` row the snapshot came from (`NULL` for pre-fee/zero-fee payments). |
-
-Example: the bot requests 500 000 TOMAN with a 10% fee active → fee 50 000,
-CentralPay charges 550 000, verify must report 550 000, and the bot is told
-only `order_id` — it credits its own original 500 000 invoice.
-
-Database `CHECK` constraints enforce the arithmetic at the storage layer
-(`payable_amount = amount + fee_amount`, rate within 0..10000, fee ≥ 0),
-and `centralpay db-check` additionally reports snapshot corruption (it
-never alters financial fields).
-
-### Snapshot immutability
-
-The fee is **snapshotted once, at payment creation**, in the same
-transaction that inserts the row (audit event `payment_fee_snapshotted`).
-After that it never changes:
-
-- Fee policy changes affect **new orders only**; existing payments keep
-  their snapshot forever.
-- Idempotent duplicate requests return the existing link with the original
-  snapshot — even if the fee changed in between.
-- A retry after `getlink_failed` keeps the original snapshot and re-sends
-  the stored `payable_amount`.
-
-### Verification and bounds
-
-- `verify` must report exactly `payable_amount`; anything else (including
-  the original amount, i.e. a fee that was not charged) routes the payment
-  to `manual_review` with the `verify_payable_amount_mismatch` event. The
-  bot is never notified for such a payment.
-- `MIN_PAYMENT_AMOUNT_TOMAN` bounds the **original** amount;
-  `MAX_PAYMENT_AMOUNT_TOMAN` bounds the **final payable** amount. If
-  `amount + fee` would exceed the maximum, creation is rejected with
-  `payable_amount_out_of_range` (HTTP 400) before any row, snapshot, or
-  gateway call — the fee is never silently clamped or reduced.
-
-### Fee policies (append-only, no restarts)
-
-Policies live in the `fee_policies` table — never in an environment
-variable — so every API/worker replica observes changes through
-PostgreSQL, and backups capture the full history. The table is
-append-only: policies are added or cancelled, never edited or deleted.
-The active policy is selected deterministically: highest `effective_at`
-not in the future, ties broken by highest `id`, cancelled rows excluded.
-A scheduled policy activates at exactly its `effective_at` with no
-restart. All changes are recorded as permanent audit events
-(`fee_policy_created` / `fee_policy_scheduled` / `fee_policy_cancelled`).
-
-### Operating the fee
-
-```bash
-centralpay fee status                                # current + next scheduled
-centralpay fee set 10 --note "launch fee"            # root only
-centralpay fee schedule 2.5 --at 2026-08-01T00:00:00+03:30 --note "summer"
-centralpay fee history                               # full append-only history
-centralpay fee cancel 3 --note "wrong rate"          # cancel a SCHEDULED policy only
-```
-
-Rates are 0–100 with at most two decimals; signs, scientific notation,
-separators, and anything else are rejected. Mutations require root and
-delegate to the typed Python ops command (`python -m app.ops fee ...`) —
-never shell-generated SQL. The admin Telegram bot's `/fee` command is
-strictly read-only. `fee cancel` refuses the currently effective policy
-(and superseded history): cancelling it would silently fall back to an
-older rate — change the current fee only with `fee set` (`fee set 0` to
-remove it). The installer asks for the initial fee percentage (default
-0) and applies it with `--ensure-initial`, which creates a policy only
-when no policy row has ever existed (scheduled and cancelled history
-count) — an installer re-run can never reset or inject a fee, and
-concurrent reruns are serialized by a database advisory lock.
-
-**Operator obligation:** the fee is charged to the payer, so the payer
-must be told the final payable amount before paying. Disclose the fee in
-the bot's purchase flow before issuing the payment link.
+A backup on the same host is **not** disaster recovery. Off-site replication remains an operator responsibility unless separately implemented.
 
 ## Monitoring
 
-Optional, dedicated monitoring process (`MONITOR_ENABLED=false` by
-default): public readiness, database, worker heartbeats,
-notification/manual-review backlog, reconciliation health, backup
-freshness, disk space, DB integrity, and gateway/bot failure bursts, with
-durable (cross-restart) incident deduplication and exactly-once
-open/escalation/recovery alerts delivered through the existing admin-bot
-Telegram pipeline.
+An optional, dedicated monitoring process (`MONITOR_ENABLED=false` by default, separate from the worker) checks public readiness, database connectivity, worker heartbeats, notification/manual-review backlog, reconciliation health, backup freshness and manifest integrity, disk space, DB integrity, and gateway/bot failure bursts. Incidents are durable — backed by the `monitor_incidents` table, so state survives a restart — with deduplicated, exactly-once open/escalation/recovery alerts delivered through the existing admin-bot Telegram pipeline.
 
 ```bash
 centralpay monitor enable            # start the monitor service
@@ -776,88 +207,70 @@ centralpay monitor check --json      # run every check now
 centralpay monitor incidents         # currently open incidents
 ```
 
-An admin can also run `/monitor` in Telegram for the same live snapshot.
-See [MONITORING.md](MONITORING.md) for the full architecture, check/
-threshold reference, incident-lifecycle design, and operator runbook.
+An admin can also run `/monitor` in Telegram for the same live snapshot (read-only). Gateway/bot failure-burst counting only counts genuine transport/protocol-level failures — an ordinary payer declining or abandoning a payment never trips it. Backup validation checks manifest metadata (filename, size, checksum shape) without ever hashing the full dump file. If PostgreSQL itself is unreachable, database-independent checks keep running and database-dependent checks degrade to a `database_unavailable` result instead of crashing the pass.
 
-## Tests
+See [MONITORING.md](MONITORING.md) for the full architecture, check/threshold reference, incident-lifecycle design, operator runbook, and known limitations (including PostgreSQL-outage behavior).
 
-Unit tests (SQLite in-memory, CentralPay mocked at the HTTP transport layer):
+## Security
+
+Important controls include:
+
+- HMAC-signed callback + one-time callback token hash
+- constant-time comparison for inbound secrets/signatures
+- strict gateway response parsing
+- HTTPS-only CentralPay transport
+- bounded redirect/reference validation
+- least-privilege container secret distribution
+- structured logs with secret redaction
+- Caddy callback query and `Referer` redaction for `ct` and `sig`
+- application rate limiting
+- PostgreSQL row locks, uniqueness constraints, and check constraints
+- gitleaks/dependency scans in CI
+
+See [SECURITY.md](SECURITY.md) and [SECURITY_HARDENING_AUDIT.md](SECURITY_HARDENING_AUDIT.md).
+
+## Verification and historical audit documents
+
+The repository contains several audit, validation, incident, and release-candidate documents produced at specific commits. They are retained as evidence and history; they are **not automatically kept synchronized with later code**. When an old audit says a review was still pending, treat that as the state at that audit's commit, not necessarily the current repository state.
+
+[DOCUMENTATION.md](DOCUMENTATION.md) classifies every Markdown document as current/living, historical snapshot, validation evidence, or archive/legacy material.
+
+## Development
 
 ```bash
-pytest
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cp .env.example .env
 ```
 
-PostgreSQL integration tests (migration on an empty database, full payment
-flow, concurrent callback locking) require `TEST_DATABASE_URL` pointing at a
-disposable database:
+Production and concurrency-sensitive integration tests use PostgreSQL. SQLite is allowed only for isolated tests that do not depend on PostgreSQL semantics.
+
+Apply migrations, then run the API and worker locally:
 
 ```bash
-export TEST_DATABASE_URL='postgresql+psycopg://centralpay:devpassword@localhost:5432/centralpay_test'
-pytest -m postgres
+alembic upgrade head
+uvicorn app.asgi:app --host 127.0.0.1 --port 8000 --no-access-log
+python -m app.worker
 ```
 
-Without `TEST_DATABASE_URL`, the `postgres`-marked tests are skipped.
+`--no-access-log` is required in every environment that handles real callbacks: uvicorn's default access log prints full request lines including query strings, which would leak callback signatures. See [MIGRATION_GUIDE.md](MIGRATION_GUIDE.md) for the migration chain.
 
-## Lint and type checking
+Typical validation:
 
 ```bash
+pytest -q
 ruff check .
 mypy app tests
+shellcheck install.sh scripts/backup.sh scripts/centralpay
+bash -n install.sh scripts/backup.sh scripts/centralpay
+docker compose config --quiet
 ```
 
-## Configuration reference
+GitHub Actions additionally builds the image and runs secret/dependency scans.
 
-See [.env.example](.env.example) for the full list. Notable values:
+## Release state
 
-| Variable | Meaning |
-| --- | --- |
-| `PUBLIC_BASE_URL` | Public HTTPS **origin** of the bridge (`https://host[:port]` — no path/query/fragment/userinfo; cleartext HTTP rejected at startup); used to build the signed CentralPay return URL |
-| `INBOUND_API_KEY` | Key the bot must send in `POST /api/custom-payment` (min 16 chars) |
-| `CALLBACK_HMAC_SECRET` | Secret for HMAC-SHA256 callback signatures (min 16 chars) |
-| `CENTRALPAY_GETLINK_API_KEY` / `CENTRALPAY_VERIFY_API_KEY` | CentralPay web service key. The gateway issues a **single** API key used for both getLink and verify — the installer asks for it once and sets the same value in both variables (kept separate so a future split key needs no contract change) |
-| `CENTRALPAY_USER_ID` | Numeric userId sent to getLink and validated on verify |
-| `BOT_PAYMENT_NOTIFY_URL` | Complete bot payment endpoint (e.g. `https://bot.example.com/api/payment`). HTTPS required by default; validated strictly (no userinfo/query/fragment; path stored exactly) |
-| `ALLOW_INSECURE_BOT_NOTIFY_URL` | Default `false`. When `true`, cleartext `http://` is allowed ONLY for private/internal hosts (localhost, private IP literals, single-label service names, `*.internal`/`*.local`) — for isolated mock-bot networks; the `Token` header then crosses without TLS. Public hosts stay rejected. No DNS is consulted |
-| `CENTRALPAY_BASE_URL` | CentralPay service base (default `https://centralapi.org/webservice/basic`). Always HTTPS — no insecure exception; the API key travels in request bodies |
-| `BOT_NOTIFY_TOKEN` | Bot `Token` header value; never logged |
-| `BOT_NOTIFY_RETRY_MODE` | `safe` (default) or `idempotent` — see retry modes above |
-| `BOT_NOTIFY_MAX_ATTEMPTS` | Attempts before `manual_review` with `retry_limit_reached` (default 6) |
-| `BOT_NOTIFY_CONNECT_TIMEOUT_SECONDS` / `BOT_NOTIFY_READ_TIMEOUT_SECONDS` | Bot HTTP timeouts (5 / 15) |
-| `BOT_NOTIFY_WORKER_INTERVAL_SECONDS` | Worker poll interval (default 10) |
-| `BOT_NOTIFY_CLAIM_TIMEOUT_SECONDS` | Stale-claim threshold; must exceed connect+read timeouts (default 120) |
-| `RECONCILIATION_ENABLED` | Server-side stuck-payment reconciliation in the worker (default `true`); disabling only stops the polling — callbacks are unaffected |
-| `RECONCILIATION_MIN_AGE_SECONDS` | Grace period for the normal browser callback before the first server-side check (default 10) |
-| `RECONCILIATION_INTERVAL_SECONDS` / `RECONCILIATION_BATCH_SIZE` | Scan cadence and per-pass payment cap (defaults 5 / 10 — average ≤ 2 verifies/second; a pass may burst its whole batch) |
-| `RECONCILIATION_SLOW_TIER_RESERVED_SLOTS` | Per-pass batch slots reserved for the expiring (15 min-2 h) tier so it can't be starved by active-tier traffic (default 1; must stay below `RECONCILIATION_BATCH_SIZE`) |
-| `RECONCILIATION_FAST_WINDOW_SECONDS` | Age boundary between the active and expiring tiers / the fast and slow retry stages (default 900 = the 15-minute CentralPay link lifetime) |
-| `RECONCILIATION_FAST_INTERVAL_SECONDS` / `RECONCILIATION_SLOW_INTERVAL_SECONDS` | Retry cadence below / at-or-above the boundary (defaults 10 / 300) |
-| `RECONCILIATION_MAX_AGE_SECONDS` | Hard reconciliation lifetime (default 7200 = 2 h): payments this old or older are excluded from selection entirely — never deleted, never marked paid/failed, kept `link_created` for operators. The PRIMARY lifetime limit; must stay greater than `RECONCILIATION_FAST_WINDOW_SECONDS` |
-| `RECONCILIATION_MAX_ATTEMPTS` | Per-payment retry budget before `reconciliation_exhausted` (default 1000); a SECONDARY safety guard behind `RECONCILIATION_MAX_AGE_SECONDS` |
-| `RECONCILIATION_INITIAL_BACKOFF_SECONDS` / `RECONCILIATION_MAX_BACKOFF_SECONDS` | **Deprecated** — accepted for compatibility, no longer control the schedule |
-| `MIN_PAYMENT_AMOUNT_TOMAN` / `MAX_PAYMENT_AMOUNT_TOMAN` | Enforced amount bounds (defaults 1 000 / 100 000 000) |
-| `TELEGRAM_BOT_USERNAME` | Optional; adds a "return to bot" link to payer pages |
-| `LOG_FORMAT` | `json` (default) or `text`; both redact secrets |
-| `CALLBACK_SECRET` | Accepted alias for `CALLBACK_HMAC_SECRET` |
-| `ADMIN_BOT_ENABLED` | Admin Telegram bot (default `false`); see [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md) |
-| `ADMIN_BOT_TOKEN` / `ADMIN_TELEGRAM_IDS` | BotFather token + comma-separated numeric admin IDs |
-| `ADMIN_BOT_*_ALERTS` | Per-category alert toggles (payment-success off by default) |
-| `ADMIN_BOT_DAILY_REPORT_*` / `ADMIN_BOT_TIMEZONE` | Daily report time and timezone (Asia/Tehran) |
-| `CENTRALPAY_UPDATE_REF` | Update channel for `centralpay update`, in `/etc/centralpay-bridge/centralpay.env` (host-managed, not app config). Production must pin a release tag (`vX.Y.Z` / `vX.Y.Z-rcN`); a branch is rejected unless `CENTRALPAY_UPDATE_ALLOW_DEV_REF=true`. See "Upgrading production" above |
-| `CENTRALPAY_UPDATE_ALLOW_DEV_REF` | Default `false`. Root-only, local-development-only opt-in to deploy a non-tag ref (e.g. `main`) with no checksum or `SOURCE_COMMIT` verification. Never set on production |
-| `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED` | Default `false`. Root-only escape hatch to deploy a release tag's fetched commit when its release assets aren't downloadable, skipping checksum/`SOURCE_COMMIT` verification. Not recommended |
-| `MONITOR_ENABLED` | Optional dedicated monitoring service (default `false`); see [MONITORING.md](MONITORING.md) |
-| `MONITOR_INTERVAL_SECONDS` / `MONITOR_DB_INTEGRITY_INTERVAL_SECONDS` | Cheap-check / expensive-check cadence (defaults 60 / 1800) |
-| `MONITOR_*_WARNING_*` / `MONITOR_*_CRITICAL_*` | Per-check thresholds (notification/manual-review backlog, backup age, disk space, gateway/bot failure bursts, worker heartbeat age) — full list with defaults in [.env.example](.env.example) |
-| `CENTRALPAY_BACKUP_DIR` | Host backup directory; shared by `scripts/backup.sh` and the monitor's read-only bind mount (default `/var/backups/centralpay-bridge`) |
+`0.6.0-rc1` is a pre-release. Do not infer go-live readiness from an old checklist or audit snapshot; use current source, current CI, the current operational checklist, and the cumulative risk history together.
 
-## Security notes
-
-- Secrets live only in environment variables / `.env` (git-ignored).
-- All configured secret values are redacted from log output as a backstop;
-  code paths additionally never log keys, signatures, full card numbers, full
-  redirect URLs, or callback query strings.
-- Only the final four card digits are ever stored.
-- Financial state transitions run inside database transactions with row
-  locking (`SELECT ... FOR UPDATE`) and are each recorded in the permanent
-  `payment_events` audit table.
+For documentation ownership and which files are authoritative, start with [DOCUMENTATION.md](DOCUMENTATION.md).

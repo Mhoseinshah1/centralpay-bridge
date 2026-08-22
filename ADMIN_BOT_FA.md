@@ -1,194 +1,263 @@
-# راهنمای ربات تلگرام مدیریتی (فارسی)
+# راهنمای ربات تلگرام مدیریتی
 
 <div dir="rtl">
 
-ربات مدیریتی یک سرویس اختیاری و **فقط‌خواندنی** برای دیدبانی عملیاتی است.
-هرگز بخشی از مسیر پرداخت مشتری نیست: قطع تلگرام هیچ تأثیری بر ایجاد
-پرداخت، تأیید CentralPay، اطلاع‌رسانی به ربات فروش یا تلاش‌های مجدد ندارد.
+ربات مدیریتی (`admin-bot`) یک سرویس اختیاری برای مشاهده و عملیات کنترل‌شدهٔ CentralPay Bridge است. این سرویس در مسیر correctness پرداخت مشتری قرار ندارد؛ قطع Telegram نباید ایجاد/تأیید/اعلان پرداخت را متوقف یا rollback کند.
 
-## ساخت ربات با BotFather
+**مدل دسترسی فعلی:** تقریباً همهٔ دستورها read-only هستند. تنها عملیات mutating تلگرام در main فعلی، `/resend_failed confirm` است که با شرط‌های سخت‌گیرانه و فقط در notification mode `idempotent` اجازهٔ requeue delivery-failureهای از قبل gateway-verified را می‌دهد.
 
-1. در تلگرام به `@BotFather` پیام دهید و `/newbot` را اجرا کنید.
-2. یک نام و یک نام کاربری (به `bot` ختم شود) انتخاب کنید.
-3. توکن دریافتی را در جای امن نگه دارید؛ این توکن هرگز در لاگ یا خروجی
-   چاپ نمی‌شود و نباید در جایی ارسال شود.
+## احراز هویت مدیر
 
-## دریافت شناسهٔ عددی تلگرام
+مجوزدهی فقط بر اساس Telegram **numeric user ID** انجام می‌شود.
 
-مجوزدهی **فقط با شناسهٔ عددی** انجام می‌شود؛ نام کاربری هرگز ملاک نیست.
-برای دیدن شناسهٔ عددی خود، به ربات رسمی‌شناخته‌شده‌ای مانند
-`@userinfobot` پیام دهید یا از بخش تنظیمات کلاینت‌های تلگرام دسکتاپ
-استفاده کنید. شناسه یک عدد مثبت است، مثلاً `123456789`.
+قواعد:
 
-## پیکربندی چند مدیر
+- username ملاک مجوز نیست
+- فقط private chat پذیرفته می‌شود
+- user ID باید در `ADMIN_TELEGRAM_IDS` باشد
+- درخواست غیرمجاز پاسخ عمومی/غیرحساس می‌گیرد و audit می‌شود
 
-در `/etc/centralpay-bridge/centralpay.env`:
+پیکربندی نمونه در `/etc/centralpay-bridge/centralpay.env`:
 
 <div dir="ltr">
 
 ```env
 ADMIN_BOT_ENABLED=true
-ADMIN_BOT_TOKEN=(توکن BotFather)
+ADMIN_BOT_TOKEN=...
 ADMIN_TELEGRAM_IDS=123456789,987654321
 ```
 
 </div>
 
-## فعال/غیرفعال کردن
+## عملیات host برای خود Admin Bot
 
 <div dir="ltr">
 
 ```bash
-centralpay admin-bot enable    # اعتبارسنجی و راه‌اندازی
-centralpay admin-bot disable   # توقف؛ تنظیمات حفظ می‌شود
 centralpay admin-bot status
 centralpay admin-bot logs
-centralpay admin-bot test-alert  # پیام آزمایشی به مدیران
+centralpay admin-bot restart
+centralpay admin-bot enable
+centralpay admin-bot disable
+centralpay admin-bot test-alert
 ```
 
 </div>
 
-## مرجع دستورها
+`admin-bot` با Compose profile فعال می‌شود و public port ندارد.
 
-| دستور | کارکرد |
-| --- | --- |
-| `/start` | معرفی، نسخه، محیط، فهرست دستورها |
-| `/help` | راهنمای مختصر |
-| `/status` | سلامت اجزا، صف‌ها، خطاهای اخیر، آخرین پشتیبان |
-| `/health` | جزئیات live/ready، پایگاه‌داده، ضربان ورکر، صف |
-| `/recent [n]` | آخرین پرداخت‌ها (پیش‌فرض ۱۰، حداکثر ۵۰) |
-| `/stuck` | **فقط** خطاهای تحویل به ربات فروش، با **کد دلیل دقیق** — همیشه یک پیام |
-| `/waiting [n]` | پرداخت‌های در انتظار تأیید درگاه (پیش‌فرض ۱۰، حداکثر ۵۰) |
-| `/expired [n]` | لینک‌های منقضی‌شده (پیش‌فرض ۱۰، حداکثر ۵۰) |
-| `/manual_review` | بررسی‌های دستی **باز** (تعیین‌تکلیف‌نشده) با جزئیات |
-| `/resolved_reviews [n]` | بررسی‌های **تعیین‌تکلیف‌شده** (پیش‌فرض ۱۰، حداکثر ۵۰)، جدیدترین اول |
-| `/errors` | خطاهای گروه‌بندی‌شدهٔ ۲۴ ساعت اخیر |
-| `/payment ORDER_ID` | جزئیات کامل + ۱۰ رویداد آخر |
-| `/retry_queue` | سررسید، زمان‌بندی، در حال ارسال، پایان تلاش |
-| `/resend_failed` | پیش‌نمایش ارسال مجدد گروهیِ موارد تحویل‌نشده |
-| `/resend_failed confirm` | بازگرداندن گروهی به صف ارسال، فقط در حالت idempotent |
-| `/backup_status` | آخرین پشتیبان، اعتبارسنجی، زمان‌بندی |
-| `/version` | نسخهٔ برنامه و مهاجرت پایگاه‌داده |
+## فهرست دستورهای تلگرام
 
-## ارسال مجدد گروهی موارد تحویل‌نشده (`/resend_failed`)
+دستورهای ثبت‌شده در main فعلی:
 
-این دستور پرداخت‌هایی را که **توسط درگاه تأیید شده‌اند** ولی تحویل اعلان
-به ربات فروش کامل نشده و به بررسی دستی رفته‌اند، دوباره وارد صف ارسال ورکر
-می‌کند. فقط پرداخت‌هایی انتخاب می‌شوند که همهٔ شرط‌های زیر را داشته باشند:
+| دستور | نوع | کاربرد |
+| --- | --- | --- |
+| `/start` | read-only | معرفی و شروع |
+| `/help` | read-only | راهنمای دستورها |
+| `/status` | read-only | خلاصهٔ وضعیت عملیاتی |
+| `/health` | read-only | سلامت API/DB/worker/queue |
+| `/monitor` | read-only | گزارش کامل پایش سیستم (همان checkهای `app.monitor`/`centralpay monitor check`) |
+| `/recent [n]` | read-only | آخرین پرداخت‌ها |
+| `/stuck` | read-only | delivery failureهای نیازمند توجه |
+| `/waiting [n]` | read-only | paymentهای منتظر تأیید درگاه |
+| `/expired [n]` | read-only | لینک‌های منقضی/aged |
+| `/manual_review` | read-only | reviewهای باز/عملیاتی |
+| `/resolved_reviews [n]` | read-only | reviewهای resolveشده |
+| `/errors` | read-only | خطاهای عملیاتی اخیر |
+| `/payment ORDER_ID` | read-only | جزئیات یک payment و audit history |
+| `/retry_queue` | read-only | صف و زمان‌بندی notification |
+| `/backup_status` | read-only | وضعیت backup |
+| `/version` | read-only | نسخه/مهاجرت |
+| `/fee` | read-only | وضعیت fee policy |
+| `/resend_failed` | preview | پیش‌نمایش requeue گروهی |
+| `/resend_failed confirm` | **mutating / gated** | requeue گروهی موارد واجد شرایط |
 
-- وضعیت `manual_review`
-- `gateway_verified_at` مقداردار (پرداخت واقعاً تأیید شده)
-- `review_resolved_at` خالی (تعیین‌تکلیف‌نشده)
-- `notification_claimed_at` خالی (بدون ادعای فعال ورکر)
-- دلیل دقیقاً یکی از `retry_limit_reached` یا `bot_timeout_ambiguous`
+محدودهٔ `[n]` در commandهای لیستی به‌صورت bounded اعتبارسنجی می‌شود و ورودی نامعتبر silently clamp نمی‌شود.
 
-موارد مالی/تأییدی (مغایرت مبلغ یا شناسهٔ کاربر، کد پیگیری نامعتبر/تکراری،
-کال‌بک نامعتبر، خطای پیکربندی، خطای صریح HTTP 4xx ربات) **هرگز** انتخاب
-نمی‌شوند.
+## `/status` و `/health`
 
-نکات مهم دربارهٔ این دستور:
+این commandها برای دید سریع هستند، نه جایگزین `centralpay db-check` یا بررسی payment audit.
 
-- تأیید CentralPay را **جعل نمی‌کند** و هیچ فاکت مالی/تأییدی را تغییر
-  نمی‌دهد (مبلغ، کارمزد، مبلغ قابل پرداخت، کد پیگیری، زمان تأیید درگاه دست‌نخورده).
-- **مستقیماً ربات فروش را صدا نمی‌زند**؛ فقط وضعیت تحویل را تغییر می‌دهد و
-  ارسال واقعی را **ورکر** انجام می‌دهد.
-- فقط پرداخت‌های **تأییدشدهٔ درگاه** را دوباره در صف می‌گذارد.
-- فقط وقتی مجاز است که ربات فروش دریافت تکراری `order_id` را **idempotent**
-  تضمین کند و `BOT_NOTIFY_RETRY_MODE=idempotent` باشد. در حالت `safe`
-  هم پیش‌نمایش و هم اجرا با پیام ثابت رد می‌شوند و هیچ ردیفی تغییر نمی‌کند.
-- ممکن است همان `order_id` را **دوباره** تحویل دهد (به‌همین‌دلیل نیاز به
-  idempotent بودن ربات).
-- **شمارندهٔ تلاش‌ها را بازنشانی نمی‌کند**: هر بار یک فرصت عملیاتی جدید است؛
-  اگر تلاش بعدی هم شکست بخورد، طبق منطق موجود دوباره به `manual_review`
-  برمی‌گردد (چرخهٔ نامحدود ایجاد نمی‌شود).
-- **اثبات واریز اعتبار به مشتری نیست**؛ فقط وضعیت تحویل اعلان را تغییر می‌دهد.
+Health فعلی می‌تواند مواردی مثل این‌ها را بسنجد:
 
-پیش‌نمایش تعداد واجدین شرایط، مجموع مبلغ اصلی و حداکثر ۲۰ شناسه را نشان
-می‌دهد و تأکید می‌کند که هنوز هیچ ارسالی انجام نشده است؛ اجرا با
-`/resend_failed confirm` انجام می‌شود. انتخاب و تغییر وضعیت با قفل ردیف
-(`FOR UPDATE SKIP LOCKED`) و در دسته‌های کران‌دار انجام می‌شود، پس دو مدیر
-هم‌زمان یک ردیف را دوبار وارد صف نمی‌کنند و رویداد تکراری نمی‌سازند. برای
-هر پرداخت رویداد دائمی `admin_bulk_resend_requested` و برای کل اجرا رویداد
-`admin_bulk_resend_completed` ثبت می‌شود.
+- API readiness
+- database connectivity
+- worker heartbeat freshness
+- retry queue stall
+- backup freshness از دید alert history
+- stuck admin-alert delivery queue
 
-## مرجع هشدارها
+Health monitor موجود (همین `/health`، بخشی از خود admin-bot) از consecutive-failure / recovery threshold استفاده می‌کند.
 
-هشدارهای مالی (بررسی دستی، مغایرت مبلغ/شناسه، تایم‌اوت مبهم، پایان
-تلاش‌ها) با فعال بودن ربات به‌صورت پیش‌فرض روشن‌اند. هشدار پرداخت موفق
-به‌صورت پیش‌فرض **خاموش** است (برای جلوگیری از شلوغی) و با
-`ADMIN_BOT_PAYMENT_SUCCESS_ALERTS=true` روشن می‌شود. هشدارهای پشتیبان،
-سلامت سرویس‌ها، بازیابی ورکر و طوفان امضای نامعتبر نیز ارسال می‌شوند.
-هشدارهای زیرساختی تکراری در پنجرهٔ ۳۰ دقیقه‌ای (قابل تنظیم) فشرده
-می‌شوند؛ هشدارهای مالی هرگز فشرده نمی‌شوند.
+**محدودیت فعلی main:** counterهای failure/success این health monitor سبک داخلی در حافظهٔ process هستند؛ restart آن‌ها را reset می‌کند. این محدودیت مختص همین چک سبک `/health` است و همچنان برقرار است.
 
-## مالکیت ادعای تحویل هشدار (از fix/admin-alert-claim-ownership)
+این محدودیت را با نبود پایش جدی اشتباه نگیرید: سرویس اختیاری و جداگانهٔ `app.monitor` (`MONITOR_ENABLED`، پیش‌فرض `false`) مجموعهٔ کامل‌تری از checkها (readiness عمومی، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot) را اجرا می‌کند و incident state آن در جدول دائمی `monitor_incidents` نگه‌داری می‌شود — یعنی restart آن را پاک نمی‌کند. دستور `/monitor` بالا و `centralpay monitor check`/`centralpay monitor incidents` دقیقاً همین سیستم دائمی را می‌خوانند. جزئیات کامل در [MONITORING.md](MONITORING.md).
 
-نتیجهٔ تحویل یک هشدار فقط زمانی ثبت می‌شود که ردیف پایگاه‌داده هنوز
-همان شناسهٔ ورکر و همان شمارهٔ تلاش را داشته باشد (بررسی زیر قفل
-ردیف). نتیجهٔ دیررسیده از ادعای آزادشده یا جایگزین‌شده دور انداخته و
-با رویداد `admin_alert_result_discarded` حسابرسی می‌شود، بدون آنکه
-ادعای ورکر جانشین را تغییر دهد.
+## `/manual_review` و `/resolved_reviews`
 
-توجه: ارسال تلگرام همچنان «حداقل یک‌بار» است — ورکر کند ممکن است پیش
-از دورانداخته‌شدن نتیجه‌اش، پیام تکراری عملیاتی فرستاده باشد. مالکیت
-ادعا از بازنویسی نتیجه در پایگاه‌داده جلوگیری می‌کند، نه از ارسال
-تکراری تلگرام. هشدارهای مدیریتی غیرمالی‌اند.
+`/manual_review` باید برای موارد unresolved/actionable استفاده شود، نه شمارندهٔ خام تاریخی status.
 
-## معنی «پذیرفته‌شده توسط ربات» (bot_notify_accepted)
+Resolve کردن review از Telegram انجام نمی‌شود؛ مسیر audited host CLI:
 
-یعنی API ربات فروش پاسخ HTTP 2xx داده است. قرارداد آن API واریز اعتبار
-را تضمین نمی‌کند؛ بنابراین این وضعیت **اثبات واریز به حساب مشتری نیست**.
+<div dir="ltr">
 
-## معنی بررسی دستی (manual_review)
+```bash
+centralpay review show ORDER_ID
+centralpay review acknowledge ORDER_ID --note "..."
+centralpay review resolve ORDER_ID --resolution RESOLUTION --note "..."
+```
 
-سامانه نتوانسته بدون ریسک تصمیم بگیرد (مغایرت تأیید، تحویل مبهم، پایان
-تلاش‌ها). پرداخت منجمد است و مدیر باید با `/payment` و
-`centralpay review` بررسی و به‌صورت دستی تعیین تکلیف کند.
+</div>
 
-تعیین تکلیف با دستور `centralpay review resolve` روی سرور انجام می‌شود.
-این دستور **وضعیت پرداخت را تغییر نمی‌دهد** — `manual_review` به‌عنوان
-تاریخچهٔ پرداخت باقی می‌ماند — و فقط زمان و نوع تعیین‌تکلیف
-(`review_resolved_at` و `review_resolution`) را ثبت می‌کند. پس از آن،
-ردیف از نماهای پیش‌فرض `/manual_review` و `/stuck` و بخش «پایان تلاش‌ها»
-در `/retry_queue` و شمارندهٔ «بررسی دستی» در `/status` خارج می‌شود و
-فقط در `/resolved_reviews` و `/payment` (با زمان و نوع تعیین‌تکلیف)
-دیده می‌شود. هیچ فاکت مالی (مبلغ‌ها، کد پیگیری، زمان تأیید درگاه،
-اعتبار مشتری) تغییر نمی‌کند.
+## `/payment ORDER_ID`
 
-## گزارش روزانه
+برای بررسی یک تراکنش از این command استفاده کنید تا state و audit history را ببینید. خروجی نباید secret، callback signature/token، full redirect URL، full card number یا raw external error text نشان دهد.
 
-با `ADMIN_BOT_DAILY_REPORT_ENABLED=true` هر روز در ساعت
-`ADMIN_BOT_DAILY_REPORT_TIME` (پیش‌فرض ۰۹:۰۰ به وقت
-`ADMIN_BOT_TIMEZONE`، پیش‌فرض Asia/Tehran) ارسال می‌شود. پس از
-ری‌استارت، گزارش همان روز دوباره ارسال نمی‌شود.
+برای تصمیم مالی پیچیده‌تر، `centralpay payment ORDER_ID` روی host مرجع عملیاتی کامل‌تری است.
 
-## رفتار در برابر کاربر غیرمجاز
+## `/fee`
 
-کاربر غیرمجاز فقط پیام «دسترسی مجاز نیست.» می‌بیند؛ هیچ اطلاعاتی از
-وضعیت، پیکربندی یا پرداخت‌ها فاش نمی‌شود و تلاش او با شناسهٔ عددی در
-لاگ و جدول حسابرسی ثبت می‌شود. فقط گفتگوی خصوصی پشتیبانی می‌شود؛
-گروه‌ها همیشه رد می‌شوند.
+`/fee` فقط وضعیت fee policy را نشان می‌دهد. تغییر fee از Telegram انجام نمی‌شود.
 
-## رفع اشکال
+Mutationهای fee فقط host CLI:
 
-- **429 تلگرام:** ارسال با احترام به `Retry-After` به تعویق می‌افتد و
-  خودکار تکرار می‌شود.
-- **توکن نامعتبر:** سرویس با پیام `admin_bot_config_invalid` بالا نمی‌آید
-  یا هشدارها با کد `telegram_invalid_token` متوقف می‌شوند؛ توکن را در
-  env اصلاح و `centralpay admin-bot restart` کنید.
-- **ربات توسط مدیر بلاک شده:** آن گیرنده با کد `telegram_forbidden` حذف
-  می‌شود؛ سایر مدیران پیام را می‌گیرند. ربات را در تلگرام Start کنید.
-- **هشداری نمی‌رسد:** بررسی کنید `ADMIN_BOT_ENABLED=true` و
-  `ADMIN_BOT_ALERTS_ENABLED=true` باشد، سرویس اجرا باشد
-  (`centralpay admin-bot status`)، و با `test-alert` آزمایش کنید. توجه:
-  هشدار پرداخت موفق به‌صورت پیش‌فرض خاموش است.
+<div dir="ltr">
 
-## محدودیت‌های امنیتی
+```bash
+centralpay fee status
+centralpay fee set RATE --note "..."
+centralpay fee schedule RATE --at ISO --note "..."
+centralpay fee history
+centralpay fee cancel POLICY_ID --note "..."
+```
 
-این داده‌ها **هرگز** به تلگرام ارسال نمی‌شوند: کلیدهای API، توکن ربات
-فروش، رمز پایگاه‌داده، secret و امضای کال‌بک، شمارهٔ کامل کارت (فقط چهار
-رقم آخر)، لینک کامل پرداخت، متن خام خطاهای سرویس‌های خارجی و مسیر
-فایل‌های پشتیبان. ربات فقط‌خواندنی است: هیچ فرمانی برای تغییر وضعیت
-پرداخت، تغییر مبلغ، حذف رکورد یا ارسال مجدد تحویل مبهم وجود ندارد.
+</div>
+
+## `/resend_failed` — عملیات استثنایی و gated
+
+این command فقط برای delivery failureهایی است که:
+
+- payment واقعاً gateway-verified است
+- status/operational review در حالت واجد شرایط است
+- review هنوز unresolved است
+- worker claim فعال روی آن وجود ندارد
+- reason در allowlist delivery ambiguity/failure قرار دارد، از جمله `retry_limit_reached` یا `bot_timeout_ambiguous`
+
+موارد financial mismatch / identity mismatch / invalid reference / configuration failure نباید توسط bulk resend انتخاب شوند.
+
+### Preview
+
+<div dir="ltr">
+
+```text
+/resend_failed
+```
+
+</div>
+
+هیچ تغییر DB انجام نمی‌دهد و تعداد/خلاصهٔ واجدین شرایط را نشان می‌دهد.
+
+### Confirm
+
+<div dir="ltr">
+
+```text
+/resend_failed confirm
+```
+
+</div>
+
+فقط وقتی `BOT_NOTIFY_RETRY_MODE=idempotent` است مجاز می‌شود. در `safe` mode هم preview و هم confirm باید با پیام ثابت رد شوند تا اپراتور به‌اشتباه تصور نکند re-delivery امن است.
+
+این عملیات:
+
+- CentralPay verification را جعل نمی‌کند
+- amount/fee/reference/gateway-verified facts را تغییر نمی‌دهد
+- مستقیماً به selling bot HTTP نمی‌زند
+- فقط paymentهای واجد شرایط را برای worker requeue می‌کند
+- attempt history را reset نمی‌کند
+- duplicate delivery را ممکن می‌کند، بنابراین idempotent بودن downstream bot شرط اساسی است
+- proof of customer balance credit نیست
+
+انتخاب/requeue با PostgreSQL locking و batchهای bounded انجام می‌شود تا دو مدیر همزمان یک payment را دوبار requeue نکنند.
+
+## معنی `bot_notify_accepted`
+
+`bot_notify_accepted` یعنی downstream bot API پاسخ HTTP 2xx داده است.
+
+این state **به‌تنهایی سند قطعی شارژ حساب مشتری نیست**. اگر برای یک incident نیاز به اثبات balance دارید، باید با خود downstream bot یا اپراتور آن مستقل بررسی شود.
+
+## هشدارها
+
+Admin alert outbox در PostgreSQL نگه‌داری می‌شود تا Telegram delivery از transaction مالی جدا بماند.
+
+دسته‌های alert شامل payment/manual-review/delivery/health/backup/security operational alerts هستند. Payment-success alert می‌تواند جداگانه configurable باشد تا Telegram شلوغ نشود.
+
+Alert creation در مسیر مالی با savepoint ایزوله می‌شود: خرابی ساخت alert نباید transaction اصلی payment را abort کند.
+
+## مالکیت claim هشدار
+
+هنگام delivery admin alert، نتیجهٔ HTTP/Telegram فقط وقتی روی row ثبت می‌شود که claim هنوز متعلق به همان worker/attempt باشد. نتیجهٔ دیررسیدهٔ claim قدیمی discard و audit می‌شود و نباید claim جانشین را overwrite کند.
+
+این مکانیزم DB-result overwrite را جلوگیری می‌کند؛ Telegram delivery ذاتاً می‌تواند at-least-once باشد و در شرایط crash/timeout operational message duplicate ممکن است رخ دهد.
+
+## داده‌هایی که هرگز نباید به Telegram بروند
+
+- CentralPay API key
+- inbound API key
+- selling-bot Token
+- admin bot Token
+- DB password
+- callback HMAC secret
+- callback `ct`
+- callback `sig`
+- full redirect URL
+- full card number
+- raw gateway response/error body
+
+Dynamic valueها باید escape شوند.
+
+## Container security
+
+`admin-bot`:
+
+- public port ندارد
+- فقط روی internal network است
+- CentralPay keys / inbound key / callback secret / selling-bot Token را نیاز ندارد و Compose آن‌ها را mask می‌کند
+- root filesystem فقط‌خواندنی دارد
+- capabilityها drop شده‌اند
+- `no-new-privileges` دارد
+- Docker socket ندارد
+- از DB و Telegram credential خودش استفاده می‌کند
+
+## تست هشدار
+
+<div dir="ltr">
+
+```bash
+centralpay admin-bot test-alert
+```
+
+</div>
+
+برای validate کردن setup مفید است، اما تست alert به معنی تست end-to-end payment flow نیست.
+
+## Troubleshooting
+
+اگر command پاسخ نمی‌دهد:
+
+<div dir="ltr">
+
+```bash
+centralpay admin-bot status
+centralpay admin-bot logs
+centralpay status
+```
+
+</div>
+
+اگر alert نمی‌رسد ولی payment processing سالم است، ابتدا admin alert delivery را جدا از payment path بررسی کنید؛ Telegram outage نباید payment را fail کند.
+
+اگر `/resend_failed` رد شد، قبل از تغییر config بررسی کنید downstream bot واقعاً duplicate `order_id` را idempotent پردازش می‌کند. فقط برای راحتی عملیات `safe` mode را به `idempotent` تغییر ندهید.
 
 </div>
