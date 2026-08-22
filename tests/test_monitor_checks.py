@@ -6,9 +6,13 @@ import shutil
 import time
 from collections import namedtuple
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
-from sqlalchemy import text
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.orm import sessionmaker
 
 from app.adminbot import queries
 from app.audit import record_event
@@ -450,6 +454,27 @@ def test_reconciliation_disabled_is_healthy(session_factory, settings):
 # --- backup ------------------------------------------------------------
 
 
+def _write_manifest(dump: Path, **overrides) -> Path:
+    """Writes scripts/backup.sh's write_manifest() sidecar format (plain
+    key=value lines) for `dump`. Callers override individual fields to
+    exercise malformed/inconsistent manifests; the default fields describe
+    a fully valid, matching manifest."""
+    fields = {
+        "backup_file": dump.name,
+        "sha256": "a" * 64,
+        "size_bytes": str(dump.stat().st_size),
+        "created_at": "2026-01-01T00:00:00Z",
+        "app_version": "0.6.0",
+        "postgres_version": "16.0",
+        "alembic_revision": "0012",
+        "validation": "passed",
+    }
+    fields.update(overrides)
+    manifest = dump.with_name(dump.name + ".manifest")
+    manifest.write_text("\n".join(f"{key}={value}" for key, value in fields.items()) + "\n")
+    return manifest
+
+
 def test_backup_missing(settings, tmp_path):
     backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
     result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
@@ -469,6 +494,7 @@ def test_backup_healthy(settings, tmp_path):
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")
     (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump)
     backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
     result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
     assert result.status == "ok"
@@ -479,9 +505,11 @@ def test_backup_stale(settings, tmp_path):
     dump.write_bytes(b"PGDMP")
     ok_file = tmp_path / (dump.name + ".ok")
     ok_file.touch()
+    manifest = _write_manifest(dump)
     old_mtime = time.time() - 100
     os.utime(dump, (old_mtime, old_mtime))
     os.utime(ok_file, (old_mtime, old_mtime))
+    os.utime(manifest, (old_mtime, old_mtime))
     backup_settings = settings.model_copy(
         update={
             "centralpay_backup_dir": str(tmp_path),
@@ -491,6 +519,332 @@ def test_backup_stale(settings, tmp_path):
     )
     result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
     assert result.status == "warning"
+    assert result.reason == "backup_aging"
+
+
+# --- backup manifest validation ---------------------------------------
+
+
+def test_backup_missing_manifest_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    # deliberately no .manifest sidecar written
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.reason == "backup_manifest_invalid"
+    assert result.details["manifest_issue"] == "manifest_missing"
+
+
+def test_backup_malformed_manifest_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    (tmp_path / (dump.name + ".manifest")).write_text("this is not a key=value sidecar at all\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_missing_required_key_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    # A truncated manifest -- present, well-formed key=value lines, but
+    # missing sha256/size_bytes entirely (never something backup.sh's own
+    # write_manifest() would produce for a real backup).
+    (tmp_path / (dump.name + ".manifest")).write_text(f"backup_file={dump.name}\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_truncated_before_validation_marker_is_not_healthy(settings, tmp_path):
+    """write_manifest() writes "validation=passed" LAST -- a manifest
+    truncated partway through writing (a crash/kill between lines) can
+    have every OTHER field present and consistent, but be missing that
+    final marker. That must still be rejected: it's incomplete evidence
+    that the archive actually passed validation, not just an unrelated
+    missing field."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    fields = {
+        "backup_file": dump.name,
+        "sha256": "a" * 64,
+        "size_bytes": str(dump.stat().st_size),
+        "created_at": "2026-01-01T00:00:00Z",
+        "app_version": "0.6.0",
+        "postgres_version": "16.0",
+        "alembic_revision": "0012",
+        # "validation=passed" deliberately omitted -- truncated write.
+    }
+    (tmp_path / (dump.name + ".manifest")).write_text(
+        "\n".join(f"{key}={value}" for key, value in fields.items()) + "\n"
+    )
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_wrong_dump_filename_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, backup_file="centralpay-99990101-000000.dump")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_filename_mismatch"
+
+
+def test_backup_manifest_path_traversal_payload_never_touches_the_filesystem(settings, tmp_path):
+    """backup_file is only ever compared as a plain string against the
+    already-known dump filename -- never used to construct a Path or open
+    anything. A traversal-shaped value must be rejected as a plain
+    mismatch, exactly like any other wrong filename, and must never cause
+    any file outside the backup directory to be read."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, backup_file="../../../../etc/passwd")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_filename_mismatch"
+
+
+def test_backup_manifest_duplicate_key_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's OWN restore-side check
+    (`grep -E '^sha256=' | head -1`) reads only the FIRST sha256= line; a
+    manifest with two conflicting sha256 lines (corruption, or a forged
+    second value) must be rejected outright rather than silently resolved
+    by picking either the first or the last -- disagreeing with restore's
+    own choice would let this check claim recoverability for an archive
+    restore itself would refuse."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    good_sha = "a" * 64
+    lines = [
+        f"backup_file={dump.name}",
+        "sha256=0000000000000000000000000000000000000000000000000000000000bad",
+        f"sha256={good_sha}",  # duplicate key -- forged/corrupted second value
+        f"size_bytes={dump.stat().st_size}",
+        "validation=passed",
+    ]
+    (tmp_path / (dump.name + ".manifest")).write_text("\n".join(lines) + "\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_checksum_trailing_whitespace_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's restore-side extraction
+    (`cut -d= -f2`, no trimming) would keep trailing whitespace as part of
+    the expected checksum, which a real sha256sum output never has --
+    restore would reject this backup with a checksum mismatch. This check
+    must never be more lenient than that: a value's surrounding whitespace
+    is never stripped, so the same trailing whitespace fails the 64-hex
+    shape check here too, instead of being silently cleaned up and
+    reported healthy."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, sha256=("a" * 64) + "  ")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
+
+
+def test_backup_manifest_crlf_checksum_line_not_healthy(settings, tmp_path):
+    """str.splitlines() treats a bare "\\r" (as left behind by a CRLF line
+    ending) as its own line boundary and silently discards it -- unlike
+    scripts/centralpay's restore-side extraction (grep/cut), which does no
+    such normalization and would see the checksum value WITH its trailing
+    "\\r" attached, never matching a real sha256sum output. A
+    CRLF-corrupted checksum line (e.g. the manifest edited on Windows)
+    must fail here too, not be quietly normalized into a passing shape."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    lines = [
+        f"backup_file={dump.name}",
+        f"sha256={'a' * 64}\r",  # CRLF: a trailing \r left before the \n
+        f"size_bytes={dump.stat().st_size}",
+        "validation=passed",
+    ]
+    (tmp_path / (dump.name + ".manifest")).write_bytes(("\n".join(lines) + "\n").encode())
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
+
+
+def test_backup_symlinked_manifest_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's restore path explicitly requires
+    `! -L "$manifest"` and treats a symlinked manifest as equivalent to no
+    integrity proof at all. Path.is_file()/read_text() FOLLOW symlinks, so
+    without an explicit is_symlink() check, a manifest that is actually a
+    symlink to an otherwise-valid file would be certified healthy here
+    while restore itself would refuse to trust it."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    real_manifest = tmp_path / "real.manifest"
+    _write_manifest(dump)  # writes dump.name + ".manifest" with valid fields
+    canonical_manifest = tmp_path / (dump.name + ".manifest")
+    canonical_manifest.rename(real_manifest)
+    canonical_manifest.symlink_to(real_manifest)
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_missing"
+
+
+def test_backup_manifest_size_mismatch_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, size_bytes=str(dump.stat().st_size + 999))
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_size_mismatch"
+
+
+def test_backup_manifest_malformed_checksum_shape_is_not_healthy(settings, tmp_path):
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, sha256="not-a-valid-sha256-digest")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
+
+
+def test_backup_stale_but_structurally_valid_manifest_preserves_age_semantics(settings, tmp_path):
+    """A stale backup with a fully valid, consistent manifest still follows
+    the existing age-based warning/critical semantics -- manifest
+    validation and staleness are independent conditions."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    ok_file = tmp_path / (dump.name + ".ok")
+    ok_file.touch()
+    manifest = _write_manifest(dump)
+    old_mtime = time.time() - 100_000
+    os.utime(dump, (old_mtime, old_mtime))
+    os.utime(ok_file, (old_mtime, old_mtime))
+    os.utime(manifest, (old_mtime, old_mtime))
+    backup_settings = settings.model_copy(
+        update={
+            "centralpay_backup_dir": str(tmp_path),
+            "monitor_backup_warning_age_seconds": 10,
+            "monitor_backup_critical_age_seconds": 3600,
+        }
+    )
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.reason == "backup_stale"  # a staleness reason, not a manifest one
+
+
+def test_backup_check_never_reads_dump_contents(settings, tmp_path, monkeypatch):
+    """Metadata-only proof: check_backup must never read the dump file's
+    own bytes, only .stat() it and parse its small .manifest sidecar. A
+    guard on Path.read_bytes raises if the check ever tries to read the
+    (here, deliberately huge) dump file itself."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    with open(dump, "wb") as handle:
+        handle.seek(200 * 1024 * 1024)  # 200MB sparse file: near-instant, no real disk usage
+        handle.write(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, size_bytes=str(dump.stat().st_size))
+
+    real_read_bytes = Path.read_bytes
+
+    def _guarded_read_bytes(self, *args, **kwargs):
+        if self.suffix == ".dump":
+            raise AssertionError(f"check_backup must never read dump file bytes: {self}")
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", _guarded_read_bytes)
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "ok"
+
+
+def test_backup_oversized_manifest_is_not_healthy(settings, tmp_path):
+    """A real write_manifest() sidecar is well under 300 bytes. A manifest
+    file far larger than that -- corrupted, accidentally replaced, or
+    deliberately huge -- must be rejected as malformed rather than
+    accepted after being read in full."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    manifest = tmp_path / (dump.name + ".manifest")
+    # Otherwise well-formed content, just padded far past the size bound.
+    manifest.write_text(f"backup_file={dump.name}\n" + ("x" * 10_000) + "\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_parse_never_reads_more_than_the_size_bound(
+    settings, tmp_path, monkeypatch
+):
+    """Metadata-only proof for the manifest sidecar itself: even when the
+    file on disk is deliberately huge (here, a 200MB sparse file), the
+    parser must never read more than a few KB of it into memory. A guard
+    on the underlying file object's .read() raises if ever asked to read
+    past the documented bound."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    manifest = tmp_path / (dump.name + ".manifest")
+    with open(manifest, "wb") as handle:
+        handle.write(f"backup_file={dump.name}\n".encode())
+        handle.seek(200 * 1024 * 1024)  # 200MB sparse file: near-instant, no real disk usage
+        handle.write(b"x")
+
+    # _io.BufferedReader is an immutable C type -- its .read method can't be
+    # monkeypatched directly. Instead wrap Path.open itself so every read
+    # against the manifest file goes through a size-bound guard.
+    class _BoundedReadGuard:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def read(self, size=-1):
+            max_size = monitor_checks._BACKUP_MANIFEST_MAX_BYTES + 1
+            if size is None or size < 0 or size > max_size:
+                raise AssertionError(f"manifest read must be bounded, got size={size}")
+            return self._handle.read(size)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._handle.__exit__(*exc_info)
+
+    real_open = Path.open
+
+    def _guarded_open(self, *args, **kwargs):
+        handle = real_open(self, *args, **kwargs)
+        return _BoundedReadGuard(handle) if self.suffix == ".manifest" else handle
+
+    monkeypatch.setattr(Path, "open", _guarded_open)
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
 
 
 # --- disk space ------------------------------------------------------------
@@ -580,11 +934,233 @@ def test_gateway_failure_burst_counts_affected_payments_not_attempts(session_fac
     )
     with session_factory() as db:
         for _ in range(3):
-            record_event(db, payment_id=payment.id, event_type="centralpay_verify_failed", data={})
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                data={"stage": "transport"},
+            )
         db.commit()
         result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
     assert result.status == "ok"  # one affected payment, below the warning threshold of 2
     assert result.details["affected_payments"] == 1
+
+
+def test_gateway_failure_burst_excludes_verify_failed_explicit_rejection(
+    session_factory, settings
+):
+    """centralpay_verify_failed stage="gateway" reason="gateway_rejected"
+    (app.centralpay.GATEWAY_REJECTED) is CentralPay EXPLICITLY answering
+    "not successful" for one specific payment during a callback
+    (app.services.verification.verify_and_settle) -- an ordinary, expected
+    outcome (the payer didn't complete/abandoned), never a gateway
+    infrastructure failure. Several payers failing around the same time
+    must never trip this burst check."""
+    payments = [_make_payment(session_factory, status="link_created") for _ in range(5)]
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        for payment in payments:
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                data={"stage": "gateway", "reason": "gateway_rejected"},
+            )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "ok"
+    assert result.details["affected_payments"] == 0
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_response_invalid(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_response_invalid"
+    (app.centralpay.GATEWAY_RESPONSE_INVALID) means CentralPay's response
+    had NEITHER a clear success NOR a clear failure marker -- unlike an
+    explicit rejection, this is the verify API itself behaving abnormally,
+    a genuine protocol-level infra signal that must still count. Otherwise
+    a systemic verify-API outage returning HTTP 200 with a broken body for
+    every payment would produce zero burst incidents."""
+    payments = [_make_payment(session_factory, status="link_created") for _ in range(3)]
+    low = settings.model_copy(
+        update={
+            "monitor_gateway_failure_warning_count": 1,
+            "monitor_gateway_failure_critical_count": 3,
+        }
+    )
+    with session_factory() as db:
+        for payment in payments:
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                data={"stage": "gateway", "reason": "gateway_response_invalid"},
+            )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["affected_payments"] == 3
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_missing_data(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_missing_data"
+    (app.centralpay.GATEWAY_MISSING_DATA) -- same reasoning as
+    gateway_response_invalid above: a protocol-level anomaly, not an
+    ordinary payer-declined outcome, so it must still count."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway", "reason": "gateway_missing_data"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "warning"
+    assert result.details["affected_payments"] == 1
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_error_field(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_error_field"
+    (app.centralpay.GATEWAY_ERROR_FIELD) -- a dedicated "error" field in
+    CentralPay's response, distinct from an explicit success=false/failure
+    status value (see app.centralpay.gateway_reason_code). A service/
+    protocol-level error signal, not CentralPay answering that one specific
+    payment wasn't successful, so it must still count -- otherwise a
+    systemic outage where verify.php returns an error field for every
+    payment would produce zero burst incidents."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway", "reason": "gateway_error_field"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "warning"
+    assert result.details["affected_payments"] == 1
+
+
+def test_gateway_failure_burst_excludes_verify_failed_missing_stage(session_factory, settings):
+    """An event shape with no stage at all is ambiguous -- excluded rather
+    than risk a misleading alert, same as an unrecognized stage value."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db, payment_id=payment.id, event_type="centralpay_verify_failed", data={}
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "ok"
+    assert result.details["affected_payments"] == 0
+
+
+def test_gateway_failure_burst_excludes_verify_failed_gateway_stage_missing_reason(
+    session_factory, settings
+):
+    """stage="gateway" with no reason field at all (or an unrecognized one)
+    is ambiguous -- excluded rather than risk a misleading alert, same as
+    a missing stage."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "ok"
+    assert result.details["affected_payments"] == 0
+
+
+def test_gateway_failure_burst_counts_verify_failed_transport_stage(session_factory, settings):
+    """A genuine CentralPayError raised from client.verify() -- recorded
+    stage="transport" -- IS a reliable infrastructure signal and must
+    count."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "transport", "error_code": "centralpay_connection_error"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "warning"
+    assert result.details["affected_payments"] == 1
+
+
+def test_gateway_failure_burst_counts_distinct_transport_failure_payments(
+    session_factory, settings
+):
+    payments = [_make_payment(session_factory, status="link_created") for _ in range(3)]
+    low = settings.model_copy(
+        update={
+            "monitor_gateway_failure_warning_count": 1,
+            "monitor_gateway_failure_critical_count": 3,
+        }
+    )
+    with session_factory() as db:
+        for payment in payments:
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_verify_failed",
+                data={"stage": "transport"},
+            )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["affected_payments"] == 3
+
+
+def test_gateway_failure_burst_counts_every_getlink_failed_error_shape(session_factory, settings):
+    """centralpay_getlink_failed has no "ordinary outcome" variant --
+    get_link() only ever returns a redirect URL or raises CentralPayError
+    (app.centralpay.CentralPayClient.get_link) -- so every error_code shape
+    it can carry (connection/rejected/invalid-response) is already a
+    genuine gateway failure; unlike centralpay_verify_failed, it needs no
+    stage-style filtering."""
+    payments = [_make_payment(session_factory, status="link_created") for _ in range(3)]
+    low = settings.model_copy(
+        update={
+            "monitor_gateway_failure_warning_count": 1,
+            "monitor_gateway_failure_critical_count": 3,
+        }
+    )
+    error_codes = [
+        "centralpay_connection_error",
+        "centralpay_rejected",
+        "centralpay_invalid_response",
+    ]
+    with session_factory() as db:
+        for payment, error_code in zip(payments, error_codes, strict=True):
+            record_event(
+                db,
+                payment_id=payment.id,
+                event_type="centralpay_getlink_failed",
+                data={"error_code": error_code, "reason": "x"},
+            )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["affected_payments"] == 3
 
 
 def test_gateway_failure_burst_warning_and_critical(session_factory, settings):
@@ -662,6 +1238,7 @@ def test_run_all_checks_entirely_healthy(session_factory, settings, monkeypatch,
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")
     (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump)
     healthy = settings.model_copy(
         update={
             "centralpay_backup_dir": str(tmp_path),
@@ -753,3 +1330,218 @@ def test_run_all_checks_omits_admin_bot_delivery_heartbeat_when_disabled(
         results = monitor_checks.run_all_checks(db, disabled, include_db_integrity=False)
     keys = {r.key for r in results}
     assert "worker_heartbeat:admin-bot-delivery" not in keys
+
+
+# --- graceful degradation during a real database outage --------------------
+
+_DB_DEPENDENT_KEYS_ALL_ENABLED = (
+    "worker_heartbeat:notification-worker",
+    "worker_heartbeat:reconciliation-worker",
+    "worker_heartbeat:admin-bot-delivery",
+    "notification_backlog",
+    "manual_review",
+    "reconciliation",
+    "gateway_failure_burst",
+    "bot_failure_burst",
+    "db_integrity",
+)
+
+
+def test_run_all_checks_degrades_gracefully_when_database_is_unreachable(
+    settings, monkeypatch, tmp_path
+):
+    """A genuinely broken engine/session (bound to a database file whose
+    parent directory does not exist -- every connection attempt raises a
+    real sqlalchemy.exc.OperationalError, not a monkeypatched bool), the
+    same shape of failure a fully unreachable PostgreSQL would produce.
+    run_all_checks must still return a complete, structured result list:
+    DB-independent checks run normally, every DB-dependent check gets a
+    critical database_unavailable placeholder, and nothing raises."""
+    _patch_httpx_client(
+        monkeypatch, _FakeClient(response=_FakeResponse(200, {"status": "ready", "database": "ok"}))
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: _Usage(total=100, used=10, free=90))
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump)
+    broken_settings = settings.model_copy(
+        update={
+            "centralpay_backup_dir": str(tmp_path),
+            "reconciliation_enabled": True,
+            "admin_bot_enabled": True,
+            "monitor_disk_min_free_bytes": 1,
+        }
+    )
+
+    unreachable_dir = tmp_path / "no-such-directory"  # never created
+    broken_engine = create_engine(f"sqlite:///{unreachable_dir}/db.sqlite")
+    broken_factory = sessionmaker(bind=broken_engine, expire_on_commit=False, autoflush=False)
+
+    with broken_factory() as db:
+        results = monitor_checks.run_all_checks(db, broken_settings, include_db_integrity=True)
+
+    by_key = {r.key: r for r in results}
+    assert by_key["public_ready"].status == "ok"
+    assert by_key["backup"].status == "ok"
+    assert by_key["disk_space"].status == "ok"
+    assert by_key["database"].status == "critical"
+    assert by_key["database"].reason == "query_failed"
+    for key in _DB_DEPENDENT_KEYS_ALL_ENABLED:
+        assert by_key[key].status == "critical", key
+        assert by_key[key].reason == "database_unavailable", key
+        assert by_key[key].details == {"dependency": "database"}
+
+
+def test_run_all_checks_reconciliation_disabled_stays_healthy_during_outage(
+    settings, monkeypatch, tmp_path
+):
+    """check_reconciliation short-circuits to ok/disabled WITHOUT ever
+    touching `db` when reconciliation_enabled is False -- it is
+    DB-INDEPENDENT in that case, so a database outage must never turn it
+    into a fabricated database_unavailable placeholder for a feature
+    that's simply turned off (which could otherwise be persisted and
+    alerted on as a real incident once the database recovers)."""
+    _patch_httpx_client(
+        monkeypatch, _FakeClient(response=_FakeResponse(200, {"status": "ready", "database": "ok"}))
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: _Usage(total=100, used=10, free=90))
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump)
+    broken_settings = settings.model_copy(
+        update={
+            "centralpay_backup_dir": str(tmp_path),
+            "reconciliation_enabled": False,
+            "monitor_disk_min_free_bytes": 1,
+        }
+    )
+
+    unreachable_dir = tmp_path / "no-such-directory"  # never created
+    broken_engine = create_engine(f"sqlite:///{unreachable_dir}/db.sqlite")
+    broken_factory = sessionmaker(bind=broken_engine, expire_on_commit=False, autoflush=False)
+
+    with broken_factory() as db:
+        results = monitor_checks.run_all_checks(db, broken_settings, include_db_integrity=False)
+
+    by_key = {r.key: r for r in results}
+    assert by_key["database"].status == "critical"
+    assert by_key["reconciliation"].status == "ok"
+    assert by_key["reconciliation"].reason == "disabled"
+    assert "worker_heartbeat:reconciliation-worker" not in by_key
+
+
+def test_run_all_checks_excludes_db_integrity_when_unreachable_and_excluded(settings, tmp_path):
+    unreachable_dir = tmp_path / "no-such-directory"
+    broken_engine = create_engine(f"sqlite:///{unreachable_dir}/db.sqlite")
+    broken_factory = sessionmaker(bind=broken_engine, expire_on_commit=False, autoflush=False)
+    with broken_factory() as db:
+        results = monitor_checks.run_all_checks(db, settings, include_db_integrity=False)
+    keys = {r.key for r in results}
+    assert monitor_checks.DB_INTEGRITY_CHECK_KEY not in keys
+    assert "database" in keys
+
+
+def test_run_all_checks_degrades_gracefully_when_a_later_query_fails_mid_pass(
+    session_factory, settings, monkeypatch
+):
+    """The initial `database` probe (SELECT 1) succeeds, but a LATER
+    DB-dependent check's own query raises a real OperationalError with
+    connection_invalidated=True -- SQLAlchemy's own signal (set by its
+    dialect-level is_disconnect() check) that the connection itself died,
+    not just that one statement was bad. Every check already run stays
+    as-is, the failing check and everything after it in the list becomes
+    database_unavailable, and nothing raises."""
+
+    def _boom(db, status):
+        raise OperationalError(
+            "SELECT ...",
+            {},
+            Exception("server closed the connection unexpectedly"),
+            connection_invalidated=True,
+        )
+
+    monkeypatch.setattr(queries, "count_by_status", _boom)
+
+    with session_factory() as db:
+        results = monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
+
+    by_key = {r.key: r for r in results}
+    # database's own SELECT 1 never touched count_by_status -- it still
+    # succeeded for real.
+    assert by_key["database"].status == "ok"
+    # The check immediately before notification_backlog in the DB-dependent
+    # order ran normally (never itself queried count_by_status).
+    assert by_key["worker_heartbeat:notification-worker"].reason != "database_unavailable"
+    # notification_backlog is the one whose own query broke, and every
+    # DB-dependent check scheduled after it never even attempted a query.
+    remaining_keys = (
+        "notification_backlog",
+        "manual_review",
+        "reconciliation",
+        "gateway_failure_burst",
+        "bot_failure_burst",
+        "db_integrity",
+    )
+    for key in remaining_keys:
+        assert by_key[key].status == "critical", key
+        assert by_key[key].reason == "database_unavailable", key
+
+
+def test_run_all_checks_does_not_mislabel_a_non_database_bug(
+    session_factory, settings, monkeypatch
+):
+    """A bug in a check that has nothing to do with database connectivity
+    (here: a plain ValueError, as if run_db_checks had a real defect) must
+    propagate normally, not get silently absorbed and reported as a
+    fabricated `database_unavailable` -- that would hide the actual
+    failure behind a misleading "PostgreSQL is down" story. Only a
+    DBAPIError with connection_invalidated=True triggers the
+    outage-degradation path."""
+
+    def _buggy(db, status):
+        raise ValueError("not a database problem")
+
+    monkeypatch.setattr(queries, "count_by_status", _buggy)
+
+    with session_factory() as db, pytest.raises(ValueError, match="not a database problem"):
+        monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
+
+
+def test_run_all_checks_does_not_mislabel_a_non_connectivity_dbapi_error(
+    session_factory, settings, monkeypatch
+):
+    """A DBAPIError that is NOT a connectivity failure (connection_
+    invalidated=False -- e.g. a real ProgrammingError from a bad query on
+    an otherwise-live connection) must also propagate normally, not be
+    treated as a PostgreSQL outage. Distinguishing this from the test
+    above is the whole point: not every SQLAlchemyError means the database
+    is unreachable."""
+
+    def _buggy(db, status):
+        raise ProgrammingError(
+            "SELECT ...", {}, Exception("column does not exist"), connection_invalidated=False
+        )
+
+    monkeypatch.setattr(queries, "count_by_status", _buggy)
+
+    with session_factory() as db, pytest.raises(ProgrammingError, match="column does not exist"):
+        monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
+
+
+def test_run_all_checks_healthy_path_unaffected_by_outage_handling(
+    session_factory, settings, monkeypatch
+):
+    """Belt-and-braces: a fully healthy database (the normal SQLite unit-
+    test session) must never itself get a database_unavailable result --
+    proves the new degrade-on-failure logic never fires on the happy
+    path."""
+    _seed_alembic_version(session_factory)
+    _patch_httpx_client(
+        monkeypatch, _FakeClient(response=_FakeResponse(200, {"status": "ready", "database": "ok"}))
+    )
+    with session_factory() as db:
+        results = monitor_checks.run_all_checks(db, settings, include_db_integrity=True)
+    assert all(r.reason != "database_unavailable" for r in results)
+    assert next(r for r in results if r.key == "database").status == "ok"

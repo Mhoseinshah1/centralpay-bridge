@@ -47,6 +47,19 @@ def cli_env(settings, session_factory, monkeypatch, tmp_path):
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")
     (tmp_path / (dump.name + ".ok")).touch()
+    manifest_fields = {
+        "backup_file": dump.name,
+        "sha256": "a" * 64,
+        "size_bytes": str(dump.stat().st_size),
+        "created_at": "2026-01-01T00:00:00Z",
+        "app_version": "0.6.0",
+        "postgres_version": "16.0",
+        "alembic_revision": "0012",
+        "validation": "passed",
+    }
+    (tmp_path / (dump.name + ".manifest")).write_text(
+        "\n".join(f"{key}={value}" for key, value in manifest_fields.items()) + "\n"
+    )
 
     from app.models import WorkerHeartbeat
 

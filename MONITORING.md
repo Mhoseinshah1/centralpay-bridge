@@ -84,14 +84,37 @@ once the previous one has fully returned.
 | `notification_backlog` | Count of `bot_notify_pending` payments + oldest one's age (excludes `manual_review` and every resolved/accepted row) | `count_by_status`, `oldest_pending_notification_age_seconds` |
 | `manual_review` | Count of genuinely **unresolved** manual reviews + oldest age + reason buckets (a row resolved via `centralpay review resolve` is never counted) | `count_open_manual_reviews`, `oldest_open_manual_review_age_seconds`, `open_manual_review_reason_buckets` |
 | `reconciliation` | Reconciliation-exhausted count (stays counted even after a payment ALSO ages out — it never silently "recovers" just because more time passed) + how long the oldest due row has waited since becoming eligible (not payment-link age, so a slow-paying customer alone never trips it). Ordinary `gateway_not_paid` + `reconciliation_retry_scheduled` activity is never itself an incident | `app.services.reconciliation_status.build_reconciliation_status_snapshot` |
-| `backup` | Newest `*.dump` under `CENTRALPAY_BACKUP_DIR` with a validated `.ok` sidecar, and its age | plain, bounded directory listing (read-only bind mount) |
+| `backup` | Newest `*.dump` under `CENTRALPAY_BACKUP_DIR` with a validated `.ok` sidecar, its age, AND its `.manifest` metadata sidecar (present, well-formed, filename/size-consistent, checksum field shaped like a real sha256 — never the dump's own bytes, see below) | plain, bounded directory listing (read-only bind mount) + a small text-file parse |
 | `disk_space` | Free space (percent + absolute floor) of the filesystem backing `CENTRALPAY_BACKUP_DIR` — the one filesystem this project's single-host topology shares between PostgreSQL data, backups, and the application runtime | `shutil.disk_usage` |
-| `gateway_failure_burst` | Distinct payments affected by `centralpay_getlink_failed`/`centralpay_verify_failed` in a rolling window — genuine transport/server failures, never `gateway_not_paid` | bounded `COUNT(DISTINCT payment_id)` |
+| `gateway_failure_burst` | Distinct payments affected, in a rolling window, by: any `centralpay_getlink_failed` (no "ordinary outcome" variant exists for it); a `centralpay_verify_failed` row with `stage == "transport"` (a real `CentralPayError`); or a `stage == "gateway"` row whose `reason` is `gateway_error_field`, `gateway_response_invalid`, or `gateway_missing_data` — CentralPay's response carrying a service-level error field, or neither a clear success nor failure marker at all, rather than an explicit per-payment rejection. Never `gateway_not_paid`, and never a `stage == "gateway"` row with `reason == "gateway_rejected"` (CentralPay explicitly answering one payment as unsuccessful — an ordinary, expected, high-frequency payer outcome, not a gateway outage) | bounded `COUNT(DISTINCT payment_id)` |
 | `bot_failure_burst` | Distinct payments affected by `bot_notification_failed` in a rolling window (a payment retried 6 times still counts once) | same |
 | `db_integrity` | The exact same checks as `centralpay db-check` (duplicate order/reference ids, orphan events, invalid fee snapshots, sequence drift, …), read-only | `app.ops.run_db_checks` |
 
 Every check function lives in `app/services/monitor_checks.py` and is
 covered by unit tests in `tests/test_monitor_checks.py`.
+
+### Backup manifest validation
+
+`scripts/backup.sh`'s `write_manifest()` writes a small `<dump>.manifest`
+sidecar (plain `key=value` lines: `backup_file`, `sha256`, `size_bytes`,
+`created_at`, `app_version`, `postgres_version`, `alembic_revision`,
+`validation`) next to every validated backup. The `backup` check parses
+that sidecar and requires it to be present, well-formed, name the SAME
+dump file, and agree with the dump's actual size — plus that its `sha256`
+field is *shaped* like a real digest (64 hex characters). A missing,
+malformed, or inconsistent manifest is reported `critical`/
+`backup_manifest_invalid` (with the specific `manifest_issue` in
+`details`) regardless of the dump's age, because the recoverability
+evidence for that backup is incomplete — a dump/`.ok` pair alone is no
+longer treated as sufficient.
+
+This is deliberately **metadata-only**: the monitor never reads or hashes
+the dump file's own (multi-hundred-MB, growing) bytes — that would make a
+periodic check itself a load problem. Byte-level checksum verification
+against the recorded `sha256` remains the job of the canonical tooling
+(`scripts/backup.sh`'s own `validate_archive` at creation time, and a
+manual/restore-time `pg_restore --list` or checksum comparison) — never
+this periodic monitor's.
 
 ### Deliberately not implemented as a separate metric
 
@@ -227,6 +250,69 @@ never leak it through an alert (it stays on the `MonitorIncident` row,
 which is a host-CLI-only, never-Telegram surface). See
 `tests/test_monitor_incidents.py::test_alert_payload_never_leaks_beyond_the_safe_allowlist`.
 
+## Behavior during a database outage
+
+`run_all_checks` explicitly classifies every check as DB-independent
+(`public_ready`, `backup`, `disk_space` — they never touch the `db`
+session) or DB-dependent (everything else: `database`,
+`worker_heartbeat:*`, `notification_backlog`, `manual_review`,
+`reconciliation`, `gateway_failure_burst`, `bot_failure_burst`,
+`db_integrity`). The DB-independent checks always run, even when
+PostgreSQL itself is unreachable. If the initial `database` probe (`SELECT
+1`) already fails, or a later DB-dependent check's own query raises mid-
+pass (the connection dying partway through, not only at the start), no
+further SQL is attempted against that session for the rest of the pass —
+every DB-dependent check that had to be skipped gets a
+`critical`/`database_unavailable` result (`details.dependency ==
+"database"`) instead of being silently reported healthy or making the
+whole pass crash.
+
+This means `centralpay monitor check` stays fully usable DURING an
+outage, PROVIDED the `monitor` container is already running — it shows
+`public_ready`, `backup`, and `disk_space` at their real status and every
+DB-dependent check as `database_unavailable`, rather than raising an
+unhandled exception. app.monitor's own background loop already tolerated
+a raised pass (it logs `monitor_pass_failed` and retries next cycle) —
+this makes that tolerance produce a structured, useful snapshot instead
+of nothing, for the CLI's on-demand, human-triggered surface that doesn't
+go through the incident-recording pipeline at all.
+
+**The "already running" qualifier matters**: `centralpay monitor check`
+runs `docker compose exec monitor ...` (`scripts/centralpay`), which
+requires an existing, running `monitor` container — it never starts a new
+one. `docker-compose.yml`'s `monitor` service declares `depends_on: db:
+condition: service_healthy`, so Compose refuses to (re)start it while
+PostgreSQL is unhealthy. If the monitor container was already up when the
+outage began, it keeps running and `monitor check` keeps working exactly
+as described above. If it needs to (re)start DURING the outage — a host
+reboot, or the container being recreated for an unrelated reason — it
+cannot come up until PostgreSQL recovers, and `monitor check` is
+unavailable for that window too. In that specific case, fall back to the
+same signals documented for a fully unreachable database below: the
+monitor's own Docker healthcheck, host-level container monitoring, or an
+external uptime probe.
+
+**The admin bot's `/monitor` is NOT covered by this**, even though it
+calls the same `run_all_checks`: `CommandHandlers.handle`
+(`app/adminbot/commands.py`) unconditionally records and commits an
+`admin_command_received` audit event *before* invoking any command
+handler, on every command including `/monitor` — that commit itself
+requires a working database and raises first, so `/monitor` never even
+reaches `run_all_checks` during a full outage. Making every admin-bot
+command's audit trail best-effort during a database outage is a
+separate, broader change to the command-dispatch path (touching every
+command, not just this one diagnostic), out of scope here — during a
+genuine full PostgreSQL outage, use the host CLI's `centralpay monitor
+check` instead.
+
+**What this does NOT fix:** app.monitor's own loop still cannot durably
+record a "PostgreSQL is down" incident or Telegram alert, because
+persisting either one requires writing to the very PostgreSQL instance
+that is unreachable — see "The database itself is fully unreachable" in
+the runbook below. Graceful degradation and durable persistence are two
+different problems; this subsystem solves the first and documents the
+second as an accepted, external-monitoring limitation.
+
 ## `/monitor` (admin bot) and CLI
 
 **Admin bot** (Telegram, read-only, same numeric-ID authorization as every
@@ -360,21 +446,44 @@ test_monitoring_reads_never_mutate_financial_state`).
      host, run once as root:
      `chgrp 10001 /var/backups/centralpay-bridge && chmod 0750 /var/backups/centralpay-bridge`
      (adjust the path if `CENTRALPAY_BACKUP_DIR` was customized).
-- **The database itself is fully unreachable** — this is the one scenario
-  Telegram alerting cannot cover: an open incident and its alert both need
-  to be written to the very PostgreSQL instance that is down, so a genuine
-  full outage can be detected (`database`/`public_ready` go critical in
-  the monitor's own logs) but not delivered as a durable incident or a
-  Telegram message until PostgreSQL is back — and once it is, the very
-  next healthy cycle just closes out as "was never open," with no
-  after-the-fact alert for the outage window. The monitor's OWN heartbeat
-  file is deliberately NOT touched on a failed pass (see `app/monitor.py`),
-  so its Docker healthcheck goes unhealthy independently of Postgres
-  within `max(MONITOR_INTERVAL_SECONDS * 6, 180)` seconds — `docker
-  inspect`/`centralpay status`/`centralpay monitor status` remain a valid,
-  Postgres-independent liveness signal for exactly this case. Treat a
-  genuine "is Postgres up at all" alert as a job for host/infrastructure-
-  level monitoring outside this application, not this subsystem.
+  3. **`backup_manifest_invalid` on a real backup**: `scripts/backup.sh`'s
+     `write_manifest()` makes each `.manifest` sidecar (non-secret
+     metadata — never the dump itself) group-readable by GID `10001` so
+     the monitor can parse it; a manifest written before this change
+     stays `0600` root-owned until the next backup rotation overwrites it
+     (daily by default). To fix an existing one without waiting, run once
+     as root: `chgrp 10001 /var/backups/centralpay-bridge/*.manifest &&
+     chmod 640 /var/backups/centralpay-bridge/*.manifest`.
+- **The database itself is fully unreachable** — `run_all_checks` itself
+  degrades gracefully (see "Behavior during a database outage" above):
+  `centralpay monitor check` keeps working, showing
+  `public_ready`/`backup`/`disk_space` at their real status and every
+  DB-dependent check as `database_unavailable`. The admin bot's
+  `/monitor` does NOT share this — its own mandatory command-audit write
+  fails first (see "Behavior during a database outage" above), so use
+  the host CLI during a genuine full outage. What remains the one
+  scenario Telegram alerting genuinely cannot cover is DURABLE,
+  PROACTIVE notification: an open incident and its alert both need to be
+  written to the very PostgreSQL instance that is down, so app.monitor's
+  own background loop detects the outage on every pass but cannot
+  persist it as a durable incident or a Telegram message until
+  PostgreSQL is back — and once it is, the very next healthy cycle just
+  closes out as "was never open," with no after-the-fact alert for the
+  outage window. The monitor's OWN heartbeat file is deliberately NOT
+  touched on a failed pass (see `app/monitor.py`), so its Docker
+  healthcheck goes unhealthy independently of Postgres within
+  `max(MONITOR_INTERVAL_SECONDS * 6, 180)` seconds. During exactly this
+  window, the signals that DO remain available are: `docker
+  inspect`/`centralpay status`/`centralpay monitor status` (the
+  monitor's own Postgres-independent container health), any host-level
+  process/service monitoring already watching the `db` container, and
+  external uptime/infrastructure monitoring (e.g. Uptime Kuma,
+  Prometheus/Alertmanager, or a host watchdog) pointed at this
+  deployment from outside it — none of which this application-level
+  subsystem provides itself. Treat a genuine "is Postgres up at all"
+  alert as a job for that external layer, not this subsystem; wiring one
+  up is a deliberately separate, future piece of work, not part of this
+  monitor.
 - **Two monitor containers somehow both running** — by design this is
   safe (see "Incident lifecycle and deduplication" above): at most one
   open incident and one alert per condition regardless. It is still not a

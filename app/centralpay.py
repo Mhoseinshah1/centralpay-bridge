@@ -33,6 +33,16 @@ logger = logging.getLogger("app.centralpay")
 # module. Fixed strings; never derived from response content.
 GATEWAY_RESPONSE_INVALID = "gateway_response_invalid"
 GATEWAY_REJECTED = "gateway_rejected"
+# A dedicated "error" field, distinct from an explicit success=false or a
+# recognized failure status value (see gateway_reason_code below) -- a
+# service/protocol-level error signal (e.g. an internal error, rate
+# limiting) rather than CentralPay answering that one specific payment
+# wasn't successful. Kept separate from GATEWAY_REJECTED so a caller (see
+# app.services.monitor_checks) can tell an ordinary per-payment rejection
+# apart from a service-level error without weakening either the "gateway
+# response text never leaves this module" guarantee or verify()/get_link()'s
+# actual success/failure decision, which is identical either way.
+GATEWAY_ERROR_FIELD = "gateway_error_field"
 GATEWAY_MISSING_DATA = "gateway_missing_data"
 GATEWAY_INVALID_REDIRECT_URL = "gateway_invalid_redirect_url"
 GATEWAY_INVALID_REFERENCE_ID = "gateway_invalid_reference_id"
@@ -165,7 +175,19 @@ def gateway_reason_code(body: dict[str, Any]) -> tuple[str | None, str | None]:
     values come from fixed vocabularies — the response's own text is never
     returned. The marker records WHICH failure signal was present (for
     debugging) without exposing gateway-controlled content.
+
+    The dedicated "error" field is checked FIRST, ahead of success=false/a
+    failure status value: a response can carry more than one marker at
+    once (e.g. ``{"success": false, "error": "service unavailable"}``), and
+    checking error last would make it unreachable -- and therefore
+    permanently misclassified as an ordinary per-payment rejection --
+    whenever a systemic failure also happens to set one of those other
+    fields (see app.services.monitor_checks, which relies on this exact
+    ordering to keep counting a systemic verify-API error even when it
+    coexists with those fields).
     """
+    if body.get("error"):
+        return GATEWAY_ERROR_FIELD, "error_field"
     if body.get("success") is False:
         return GATEWAY_REJECTED, "success_false"
     status = body.get("status")
@@ -175,8 +197,6 @@ def gateway_reason_code(body: dict[str, Any]) -> tuple[str | None, str | None]:
         and str(status).strip().lower() in _FAILURE_STATUS_VALUES
     ):
         return GATEWAY_REJECTED, "failure_status"
-    if body.get("error"):
-        return GATEWAY_REJECTED, "error_field"
     if not _explicit_success(body):
         # No explicit positive marker: success is never guessed.
         return GATEWAY_RESPONSE_INVALID, "no_success_marker"
