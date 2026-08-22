@@ -380,7 +380,15 @@ def _backup_manifest_issue(dump: Path, dump_size: int) -> str | None:
     plain string comparison against the already-known dump filename) --
     no path traversal, no unsafe filename interpretation."""
     manifest_path = dump.with_name(dump.name + ".manifest")
-    if not manifest_path.is_file():
+    # is_symlink() checked separately (and first): Path.is_file() FOLLOWS
+    # symlinks, so a manifest that is actually a symlink to some other
+    # regular file would otherwise pass straight through. scripts/
+    # centralpay's own restore-side check explicitly requires `! -L
+    # "$manifest"` and treats a symlinked manifest as equivalent to no
+    # manifest at all (falling back to the interactive LEGACY path) --
+    # matched here rather than letting this check certify a manifest
+    # restore itself would refuse to trust.
+    if manifest_path.is_symlink() or not manifest_path.is_file():
         return "manifest_missing"
     fields = _parse_backup_manifest(manifest_path)
     if fields is None or any(key not in fields for key in _BACKUP_MANIFEST_REQUIRED_KEYS):

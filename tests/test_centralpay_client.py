@@ -241,6 +241,11 @@ _SENTINEL = "GATEWAY-CONTROLLED-TEXT-8f3a1"
             "gateway_rejected",
         ),
         ({"status": "failed", "msg": _SENTINEL}, "gateway_rejected"),
+        # error co-occurring with success=false must still classify as
+        # gateway_error_field, not be masked by the success=false check --
+        # a plausible real shape for a systemic outage ("service
+        # unavailable" for every request), not a per-payment rejection.
+        ({"success": False, "error": _SENTINEL}, "gateway_error_field"),
     ],
 )
 def test_get_link_never_exposes_gateway_text(body, expected_reason, caplog):
@@ -260,6 +265,10 @@ def test_get_link_never_exposes_gateway_text(body, expected_reason, caplog):
         ({"status": "error", "message": _SENTINEL}, "gateway_rejected"),
         ({"error": _SENTINEL}, "gateway_error_field"),
         ({"success": False, "message": _SENTINEL}, "gateway_rejected"),
+        # error co-occurring with success=false must still classify as
+        # gateway_error_field -- see the matching get_link test above.
+        ({"success": False, "error": _SENTINEL}, "gateway_error_field"),
+        ({"status": "failed", "error": _SENTINEL}, "gateway_error_field"),
     ],
 )
 def test_verify_never_exposes_gateway_text(body, expected_reason, caplog):

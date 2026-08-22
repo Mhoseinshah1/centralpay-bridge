@@ -663,6 +663,27 @@ def test_backup_manifest_checksum_trailing_whitespace_is_not_healthy(settings, t
     assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
 
 
+def test_backup_symlinked_manifest_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's restore path explicitly requires
+    `! -L "$manifest"` and treats a symlinked manifest as equivalent to no
+    integrity proof at all. Path.is_file()/read_text() FOLLOW symlinks, so
+    without an explicit is_symlink() check, a manifest that is actually a
+    symlink to an otherwise-valid file would be certified healthy here
+    while restore itself would refuse to trust it."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    real_manifest = tmp_path / "real.manifest"
+    _write_manifest(dump)  # writes dump.name + ".manifest" with valid fields
+    canonical_manifest = tmp_path / (dump.name + ".manifest")
+    canonical_manifest.rename(real_manifest)
+    canonical_manifest.symlink_to(real_manifest)
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_missing"
+
+
 def test_backup_manifest_size_mismatch_is_not_healthy(settings, tmp_path):
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")

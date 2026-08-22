@@ -175,7 +175,19 @@ def gateway_reason_code(body: dict[str, Any]) -> tuple[str | None, str | None]:
     values come from fixed vocabularies — the response's own text is never
     returned. The marker records WHICH failure signal was present (for
     debugging) without exposing gateway-controlled content.
+
+    The dedicated "error" field is checked FIRST, ahead of success=false/a
+    failure status value: a response can carry more than one marker at
+    once (e.g. ``{"success": false, "error": "service unavailable"}``), and
+    checking error last would make it unreachable -- and therefore
+    permanently misclassified as an ordinary per-payment rejection --
+    whenever a systemic failure also happens to set one of those other
+    fields (see app.services.monitor_checks, which relies on this exact
+    ordering to keep counting a systemic verify-API error even when it
+    coexists with those fields).
     """
+    if body.get("error"):
+        return GATEWAY_ERROR_FIELD, "error_field"
     if body.get("success") is False:
         return GATEWAY_REJECTED, "success_false"
     status = body.get("status")
@@ -185,8 +197,6 @@ def gateway_reason_code(body: dict[str, Any]) -> tuple[str | None, str | None]:
         and str(status).strip().lower() in _FAILURE_STATUS_VALUES
     ):
         return GATEWAY_REJECTED, "failure_status"
-    if body.get("error"):
-        return GATEWAY_ERROR_FIELD, "error_field"
     if not _explicit_success(body):
         # No explicit positive marker: success is never guessed.
         return GATEWAY_RESPONSE_INVALID, "no_success_marker"
