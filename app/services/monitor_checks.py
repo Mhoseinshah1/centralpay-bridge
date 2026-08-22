@@ -369,7 +369,14 @@ def _parse_backup_manifest(path: Path) -> dict[str, str] | None:
     except (OSError, UnicodeDecodeError):
         return None
     fields: dict[str, str] = {}
-    for raw_line in text.splitlines():
+    # Split on "\n" only -- NOT str.splitlines(), which also treats a bare
+    # "\r" and "\r\n" as line boundaries and silently discards them.
+    # scripts/centralpay's restore-side extraction (grep/cut) does no such
+    # normalization: a CRLF-corrupted manifest leaves the "\r" as part of
+    # the value there, so a checksum with a trailing "\r" fails restore's
+    # comparison. splitlines() would have hidden that same "\r" here,
+    # letting this check certify a manifest restore would reject.
+    for raw_line in text.split("\n"):
         if not raw_line.strip():
             continue  # blank line: skipped, but never strips a real value
         key, sep, value = raw_line.partition("=")
@@ -635,11 +642,15 @@ def _build_db_dependent_checks(
         ),
         ("notification_backlog", lambda: check_notification_backlog(db, settings, now=now)),
         ("manual_review", lambda: check_manual_review(db, settings, now=now)),
-        ("reconciliation", lambda: check_reconciliation(db, settings, now=now)),
         ("gateway_failure_burst", lambda: check_gateway_failure_burst(db, settings, now=now)),
         ("bot_failure_burst", lambda: check_bot_failure_burst(db, settings, now=now)),
     ]
     if settings.reconciliation_enabled:
+        # check_reconciliation only queries `db` when reconciliation is
+        # enabled -- disabled, it short-circuits to ok/disabled without
+        # touching the session at all, so it belongs in the DB-INDEPENDENT
+        # results built by run_all_checks instead (see there), never here.
+        checks.append(("reconciliation", lambda: check_reconciliation(db, settings, now=now)))
         checks.append(
             (
                 "worker_heartbeat:reconciliation-worker",
@@ -691,10 +702,13 @@ def run_all_checks(
     surfaces (human-triggered, on demand) always pass True — see their
     call sites for why that split is safe.
 
-    DB-INDEPENDENT checks (public_ready, backup, disk_space) always run,
-    even when PostgreSQL itself is unavailable — they read one outbound
-    HTTPS URL and the filesystem, never this function's `db` session.
-    Every other check is DB-DEPENDENT. If the initial `database` probe
+    DB-INDEPENDENT checks (public_ready, backup, disk_space, and
+    reconciliation specifically WHEN settings.reconciliation_enabled is
+    False -- check_reconciliation short-circuits to ok/disabled without
+    touching `db` in that case) always run, even when PostgreSQL itself is
+    unavailable — they read one outbound HTTPS URL and the filesystem
+    (or nothing at all), never this function's `db` session. Every other
+    check is DB-DEPENDENT. If the initial `database` probe
     already reports critical, or if a later DB-dependent check raises a
     genuine connectivity failure mid-pass (a DBAPIError whose
     connection_invalidated flag is True — SQLAlchemy's own signal that the
@@ -714,6 +728,8 @@ def run_all_checks(
     list, even mid-outage."""
     now = now_fn()
     results = [check_public_ready(settings), check_backup(settings, now=now), check_disk(settings)]
+    if not settings.reconciliation_enabled:
+        results.append(check_reconciliation(db, settings, now=now))
 
     db_result = check_database(db)
     results.append(db_result)

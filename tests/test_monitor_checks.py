@@ -663,6 +663,30 @@ def test_backup_manifest_checksum_trailing_whitespace_is_not_healthy(settings, t
     assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
 
 
+def test_backup_manifest_crlf_checksum_line_not_healthy(settings, tmp_path):
+    """str.splitlines() treats a bare "\\r" (as left behind by a CRLF line
+    ending) as its own line boundary and silently discards it -- unlike
+    scripts/centralpay's restore-side extraction (grep/cut), which does no
+    such normalization and would see the checksum value WITH its trailing
+    "\\r" attached, never matching a real sha256sum output. A
+    CRLF-corrupted checksum line (e.g. the manifest edited on Windows)
+    must fail here too, not be quietly normalized into a passing shape."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    lines = [
+        f"backup_file={dump.name}",
+        f"sha256={'a' * 64}\r",  # CRLF: a trailing \r left before the \n
+        f"size_bytes={dump.stat().st_size}",
+        "validation=passed",
+    ]
+    (tmp_path / (dump.name + ".manifest")).write_bytes(("\n".join(lines) + "\n").encode())
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
+
+
 def test_backup_symlinked_manifest_is_not_healthy(settings, tmp_path):
     """scripts/centralpay's restore path explicitly requires
     `! -L "$manifest"` and treats a symlinked manifest as equivalent to no
@@ -1367,6 +1391,45 @@ def test_run_all_checks_degrades_gracefully_when_database_is_unreachable(
         assert by_key[key].status == "critical", key
         assert by_key[key].reason == "database_unavailable", key
         assert by_key[key].details == {"dependency": "database"}
+
+
+def test_run_all_checks_reconciliation_disabled_stays_healthy_during_outage(
+    settings, monkeypatch, tmp_path
+):
+    """check_reconciliation short-circuits to ok/disabled WITHOUT ever
+    touching `db` when reconciliation_enabled is False -- it is
+    DB-INDEPENDENT in that case, so a database outage must never turn it
+    into a fabricated database_unavailable placeholder for a feature
+    that's simply turned off (which could otherwise be persisted and
+    alerted on as a real incident once the database recovers)."""
+    _patch_httpx_client(
+        monkeypatch, _FakeClient(response=_FakeResponse(200, {"status": "ready", "database": "ok"}))
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: _Usage(total=100, used=10, free=90))
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump)
+    broken_settings = settings.model_copy(
+        update={
+            "centralpay_backup_dir": str(tmp_path),
+            "reconciliation_enabled": False,
+            "monitor_disk_min_free_bytes": 1,
+        }
+    )
+
+    unreachable_dir = tmp_path / "no-such-directory"  # never created
+    broken_engine = create_engine(f"sqlite:///{unreachable_dir}/db.sqlite")
+    broken_factory = sessionmaker(bind=broken_engine, expire_on_commit=False, autoflush=False)
+
+    with broken_factory() as db:
+        results = monitor_checks.run_all_checks(db, broken_settings, include_db_integrity=False)
+
+    by_key = {r.key: r for r in results}
+    assert by_key["database"].status == "critical"
+    assert by_key["reconciliation"].status == "ok"
+    assert by_key["reconciliation"].reason == "disabled"
+    assert "worker_heartbeat:reconciliation-worker" not in by_key
 
 
 def test_run_all_checks_excludes_db_integrity_when_unreachable_and_excluded(settings, tmp_path):
