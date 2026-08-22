@@ -262,8 +262,8 @@ Typical validation:
 pytest -q
 ruff check .
 mypy app tests
-shellcheck install.sh scripts/centralpay scripts/backup.sh
-bash -n install.sh scripts/centralpay scripts/backup.sh
+shellcheck install.sh scripts/backup.sh scripts/centralpay
+bash -n install.sh scripts/backup.sh scripts/centralpay
 docker compose config --quiet
 ```
 
