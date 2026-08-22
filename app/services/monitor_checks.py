@@ -12,15 +12,17 @@ can never quietly disagree with what those surfaces already report.
 """
 
 import logging
+import re
 import shutil
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.adminbot import queries
@@ -38,13 +40,47 @@ STATUS_CRITICAL = "critical"
 # Ordering for "worst status wins" aggregation.
 _SEVERITY_RANK = {STATUS_OK: 0, STATUS_WARNING: 1, STATUS_CRITICAL: 2}
 
-_GATEWAY_FAILURE_EVENT_TYPES = ("centralpay_getlink_failed", "centralpay_verify_failed")
+# centralpay_getlink_failed has no "ordinary outcome" variant: get_link()
+# either returns a redirect URL or raises CentralPayError (see
+# app.services.payments._create_payment_link / app.centralpay.get_link) --
+# there is no code path where a payer's own choice produces this event, so
+# every instance already is a genuine gateway/transport failure. No further
+# filtering needed.
+#
+# centralpay_verify_failed is different: app.services.verification.
+# verify_and_settle records it for TWO semantically different outcomes
+# under the SAME event type, distinguished only by data.stage --
+# stage="transport" is a real CentralPayError (connection/protocol/HTTP
+# failure calling verify.php), an infrastructure signal; stage="gateway" is
+# CentralPay explicitly answering that one specific payment was not
+# successful (the payer simply didn't complete or abandoned it) -- an
+# ordinary, expected, high-frequency business outcome that must never feed
+# a gateway-outage burst count, no matter how many payers it happens to at
+# once. A row with no/other stage value is treated the same as
+# stage="gateway": excluded rather than risk a misleading alert.
+_GATEWAY_FAILURE_TRANSPORT_STAGE = "transport"
+_GATEWAY_FAILURE_RELIABLE_PREDICATE = or_(
+    PaymentEvent.event_type == "centralpay_getlink_failed",
+    and_(
+        PaymentEvent.event_type == "centralpay_verify_failed",
+        PaymentEvent.data["stage"].as_string() == _GATEWAY_FAILURE_TRANSPORT_STAGE,
+    ),
+)
 _BOT_FAILURE_EVENT_TYPE = "bot_notification_failed"
 _BACKUP_GLOB = "centralpay-*.dump"
+# scripts/backup.sh's write_manifest() always writes exactly these keys
+# for a successfully validated backup. Any manifest missing one is either
+# truncated, corrupted, or was never produced by that tooling at all.
+_BACKUP_MANIFEST_REQUIRED_KEYS = ("backup_file", "sha256", "size_bytes")
+_BACKUP_MANIFEST_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # Check keys that always run every cheap cycle (everything except
 # db_integrity, which app.monitor gates on its own slower cadence).
 DB_INTEGRITY_CHECK_KEY = "db_integrity"
+# CheckResult.reason for a DB-dependent check that could not run because
+# check_database (or an earlier DB-dependent check this same pass) already
+# found PostgreSQL unavailable -- never itself the result of a query.
+_DB_UNAVAILABLE_REASON = "database_unavailable"
 
 
 @dataclass(frozen=True)
@@ -256,11 +292,75 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
     return CheckResult("reconciliation", STATUS_OK, "healthy", details)
 
 
+def _parse_backup_manifest(path: Path) -> dict[str, str] | None:
+    """Parse scripts/backup.sh's ``write_manifest`` sidecar: a plain
+    line-oriented ``key=value`` text file. Returns None (never raises) for
+    anything unreadable or not in that shape -- callers treat that
+    identically to a missing manifest. Only ever reads this small (~200
+    byte) sidecar, never the dump file itself."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            return None
+        fields[key] = value
+    return fields
+
+
+def _backup_manifest_issue(dump: Path, dump_size: int) -> str | None:
+    """None when dump's ``.manifest`` sidecar is present, well-formed, and
+    consistent with the dump file itself; otherwise a short machine-
+    readable reason.
+
+    Deliberately cheap, metadata-only validation: parses the small text
+    sidecar and compares it against the dump's own name/size (already
+    known from a stat the caller already did). NEVER reads or hashes the
+    dump's own bytes -- byte-level checksum verification is the canonical
+    backup tooling's job (scripts/backup.sh's validate_archive at creation
+    time, and restore-time verification), not this periodic monitor's; a
+    multi-hundred-MB pg_dump hashed every MONITOR_INTERVAL_SECONDS would
+    make the monitor itself a load problem. Only the checksum field's
+    SHAPE is validated here, never its correctness against the actual
+    bytes.
+
+    Never constructs a filesystem path from manifest-supplied data (only a
+    plain string comparison against the already-known dump filename) --
+    no path traversal, no unsafe filename interpretation."""
+    manifest_path = dump.with_name(dump.name + ".manifest")
+    if not manifest_path.is_file():
+        return "manifest_missing"
+    fields = _parse_backup_manifest(manifest_path)
+    if fields is None or any(key not in fields for key in _BACKUP_MANIFEST_REQUIRED_KEYS):
+        return "manifest_malformed"
+    if fields["backup_file"] != dump.name:
+        return "manifest_filename_mismatch"
+    if not _BACKUP_MANIFEST_SHA256_RE.match(fields["sha256"]):
+        return "manifest_checksum_shape_invalid"
+    try:
+        manifest_size = int(fields["size_bytes"])
+    except ValueError:
+        return "manifest_malformed"
+    if manifest_size != dump_size:
+        return "manifest_size_mismatch"
+    validation = fields.get("validation")
+    if validation is not None and validation != "passed":
+        return "manifest_malformed"
+    return None
+
+
 def check_backup(settings: Settings, *, now: datetime) -> CheckResult:
     """Newest backup with a validated .ok sidecar, under the SAME
     bind-mounted, read-only backup directory scripts/backup.sh writes to.
-    Never creates, validates the CONTENTS of, or deletes a backup — purely
-    a bounded directory listing + stat."""
+    Never creates, validates the byte CONTENTS of, or deletes a backup --
+    a bounded directory listing + stat, plus a cheap parse of the small
+    .manifest metadata sidecar (see _backup_manifest_issue)."""
     backup_dir = Path(settings.centralpay_backup_dir)
     try:
         candidates = [
@@ -279,8 +379,32 @@ def check_backup(settings: Settings, *, now: datetime) -> CheckResult:
         return CheckResult(
             "backup", STATUS_CRITICAL, "no_valid_backup_found", {"backup_dir": str(backup_dir)}
         )
-    newest = max(candidates, key=lambda p: p.stat().st_mtime)
-    age_seconds = now.timestamp() - newest.stat().st_mtime
+    try:
+        newest = max(candidates, key=lambda p: p.stat().st_mtime)
+        newest_stat = newest.stat()
+        manifest_issue = _backup_manifest_issue(newest, newest_stat.st_size)
+    except OSError as exc:
+        # A filesystem race (file removed between the glob() listing above
+        # and this stat) or a permission error stat() doesn't ignore (e.g.
+        # EACCES) -- still never allowed to raise out of a check that must
+        # keep running during a database outage (see run_all_checks).
+        return CheckResult(
+            "backup",
+            STATUS_CRITICAL,
+            "backup_dir_unreadable",
+            {"backup_dir": str(backup_dir), "error": type(exc).__name__},
+        )
+    if manifest_issue is not None:
+        # Missing/malformed/inconsistent manifest metadata means the
+        # recoverability evidence for the newest backup is incomplete --
+        # never reported as healthy, regardless of the backup's age.
+        return CheckResult(
+            "backup",
+            STATUS_CRITICAL,
+            "backup_manifest_invalid",
+            {"newest_backup": newest.name, "manifest_issue": manifest_issue},
+        )
+    age_seconds = now.timestamp() - newest_stat.st_mtime
     details = {"newest_backup": newest.name, "age_seconds": round(age_seconds, 1)}
     if age_seconds >= settings.monitor_backup_critical_age_seconds:
         return CheckResult("backup", STATUS_CRITICAL, "backup_stale", details)
@@ -339,15 +463,15 @@ def check_db_integrity(db: Session) -> CheckResult:
 
 
 def _affected_payments_in_window(
-    db: Session, *, event_types: tuple[str, ...], window_seconds: int, now: datetime
+    db: Session, *, predicate: Any, window_seconds: int, now: datetime
 ) -> int:
-    """COUNT(DISTINCT payment_id) of PaymentEvent rows of the given types in
-    the trailing window — AFFECTED PAYMENTS, never raw attempt counts (a
+    """COUNT(DISTINCT payment_id) of PaymentEvent rows matching `predicate`
+    in the trailing window — AFFECTED PAYMENTS, never raw attempt counts (a
     single payment retried 6 times must count once, not six times)."""
     cutoff = now - timedelta(seconds=window_seconds)
     return db.execute(
         select(func.count(func.distinct(PaymentEvent.payment_id))).where(
-            PaymentEvent.event_type.in_(event_types),
+            predicate,
             PaymentEvent.payment_id.is_not(None),
             PaymentEvent.created_at >= cutoff,
         )
@@ -355,15 +479,16 @@ def _affected_payments_in_window(
 
 
 def check_gateway_failure_burst(db: Session, settings: Settings, *, now: datetime) -> CheckResult:
-    """centralpay_getlink_failed / centralpay_verify_failed only — genuine
-    transport/protocol/server failures. Never gateway_not_paid /
-    reconciliation_gateway_not_paid, which are ordinary "not paid yet"
-    outcomes recorded under different event types entirely (see
-    app.services.reconciliation / app.services.verification) and are
-    deliberately excluded here."""
+    """Reliable gateway/transport failures only — see
+    _GATEWAY_FAILURE_RELIABLE_PREDICATE for exactly which event shapes
+    count and why. Never gateway_not_paid / reconciliation_gateway_not_paid
+    (different event types entirely) or a centralpay_verify_failed row
+    whose stage shows CentralPay simply answered "not successful" for a
+    specific payment — both are ordinary, expected outcomes, not gateway
+    outages, and are deliberately excluded here."""
     window = settings.monitor_gateway_failure_window_seconds
     affected = _affected_payments_in_window(
-        db, event_types=_GATEWAY_FAILURE_EVENT_TYPES, window_seconds=window, now=now
+        db, predicate=_GATEWAY_FAILURE_RELIABLE_PREDICATE, window_seconds=window, now=now
     )
     details = {"window_seconds": window, "affected_payments": affected}
     if affected >= settings.monitor_gateway_failure_critical_count:
@@ -384,7 +509,10 @@ def check_bot_failure_burst(db: Session, settings: Settings, *, now: datetime) -
     never counted per-attempt."""
     window = settings.monitor_bot_failure_window_seconds
     affected = _affected_payments_in_window(
-        db, event_types=(_BOT_FAILURE_EVENT_TYPE,), window_seconds=window, now=now
+        db,
+        predicate=PaymentEvent.event_type == _BOT_FAILURE_EVENT_TYPE,
+        window_seconds=window,
+        now=now,
     )
     details = {"window_seconds": window, "affected_payments": affected}
     if affected >= settings.monitor_bot_failure_critical_count:
@@ -392,6 +520,89 @@ def check_bot_failure_burst(db: Session, settings: Settings, *, now: datetime) -
     if affected >= settings.monitor_bot_failure_warning_count:
         return CheckResult("bot_failure_burst", STATUS_WARNING, "bot_failure_burst", details)
     return CheckResult("bot_failure_burst", STATUS_OK, "healthy", details)
+
+
+def _db_unavailable_result(key: str) -> CheckResult:
+    """Placeholder for a DB-dependent check that could not run this pass
+    because PostgreSQL itself is unavailable. Reuses the existing
+    STATUS_CRITICAL vocabulary rather than adding a new status value, so
+    every existing caller (the CLI, the admin bot's /monitor command, and
+    app.monitor's own incident-recording loop) keeps working against the
+    same three-state CheckResult contract."""
+    return CheckResult(key, STATUS_CRITICAL, _DB_UNAVAILABLE_REASON, {"dependency": "database"})
+
+
+def _rollback_after_db_failure(db: Session) -> None:
+    # Best-effort: if the connection itself is gone, rollback() can raise
+    # too. Either way, no further DB-dependent query is attempted this
+    # pass -- this is defense in depth, not a requirement for correctness.
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning("monitor_session_rollback_failed")
+
+
+def _build_db_dependent_checks(
+    db: Session, settings: Settings, *, now: datetime, include_db_integrity: bool
+) -> list[tuple[str, Callable[[], CheckResult]]]:
+    """Every check that queries `db`, as (key, thunk) pairs in the order
+    they should run. Building this list never itself issues a query --
+    each thunk is a lambda, so run_all_checks can inspect the key set
+    (e.g. to fill in database_unavailable placeholders) without running
+    any of them."""
+    checks: list[tuple[str, Callable[[], CheckResult]]] = [
+        (
+            "worker_heartbeat:notification-worker",
+            lambda: check_worker_heartbeat(
+                db,
+                settings,
+                worker_name="notification-worker",
+                poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+                now=now,
+            ),
+        ),
+        ("notification_backlog", lambda: check_notification_backlog(db, settings, now=now)),
+        ("manual_review", lambda: check_manual_review(db, settings, now=now)),
+        ("reconciliation", lambda: check_reconciliation(db, settings, now=now)),
+        ("gateway_failure_burst", lambda: check_gateway_failure_burst(db, settings, now=now)),
+        ("bot_failure_burst", lambda: check_bot_failure_burst(db, settings, now=now)),
+    ]
+    if settings.reconciliation_enabled:
+        checks.append(
+            (
+                "worker_heartbeat:reconciliation-worker",
+                lambda: check_worker_heartbeat(
+                    db,
+                    settings,
+                    worker_name="reconciliation-worker",
+                    poll_interval_seconds=settings.reconciliation_interval_seconds,
+                    now=now,
+                ),
+            )
+        )
+    if settings.admin_bot_enabled:
+        # The admin bot's own delivery loop (app.adminbot.runner) has no
+        # OTHER visibility to this dedicated monitor -- its container
+        # liveness heartbeat file lives in its own tmpfs, and it writes no
+        # database row unless it heartbeats here. Enabled-only, exactly
+        # like reconciliation-worker above: when the admin bot is
+        # disabled, no delivery loop runs at all, so "no heartbeat" would
+        # be a false critical rather than a real signal.
+        checks.append(
+            (
+                "worker_heartbeat:admin-bot-delivery",
+                lambda: check_worker_heartbeat(
+                    db,
+                    settings,
+                    worker_name="admin-bot-delivery",
+                    poll_interval_seconds=settings.admin_bot_alert_poll_interval_seconds,
+                    now=now,
+                ),
+            )
+        )
+    if include_db_integrity:
+        checks.append((DB_INTEGRITY_CHECK_KEY, lambda: check_db_integrity(db)))
+    return checks
 
 
 def run_all_checks(
@@ -406,55 +617,46 @@ def run_all_checks(
     app.monitor's background loop passes include_db_integrity=False on
     every cycle except its own slower cadence; the CLI/admin-bot `/monitor`
     surfaces (human-triggered, on demand) always pass True — see their
-    call sites for why that split is safe."""
+    call sites for why that split is safe.
+
+    DB-INDEPENDENT checks (public_ready, backup, disk_space) always run,
+    even when PostgreSQL itself is unavailable — they read one outbound
+    HTTPS URL and the filesystem, never this function's `db` session.
+    Every other check is DB-DEPENDENT. If the initial `database` probe
+    already reports critical, or if a later DB-dependent check raises
+    (the connection dies mid-pass, e.g. a real OperationalError), no
+    further SQL is attempted on this session for the rest of this pass —
+    every check that had to be skipped gets a critical/
+    database_unavailable placeholder instead. A PostgreSQL outage must
+    never make this function raise: every caller (the CLI, the admin
+    bot's /monitor command, and app.monitor's own loop) always gets back
+    a complete, structured result list, even mid-outage."""
     now = now_fn()
-    results = [
-        check_public_ready(settings),
-        check_database(db),
-        check_worker_heartbeat(
-            db,
-            settings,
-            worker_name="notification-worker",
-            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
-            now=now,
-        ),
-        check_notification_backlog(db, settings, now=now),
-        check_manual_review(db, settings, now=now),
-        check_reconciliation(db, settings, now=now),
-        check_backup(settings, now=now),
-        check_disk(settings),
-        check_gateway_failure_burst(db, settings, now=now),
-        check_bot_failure_burst(db, settings, now=now),
-    ]
-    if settings.reconciliation_enabled:
-        results.append(
-            check_worker_heartbeat(
-                db,
-                settings,
-                worker_name="reconciliation-worker",
-                poll_interval_seconds=settings.reconciliation_interval_seconds,
-                now=now,
+    results = [check_public_ready(settings), check_backup(settings, now=now), check_disk(settings)]
+
+    db_result = check_database(db)
+    results.append(db_result)
+
+    db_dependent = _build_db_dependent_checks(
+        db, settings, now=now, include_db_integrity=include_db_integrity
+    )
+
+    if db_result.status != STATUS_OK:
+        _rollback_after_db_failure(db)
+        results.extend(_db_unavailable_result(key) for key, _ in db_dependent)
+        return results
+
+    for index, (key, thunk) in enumerate(db_dependent):
+        try:
+            results.append(thunk())
+        except Exception as exc:
+            logger.warning(
+                "monitor_check_query_failed", extra={"check": key, "error": type(exc).__name__}
             )
-        )
-    if settings.admin_bot_enabled:
-        # The admin bot's own delivery loop (app.adminbot.runner) has no
-        # OTHER visibility to this dedicated monitor -- its container
-        # liveness heartbeat file lives in its own tmpfs, and it writes no
-        # database row unless it heartbeats here. Enabled-only, exactly
-        # like reconciliation-worker above: when the admin bot is
-        # disabled, no delivery loop runs at all, so "no heartbeat" would
-        # be a false critical rather than a real signal.
-        results.append(
-            check_worker_heartbeat(
-                db,
-                settings,
-                worker_name="admin-bot-delivery",
-                poll_interval_seconds=settings.admin_bot_alert_poll_interval_seconds,
-                now=now,
-            )
-        )
-    if include_db_integrity:
-        results.append(check_db_integrity(db))
+            _rollback_after_db_failure(db)
+            results.append(_db_unavailable_result(key))
+            results.extend(_db_unavailable_result(k) for k, _ in db_dependent[index + 1 :])
+            break
     return results
 
 
