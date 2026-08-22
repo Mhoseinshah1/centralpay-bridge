@@ -618,6 +618,51 @@ def test_backup_manifest_path_traversal_payload_never_touches_the_filesystem(set
     assert result.details["manifest_issue"] == "manifest_filename_mismatch"
 
 
+def test_backup_manifest_duplicate_key_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's OWN restore-side check
+    (`grep -E '^sha256=' | head -1`) reads only the FIRST sha256= line; a
+    manifest with two conflicting sha256 lines (corruption, or a forged
+    second value) must be rejected outright rather than silently resolved
+    by picking either the first or the last -- disagreeing with restore's
+    own choice would let this check claim recoverability for an archive
+    restore itself would refuse."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    good_sha = "a" * 64
+    lines = [
+        f"backup_file={dump.name}",
+        "sha256=0000000000000000000000000000000000000000000000000000000000bad",
+        f"sha256={good_sha}",  # duplicate key -- forged/corrupted second value
+        f"size_bytes={dump.stat().st_size}",
+        "validation=passed",
+    ]
+    (tmp_path / (dump.name + ".manifest")).write_text("\n".join(lines) + "\n")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_malformed"
+
+
+def test_backup_manifest_checksum_trailing_whitespace_is_not_healthy(settings, tmp_path):
+    """scripts/centralpay's restore-side extraction
+    (`cut -d= -f2`, no trimming) would keep trailing whitespace as part of
+    the expected checksum, which a real sha256sum output never has --
+    restore would reject this backup with a checksum mismatch. This check
+    must never be more lenient than that: a value's surrounding whitespace
+    is never stripped, so the same trailing whitespace fails the 64-hex
+    shape check here too, instead of being silently cleaned up and
+    reported healthy."""
+    dump = tmp_path / "centralpay-20260101-000000.dump"
+    dump.write_bytes(b"PGDMP")
+    (tmp_path / (dump.name + ".ok")).touch()
+    _write_manifest(dump, sha256=("a" * 64) + "  ")
+    backup_settings = settings.model_copy(update={"centralpay_backup_dir": str(tmp_path)})
+    result = monitor_checks.check_backup(backup_settings, now=datetime.now(UTC))
+    assert result.status == "critical"
+    assert result.details["manifest_issue"] == "manifest_checksum_shape_invalid"
+
+
 def test_backup_manifest_size_mismatch_is_not_healthy(settings, tmp_path):
     dump = tmp_path / "centralpay-20260101-000000.dump"
     dump.write_bytes(b"PGDMP")
@@ -861,6 +906,32 @@ def test_gateway_failure_burst_counts_verify_failed_gateway_stage_missing_data(
             payment_id=payment.id,
             event_type="centralpay_verify_failed",
             data={"stage": "gateway", "reason": "gateway_missing_data"},
+        )
+        db.commit()
+        result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))
+    assert result.status == "warning"
+    assert result.details["affected_payments"] == 1
+
+
+def test_gateway_failure_burst_counts_verify_failed_gateway_stage_error_field(
+    session_factory, settings
+):
+    """stage="gateway" reason="gateway_error_field"
+    (app.centralpay.GATEWAY_ERROR_FIELD) -- a dedicated "error" field in
+    CentralPay's response, distinct from an explicit success=false/failure
+    status value (see app.centralpay.gateway_reason_code). A service/
+    protocol-level error signal, not CentralPay answering that one specific
+    payment wasn't successful, so it must still count -- otherwise a
+    systemic outage where verify.php returns an error field for every
+    payment would produce zero burst incidents."""
+    payment = _make_payment(session_factory, status="link_created")
+    low = settings.model_copy(update={"monitor_gateway_failure_warning_count": 1})
+    with session_factory() as db:
+        record_event(
+            db,
+            payment_id=payment.id,
+            event_type="centralpay_verify_failed",
+            data={"stage": "gateway", "reason": "gateway_error_field"},
         )
         db.commit()
         result = monitor_checks.check_gateway_failure_burst(db, low, now=datetime.now(UTC))

@@ -58,25 +58,32 @@ _SEVERITY_RANK = {STATUS_OK: 0, STATUS_WARNING: 1, STATUS_CRITICAL: 2}
 # that itself covers TWO different cases -- see app.centralpay.
 # gateway_reason_code / CentralPayClient.verify, whose fixed-vocabulary
 # `failure_reason` is recorded verbatim as data.reason:
-#   - "gateway_rejected" (GATEWAY_REJECTED): an EXPLICIT rejection marker
-#     (success=false / a failure status value / an error field) -- CentralPay
+#   - "gateway_rejected" (GATEWAY_REJECTED): body.success is explicitly
+#     false, or body.status matches a known failure value -- CentralPay
 #     unambiguously said "this payment wasn't successful". The payer simply
 #     didn't complete or abandoned it -- an ordinary, expected,
 #     high-frequency business outcome, never a gateway outage, no matter how
 #     many payers it happens to at once.
-#   - "gateway_response_invalid" / "gateway_missing_data"
-#     (GATEWAY_RESPONSE_INVALID / GATEWAY_MISSING_DATA): CentralPay's
-#     response had NEITHER a clear success NOR a clear failure marker --
-#     unlike an explicit rejection, this is CentralPay's verify API itself
-#     behaving abnormally (e.g. serving a malformed/incomplete body), a
-#     genuine protocol-level infrastructure signal that must keep counting
-#     -- otherwise a systemic verify-API outage that returns HTTP 200 with a
-#     broken body for every payment would produce zero burst incidents.
+#   - "gateway_error_field" (GATEWAY_ERROR_FIELD), "gateway_response_invalid"
+#     (GATEWAY_RESPONSE_INVALID), "gateway_missing_data"
+#     (GATEWAY_MISSING_DATA): CentralPay's response carried a dedicated
+#     "error" field, or had NEITHER a clear success NOR a clear failure
+#     marker at all -- unlike an explicit per-payment rejection, these are
+#     CentralPay's verify API itself behaving abnormally (a service/
+#     protocol-level error, or a malformed/incomplete body), genuine
+#     infrastructure signals that must keep counting -- otherwise a
+#     systemic verify-API outage that returns HTTP 200 with an error field
+#     or a broken body for every payment would produce zero burst
+#     incidents.
 # Any other/missing reason for stage="gateway" is ambiguous and excluded,
 # same as a row with no stage value at all.
 _GATEWAY_FAILURE_TRANSPORT_STAGE = "transport"
 _GATEWAY_FAILURE_GATEWAY_STAGE = "gateway"
-_GATEWAY_FAILURE_AMBIGUOUS_REASONS = ("gateway_response_invalid", "gateway_missing_data")
+_GATEWAY_FAILURE_AMBIGUOUS_REASONS = (
+    "gateway_error_field",
+    "gateway_response_invalid",
+    "gateway_missing_data",
+)
 _GATEWAY_FAILURE_RELIABLE_PREDICATE = or_(
     PaymentEvent.event_type == "centralpay_getlink_failed",
     and_(
@@ -324,18 +331,30 @@ def _parse_backup_manifest(path: Path) -> dict[str, str] | None:
     line-oriented ``key=value`` text file. Returns None (never raises) for
     anything unreadable or not in that shape -- callers treat that
     identically to a missing manifest. Only ever reads this small (~200
-    byte) sidecar, never the dump file itself."""
+    byte) sidecar, never the dump file itself.
+
+    Deliberately as strict as scripts/centralpay's OWN restore-side
+    manifest read (``grep -E '^sha256=' | head -1 | cut -d= -f2``, no
+    trimming): a value's surrounding whitespace is never stripped here
+    either, so a corrupted/tampered field that restore's raw extraction
+    would choke on (e.g. a checksum with trailing whitespace) fails this
+    check's shape validation too, rather than being silently cleaned up
+    and reported healthy for an archive restore would actually refuse. A
+    genuine ``write_manifest`` output never repeats a key; a duplicate is
+    corruption or a forged second value, and -- since restore reads only
+    the FIRST occurrence -- silently picking either the first or the last
+    here could make this check disagree with what restore would actually
+    accept. Rejected outright instead."""
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     fields: dict[str, str] = {}
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        key, sep, value = line.partition("=")
-        if not sep:
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue  # blank line: skipped, but never strips a real value
+        key, sep, value = raw_line.partition("=")
+        if not sep or key in fields:
             return None
         fields[key] = value
     return fields

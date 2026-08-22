@@ -225,39 +225,49 @@ _SENTINEL = "GATEWAY-CONTROLLED-TEXT-8f3a1"
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_reason"),
     [
-        {"status": "error", "message": _SENTINEL},
-        {"error": _SENTINEL},
-        {"success": False, "message": _SENTINEL, "description": _SENTINEL},
-        {"status": "failed", "msg": _SENTINEL},
+        ({"status": "error", "message": _SENTINEL}, "gateway_rejected"),
+        # A dedicated "error" field is a distinct, more specific internal
+        # code (GATEWAY_ERROR_FIELD) from the other three -- see
+        # app.centralpay.gateway_reason_code and
+        # app.services.monitor_checks, which relies on this exact
+        # distinction to keep counting a systemic verify-API error as a
+        # gateway-failure signal without reintroducing ordinary
+        # payer-declined outcomes.
+        ({"error": _SENTINEL}, "gateway_error_field"),
+        (
+            {"success": False, "message": _SENTINEL, "description": _SENTINEL},
+            "gateway_rejected",
+        ),
+        ({"status": "failed", "msg": _SENTINEL}, "gateway_rejected"),
     ],
 )
-def test_get_link_never_exposes_gateway_text(body, caplog):
+def test_get_link_never_exposes_gateway_text(body, expected_reason, caplog):
     client = make_client(respond_with(httpx.Response(200, json=body)))
     with caplog.at_level("DEBUG"), pytest.raises(CentralPayRejectedError) as excinfo:
         client.get_link(amount=1000, user_id=1, order_id=2, return_url="https://cb.test")
     assert _SENTINEL not in str(excinfo.value)
-    assert excinfo.value.message == "getLink rejected: gateway_rejected"
+    assert excinfo.value.message == f"getLink rejected: {expected_reason}"
     for record in caplog.records:
         assert _SENTINEL not in record.getMessage()
         assert _SENTINEL not in repr(record.__dict__)
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_reason"),
     [
-        {"status": "error", "message": _SENTINEL},
-        {"error": _SENTINEL},
-        {"success": False, "message": _SENTINEL},
+        ({"status": "error", "message": _SENTINEL}, "gateway_rejected"),
+        ({"error": _SENTINEL}, "gateway_error_field"),
+        ({"success": False, "message": _SENTINEL}, "gateway_rejected"),
     ],
 )
-def test_verify_never_exposes_gateway_text(body, caplog):
+def test_verify_never_exposes_gateway_text(body, expected_reason, caplog):
     client = make_client(respond_with(httpx.Response(200, json=body)))
     with caplog.at_level("DEBUG"):
         result = client.verify(order_id=5)
     assert result.gateway_success is False
-    assert result.failure_reason == "gateway_rejected"  # internal code only
+    assert result.failure_reason == expected_reason  # internal code only
     for record in caplog.records:
         assert _SENTINEL not in record.getMessage()
         assert _SENTINEL not in repr(record.__dict__)
