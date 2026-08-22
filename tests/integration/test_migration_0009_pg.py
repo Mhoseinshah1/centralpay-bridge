@@ -211,7 +211,7 @@ def test_production_0008_then_upgrade_head_runs_0009_and_app_survives(
     # Bring the schema to the full head for the application section (0010
     # adds the reconciliation columns the current ORM model selects).
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0011"
+    assert _alembic_version(pg_engine) == "0012"
 
     # --- the NEW application against the migrated database ------------------
     session_factory = sessionmaker(bind=pg_engine, expire_on_commit=False, autoflush=False)
@@ -290,7 +290,7 @@ def test_upgrade_head_is_idempotent_on_partially_applied_0009(pg_engine):
             )
         )
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0011"
+    assert _alembic_version(pg_engine) == "0012"
     assert "ck_payer_identities_identity_scheme_valid" in _check_names(
         pg_engine, "centralpay_payer_identities"
     )
@@ -308,4 +308,4 @@ def test_0009_downgrade_is_non_destructive_by_default(pg_engine):
         pg_engine, "centralpay_payer_identities"
     )
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0011"
+    assert _alembic_version(pg_engine) == "0012"

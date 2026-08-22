@@ -55,6 +55,35 @@ def _write_docker_stub(bindir: Path, *, call_log: Path, monitor_running: bool) -
     (bindir / "docker").chmod(0o755)
 
 
+def _write_failing_stop_docker_stub(
+    bindir: Path, *, call_log: Path, service: str, still_running: bool
+) -> None:
+    """A `docker` stub whose `stop <service>` always fails, simulating a
+    Docker daemon hiccup/timeout -- distinct from `still_running`, which
+    controls what `ps -q`/`inspect` report afterward so the caller's
+    verify-before-persisting logic can be tested both ways."""
+    cid = f"{service}-container-id"
+    ps_reply = cid if still_running else ""
+    running_reply = "true" if still_running else "false"
+    (bindir / "docker").write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(call_log))}\n"
+        f'if [[ "$*" == *"stop {service}"* ]]; then\n'
+        "    exit 1\n"
+        "fi\n"
+        f'if [[ "$*" == *"ps -q {service}"* ]]; then\n'
+        f"    echo {shlex.quote(ps_reply)}\n"
+        "    exit 0\n"
+        "fi\n"
+        f'if [[ "$*" == *"inspect"* && "$*" == *"{cid}"* ]]; then\n'
+        f"    echo {shlex.quote(running_reply)}\n"
+        "    exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    (bindir / "docker").chmod(0o755)
+
+
 def _write_id_stub(bindir: Path) -> None:
     # require_root shells out to `id -u`; these tests exercise the
     # root-gated enable/disable subcommands without actually running as
@@ -179,3 +208,48 @@ def test_backup_dir_defaults_when_unset_everywhere(tmp_path):
     result = cli_call('echo "BACKUP_DIR=$BACKUP_DIR"', {"CENTRALPAY_CONFIG_DIR": str(config)})
     assert result.returncode == 0, result.stderr
     assert "BACKUP_DIR=/var/backups/centralpay-bridge" in result.stdout
+
+
+def test_monitor_disable_fails_loudly_when_container_still_running(admin_bot_sandbox):
+    """A `docker compose stop monitor` failure (daemon hiccup, timeout, ...)
+    must never be silently swallowed while the container is still actually
+    running -- MONITOR_ENABLED must NOT be rewritten to false in that case,
+    or an operator would believe monitoring was disabled while it keeps
+    polling and creating incidents/alerts."""
+    call_log = admin_bot_sandbox["bindir"] / "docker_calls.log"
+    _write_failing_stop_docker_stub(
+        admin_bot_sandbox["bindir"], call_log=call_log, service="monitor", still_running=True
+    )
+    _write_id_stub(admin_bot_sandbox["bindir"])
+    env = {
+        "PATH": f"{admin_bot_sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "CENTRALPAY_INSTALL_DIR": str(admin_bot_sandbox["install"]),
+        "CENTRALPAY_CONFIG_DIR": str(admin_bot_sandbox["config"]),
+    }
+    result = cli_call("cmd_monitor disable", env)
+    assert result.returncode != 0
+    assert "still running" in result.stderr
+
+    env_text = (admin_bot_sandbox["config"] / "centralpay.env").read_text()
+    assert "MONITOR_ENABLED=true" in env_text  # unchanged
+
+
+def test_monitor_disable_succeeds_when_stop_fails_but_already_stopped(admin_bot_sandbox):
+    """A `stop` failure is benign if the container was never actually
+    running (e.g. already stopped) -- the desired end state already holds,
+    so disable must still succeed and persist the config change."""
+    call_log = admin_bot_sandbox["bindir"] / "docker_calls.log"
+    _write_failing_stop_docker_stub(
+        admin_bot_sandbox["bindir"], call_log=call_log, service="monitor", still_running=False
+    )
+    _write_id_stub(admin_bot_sandbox["bindir"])
+    env = {
+        "PATH": f"{admin_bot_sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "CENTRALPAY_INSTALL_DIR": str(admin_bot_sandbox["install"]),
+        "CENTRALPAY_CONFIG_DIR": str(admin_bot_sandbox["config"]),
+    }
+    result = cli_call("cmd_monitor disable", env)
+    assert result.returncode == 0, result.stderr
+
+    env_text = (admin_bot_sandbox["config"] / "centralpay.env").read_text()
+    assert "MONITOR_ENABLED=false" in env_text

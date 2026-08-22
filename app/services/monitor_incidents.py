@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 
 from app.adminbot.alerts import create_alert
 from app.config import Settings
-from app.models import MonitorIncident, MonitorIncidentStatus
+from app.models import AdminAlert, AlertStatus, MonitorIncident, MonitorIncidentStatus
 from app.services.monitor_checks import STATUS_OK, CheckResult
 
 logger = logging.getLogger("app.services.monitor_incidents")
@@ -105,6 +105,26 @@ def _alerts_enabled(settings: Settings, check_key: str) -> bool:
     return settings.admin_bot_health_alerts
 
 
+def _needs_catchup(db: Session, incident: MonitorIncident) -> bool:
+    """True when the incident's CURRENT severity has never actually reached
+    an administrator: either it was never queued for delivery at all
+    (``last_alerted_at is None`` — never alerted from birth, or the
+    escalation branch cleared it after a since-superseded lower-severity
+    alert), or it WAS queued but that specific outbox row permanently
+    failed (every Telegram retry exhausted, ``AlertStatus.FAILED``) rather
+    than merely being pending/retrying/delivered. A permanently-failed
+    alert must be re-queued exactly like a never-sent one -- otherwise an
+    administrator can silently miss an ongoing incident forever even
+    though the admin-bot's delivery loop itself keeps heartbeating fine.
+    """
+    if incident.last_alerted_at is None:
+        return True
+    if incident.last_alert_id is None:
+        return False
+    last_alert = db.get(AdminAlert, incident.last_alert_id)
+    return last_alert is not None and last_alert.status == AlertStatus.FAILED.value
+
+
 def _alert_payload(result: CheckResult) -> dict[str, object]:
     payload: dict[str, object] = {"check": result.key, "detail": result.reason}
     if "count" in result.details:
@@ -153,7 +173,7 @@ def _handle_healthy(
         incident.last_alerted_at = now
         db.flush()
         duration_seconds = int((now - _as_utc(incident.opened_at)).total_seconds())
-        create_alert(
+        alert = create_alert(
             db,
             alert_type="monitor_incident_resolved",
             severity="info",
@@ -164,6 +184,7 @@ def _handle_healthy(
             },
             now=now,
         )
+        incident.last_alert_id = alert.id
     db.commit()
     return IncidentTransition(result.key, TRANSITION_CLOSED, incident.id)
 
@@ -199,7 +220,7 @@ def _handle_unhealthy(
             if _alerts_enabled(settings, result.key):
                 candidate.last_alerted_at = now
                 db.flush()
-                create_alert(
+                alert = create_alert(
                     db,
                     alert_type="monitor_incident_opened",
                     severity=result.status,
@@ -207,6 +228,7 @@ def _handle_unhealthy(
                     payload=_alert_payload(result),
                     now=now,
                 )
+                candidate.last_alert_id = alert.id
             db.commit()
             return IncidentTransition(result.key, TRANSITION_OPENED, candidate.id)
 
@@ -222,7 +244,7 @@ def _handle_unhealthy(
         if _alerts_enabled(settings, result.key):
             incident.last_alerted_at = now
             db.flush()
-            create_alert(
+            alert = create_alert(
                 db,
                 alert_type="monitor_incident_escalated",
                 severity=result.status,
@@ -243,6 +265,7 @@ def _handle_unhealthy(
                 payload=_alert_payload(result),
                 now=now,
             )
+            incident.last_alert_id = alert.id
         else:
             # Alerting is unavailable right now (admin bot/category
             # disabled), but the severity just got WORSE than whatever
@@ -261,30 +284,30 @@ def _handle_unhealthy(
         # update severity silently, never a duplicate alert.
         incident.severity = result.status
 
-    if incident.last_alerted_at is None and _alerts_enabled(settings, result.key):
-        # This incident has never actually been queued for delivery at its
-        # CURRENT severity -- either it opened while alerting was disabled
-        # (the loser of an open-race whose winner ran with alerting
-        # disabled counts too), or it escalated further while disabled
-        # AFTER an earlier severity's alert already went out (see the
-        # escalation branch above, which resets last_alerted_at to None
-        # for exactly this reason). Now that alerting is available, catch
-        # up with one alert at the incident's CURRENT severity -- otherwise
-        # an admin enabling the admin bot after `monitor enable` (the exact
-        # order MONITORING.md documents) would never hear about an
-        # incident that opened or worsened before that point.
+    if _needs_catchup(db, incident) and _alerts_enabled(settings, result.key):
+        # This incident's CURRENT severity has never actually reached an
+        # administrator -- it opened or escalated further while alerting
+        # was disabled (see the escalation branch above, which resets
+        # last_alerted_at to None for exactly this reason), OR it WAS
+        # queued but that specific outbox row permanently failed delivery
+        # (see _needs_catchup). Catch up with one alert at the incident's
+        # CURRENT severity -- otherwise an admin enabling the admin bot
+        # after `monitor enable` (the exact order MONITORING.md documents),
+        # or a Telegram outage that outlasted every retry, would leave an
+        # incident that opened or worsened before that point permanently
+        # unreported.
         incident.last_alerted_at = now
         db.flush()
-        create_alert(
+        alert = create_alert(
             db,
             alert_type="monitor_incident_opened",
             severity=incident.severity,
             # Time-varying (like the escalation key above), never just
             # f"monitor:{result.key}:{incident.id}" -- that exact key may
-            # already belong to a REAL, already-delivered alert (the
-            # incident's original opening alert, if this catch-up follows
-            # a since-cleared escalation rather than a from-birth one),
-            # and colliding with it would get this genuinely new alert
+            # already belong to a REAL, already-delivered (or merely
+            # permanently-failed, still a real row) alert for the
+            # incident's original opening or an earlier catch-up, and
+            # colliding with it would get this genuinely new alert
             # silently marked "suppressed" by create_alert's own
             # dedup-window check instead of actually queued.
             deduplication_key=(
@@ -294,6 +317,7 @@ def _handle_unhealthy(
             payload=_alert_payload(result),
             now=now,
         )
+        incident.last_alert_id = alert.id
         db.commit()
         return IncidentTransition(result.key, TRANSITION_ALERT_CAUGHT_UP, incident.id)
 

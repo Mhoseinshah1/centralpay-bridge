@@ -403,6 +403,15 @@ class MonitorIncident(Base):
     # When an admin_alerts row was last created for this incident (open or
     # an escalation) — never set for a silent severity de-escalation.
     last_alerted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The admin_alerts row that last_alerted_at refers to. Lets
+    # app.services.monitor_incidents distinguish "genuinely delivered (or
+    # still pending)" from "permanently failed after every Telegram retry
+    # was exhausted" -- in the latter case last_alerted_at alone would
+    # otherwise leave the incident looking "already alerted" forever even
+    # though no administrator ever actually received it.
+    last_alert_id: Mapped[int | None] = mapped_column(
+        ForeignKey("admin_alerts.id", ondelete="RESTRICT"), nullable=True
+    )
     # Safe, non-secret metadata only (counts, ages, check-specific labels) —
     # same contract as AdminAlert.payload; never customer/card/credential data.
     details: Mapped[dict[str, Any] | None] = mapped_column(JSONColumn)

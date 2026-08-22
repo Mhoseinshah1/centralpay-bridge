@@ -135,7 +135,12 @@ def check_database(db: Session) -> CheckResult:
 
 
 def check_worker_heartbeat(
-    db: Session, settings: Settings, *, worker_name: str, now: datetime
+    db: Session,
+    settings: Settings,
+    *,
+    worker_name: str,
+    poll_interval_seconds: float,
+    now: datetime,
 ) -> CheckResult:
     key = f"worker_heartbeat:{worker_name}"
     heartbeat = queries.latest_worker_heartbeat(db, worker_name=worker_name)
@@ -149,9 +154,21 @@ def check_worker_heartbeat(
         "age_seconds": round(age_seconds, 1),
         "last_error_code": heartbeat.last_error_code,
     }
-    if age_seconds >= settings.monitor_worker_heartbeat_critical_seconds:
+    # Effective cutoffs scale with THIS worker's own polling interval --
+    # same reasoning as docker-compose.yml's monitor healthcheck and
+    # reconciliation_status._runtime's heartbeat_fresh (both
+    # max(interval * 6, floor)) -- so a successful worker configured with a
+    # longer-than-default interval is never falsely reported stale on every
+    # single cycle. Identical to the fixed configured values for every
+    # worker's own default interval; only loosens when an operator
+    # configures something slower.
+    warning_cutoff = max(
+        settings.monitor_worker_heartbeat_warning_seconds, poll_interval_seconds * 6
+    )
+    critical_cutoff = max(settings.monitor_worker_heartbeat_critical_seconds, warning_cutoff * 3)
+    if age_seconds >= critical_cutoff:
         return CheckResult(key, STATUS_CRITICAL, "heartbeat_stale", details)
-    if age_seconds >= settings.monitor_worker_heartbeat_warning_seconds:
+    if age_seconds >= warning_cutoff:
         return CheckResult(key, STATUS_WARNING, "heartbeat_aging", details)
     if heartbeat.last_error_code is not None:
         # The loop is alive (fresh heartbeat) but its most recent pass
@@ -394,7 +411,13 @@ def run_all_checks(
     results = [
         check_public_ready(settings),
         check_database(db),
-        check_worker_heartbeat(db, settings, worker_name="notification-worker", now=now),
+        check_worker_heartbeat(
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+            now=now,
+        ),
         check_notification_backlog(db, settings, now=now),
         check_manual_review(db, settings, now=now),
         check_reconciliation(db, settings, now=now),
@@ -405,7 +428,13 @@ def run_all_checks(
     ]
     if settings.reconciliation_enabled:
         results.append(
-            check_worker_heartbeat(db, settings, worker_name="reconciliation-worker", now=now)
+            check_worker_heartbeat(
+                db,
+                settings,
+                worker_name="reconciliation-worker",
+                poll_interval_seconds=settings.reconciliation_interval_seconds,
+                now=now,
+            )
         )
     if settings.admin_bot_enabled:
         # The admin bot's own delivery loop (app.adminbot.runner) has no
@@ -416,7 +445,13 @@ def run_all_checks(
         # disabled, no delivery loop runs at all, so "no heartbeat" would
         # be a false critical rather than a real signal.
         results.append(
-            check_worker_heartbeat(db, settings, worker_name="admin-bot-delivery", now=now)
+            check_worker_heartbeat(
+                db,
+                settings,
+                worker_name="admin-bot-delivery",
+                poll_interval_seconds=settings.admin_bot_alert_poll_interval_seconds,
+                now=now,
+            )
         )
     if include_db_integrity:
         results.append(check_db_integrity(db))

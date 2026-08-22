@@ -1088,6 +1088,28 @@ cmd_version() {
     echo "docker:      $(docker --version 2>/dev/null || echo unavailable)"
 }
 
+_stop_service_verified() {
+    # $1 = profile name, $2 = service name (usually the same). A failed
+    # `stop` (Docker daemon hiccup, timeout, ...) must not silently leave a
+    # still-running, restart-enabled container while the caller persists a
+    # *_ENABLED=false config -- verify the container is ACTUALLY stopped
+    # (or was never running) before the caller does that, instead of
+    # blindly swallowing every possible failure with `|| true`.
+    local profile="$1" service="$2"
+    if compose --profile "$profile" stop "$service" 2>/dev/null; then
+        return 0
+    fi
+    local cid running
+    cid=$(compose ps -q "$service" 2>/dev/null || true)
+    if [[ -z "$cid" ]]; then
+        return 0 # nothing running -- the stop command's failure was benign
+    fi
+    running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || echo "unknown")
+    if [[ "$running" == "true" ]]; then
+        fail "Could not stop the ${service} container; it is still running. Configuration was NOT changed. Check 'docker ps'/'centralpay ${service} logs' and retry."
+    fi
+}
+
 _restart_monitor_if_running() {
     # The monitor reads ADMIN_BOT_* settings (including the alert-category
     # toggles and admin_bot_enabled itself) once at container start, per
@@ -1156,7 +1178,7 @@ cmd_admin_bot() {
             require_install
             # Stop the service; configuration (including the token) is
             # preserved unless the administrator edits the env file.
-            compose --profile admin-bot stop admin-bot 2>/dev/null || true
+            _stop_service_verified admin-bot admin-bot
             sed -i 's/^ADMIN_BOT_ENABLED=.*/ADMIN_BOT_ENABLED=false/' "$ENV_FILE"
             log "Admin bot disabled. Configuration preserved in ${ENV_FILE}."
             _restart_monitor_if_running
@@ -1215,7 +1237,7 @@ cmd_monitor() {
         disable)
             require_root monitor disable
             require_install
-            compose --profile monitor stop monitor 2>/dev/null || true
+            _stop_service_verified monitor monitor
             if grep -qE '^MONITOR_ENABLED=' "$ENV_FILE" 2>/dev/null; then
                 sed -i 's/^MONITOR_ENABLED=.*/MONITOR_ENABLED=false/' "$ENV_FILE"
             else

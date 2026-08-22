@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import select
 
-from app.models import AdminAlert, MonitorIncident, MonitorIncidentStatus
+from app.models import AdminAlert, AlertStatus, MonitorIncident, MonitorIncidentStatus
 from app.services.monitor_checks import CheckResult
 from app.services.monitor_incidents import (
     TRANSITION_ALERT_CAUGHT_UP,
@@ -399,3 +399,62 @@ def test_escalation_while_disabled_is_caught_up_once_delivery_resumes(
     # neither suppressed as a false duplicate of the other.
     assert len(opened_alerts) == 2
     assert {a.status for a in opened_alerts} == {"pending"}
+
+
+def test_permanently_failed_alert_is_caught_up_on_the_next_cycle(
+    session_factory, admin_settings
+):
+    """last_alerted_at alone must not be trusted as "an administrator was
+    told" -- it is set the moment an alert is QUEUED, before the admin
+    bot's separate delivery loop ever attempts Telegram. If that outbox
+    row later permanently fails (every retry exhausted,
+    AdminAlert.status == 'failed'), the incident must not be stuck looking
+    "already alerted" forever; the next unhealthy cycle must queue a
+    fresh alert."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        opened = record_check_result(db, admin_settings, _critical(), now=now)
+    assert opened.transition == TRANSITION_OPENED
+
+    # Simulate the admin-bot's delivery loop permanently giving up on the
+    # opening alert (out of band -- this monitor_incidents module never
+    # does this itself, but must react correctly to it).
+    with session_factory() as db:
+        alert = db.execute(
+            select(AdminAlert).where(AdminAlert.alert_type == "monitor_incident_opened")
+        ).scalar_one()
+        alert.status = AlertStatus.FAILED.value
+        db.commit()
+
+    with session_factory() as db:
+        caught_up = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=5)
+        )
+    assert caught_up.transition == TRANSITION_ALERT_CAUGHT_UP
+    assert caught_up.incident_id == opened.incident_id
+
+    opened_alerts = _alerts(session_factory, "monitor_incident_opened")
+    assert len(opened_alerts) == 2  # the permanently-failed one, plus a fresh catch-up
+    statuses = {a.status for a in opened_alerts}
+    assert AlertStatus.FAILED.value in statuses
+    assert AlertStatus.PENDING.value in statuses  # the new one was actually queued
+
+    with session_factory() as db:
+        incident = db.get(MonitorIncident, opened.incident_id)
+        assert incident.last_alert_id != alert.id  # points at the fresh alert now
+
+
+def test_still_pending_alert_is_not_caught_up_again(session_factory, admin_settings):
+    """A pending (not yet delivered, not yet failed) alert must never be
+    treated as needing catch-up -- only a permanently FAILED one."""
+    now = datetime.now(UTC)
+    with session_factory() as db:
+        opened = record_check_result(db, admin_settings, _critical(), now=now)
+    assert opened.transition == TRANSITION_OPENED
+
+    with session_factory() as db:
+        still_unhealthy = record_check_result(
+            db, admin_settings, _critical(), now=now + timedelta(minutes=5)
+        )
+    assert still_unhealthy.transition == TRANSITION_UNCHANGED_UNHEALTHY
+    assert len(_alerts(session_factory, "monitor_incident_opened")) == 1

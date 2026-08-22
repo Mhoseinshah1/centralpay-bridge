@@ -170,7 +170,11 @@ def test_worker_heartbeat_fresh(session_factory, settings):
         )
         db.commit()
         result = monitor_checks.check_worker_heartbeat(
-            db, settings, worker_name="notification-worker", now=now
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+            now=now,
         )
     assert result.status == "ok"
 
@@ -186,16 +190,50 @@ def test_worker_heartbeat_stale(session_factory, settings):
         )
         db.commit()
         result = monitor_checks.check_worker_heartbeat(
-            db, settings, worker_name="notification-worker", now=now
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+            now=now,
         )
     assert result.status == "critical"
     assert result.reason == "heartbeat_stale"
 
 
+def test_worker_heartbeat_cutoffs_scale_with_a_slower_poll_interval(session_factory, settings):
+    """A worker configured with a longer-than-default polling interval must
+    not be falsely reported stale on every single cycle just because the
+    FIXED default cutoffs (60s/180s) are shorter than how long it
+    legitimately sleeps between successful passes."""
+    now = datetime.now(UTC)
+    # 200s old: well past the fixed 60s/180s cutoffs, but well within one
+    # normal cycle of a worker polling every 300s.
+    old = now - timedelta(seconds=200)
+    with session_factory() as db:
+        db.add(
+            WorkerHeartbeat(
+                worker_name="notification-worker", instance_id="w1", last_heartbeat_at=old
+            )
+        )
+        db.commit()
+        result = monitor_checks.check_worker_heartbeat(
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=300.0,
+            now=now,
+        )
+    assert result.status == "ok"
+
+
 def test_worker_heartbeat_missing(session_factory, settings):
     with session_factory() as db:
         result = monitor_checks.check_worker_heartbeat(
-            db, settings, worker_name="notification-worker", now=datetime.now(UTC)
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+            now=datetime.now(UTC),
         )
     assert result.status == "critical"
     assert result.reason == "no_heartbeat_recorded"
@@ -218,7 +256,11 @@ def test_worker_heartbeat_fresh_but_last_cycle_failed(session_factory, settings)
         )
         db.commit()
         result = monitor_checks.check_worker_heartbeat(
-            db, settings, worker_name="notification-worker", now=now
+            db,
+            settings,
+            worker_name="notification-worker",
+            poll_interval_seconds=settings.bot_notify_worker_interval_seconds,
+            now=now,
         )
     assert result.status == "warning"
     assert result.reason == "last_cycle_failed"

@@ -78,7 +78,7 @@ once the previous one has fully returned.
 | --- | --- | --- |
 | `public_ready` | `GET {PUBLIC_BASE_URL}/health/ready` over the real internet (bounded timeouts, no redirects followed, TLS/connection errors and a malformed/unhealthy body all fail) | — |
 | `database` | `SELECT 1` | `app.adminbot.queries.database_ok` |
-| `worker_heartbeat:notification-worker` | Age of the newest heartbeat row | `app.adminbot.queries.latest_worker_heartbeat` |
+| `worker_heartbeat:notification-worker` | Age of the newest heartbeat row, against cutoffs that scale with the worker's own polling interval (`max(configured cutoff, poll_interval * 6)`) so a longer-than-default interval is never falsely reported stale every cycle | `app.adminbot.queries.latest_worker_heartbeat` |
 | `worker_heartbeat:reconciliation-worker` | Same, only when `RECONCILIATION_ENABLED=true` | same |
 | `worker_heartbeat:admin-bot-delivery` | Same, only when `ADMIN_BOT_ENABLED=true` — the admin bot's own alert-delivery loop (`app.adminbot.runner`) writes this row itself, since its container-liveness heartbeat file lives in its own tmpfs and is otherwise invisible to the dedicated monitor | same |
 | `notification_backlog` | Count of `bot_notify_pending` payments + oldest one's age (excludes `manual_review` and every resolved/accepted row) | `count_by_status`, `oldest_pending_notification_age_seconds` |
@@ -168,6 +168,15 @@ unavailable: the escalation branch resets `last_alerted_at` back to `None`
 same catch-up path fires once delivery resumes — an administrator is never
 left believing an incident is still at whatever severity it was last
 actually told about.
+
+The same catch-up path also fires if an alert WAS successfully queued but
+Telegram delivery then permanently failed (every retry up to
+`ADMIN_BOT_ALERT_MAX_ATTEMPTS` exhausted, the outbox row settling as
+`failed`) — `MonitorIncident.last_alert_id` records which `admin_alerts`
+row `last_alerted_at` refers to, so the next unhealthy cycle can tell
+"queued but never delivered" apart from "queued and pending/delivered" and
+re-queue a fresh alert instead of treating the incident as already handled
+forever.
 
 `ADMIN_BOT_*` settings (including `ADMIN_BOT_ENABLED` and the per-category
 alert toggles) are read once at container start, same as every
@@ -303,6 +312,13 @@ centralpay monitor enable    # starts it; MONITOR_ENABLED=true
 centralpay monitor status    # container + configuration state
 centralpay monitor logs      # follow logs
 ```
+
+`monitor disable` (and `admin-bot disable`) verify the container actually
+stopped before persisting `*_ENABLED=false` — if `docker compose stop`
+fails (a Docker daemon hiccup, a timeout, ...) while the container is
+still genuinely running, the command fails loudly and the configuration
+is left unchanged, rather than reporting success while a restart-enabled
+container keeps polling and creating incidents/alerts in the background.
 
 Disabling monitoring **never** affects payment processing, the
 notification worker, or reconciliation — the monitor process has no code
