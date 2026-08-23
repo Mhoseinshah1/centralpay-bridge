@@ -109,14 +109,19 @@ def _monitor_detail_fa(result: CheckResult) -> str:
     if result.key in ("notification_backlog", "manual_review") and "count" in d:
         return f" — {d['count']}"
     if result.key == "reconciliation" and "exhausted_recent" in d:
-        # exhausted_recent is the aged-out-inclusive, recency-bounded count
-        # that actually drives this check's severity in every default
-        # configuration (its window comfortably exceeds the reconciliation
-        # lifetime, so it is a superset of exhausted_not_aged_out) — the
-        # single most representative number for a short summary line. The
-        # full breakdown (exhausted_not_aged_out / exhausted_historical_total)
-        # stays in `centralpay monitor check --json`, never truncated here.
-        return f" — اتمام‌یافته: {d['exhausted_recent']}"
+        # check_reconciliation alarms on exhausted_not_aged_out > 0 OR
+        # exhausted_recent > 0 (see app.services.monitor_checks) -- under a
+        # non-default MONITOR_RECONCILIATION_EXHAUSTED_RECENT_WINDOW_SECONDS
+        # shorter than RECONCILIATION_MAX_AGE_SECONDS the two can diverge
+        # (a still-within-lifetime exhausted payment whose last attempt
+        # happens to fall outside a short window), so showing exhausted_recent
+        # alone could display "critical ... 0" -- max() guarantees this
+        # summary is never zero while either population is what made the
+        # check critical. The full breakdown (exhausted_not_aged_out /
+        # exhausted_recent / exhausted_historical_total) stays in
+        # `centralpay monitor check --json`, never truncated here.
+        exhausted_summary = max(d.get("exhausted_not_aged_out", 0), d["exhausted_recent"])
+        return f" — اتمام‌یافته: {exhausted_summary}"
     if result.key == "backup" and "age_seconds" in d:
         return f" — {int(d['age_seconds'] // 3600)} ساعت پیش"
     if result.key == "disk_space" and "free_percent" in d:

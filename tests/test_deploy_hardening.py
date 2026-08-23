@@ -215,7 +215,14 @@ def _commit_deploy(
     # default; 2 "changed" for the activation-gating tests below) keeps them
     # focused on their own concern without a real Docker daemon.
     caddy_sync = scripts_dir / "render-caddy-config.sh"
-    caddy_sync.write_text(f"#!/usr/bin/env bash\nexit {caddy_sync_rc}\n")
+    caddy_sync.write_text(
+        "#!/usr/bin/env bash\n"
+        # Mirrors the real script's two invocation modes: `--confirm-active`
+        # (called after a restart) always succeeds here; a bare call reports
+        # the scripted exit code.
+        'if [[ "${1:-}" == "--confirm-active" ]]; then exit 0; fi\n'
+        f"exit {caddy_sync_rc}\n"
+    )
     caddy_sync.chmod(0o755)
     wrapper = scripts_dir / "centralpay"
     wrapper.write_text(wrapper_content)

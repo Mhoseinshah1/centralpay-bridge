@@ -824,6 +824,17 @@ main() {
     if [[ "$KEEP_EXISTING" == "true" ]]; then
         log "Reusing configuration from ${ENV_FILE}."
         PAYMENT_DOMAIN=$(grep -E '^PUBLIC_BASE_URL=' "$ENV_FILE" | cut -d= -f2- | sed -E 's#^https?://##')
+        # Recovered here (not only from an existing Caddyfile) so a rerun
+        # stays safe even if a PRIOR attempt failed before ever writing one
+        # (e.g. Caddy config validation failed partway through a fresh
+        # install) -- without this, sync_caddy_config's fallback extraction
+        # has neither an env value nor an existing file to read from, and
+        # the default "keep existing configuration" rerun would fail the
+        # same way forever. Empty on a pre-existing install from before this
+        # variable was persisted; sync_caddy_config's Caddyfile-extraction
+        # fallback (which such a host always has, from its actual working
+        # Caddyfile) still covers that case.
+        TLS_EMAIL=$(grep -E '^TLS_EMAIL=' "$ENV_FILE" | cut -d= -f2- || true)
         # print_summary reports the inbound API key; on a "keep existing"
         # rerun load_or_generate_secrets is skipped, so read it from the env
         # file here. Without this the final summary expands an unset variable
@@ -865,6 +876,13 @@ main() {
         # just started.
         log "Restarting Caddy to activate the refreshed configuration..."
         docker compose --project-directory "$INSTALL_DIR" restart caddy
+        # Durably records that Caddy has actually been restarted with this
+        # exact content -- without this, a crash/interrupt right here would
+        # leave a future rerun seeing unchanged file content and wrongly
+        # reporting "already up to date" while Caddy still serves the OLD
+        # configuration.
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+            || fail "Caddy restarted, but recording activation failed. Rerun the installer to retry."
     fi
     ensure_initial_fee_policy
     verify_deployment

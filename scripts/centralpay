@@ -683,6 +683,13 @@ perform_update() {
             # never bounces Caddy for no reason.
             log "Restarting Caddy to activate the refreshed configuration..."
             compose restart caddy
+            # Durably records that Caddy has actually been restarted with
+            # this exact content -- without this, a crash/interrupt right
+            # here would leave a future run seeing unchanged file content
+            # and wrongly reporting "already up to date" while Caddy is
+            # still serving the OLD configuration.
+            bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+                || fail "Caddy restarted, but recording activation failed; rerun 'centralpay update' to retry."
         fi
         # Only now is the new commit confirmed running: safe to make its
         # scripts/centralpay the installed command.

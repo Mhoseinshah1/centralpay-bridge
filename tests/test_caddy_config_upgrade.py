@@ -111,6 +111,20 @@ def _target(sandbox) -> Path:
     return sandbox["config"] / "Caddyfile"
 
 
+def _confirm_active(sandbox) -> subprocess.CompletedProcess[str]:
+    """Simulate the caller's post-restart step (`--confirm-active`) --
+    writes the durable activation marker for whatever is currently on disk."""
+    env = {
+        "PATH": f"{sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "CENTRALPAY_INSTALL_DIR": str(sandbox["install"]),
+        "CENTRALPAY_CONFIG_DIR": str(sandbox["config"]),
+    }
+    return subprocess.run(
+        ["bash", str(SCRIPT), "--confirm-active"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+
+
 # --- 1. fresh install --------------------------------------------------------
 
 
@@ -149,12 +163,19 @@ def test_upgrade_from_old_config_adds_referer_redaction(sandbox):
 
 
 def test_idempotent_second_run_is_a_pure_noop(sandbox):
+    """True idempotency requires the caller to have confirmed activation
+    (simulating a successful restart) between the two runs -- see
+    test_unconfirmed_activation_reports_changed_even_with_unchanged_content
+    for what happens without that call."""
     _target(sandbox).write_text(OLD_CADDYFILE)
     first, first_log = _run(sandbox)
     assert first.returncode == 2
     content_after_first = _target(sandbox).read_text()
     log_after_first = first_log.read_text() if first_log.exists() else ""
     assert log_after_first != ""  # the first run DID validate via docker
+
+    confirm = _confirm_active(sandbox)
+    assert confirm.returncode == 0, confirm.stderr
 
     second, second_log = _run(sandbox)
     assert second.returncode == 0, second.stderr
@@ -163,6 +184,60 @@ def test_idempotent_second_run_is_a_pure_noop(sandbox):
     # byte-identical to after the first run: no NEW docker call appended.
     log_after_second = second_log.read_text() if second_log.exists() else ""
     assert log_after_second == log_after_first
+
+
+def test_unconfirmed_activation_reports_changed_even_with_unchanged_content(sandbox):
+    """The activation-tracking fix: a process interrupted after this
+    script's atomic replace but BEFORE the caller's restart+confirm-active
+    (a crash, Ctrl-C, OOM kill, systemd timeout) must not silently report
+    "0 unchanged" on the next run while Caddy is still serving the OLD
+    config -- content matches, but activation was never confirmed, so the
+    next run must still report 2 (needs restart), without re-touching the
+    file (no new backup, content byte-identical)."""
+    _target(sandbox).write_text(OLD_CADDYFILE)
+    first, first_log = _run(sandbox)
+    assert first.returncode == 2
+    content_after_first = _target(sandbox).read_text()
+    backups_after_first = list(sandbox["config"].glob("Caddyfile.bak.*"))
+    assert len(backups_after_first) == 1
+    log_after_first = first_log.read_text() if first_log.exists() else ""
+    assert log_after_first != ""  # the first run DID validate via docker
+
+    # No --confirm-active call here -- simulating the interrupted case.
+    second, second_log = _run(sandbox)
+    assert second.returncode == 2, second.stderr
+    assert _target(sandbox).read_text() == content_after_first  # untouched
+    # No re-validation, no new backup: content was already correct, only
+    # the activation signal was missing -- the log must be byte-identical
+    # to after the first run (no NEW docker call appended).
+    log_after_second = second_log.read_text() if second_log.exists() else ""
+    assert log_after_second == log_after_first
+    backups_after_second = list(sandbox["config"].glob("Caddyfile.bak.*"))
+    assert len(backups_after_second) == 1
+
+    # Confirming activation now makes the NEXT run a true no-op.
+    confirm = _confirm_active(sandbox)
+    assert confirm.returncode == 0, confirm.stderr
+    third, _ = _run(sandbox)
+    assert third.returncode == 0, third.stderr
+
+
+def test_confirm_active_requires_an_existing_caddyfile(sandbox):
+    result = _confirm_active(sandbox)
+    assert result.returncode == 1
+    assert not (sandbox["config"] / ".caddy-active-sha256").exists()
+
+
+def test_confirm_active_writes_the_marker_matching_target_hash(sandbox):
+    import hashlib
+
+    _target(sandbox).write_text(OLD_CADDYFILE)
+    result = _confirm_active(sandbox)
+    assert result.returncode == 0, result.stderr
+    marker = sandbox["config"] / ".caddy-active-sha256"
+    assert marker.exists()
+    assert marker.read_text().strip() == hashlib.sha256(OLD_CADDYFILE.encode()).hexdigest()
+    assert oct(marker.stat().st_mode)[-3:] == "600"
 
 
 # --- 4 & 5. domain / TLS-email (the two operator-supported values) preserved
@@ -385,7 +460,13 @@ def test_install_sh_syncs_caddy_for_both_fresh_and_rerun_paths():
 # --- shell hygiene ------------------------------------------------------------
 
 
+@pytest.mark.skipif(not shutil.which("shellcheck"), reason="shellcheck is not installed")
 def test_script_passes_shellcheck():
+    # shellcheck is an OS package, not a Python dependency of `.[dev]` --
+    # the documented `pip install -e ".[dev]"` + `pytest -q` setup does not
+    # guarantee it, and the dedicated CI "ShellCheck" job already covers
+    # this; skip cleanly here rather than erroring the whole unit suite on
+    # an environment that simply doesn't have the binary.
     result = subprocess.run(
         ["shellcheck", str(SCRIPT)], capture_output=True, text=True, timeout=30
     )

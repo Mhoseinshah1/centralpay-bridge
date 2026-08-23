@@ -48,13 +48,37 @@
 # API, and restarting the container picked up the bind-mounted file).
 #
 # Exit codes (the caller MUST branch on this, never assume success):
-#   0  already up to date -- nothing was changed, caller should not restart.
-#   2  the Caddyfile was backed up and replaced -- caller MUST restart the
-#      caddy container to activate it.
+#   0  already up to date AND confirmed active -- nothing was changed,
+#      caller should not restart.
+#   2  the installed file does not match what Caddy has been CONFIRMED
+#      restarted with -- either because the content just changed (backed
+#      up and replaced here), or because a PRIOR run's replace was never
+#      followed by a successful `--confirm-active` call (see below). The
+#      caller MUST restart the caddy container, then call this script
+#      again with `--confirm-active`.
 #   1  a real error (missing template, unreadable/malformed existing
 #      config, invalid domain/email, failed validation, failed backup, or
 #      failed atomic replace) -- the existing configuration, if any, was
 #      left completely untouched. The caller must treat this as fatal.
+#
+# Activation tracking: a container restart activating a freshly-replaced
+# file is the CALLER's responsibility (see below), but simply diffing file
+# CONTENT is not enough to know activation actually happened -- an update
+# or install.sh run interrupted after this script's atomic replace but
+# before the caller's restart (a crash, an operator Ctrl-C, an OOM kill, a
+# systemd timeout) would leave the on-disk file already matching the new
+# template while the RUNNING Caddy process still serves the old one. The
+# next run would then see identical file content and report "0 unchanged"
+# forever, even though the security-relevant config was never actually
+# activated. To close that gap, a small durable marker
+# (CONFIG_DIR/.caddy-active-sha256, the sha256 of the Caddyfile content
+# Caddy was LAST CONFIRMED restarted with) is compared alongside the file
+# content: exit 0 requires BOTH to match. The caller writes this marker by
+# invoking `render-caddy-config.sh --confirm-active` immediately after a
+# successful restart -- never assumed automatically. A host upgrading to
+# THIS version of the script for the first time has no marker yet, so its
+# very next run reports "changed" (2) once even if the file content is
+# already correct -- a single harmless extra restart, not a bug.
 #
 # Never prints the full rendered Caddyfile or backup contents; the domain
 # and TLS email are not secrets (the domain is publicly visible in the TLS
@@ -67,6 +91,7 @@ INSTALL_DIR="${CENTRALPAY_INSTALL_DIR:-/opt/centralpay-bridge}"
 CONFIG_DIR="${CENTRALPAY_CONFIG_DIR:-/etc/centralpay-bridge}"
 TEMPLATE="${INSTALL_DIR}/deploy/caddy/Caddyfile.template"
 TARGET="${CONFIG_DIR}/Caddyfile"
+ACTIVE_MARKER="${CONFIG_DIR}/.caddy-active-sha256"
 # Pinned to the exact tag docker-compose.yml's caddy service runs, so
 # validation can never pass against a different Caddy version than what
 # actually serves traffic.
@@ -74,6 +99,30 @@ CADDY_IMAGE="${CENTRALPAY_CADDY_IMAGE:-caddy:2}"
 
 log()  { printf '[centralpay-caddy] %s\n' "$*"; }
 fail() { printf '[centralpay-caddy] ERROR: %s\n' "$*" >&2; exit 1; }
+
+sha256_of() {
+    # $1 = path. Prints the hex digest only (no filename), portable across
+    # the GNU (sha256sum) and BSD/macOS (shasum) coreutils layouts.
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+if [[ "${1:-}" == "--confirm-active" ]]; then
+    # Called by the caller (install.sh / scripts/centralpay) immediately
+    # after a successful `compose restart caddy` -- and ONLY then; a
+    # restart that itself failed must never reach this call (both callers'
+    # restart is a bare command under `set -e`, so a failure already
+    # aborts before this point).
+    [[ -f "$TARGET" ]] || fail "No Caddyfile at ${TARGET} to confirm activation for."
+    install -d -m 0700 "$CONFIG_DIR"
+    sha256_of "$TARGET" > "$ACTIVE_MARKER" || fail "Could not write the activation marker ${ACTIVE_MARKER}."
+    chmod 600 "$ACTIVE_MARKER"
+    log "Activation confirmed for the current Caddy configuration."
+    exit 0
+fi
 
 validate_domain() {
     [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,62}[a-zA-Z0-9])?)+$ ]]
@@ -136,9 +185,27 @@ trap 'rm -f "$candidate"' EXIT
 render_candidate > "$candidate"
 chmod 600 "$candidate"
 
+content_unchanged=false
 if [[ -f "$TARGET" ]] && cmp -s "$candidate" "$TARGET"; then
-    log "Caddy configuration already up to date (domain: ${domain})."
-    exit 0
+    content_unchanged=true
+fi
+
+if [[ "$content_unchanged" == "true" ]]; then
+    active_hash=""
+    [[ -f "$ACTIVE_MARKER" ]] && active_hash=$(cat "$ACTIVE_MARKER" 2>/dev/null || true)
+    if [[ -n "$active_hash" ]] && [[ "$active_hash" == "$(sha256_of "$TARGET")" ]]; then
+        log "Caddy configuration already up to date and confirmed active (domain: ${domain})."
+        exit 0
+    fi
+    # Content already matches -- nothing to validate/backup/replace -- but
+    # activation was never confirmed (a prior run's restart was skipped,
+    # failed, or was interrupted before `--confirm-active` ran; or this is
+    # the first run of this script version on this host, see the header).
+    # Signal "needs restart" without touching the file.
+    log "Caddy configuration content is current but activation was not confirmed; caller must restart and confirm."
+    trap - EXIT
+    rm -f "$candidate"
+    exit 2
 fi
 
 # --- Validate the CANDIDATE with the real image before touching anything

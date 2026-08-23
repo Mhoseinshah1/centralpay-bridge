@@ -211,16 +211,27 @@ jobs:
             || { echo "FAIL: operator TLS email was not preserved"; exit 1; }
           test -f /tmp/caddycfg/Caddyfile.bak.* \
             || { echo "FAIL: no backup of the pre-upgrade Caddyfile was created"; exit 1; }
-          # Idempotency: re-running against the now-current file must be a
-          # pure no-op (exit 0, byte-identical file, no second backup).
+          # A rerun BEFORE activation is confirmed must still report "needs
+          # restart" (2), never a false "unchanged" -- the durable
+          # activation-marker fix (crash/interrupt between replace and
+          # restart must not be silently treated as already-active).
+          rc=0
+          CENTRALPAY_INSTALL_DIR="$PWD" CENTRALPAY_CONFIG_DIR=/tmp/caddycfg \
+            bash scripts/render-caddy-config.sh || rc=$?
+          test "$rc" -eq 2 || { echo "FAIL: expected exit 2 (activation unconfirmed) before --confirm-active, got ${rc}"; exit 1; }
+          test "$(ls /tmp/caddycfg/Caddyfile.bak.* | wc -l)" -eq 1  # no second backup: content was already correct
+          # Simulate the caller's post-restart step, THEN idempotency: a
+          # rerun after activation is confirmed must be a pure no-op (exit
+          # 0, byte-identical file, no additional backup).
+          CENTRALPAY_CONFIG_DIR=/tmp/caddycfg bash scripts/render-caddy-config.sh --confirm-active
           cp /tmp/caddycfg/Caddyfile /tmp/caddycfg/Caddyfile.after-first-run
           rc=0
           CENTRALPAY_INSTALL_DIR="$PWD" CENTRALPAY_CONFIG_DIR=/tmp/caddycfg \
             bash scripts/render-caddy-config.sh || rc=$?
-          test "$rc" -eq 0 || { echo "FAIL: expected exit 0 (unchanged) on the idempotent rerun, got ${rc}"; exit 1; }
+          test "$rc" -eq 0 || { echo "FAIL: expected exit 0 (unchanged, confirmed active) on the idempotent rerun, got ${rc}"; exit 1; }
           diff -q /tmp/caddycfg/Caddyfile.after-first-run /tmp/caddycfg/Caddyfile
           test "$(ls /tmp/caddycfg/Caddyfile.bak.* | wc -l)" -eq 1
-          echo "PASS: old Caddyfile safely upgraded, validated by real caddy:2, idempotent on rerun"
+          echo "PASS: old Caddyfile safely upgraded, validated by real caddy:2, idempotent once activation is confirmed"
       # Real-runtime proof (not just a text/config check): ct/sig must never
       # reach Caddy's emitted access log, including via the Referer header a
       # subsequent /static/* request carries (the callback page's own URL,
