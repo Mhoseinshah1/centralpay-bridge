@@ -93,7 +93,13 @@ def sandbox(tmp_path):
     return {"install": install, "config": config, "bindir": bindir}
 
 
-def _run(sandbox, *, validate_ok: bool = True, env_extra: dict[str, str] | None = None):
+def _run(
+    sandbox,
+    *,
+    validate_ok: bool = True,
+    env_extra: dict[str, str] | None = None,
+    args: list[str] | None = None,
+):
     call_log = _write_fake_docker(sandbox["bindir"], validate_ok=validate_ok)
     env = {
         "PATH": f"{sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -102,7 +108,11 @@ def _run(sandbox, *, validate_ok: bool = True, env_extra: dict[str, str] | None 
         **(env_extra or {}),
     }
     result = subprocess.run(
-        ["bash", str(SCRIPT)], capture_output=True, text=True, timeout=30, env=env
+        ["bash", str(SCRIPT), *(args or [])],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
     )
     return result, call_log
 
@@ -238,6 +248,100 @@ def test_confirm_active_writes_the_marker_matching_target_hash(sandbox):
     assert marker.exists()
     assert marker.read_text().strip() == hashlib.sha256(OLD_CADDYFILE.encode()).hexdigest()
     assert oct(marker.stat().st_mode)[-3:] == "600"
+
+
+# --- 3b. --check mode: a read-only status query for `centralpay status`/
+#     `diagnose` (see caddy_activation_status_line in scripts/centralpay).
+#     Must NEVER write TARGET, NEVER back up, NEVER touch ACTIVE_MARKER,
+#     NEVER invoke docker/caddy validate -- only ever report drift.
+
+
+def test_check_mode_reports_drift_without_mutating_or_validating(sandbox):
+    _target(sandbox).write_text(OLD_CADDYFILE)
+    result, call_log = _run(sandbox, args=["--check"])
+    assert result.returncode == 2, result.stderr
+    assert _target(sandbox).read_text() == OLD_CADDYFILE  # byte-identical, untouched
+    assert not list(sandbox["config"].glob("Caddyfile.bak.*"))  # no backup created
+    assert not (sandbox["config"] / ".caddy-active-sha256").exists()
+    assert not call_log.exists()  # docker was never invoked for a --check
+
+
+def test_check_mode_reports_up_to_date_and_confirmed_without_side_effects(sandbox):
+    _target(sandbox).write_text(OLD_CADDYFILE)
+    first, first_log = _run(sandbox)  # render + replace (real run, not --check)
+    assert first.returncode == 2
+    confirm = _confirm_active(sandbox)
+    assert confirm.returncode == 0, confirm.stderr
+    content_before = _target(sandbox).read_text()
+    marker_before = (sandbox["config"] / ".caddy-active-sha256").read_text()
+    log_before = first_log.read_text() if first_log.exists() else ""
+
+    result, call_log = _run(sandbox, args=["--check"])
+    assert result.returncode == 0, result.stderr
+    assert _target(sandbox).read_text() == content_before
+    assert (sandbox["config"] / ".caddy-active-sha256").read_text() == marker_before
+    # A pure content/marker compare needs no docker call -- the log must be
+    # byte-identical to before this --check run (no NEW invocation appended).
+    log_after = call_log.read_text() if call_log.exists() else ""
+    assert log_after == log_before
+
+
+def test_check_mode_reports_unconfirmed_activation_without_mutating(sandbox):
+    """Content already matches the current template (a prior real run
+    replaced it) but --confirm-active was never called -- e.g. the exact
+    interrupted-after-restart scenario --check exists to surface loudly.
+    Must still report 2 (needs restart) without writing anything new."""
+    _target(sandbox).write_text(OLD_CADDYFILE)
+    first, first_log = _run(sandbox)
+    assert first.returncode == 2
+    content_after_first = _target(sandbox).read_text()
+    backups_after_first = list(sandbox["config"].glob("Caddyfile.bak.*"))
+    log_before = first_log.read_text() if first_log.exists() else ""
+
+    result, call_log = _run(sandbox, args=["--check"])
+    assert result.returncode == 2, result.stderr
+    assert _target(sandbox).read_text() == content_after_first
+    assert list(sandbox["config"].glob("Caddyfile.bak.*")) == backups_after_first
+    assert not (sandbox["config"] / ".caddy-active-sha256").exists()
+    log_after = call_log.read_text() if call_log.exists() else ""
+    assert log_after == log_before  # no NEW docker call from --check
+
+
+def test_check_mode_fails_closed_without_domain_or_email(sandbox):
+    result, call_log = _run(sandbox, args=["--check"])
+    assert result.returncode == 1
+    assert not _target(sandbox).exists()
+    assert not call_log.exists()
+
+
+def test_check_mode_never_creates_config_dir_on_an_uninstalled_host(tmp_path):
+    """A host with no CentralPay installation at all yet (no CONFIG_DIR) --
+    e.g. `centralpay status` run against a broken/partial install -- must
+    never have --check itself create CONFIG_DIR as a side effect of merely
+    checking. The default (mutating) mode legitimately does via `install -d`;
+    --check must not, since it is documented as never touching disk."""
+    install = tmp_path / "install"
+    config = tmp_path / "config"  # deliberately never created
+    bindir = tmp_path / "bin"
+    (install / "deploy" / "caddy").mkdir(parents=True)
+    (install / "scripts").mkdir(parents=True)
+    shutil.copy(TEMPLATE, install / "deploy" / "caddy" / "Caddyfile.template")
+    bindir.mkdir()
+    call_log = _write_fake_docker(bindir)
+    env = {
+        "PATH": f"{bindir}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "CENTRALPAY_INSTALL_DIR": str(install),
+        "CENTRALPAY_CONFIG_DIR": str(config),
+        "PAYMENT_DOMAIN": "pay.example.com",
+        "TLS_EMAIL": "ops@example.com",
+    }
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--check"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 2, result.stderr  # a fresh install has never been confirmed active
+    assert not config.exists()  # --check must never create CONFIG_DIR
+    assert not call_log.exists()
 
 
 # --- 4 & 5. domain / TLS-email (the two operator-supported values) preserved

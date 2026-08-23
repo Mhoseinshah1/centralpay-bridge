@@ -61,6 +61,22 @@
 #      failed atomic replace) -- the existing configuration, if any, was
 #      left completely untouched. The caller must treat this as fatal.
 #
+# --check mode (a THIRD, read-only invocation form, alongside the default
+# render-and-replace form and --confirm-active): reports the exact same
+# 0/1/2 exit-code contract as above, but NEVER writes anything -- no
+# candidate write beyond a throwaway temp file it always removes itself, no
+# backup, no replace of TARGET, no docker/caddy validation, no marker
+# write. Intended for a lightweight, always-safe status query (`centralpay
+# status`/`diagnose`) to answer "is the installed Caddyfile currently in
+# sync with the checked-out source, and was that content actually
+# confirmed activated" without performing (or risking) any of the mutating
+# work the default form does. This does NOT close the bootstrap gap
+# documented in SECURITY.md/AGENTS.md -- a process already running the OLD
+# perform_update never reaches any NEW code, --check mode included -- it
+# only makes the resulting drift loudly visible on the very next command
+# invocation instead of silently persisting until an operator happens to
+# rerun `update` or the installer.
+#
 # Activation tracking: a container restart activating a freshly-replaced
 # file is the CALLER's responsibility (see below), but simply diffing file
 # CONTENT is not enough to know activation actually happened -- an update
@@ -109,6 +125,9 @@ sha256_of() {
         shasum -a 256 "$1" | awk '{print $1}'
     fi
 }
+
+CHECK_ONLY=false
+[[ "${1:-}" == "--check" ]] && CHECK_ONLY=true
 
 if [[ "${1:-}" == "--confirm-active" ]]; then
     # Called by the caller (install.sh / scripts/centralpay) immediately
@@ -178,9 +197,18 @@ render_candidate() {
     printf '%s' "$content"
 }
 
-install -d -m 0700 "$CONFIG_DIR"
-candidate=$(mktemp "${CONFIG_DIR}/.Caddyfile.candidate.XXXXXX") \
-    || fail "Cannot create a temporary file in ${CONFIG_DIR}."
+if [[ "$CHECK_ONLY" == "true" ]]; then
+    # A plain system-temp scratch file, never inside CONFIG_DIR: --check
+    # must never create CONFIG_DIR (as `install -d` below would) merely by
+    # having been run against a host with no installation yet. Atomicity
+    # with TARGET is irrelevant here -- this candidate is only ever
+    # compared, never moved into place.
+    candidate=$(mktemp) || fail "Cannot create a temporary scratch file."
+else
+    install -d -m 0700 "$CONFIG_DIR"
+    candidate=$(mktemp "${CONFIG_DIR}/.Caddyfile.candidate.XXXXXX") \
+        || fail "Cannot create a temporary file in ${CONFIG_DIR}."
+fi
 trap 'rm -f "$candidate"' EXIT
 render_candidate > "$candidate"
 chmod 600 "$candidate"
@@ -203,6 +231,16 @@ if [[ "$content_unchanged" == "true" ]]; then
     # the first run of this script version on this host, see the header).
     # Signal "needs restart" without touching the file.
     log "Caddy configuration content is current but activation was not confirmed; caller must restart and confirm."
+    trap - EXIT
+    rm -f "$candidate"
+    exit 2
+fi
+
+if [[ "$CHECK_ONLY" == "true" ]]; then
+    # Read-only status query: report the drift, touch nothing else. Never
+    # validates (no docker dependency for a status check), never backs up,
+    # never replaces TARGET, never writes ACTIVE_MARKER.
+    log "Caddy configuration differs from the currently checked-out source, or a prior change was never confirmed active (domain: ${domain}). --check performed no changes."
     trap - EXIT
     rm -f "$candidate"
     exit 2
