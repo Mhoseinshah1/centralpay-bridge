@@ -441,9 +441,12 @@ def _reconciliation_status_dict(snapshot: ReconciliationStatusSnapshot) -> dict[
             "active_due": queue.active_due,
             "expiring_due": queue.expiring_due,
             "exhausted_not_aged_out": queue.exhausted_not_aged_out,
+            "exhausted_recent": queue.exhausted_recent,
+            "exhausted_historical_total": queue.exhausted_historical_total,
             "oldest_active_due_age_seconds": queue.oldest_active_due_age_seconds,
             "oldest_expiring_due_age_seconds": queue.oldest_expiring_due_age_seconds,
             "oldest_due_age_seconds": queue.oldest_due_age_seconds,
+            "oldest_overdue_seconds": queue.oldest_overdue_seconds,
         },
         "recent": {
             "window_hours": recent.window_hours,
@@ -456,7 +459,9 @@ def _reconciliation_status_dict(snapshot: ReconciliationStatusSnapshot) -> dict[
     }
 
 
-def _print_reconciliation_status_human(snapshot: ReconciliationStatusSnapshot) -> None:
+def _print_reconciliation_status_human(
+    snapshot: ReconciliationStatusSnapshot, *, settings: Settings
+) -> None:
     runtime, config = snapshot.runtime, snapshot.config
     buckets, queue, recent = snapshot.buckets, snapshot.queue, snapshot.recent
 
@@ -517,6 +522,15 @@ def _print_reconciliation_status_human(snapshot: ReconciliationStatusSnapshot) -
     print(f"  active_due:               {queue.active_due}")
     print(f"  expiring_due:             {queue.expiring_due}")
     print(f"  exhausted (within auto-reconciliation lifetime): {queue.exhausted_not_aged_out}")
+    recent_window_hours = round(
+        settings.monitor_reconciliation_exhausted_recent_window_seconds / 3600, 1
+    )
+    print(
+        f"  exhausted (recent, last {recent_window_hours}h, drives monitor CRITICAL): "
+        f"{queue.exhausted_recent}"
+    )
+    print(f"  exhausted (historical total, all-time, informational only): "
+          f"{queue.exhausted_historical_total}")
     print(f"  oldest active due age:    {_fmt_seconds(queue.oldest_active_due_age_seconds)}")
     print(f"  oldest expiring due age:  {_fmt_seconds(queue.oldest_expiring_due_age_seconds)}")
     print(f"  oldest due age (overall): {_fmt_seconds(queue.oldest_due_age_seconds)}")
@@ -542,7 +556,7 @@ def _cmd_reconciliation_status(db: Session, settings: Settings, *, as_json: bool
     if as_json:
         _print(_reconciliation_status_dict(snapshot))
     else:
-        _print_reconciliation_status_human(snapshot)
+        _print_reconciliation_status_human(snapshot, settings=settings)
     return 0
 
 
