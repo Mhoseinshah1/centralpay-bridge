@@ -865,25 +865,49 @@ main() {
     configure_firewall
     install_management_command
     install_backup_timer
-    deploy_stack
+
+    # Activate an already-running caddy container's refreshed config HERE,
+    # before deploy_stack, independent of whether deploy_stack succeeds.
+    # This candidate was already validated against the real caddy:2 image
+    # and backed up before being written to disk (sync_caddy_config, above)
+    # -- its safety does not depend on the app images building or passing
+    # health checks. Gating activation on deploy_stack's success left a real
+    # gap: a build/migration/health-check failure after this point would
+    # leave the more-secure config written to disk but never activated, and
+    # install.sh has no separate rollback command that could have closed
+    # that gap either -- only a full rerun, which would leave the config
+    # stranded, written-but-inactive, until the operator happened to retry.
+    # A genuinely FRESH install has no caddy container yet to restart --
+    # CADDY_EXISTING_CONTAINER stays empty, deploy_stack's own `up -d --wait`
+    # below creates caddy directly from the already-correct on-disk file,
+    # and only the durable confirmation (not a restart) is needed after that.
+    CADDY_EXISTING_CONTAINER=""
     if [[ "$CADDY_CONFIG_CHANGED" == "true" ]]; then
-        # A brand-new caddy container already starts with the just-written
-        # file (deploy_stack's `up -d --wait` above), so this restart is
-        # only load-bearing on a rerun where caddy was already running --
-        # docker compose does not recreate a service merely because a
-        # bind-mounted file's CONTENTS changed. Harmless (and fast) on a
-        # fresh install where it is a no-op restart of a container that
-        # just started.
-        log "Restarting Caddy to activate the refreshed configuration..."
-        docker compose --project-directory "$INSTALL_DIR" restart caddy
-        # Durably records that Caddy has actually been restarted with this
-        # exact content -- without this, a crash/interrupt right here would
-        # leave a future rerun seeing unchanged file content and wrongly
-        # reporting "already up to date" while Caddy still serves the OLD
-        # configuration.
-        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
-            || fail "Caddy restarted, but recording activation failed. Rerun the installer to retry."
+        CADDY_EXISTING_CONTAINER=$(docker compose --project-directory "$INSTALL_DIR" ps -q caddy 2>/dev/null || true)
+        if [[ -n "$CADDY_EXISTING_CONTAINER" ]]; then
+            log "Restarting Caddy to activate the refreshed configuration..."
+            docker compose --project-directory "$INSTALL_DIR" restart caddy
+            # Durably records that Caddy has actually been restarted with
+            # this exact content -- without this, a crash/interrupt right
+            # here would leave a future rerun seeing unchanged file content
+            # and wrongly reporting "already up to date" while Caddy still
+            # serves the OLD configuration.
+            bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+                || fail "Caddy restarted, but recording activation failed. Rerun the installer to retry."
+        fi
     fi
+
+    deploy_stack
+
+    if [[ "$CADDY_CONFIG_CHANGED" == "true" && -z "$CADDY_EXISTING_CONTAINER" ]]; then
+        # The brand-new caddy container deploy_stack just started already
+        # has the correct, just-written file (bind-mounted, read at
+        # container start) -- no restart needed, only the durable
+        # confirmation, now that the container is actually confirmed up.
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+            || fail "Caddy started, but recording activation failed. Rerun the installer to retry."
+    fi
+
     ensure_initial_fee_policy
     verify_deployment
     print_summary

@@ -184,6 +184,60 @@ def test_wants_help_matches_standalone_tokens_only():
     assert "rc=0" in result.stdout, result.stdout
 
 
+def test_wants_help_stops_scanning_at_a_literal_separator():
+    """Review finding (P2, round 3): an opaque, operator/bot-supplied order
+    ID that genuinely equals "-h"/"--help" (the create-payment contract
+    accepts arbitrary non-control strings unchanged) must remain
+    addressable via the standard `--` end-of-options marker -- wants_help
+    must stop scanning at a literal `--`, never treating anything after it
+    as a help flag. A `-h`/`--help` token BEFORE the `--` must still be
+    caught (the original incident fix is unaffected)."""
+
+    def _wants_help(*args: str) -> bool:
+        result = subprocess.run(
+            [
+                "bash", "-c",
+                'source "$1"; shift; if wants_help "$@"; then echo rc=0; else echo rc=1; fi',
+                "_", str(CLI), *args,
+            ],
+            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "CENTRALPAY_CLI_SOURCE_ONLY": "1"},
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.stdout.strip() in ("rc=0", "rc=1"), result.stdout
+        return result.stdout.strip() == "rc=0"
+
+    assert _wants_help("--", "--help") is False
+    assert _wants_help("--", "-h") is False
+    assert _wants_help("show", "--", "--help") is False
+    assert _wants_help("--help", "--") is True  # help flag before -- still wins
+    assert _wants_help("--help") is True  # unaffected: no -- present at all
+
+
+def test_opaque_order_id_equal_to_help_flag_is_reachable_via_separator(
+    fake_dangerous_path, tmp_path
+):
+    """End-to-end: `centralpay review show -- --help` must reach the real
+    command path (never the usage banner), with "--help" passed through
+    positionally as the order ID -- proving the fix actually restores
+    reachability, not just that wants_help's own return value changed."""
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / "docker-compose.yml").write_text("services: {}\n")
+    result, invocations = _run(
+        ["review", "show", "--", "--help"],
+        fake_dangerous_path,
+        extra_env={"CENTRALPAY_INSTALL_DIR": str(install_dir)},
+    )
+    assert "Usage: centralpay COMMAND" not in result.stdout
+    # Reached the real command path: `compose` shells out to `docker`,
+    # which the fake-dangerous-path harness intercepts and logs -- proving
+    # dispatch did not stop at the help guard, and that "--help" survived
+    # as a literal positional argument all the way to the invocation.
+    assert "docker" in invocations
+    assert "--help" in invocations
+    assert "-- --help" in invocations or "review show -- --help" in invocations
+
+
 def test_help_flag_command_list_matches_main_dispatch():
     """Regression guard: GUARDED_COMMANDS above must track the exact
     case-pattern list in main() -- if a new mutating command is added to

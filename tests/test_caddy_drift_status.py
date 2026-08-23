@@ -139,6 +139,51 @@ def test_no_crash_and_no_warning_when_render_script_is_absent(tmp_path):
     assert result.stderr == ""
 
 
+def test_non_root_gets_a_calm_message_instead_of_a_false_alarm(tmp_path):
+    """Review finding (P2, round 3): CONFIG_DIR is 0700 root-owned (it
+    holds centralpay.env with real secrets) and the Caddyfile/activation
+    marker inside it are 0600 -- a non-root `centralpay status`/`diagnose`
+    (neither requires root) cannot read either file, so --check would
+    always fail with a generic error and every healthy non-root status
+    call would wrongly show 'Could not determine ...' as if something were
+    actually wrong. A fake `id` on PATH simulates a non-root caller
+    (portable across environments, unlike relying on a real unprivileged
+    system account) -- caddy_activation_status_line must detect this and
+    report a calm, distinct, non-alarming line instead of running --check
+    at all."""
+    install = _install_dir(tmp_path)
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "Caddyfile").write_text(OLD_CADDYFILE)  # would report drift if --check ran
+
+    fake_bin = tmp_path / "fakebin"
+    fake_bin.mkdir()
+    fake_id = fake_bin / "id"
+    fake_id.write_text("#!/usr/bin/env bash\n[[ \"$1\" == '-u' ]] && echo 1000 || exit 1\n")
+    fake_id.chmod(0o755)
+
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        "CENTRALPAY_CLI_SOURCE_ONLY": "1",
+        "CENTRALPAY_INSTALL_DIR": str(install),
+        "CENTRALPAY_CONFIG_DIR": str(config),
+    }
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; shift; caddy_activation_status_line diagnose', "_", str(CLI)],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "requires root" in result.stdout
+    assert "sudo centralpay diagnose" in result.stdout
+    # No alarming warning, and no claim of being in sync either -- the
+    # check genuinely never ran.
+    assert result.stderr == ""
+    assert "OUT OF SYNC" not in result.stdout
+    assert "in sync" not in result.stdout
+    # Untouched -- confirms --check was never even attempted.
+    assert (config / "Caddyfile").read_text() == OLD_CADDYFILE
+
+
 def test_cmd_status_and_cmd_diagnose_are_wired_to_the_drift_check():
     body = CLI.read_text()
     status_start = body.index("cmd_status()")

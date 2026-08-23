@@ -561,6 +561,65 @@ def test_install_sh_syncs_caddy_for_both_fresh_and_rerun_paths():
     assert "sync_caddy_config" in main_body[keep_existing_block_end:]
 
 
+def test_perform_update_activates_caddy_before_build_not_gated_on_deploy_success(tmp_path):
+    """Review finding (P1, round 3): activation was previously nested inside
+    `if compose up -d --wait; then`, so a LATER build/health-check failure
+    left an already-validated, already-written Caddy config never activated
+    -- and `centralpay rollback` never touches Caddy either (deliberately,
+    see SECURITY.md), so the advertised recovery path could never have
+    closed that gap. The restart + --confirm-active calls must now appear
+    BEFORE `compose build`, textually outside the `if compose up -d --wait;
+    then ... else ... fi` block, so activation happens regardless of
+    whether the app-level deploy later succeeds."""
+    source = (PROJECT_ROOT / "scripts" / "centralpay").read_text()
+    body = source[source.index("perform_update() {") :]
+    body = body[: body.index("\nperform_rollback() {")]
+
+    restart_i = body.index("compose restart caddy")
+    confirm_i = body.index('render-caddy-config.sh" --confirm-active')
+    build_i = body.index("compose build")
+    up_wait_i = body.index('if compose up -d --wait; then')
+
+    # Both activation calls happen before the build step...
+    assert restart_i < build_i
+    assert confirm_i < build_i
+    # ...and both happen before the `if compose up -d --wait; then` line
+    # itself, i.e. strictly outside (before) that conditional block, not
+    # nested inside its success branch.
+    assert restart_i < up_wait_i
+    assert confirm_i < up_wait_i
+
+
+def test_install_sh_activates_existing_caddy_container_before_deploy_stack():
+    """Mirrors the perform_update fix: on a rerun where caddy is ALREADY
+    running (an existing install), activation must not be gated on
+    deploy_stack succeeding -- install.sh has no rollback command either,
+    so a deploy_stack failure after an ungated activation would strand the
+    config written-but-inactive until the operator happens to retry."""
+    source = (PROJECT_ROOT / "install.sh").read_text()
+    main_body = source[source.index("main() {") :]
+    restart_i = main_body.index("docker compose --project-directory \"$INSTALL_DIR\" restart caddy")
+    deploy_i = main_body.index("\n    deploy_stack\n")
+    assert restart_i < deploy_i
+
+
+def test_install_sh_confirms_fresh_caddy_container_after_deploy_stack():
+    """A genuinely fresh install has no caddy container to restart before
+    deploy_stack creates it -- the durable confirm-active call for that
+    case must come AFTER deploy_stack (once the container is confirmed
+    up), not before, and must be reachable only when there was no existing
+    container to restart pre-deploy."""
+    source = (PROJECT_ROOT / "install.sh").read_text()
+    main_body = source[source.index("main() {") :]
+    deploy_i = main_body.index("\n    deploy_stack\n")
+    post_deploy = main_body[deploy_i:]
+    assert "CADDY_EXISTING_CONTAINER" in post_deploy
+    assert '--confirm-active' in post_deploy
+    ensure_fee_i = post_deploy.index("ensure_initial_fee_policy")
+    confirm_i = post_deploy.index("--confirm-active")
+    assert confirm_i < ensure_fee_i
+
+
 # --- shell hygiene ------------------------------------------------------------
 
 

@@ -172,17 +172,31 @@ Removal:
 EOF
 }
 
-# True iff `-h` or `--help` appears anywhere in the given arguments. Used to
-# short-circuit a production-mutating command straight to `usage`/exit 0
-# BEFORE any side-effecting code runs -- see the guard in main() below.
-# Deliberately checked as a standalone token (never a substring), so a
-# `--note`/`--resolution` VALUE would have to be the literal two-or-four
-# character string "-h"/"--help" to match; that is far safer than silently
-# proceeding into a real update/restore/migration/etc. on ambiguous input.
+# True iff `-h` or `--help` appears anywhere in the given arguments BEFORE a
+# literal `--`. Used to short-circuit a production-mutating command straight
+# to `usage`/exit 0 BEFORE any side-effecting code runs -- see the guard in
+# main() below. Deliberately checked as a standalone token (never a
+# substring), so a `--note`/`--resolution` VALUE would have to be the
+# literal two-or-four character string "-h"/"--help" to match; that is far
+# safer than silently proceeding into a real update/restore/migration/etc.
+# on ambiguous input.
+#
+# A literal `--` (the standard end-of-options marker) stops the scan: an
+# opaque, operator/bot-supplied order ID that genuinely equals "-h" or
+# "--help" (the create-payment contract accepts arbitrary non-control
+# strings unchanged, so this is a real, if rare, possible value) can still
+# be addressed via `centralpay review show -- --help`, `notification
+# accept -- -h`, etc. -- every guarded command's underlying `app.ops`
+# argparse subparser already honors `--` as the standard end-of-options
+# marker, so a value after `--` is passed straight through positionally.
+# `-h`/`--help` tokens BEFORE a `--` are unaffected and still trigger help
+# immediately, so the original incident (`update --help` running a real
+# update) stays fixed exactly as before.
 wants_help() {
     local a
     for a in "$@"; do
         case "$a" in
+            --) return 1 ;;
             -h | --help) return 0 ;;
         esac
     done
@@ -226,6 +240,10 @@ app_version() {
 }
 
 caddy_activation_status_line() {
+    # $1 = the command name to suggest in the non-root message (defaults to
+    # "status"; cmd_diagnose passes "diagnose" so the suggested command
+    # actually matches what the operator just ran).
+    local suggested_cmd="${1:-status}"
     # Read-only: invokes render-caddy-config.sh's --check mode only, which
     # never mutates the Caddyfile, never validates against Docker, never
     # restarts anything (see that script's header for the exit-code
@@ -240,6 +258,19 @@ caddy_activation_status_line() {
     # update's process exits), so it surfaces the drift immediately.
     local script="${INSTALL_DIR}/scripts/render-caddy-config.sh"
     [[ -f "$script" ]] || return 0
+    if [[ "$(id -u)" -ne 0 ]]; then
+        # CONFIG_DIR is 0700 root-owned (it holds centralpay.env, which
+        # contains real secrets) and the Caddyfile/activation marker inside
+        # it are 0600 -- a non-root caller cannot read either, the same
+        # pre-existing limitation payment_domain() already degrades
+        # gracefully around (see "(domain unknown -- configuration
+        # unreadable)" above). Report that plainly, matching that existing
+        # tone, rather than running --check anyway and having it report a
+        # generic, alarming "could not determine" on every single healthy
+        # non-root status/diagnose call.
+        echo "  Caddy config: sync status requires root (rerun via: sudo centralpay ${suggested_cmd})"
+        return 0
+    fi
     local rc=0
     bash "$script" --check >/dev/null 2>&1 || rc=$?
     case "$rc" in
@@ -289,7 +320,7 @@ cmd_status() {
     fi
     echo
     echo "-- Caddy configuration --"
-    caddy_activation_status_line
+    caddy_activation_status_line status
     echo
     echo "-- Queues --"
     echo "  pending notifications: $(psql_count "SELECT count(*) FROM payments WHERE status='bot_notify_pending'")"
@@ -698,26 +729,38 @@ perform_update() {
         fail "Managed Caddy configuration could not be safely synced; update aborted before any build/migration/restart. Existing services and configuration are unchanged. Roll the checked-out source back with: centralpay rollback"
     fi
 
+    if [[ "$caddy_sync_rc" -eq 2 ]]; then
+        # Activate the already-validated, already-written Caddy config HERE,
+        # independent of whether the app build/migrate/restart below
+        # succeeds. This candidate was already validated against the real
+        # caddy:2 image and backed up before being written to disk, above --
+        # its safety does not depend on api/worker building or passing
+        # health checks, so gating its activation on that (as a previous
+        # version of this function did) left a real gap: a build or health-
+        # check failure after this point would leave the more-secure config
+        # written to disk but never activated, and the advertised recovery
+        # (`centralpay rollback`) never touches Caddy at all (deliberately --
+        # see SECURITY.md's Caddy-rollback ratchet) and so could never have
+        # closed that gap either. Caddy's admin API is intentionally disabled
+        # (no hot reload possible -- see render-caddy-config.sh); only a
+        # container restart activates the refreshed bind-mounted file.
+        # Skipped entirely when the config did not change, so a routine
+        # update never bounces Caddy for no reason.
+        log "Restarting Caddy to activate the refreshed configuration..."
+        compose restart caddy
+        # Durably records that Caddy has actually been restarted with this
+        # exact content -- without this, a crash/interrupt right here would
+        # leave a future run seeing unchanged file content and wrongly
+        # reporting "already up to date" while Caddy is still serving the
+        # OLD configuration.
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+            || fail "Caddy restarted, but recording activation failed; rerun 'centralpay update' to retry."
+    fi
+
     log "Building images..."
     compose build --quiet
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
-        if [[ "$caddy_sync_rc" -eq 2 ]]; then
-            # Caddy's admin API is intentionally disabled (no hot reload
-            # possible — see render-caddy-config.sh); only a container
-            # restart activates the refreshed bind-mounted file. Skipped
-            # entirely when the config did not change, so a routine update
-            # never bounces Caddy for no reason.
-            log "Restarting Caddy to activate the refreshed configuration..."
-            compose restart caddy
-            # Durably records that Caddy has actually been restarted with
-            # this exact content -- without this, a crash/interrupt right
-            # here would leave a future run seeing unchanged file content
-            # and wrongly reporting "already up to date" while Caddy is
-            # still serving the OLD configuration.
-            bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
-                || fail "Caddy restarted, but recording activation failed; rerun 'centralpay update' to retry."
-        fi
         # Only now is the new commit confirmed running: safe to make its
         # scripts/centralpay the installed command.
         sync_management_wrapper
@@ -1040,7 +1083,7 @@ cmd_diagnose() {
     echo "unresolved manual reviews: $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review' AND review_resolved_at IS NULL")"
     echo
     echo "-- Caddy configuration --"
-    caddy_activation_status_line
+    caddy_activation_status_line diagnose
     echo
     echo "-- API --"
     echo "local ready:   $(compose exec -T api curl -fsS --max-time 5 http://127.0.0.1:8000/health/ready 2>/dev/null || echo 'NOT READY')"
