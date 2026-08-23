@@ -199,7 +199,7 @@ A backup on the same host is **not** disaster recovery. Off-site replication rem
 
 ## Monitoring
 
-An optional, dedicated monitoring process (`MONITOR_ENABLED=false` by default, separate from the worker) checks public readiness, database connectivity, worker heartbeats, notification/manual-review backlog, reconciliation health, backup freshness and manifest integrity, disk space, DB integrity, and gateway/bot failure bursts. Incidents are durable — backed by the `monitor_incidents` table, so state survives a restart — with deduplicated open/escalation/recovery alerts queued exactly once per transition and delivered through the existing admin-bot Telegram pipeline; external Telegram delivery itself is at-least-once (a lost response after Telegram accepts the message can produce a duplicate), never exactly-once.
+An optional, dedicated monitoring process (`MONITOR_ENABLED=false` by default, separate from the worker) checks public readiness, database connectivity, worker heartbeats, notification/manual-review backlog, reconciliation health, backup freshness and manifest integrity, disk space, DB integrity, and gateway/bot failure bursts. Incidents are durable — backed by the `monitor_incidents` table, so state survives a restart — with deduplicated open/escalation/recovery alerts queued through the existing admin-bot Telegram pipeline (a disabled alert category or a permanently failed delivery can add a later catch-up row for the same still-open incident, so queuing is not a strict one-row-per-transition guarantee); delivery to Telegram itself is at-least-once (a lost response after Telegram accepts the message can produce a duplicate), never exactly-once.
 
 ```bash
 centralpay monitor enable            # start the monitor service
