@@ -56,7 +56,7 @@ Only Caddy publishes host ports. PostgreSQL is on the internal network only. Cad
 
 The `admin-bot` service is optional and profile-gated. Most Telegram commands are read-only. The only currently supported mutating Telegram operation is the heavily gated `/resend_failed confirm`, which can only requeue already gateway-verified delivery failures when `BOT_NOTIFY_RETRY_MODE=idempotent` is configured.
 
-The `monitor` service is also optional and profile-gated (`MONITOR_ENABLED=false` by default). It runs read-only checks against the database and filesystem and never writes payment rows; it delivers alerts through the same admin-bot Telegram pipeline. See [Monitoring](#monitoring) below.
+The `monitor` service is also optional and profile-gated (`MONITOR_ENABLED=false` by default). Its checks are read-only against the database and filesystem and never write payment rows; its durable incident lifecycle does write a separate, non-financial `monitor_incidents` table and an alert-outbox row per open/escalate/resolve transition, delivered through the same admin-bot Telegram pipeline. See [Monitoring](#monitoring) below.
 
 ## Financial safety guarantees
 
@@ -72,7 +72,7 @@ The `monitor` service is also optional and profile-gated (`MONITOR_ENABLED=false
 - Financial state transitions are permanently appended to `payment_events`.
 - Dynamic fee arithmetic is integer-only and snapshotted once per payment.
 - Reconciliation only uses the canonical verification/settlement path and ages out rather than retrying forever.
-- Monitoring is strictly read-only: no check writes a payment row, resolves a manual review, or mutates financial state.
+- Monitoring's checks are read-only against financial state: no check writes a payment row, resolves a manual review, or mutates financial state. (Its own incident-tracking table is a separate, non-financial write — see [Monitoring](#monitoring).)
 
 See [FINANCIAL_INVARIANTS.md](FINANCIAL_INVARIANTS.md) and [FINANCIAL_TEST_MATRIX.md](FINANCIAL_TEST_MATRIX.md) for detailed audit/test snapshots.
 
@@ -199,7 +199,7 @@ A backup on the same host is **not** disaster recovery. Off-site replication rem
 
 ## Monitoring
 
-An optional, dedicated monitoring process (`MONITOR_ENABLED=false` by default, separate from the worker) checks public readiness, database connectivity, worker heartbeats, notification/manual-review backlog, reconciliation health, backup freshness and manifest integrity, disk space, DB integrity, and gateway/bot failure bursts. Incidents are durable — backed by the `monitor_incidents` table, so state survives a restart — with deduplicated, exactly-once open/escalation/recovery alerts delivered through the existing admin-bot Telegram pipeline.
+An optional, dedicated monitoring process (`MONITOR_ENABLED=false` by default, separate from the worker) checks public readiness, database connectivity, worker heartbeats, notification/manual-review backlog, reconciliation health, backup freshness and manifest integrity, disk space, DB integrity, and gateway/bot failure bursts. Incidents are durable — backed by the `monitor_incidents` table, so state survives a restart — with deduplicated open/escalation/recovery alerts queued exactly once per transition and delivered through the existing admin-bot Telegram pipeline; external Telegram delivery itself is at-least-once (a lost response after Telegram accepts the message can produce a duplicate), never exactly-once.
 
 ```bash
 centralpay monitor enable            # start the monitor service

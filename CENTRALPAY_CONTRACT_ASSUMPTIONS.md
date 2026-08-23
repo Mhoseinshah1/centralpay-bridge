@@ -4,7 +4,7 @@ CentralPay is an external system outside this repository's control. This documen
 
 This is a **living external-contract/risk catalog**, not proof that every undocumented CentralPay behavior has been formally guaranteed by the provider.
 
-Production use and historical validation have demonstrated that the integration can create and verify real payments in its currently observed shapes, but that does not turn every edge-case behavior below into a provider guarantee. The bridge therefore remains fail-closed wherever a wrong assumption could affect money.
+Real/sandbox CentralPay contract validation against the live gateway has not been formally recorded in this repository: [STAGING_VALIDATION.md](STAGING_VALIDATION.md) tracks it as release blocker **B2**, currently open, with no results recorded there. The strict parsing and state-machine behavior described below are hardened against every response shape this codebase could enumerate, but are based on the supported contract implemented in `app/centralpay.py`, exercised through local stubs and unit/integration tests — not an observed real response. Unknown or unrecognized response shapes fail closed rather than being guessed as success, and confirming real response shapes, verify-after-verify idempotency, and TOMAN-unit handling against the live/sandbox gateway remains an open release gate — see `STAGING_VALIDATION.md`'s required procedure to close B2. The bridge therefore remains fail-closed wherever a wrong assumption could affect money.
 
 ## Design rule
 

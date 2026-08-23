@@ -345,7 +345,10 @@ dependencies, never blindly to `monitor`:
   reasoning `reconciliation status`/`reconcile` are routed to `worker`,
   never `api`). Exits `0` when every check is `ok`, `1` otherwise —
   suitable for a cron/alerting wrapper on top of the built-in Telegram
-  delivery.
+  delivery. Like `/monitor`, it is a live snapshot: it re-runs every check
+  on demand but does not itself write to `MonitorIncident` or go through
+  the incident-recording pipeline — only the background `app.monitor` loop
+  does that (see "Behavior during a database outage" above).
 - `monitor incidents` is a pure database read with no filesystem
   dependency, so it runs inside the always-on `api` container instead —
   never gated on `MONITOR_ENABLED` and never requiring the `monitor`

@@ -91,7 +91,9 @@ Health monitor موجود (همین `/health`، بخشی از خود admin-bot) 
 
 **محدودیت فعلی main:** counterهای failure/success این health monitor سبک داخلی در حافظهٔ process هستند؛ restart آن‌ها را reset می‌کند. این محدودیت مختص همین چک سبک `/health` است و همچنان برقرار است.
 
-این محدودیت را با نبود پایش جدی اشتباه نگیرید: سرویس اختیاری و جداگانهٔ `app.monitor` (`MONITOR_ENABLED`، پیش‌فرض `false`) مجموعهٔ کامل‌تری از checkها (readiness عمومی، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot) را اجرا می‌کند و incident state آن در جدول دائمی `monitor_incidents` نگه‌داری می‌شود — یعنی restart آن را پاک نمی‌کند. دستور `/monitor` بالا و `centralpay monitor check`/`centralpay monitor incidents` دقیقاً همین سیستم دائمی را می‌خوانند. جزئیات کامل در [MONITORING.md](MONITORING.md).
+این محدودیت را با نبود پایش جدی اشتباه نگیرید: سرویس اختیاری و جداگانهٔ `app.monitor` (`MONITOR_ENABLED`، پیش‌فرض `false`) مجموعهٔ کامل‌تری از checkها (readiness عمومی، دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot) را در background loop خودش اجرا می‌کند. فقط همین background loop نتیجهٔ هر check را در جدول دائمی `monitor_incidents` ثبت/به‌روزرسانی می‌کند و روی گذار open/escalate/resolve یک ردیف در outbox صف هشدارها می‌گذارد — یعنی restart این تاریخچه را پاک نمی‌کند.
+
+دستور `/monitor` بالا و `centralpay monitor check` هر دو یک snapshot زندهٔ لحظه‌ای هستند: همان مجموعهٔ check را در لحظهٔ فراخوانی دوباره اجرا می‌کنند، اما خودشان چیزی در `monitor_incidents` نمی‌نویسند و از مسیر ثبت دائمی incident عبور نمی‌کنند. برای خواندن تاریخچهٔ دائمی incident (بدون اجرای دوبارهٔ checkها) باید از `centralpay monitor incidents` استفاده کرد — این دستور فقط ردیف‌های از قبل ثبت‌شدهٔ همان background loop را می‌خواند. جزئیات کامل در [MONITORING.md](MONITORING.md).
 
 ## `/manual_review` و `/resolved_reviews`
 

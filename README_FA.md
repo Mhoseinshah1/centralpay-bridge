@@ -60,7 +60,7 @@ API :8000 --------> PostgreSQL 16
 
 ربات مدیریتی اختیاری است. تقریباً همهٔ فرمان‌های تلگرام فقط‌خواندنی‌اند. تنها عملیات mutating فعلی `/resend_failed confirm` است که شدیداً محدود شده و فقط برای پرداخت‌های از قبل تأییدشدهٔ درگاه و فقط در `BOT_NOTIFY_RETRY_MODE=idempotent` می‌تواند اعلان‌های واجدشرایط را دوباره در صف بگذارد.
 
-سرویس پایش (`monitor`) نیز اختیاری است (`MONITOR_ENABLED=false` پیش‌فرض). فقط‌خواندنی است و هیچ‌گاه ردیف پرداخت نمی‌نویسد؛ هشدارها را از همان مسیر Telegram admin-bot ارسال می‌کند. جزئیات در بخش «پایش» پایین‌تر.
+سرویس پایش (`monitor`) نیز اختیاری است (`MONITOR_ENABLED=false` پیش‌فرض). checkهای آن فقط‌خواندنی هستند و هیچ‌گاه ردیف پرداخت نمی‌نویسند؛ اما incident lifecycle دائمی آن یک جدول جداگانه و غیرمالی (`monitor_incidents`) و یک ردیف alert-outbox به ازای هر گذار open/escalate/resolve می‌نویسد و از همان مسیر Telegram admin-bot ارسال می‌کند. جزئیات در بخش «پایش» پایین‌تر.
 
 ## تضمین‌های مالی مهم
 
@@ -230,7 +230,7 @@ CENTRALPAY_UPDATE_ALLOW_DEV_REF=true
 
 ## پایش
 
-سرویس اختیاری و جداگانهٔ پایش (`MONITOR_ENABLED=false` پیش‌فرض، جدا از worker) این موارد را بررسی می‌کند: readiness عمومی، اتصال دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot. incident state آن دائمی است (در جدول `monitor_incidents`، restart آن را پاک نمی‌کند) و هشدارهای open/escalation/recovery با dedupe و exactly-once از همان مسیر Telegram admin-bot ارسال می‌شوند.
+سرویس اختیاری و جداگانهٔ پایش (`MONITOR_ENABLED=false` پیش‌فرض، جدا از worker) این موارد را بررسی می‌کند: readiness عمومی، اتصال دیتابیس، heartbeat workerها، backlog اعلان/manual-review، سلامت reconciliation، تازگی و اعتبار manifest بکاپ، فضای دیسک، یکپارچگی دیتابیس، و burst شکست gateway/bot. incident state آن دائمی است (در جدول `monitor_incidents`، restart آن را پاک نمی‌کند) و هشدارهای open/escalation/recovery با dedupe به‌ازای هر گذار دقیقاً یک‌بار صف می‌شوند و از همان مسیر Telegram admin-bot ارسال می‌شوند؛ خودِ تحویل روی Telegram at-least-once است، نه exactly-once — اگر پاسخ بعد از پذیرش پیام توسط Telegram گم شود، ممکن است پیام عملیاتی تکراری ارسال شود.
 
 <div dir="ltr">
 
