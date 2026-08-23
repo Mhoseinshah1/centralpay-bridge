@@ -309,13 +309,19 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
     payment in this database's history ever exhausted retries". A historical
     backlog of long-aged-out, long-untouched exhausted payments must not
     keep an otherwise-healthy system permanently critical; see
-    ReconciliationStatusSnapshot.queue.exhausted_recent /
-    exhausted_not_aged_out / exhausted_historical_total below."""
+    ReconciliationStatusSnapshot.queue.exhausted_actionable_total /
+    exhausted_recent / exhausted_not_aged_out / exhausted_historical_total
+    below."""
     if not settings.reconciliation_enabled:
         return CheckResult("reconciliation", STATUS_OK, "disabled", {"enabled": False})
     snapshot = build_reconciliation_status_snapshot(db, settings, now_fn=lambda: now)
-    # Two populations drive CRITICAL, both bounded to "current/actionable",
-    # never the unbounded all-time historical total:
+    # exhausted_actionable_total is the single authoritative "does this
+    # alarm" count, bounded to "current/actionable" and never the unbounded
+    # all-time historical total. It is the EXACT union (each row counted
+    # once) of two populations that are NOT nested whenever the recent
+    # window is shorter than the reconciliation lifetime -- summing or
+    # max()-ing them separately can double-count or undercount; see
+    # reconciliation.reconciliation_actionable_exhausted_conditions:
     #   * exhausted_not_aged_out -- still within the reconciliation lifetime
     #     (age < max_age), so inherently bounded to at most max_age_seconds
     #     old; always alarms regardless of how recently it happened.
@@ -328,16 +334,16 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
     #     keeping an otherwise-healthy system permanently critical.
     # exhausted_historical_total (unbounded, all-time) is reported
     # separately for operator context only and never drives severity here.
-    actionable_exhausted = snapshot.queue.exhausted_not_aged_out
-    recent_exhausted = snapshot.queue.exhausted_recent
+    exhausted_actionable = snapshot.queue.exhausted_actionable_total
     oldest_overdue = snapshot.queue.oldest_overdue_seconds
     details = {
-        "exhausted_not_aged_out": actionable_exhausted,
-        "exhausted_recent": recent_exhausted,
+        "exhausted_not_aged_out": snapshot.queue.exhausted_not_aged_out,
+        "exhausted_recent": snapshot.queue.exhausted_recent,
+        "exhausted_actionable_total": exhausted_actionable,
         "exhausted_historical_total": snapshot.queue.exhausted_historical_total,
         "oldest_overdue_seconds": _round_or_none(oldest_overdue),
     }
-    if actionable_exhausted > 0 or recent_exhausted > 0:
+    if exhausted_actionable > 0:
         return CheckResult(
             "reconciliation", STATUS_CRITICAL, "reconciliation_exhausted", details
         )

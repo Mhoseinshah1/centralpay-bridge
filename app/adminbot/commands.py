@@ -108,20 +108,21 @@ def _monitor_detail_fa(result: CheckResult) -> str:
         return f" — {int(d['age_seconds'])} ثانیه پیش"
     if result.key in ("notification_backlog", "manual_review") and "count" in d:
         return f" — {d['count']}"
-    if result.key == "reconciliation" and "exhausted_recent" in d:
-        # check_reconciliation alarms on exhausted_not_aged_out > 0 OR
-        # exhausted_recent > 0 (see app.services.monitor_checks) -- under a
-        # non-default MONITOR_RECONCILIATION_EXHAUSTED_RECENT_WINDOW_SECONDS
-        # shorter than RECONCILIATION_MAX_AGE_SECONDS the two can diverge
-        # (a still-within-lifetime exhausted payment whose last attempt
-        # happens to fall outside a short window), so showing exhausted_recent
-        # alone could display "critical ... 0" -- max() guarantees this
-        # summary is never zero while either population is what made the
-        # check critical. The full breakdown (exhausted_not_aged_out /
+    if result.key == "reconciliation" and "exhausted_actionable_total" in d:
+        # check_reconciliation alarms on exhausted_actionable_total > 0 --
+        # the EXACT union of exhausted_not_aged_out and exhausted_recent,
+        # each row counted once (see app.services.monitor_checks and
+        # reconciliation.reconciliation_actionable_exhausted_conditions).
+        # Those two populations are NOT nested under a non-default
+        # MONITOR_RECONCILIATION_EXHAUSTED_RECENT_WINDOW_SECONDS shorter
+        # than RECONCILIATION_MAX_AGE_SECONDS, so neither showing
+        # exhausted_recent alone (can read "critical ... 0") nor
+        # max(exhausted_not_aged_out, exhausted_recent) (can undercount two
+        # disjoint actionable rows as one) is safe here -- only the real
+        # union count is. The full breakdown (exhausted_not_aged_out /
         # exhausted_recent / exhausted_historical_total) stays in
         # `centralpay monitor check --json`, never truncated here.
-        exhausted_summary = max(d.get("exhausted_not_aged_out", 0), d["exhausted_recent"])
-        return f" — اتمام‌یافته: {exhausted_summary}"
+        return f" — اتمام‌یافته: {d['exhausted_actionable_total']}"
     if result.key == "backup" and "age_seconds" in d:
         return f" — {int(d['age_seconds'] // 3600)} ساعت پیش"
     if result.key == "disk_space" and "free_percent" in d:

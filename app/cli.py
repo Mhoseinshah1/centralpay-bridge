@@ -442,6 +442,7 @@ def _reconciliation_status_dict(snapshot: ReconciliationStatusSnapshot) -> dict[
             "expiring_due": queue.expiring_due,
             "exhausted_not_aged_out": queue.exhausted_not_aged_out,
             "exhausted_recent": queue.exhausted_recent,
+            "exhausted_actionable_total": queue.exhausted_actionable_total,
             "exhausted_historical_total": queue.exhausted_historical_total,
             "oldest_active_due_age_seconds": queue.oldest_active_due_age_seconds,
             "oldest_expiring_due_age_seconds": queue.oldest_expiring_due_age_seconds,
@@ -526,8 +527,12 @@ def _print_reconciliation_status_human(
         settings.monitor_reconciliation_exhausted_recent_window_seconds / 3600, 1
     )
     print(
-        f"  exhausted (recent, last {recent_window_hours}h, drives monitor CRITICAL): "
+        f"  exhausted (recent, last {recent_window_hours}h): "
         f"{queue.exhausted_recent}"
+    )
+    print(
+        "  exhausted (actionable total -- union of the above two, "
+        f"drives monitor CRITICAL): {queue.exhausted_actionable_total}"
     )
     print(f"  exhausted (historical total, all-time, informational only): "
           f"{queue.exhausted_historical_total}")

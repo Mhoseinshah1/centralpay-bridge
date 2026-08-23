@@ -38,6 +38,7 @@ from app.services.reconciliation import (
     expiring_tier_age_conditions,
     expiring_tier_due_conditions,
     link_age_anchor,
+    reconciliation_actionable_exhausted_conditions,
     reconciliation_exhausted_conditions,
     reconciliation_exhausted_ever_conditions,
     reconciliation_recently_exhausted_conditions,
@@ -192,6 +193,20 @@ class QueueHealth:
     # stop keeping an otherwise-healthy system critical forever. See
     # reconciliation.reconciliation_recently_exhausted_conditions.
     exhausted_recent: int
+    # The EXACT count of rows driving CRITICAL: the logical union of
+    # exhausted_not_aged_out and exhausted_recent above, each row counted
+    # once. These two populations are NOT nested when the recent window is
+    # shorter than the reconciliation lifetime, so summarizing them with
+    # max(exhausted_not_aged_out, exhausted_recent) can UNDERCOUNT -- e.g.
+    # one still-within-lifetime row whose last attempt fell outside the
+    # window, plus a SEPARATE already-aged-out row whose last attempt fell
+    # inside it: two distinct actionable rows, but max(1, 1) == 1. This
+    # field is the one operator-facing surfaces should display as "the"
+    # actionable exhausted count; it can never diverge from
+    # check_reconciliation's severity test because both are built from the
+    # same condition builder. See
+    # reconciliation.reconciliation_actionable_exhausted_conditions.
+    exhausted_actionable_total: int
     # The SAME attempts-exhausted, aged-out-inclusive population with NO
     # recency bound at all -- the full historical total, for operator
     # context only. Never used to drive monitor severity: an unbounded
@@ -315,6 +330,11 @@ def _queue(db: Session, settings: Settings, now: datetime) -> QueueHealth:
         now=now,
         window_seconds=settings.monitor_reconciliation_exhausted_recent_window_seconds,
     )
+    exhausted_actionable_conditions = reconciliation_actionable_exhausted_conditions(
+        settings,
+        now=now,
+        window_seconds=settings.monitor_reconciliation_exhausted_recent_window_seconds,
+    )
 
     oldest_active = oldest_by(anchor, active_conditions)
     oldest_expiring = oldest_by(anchor, expiring_conditions)
@@ -325,6 +345,7 @@ def _queue(db: Session, settings: Settings, now: datetime) -> QueueHealth:
         expiring_due=count(expiring_conditions),
         exhausted_not_aged_out=count(exhausted_conditions),
         exhausted_recent=count(exhausted_recent_conditions),
+        exhausted_actionable_total=count(exhausted_actionable_conditions),
         exhausted_historical_total=count(exhausted_ever_conditions),
         oldest_active_due_age_seconds=oldest_active,
         oldest_expiring_due_age_seconds=oldest_expiring,

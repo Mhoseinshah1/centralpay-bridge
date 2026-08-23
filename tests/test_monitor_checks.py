@@ -478,6 +478,7 @@ def test_reconciliation_ancient_historical_backlog_does_not_stay_critical(
     assert result.status == "ok"
     assert result.details["exhausted_not_aged_out"] == 0
     assert result.details["exhausted_recent"] == 0
+    assert result.details["exhausted_actionable_total"] == 0
     assert result.details["exhausted_historical_total"] == 1
 
 
@@ -497,6 +498,7 @@ def test_reconciliation_new_exhaustion_triggers_critical(session_factory, settin
     assert result.status == "critical"
     assert result.reason == "reconciliation_exhausted"
     assert result.details["exhausted_recent"] == 1
+    assert result.details["exhausted_actionable_total"] == 1
 
 
 def test_reconciliation_recent_exhaustion_stays_critical_just_inside_window(
@@ -526,6 +528,7 @@ def test_reconciliation_recent_exhaustion_stays_critical_just_inside_window(
     assert result.status == "critical"
     assert result.details["exhausted_not_aged_out"] == 0
     assert result.details["exhausted_recent"] == 1
+    assert result.details["exhausted_actionable_total"] == 1
 
 
 def test_reconciliation_exhaustion_recovers_just_outside_window(session_factory, settings):
@@ -554,6 +557,7 @@ def test_reconciliation_exhaustion_recovers_just_outside_window(session_factory,
         result = monitor_checks.check_reconciliation(db, recon, now=now)
     assert result.status == "ok"
     assert result.details["exhausted_recent"] == 0
+    assert result.details["exhausted_actionable_total"] == 0
     assert result.details["exhausted_historical_total"] == 1
 
 
@@ -584,6 +588,7 @@ def test_reconciliation_actionable_exhausted_alarms_even_outside_window(
         result = monitor_checks.check_reconciliation(db, recon, now=now)
     assert result.status == "critical"
     assert result.details["exhausted_not_aged_out"] == 1
+    assert result.details["exhausted_actionable_total"] == 1
 
 
 def test_reconciliation_exhausted_null_last_at_treated_as_recent(session_factory, settings):
@@ -608,6 +613,51 @@ def test_reconciliation_exhausted_null_last_at_treated_as_recent(session_factory
         result = monitor_checks.check_reconciliation(db, recon, now=now)
     assert result.status == "critical"
     assert result.details["exhausted_recent"] == 1
+    assert result.details["exhausted_actionable_total"] == 1
+
+
+def test_reconciliation_actionable_total_counts_disjoint_rows_correctly(
+    session_factory, settings
+):
+    """Two DISTINCT exhausted rows can each satisfy exactly one of the two
+    populations that drive CRITICAL, without satisfying the other: row A is
+    still within the reconciliation lifetime (not aged out) but its last
+    attempt fell OUTSIDE the recent window; row B has already aged out but
+    its last attempt fell INSIDE the recent window. Neither population
+    contains the other, so max(exhausted_not_aged_out, exhausted_recent)
+    would collapse this to 1 -- an earlier fix briefly did exactly that.
+    exhausted_actionable_total must report the real, distinct total of 2."""
+    now = datetime.now(UTC)
+    recon = settings.model_copy(
+        update={
+            "reconciliation_max_attempts": 3,
+            "monitor_reconciliation_exhausted_recent_window_seconds": 3600,
+        }
+    )
+    _make_payment(
+        session_factory,
+        status="link_created",
+        reconciliation_attempts=3,
+        reconciliation_next_at=None,
+        reconciliation_last_at=now - timedelta(seconds=7200),
+        callback_token_issued_at=now - timedelta(seconds=100),
+    )
+    _make_payment(
+        session_factory,
+        status="link_created",
+        reconciliation_attempts=3,
+        reconciliation_next_at=None,
+        reconciliation_last_at=now - timedelta(seconds=100),
+        callback_token_issued_at=(
+            now - timedelta(seconds=recon.reconciliation_max_age_seconds + 100)
+        ),
+    )
+    with session_factory() as db:
+        result = monitor_checks.check_reconciliation(db, recon, now=now)
+    assert result.status == "critical"
+    assert result.details["exhausted_not_aged_out"] == 1
+    assert result.details["exhausted_recent"] == 1
+    assert result.details["exhausted_actionable_total"] == 2
 
 
 def test_reconciliation_healthy_queue_and_historical_backlog_resolves(session_factory, settings):
@@ -635,6 +685,7 @@ def test_reconciliation_healthy_queue_and_historical_backlog_resolves(session_fa
     with session_factory() as db:
         result = monitor_checks.check_reconciliation(db, recon, now=now)
     assert result.status == "ok"
+    assert result.details["exhausted_actionable_total"] == 0
     assert result.details["exhausted_historical_total"] == 1
 
 
