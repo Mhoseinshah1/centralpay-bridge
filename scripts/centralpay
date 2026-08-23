@@ -266,7 +266,13 @@ cmd_status() {
     echo
     echo "-- Queues --"
     echo "  pending notifications: $(psql_count "SELECT count(*) FROM payments WHERE status='bot_notify_pending'")"
-    echo "  manual review:         $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review'")"
+    # Unresolved only -- a row an operator already resolved via
+    # `centralpay review resolve` keeps status='manual_review' permanently
+    # as history (review_resolved_at is stamped instead), so a plain
+    # status count would report an ever-growing, mostly-historical number
+    # here that never matches `centralpay review list` or the monitor's
+    # manual_review check (see app.adminbot.queries.count_open_manual_reviews).
+    echo "  unresolved manual reviews: $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review' AND review_resolved_at IS NULL")"
     echo
     echo "-- Backups --"
     local last_backup
@@ -996,7 +1002,8 @@ cmd_diagnose() {
     echo "readiness:     $(compose exec -T db pg_isready -U centralpay -d centralpay 2>/dev/null || echo 'NOT READY')"
     echo "migration:     $(psql_count "SELECT version_num FROM alembic_version")"
     echo "pending queue: $(psql_count "SELECT count(*) FROM payments WHERE status='bot_notify_pending'")"
-    echo "manual review: $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review'")"
+    # Unresolved only -- see the matching comment in cmd_status above.
+    echo "unresolved manual reviews: $(psql_count "SELECT count(*) FROM payments WHERE status='manual_review' AND review_resolved_at IS NULL")"
     echo
     echo "-- API --"
     echo "local ready:   $(compose exec -T api curl -fsS --max-time 5 http://127.0.0.1:8000/health/ready 2>/dev/null || echo 'NOT READY')"
