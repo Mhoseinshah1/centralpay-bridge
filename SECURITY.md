@@ -63,7 +63,9 @@ Fee policy changes are explicit host-CLI operations and affect new payments only
 
 ### Payer identity isolation
 
-New payment flows use the repository's payer-identity scheme rather than a shared gateway user ID. The gateway user ID stored on the payment is reused for link retry and verification.
+New payment flows use the repository's payer-identity scheme rather than a shared gateway user ID.
+
+Once a payment has a live gateway link (a `getLink` call has already succeeded), its stored gateway user ID is fixed and reused verbatim for every retry and for verification — a live link is never re-pointed to a different identity. Before a live link exists, a retry's resolved identity is reconciled against the payment's stored one: the same identity resolving again is idempotently reused; a legacy/untyped row, or an order first seen without a Telegram id that now supplies one, may adopt the freshly resolved (stronger) identity; a retry that resolves to a genuinely different Telegram user is always rejected, never silently adopted or reused — one user's payment can never be reassigned to another user's identity, live link or not.
 
 Safe replay of an existing payment is allowed to bypass create limiting only when the request's identity shape exactly matches the stored identity. Changing Telegram-user presence/value is conservatively treated as real work and remains rate-limited.
 
@@ -155,7 +157,7 @@ Never send secrets, callback token/signature, raw gateway text, full card data, 
 
 ### Monitoring
 
-The optional monitor service (`MONITOR_ENABLED=false` by default) is isolated from the customer payment path, exactly like the admin bot. It only reads existing tables and the filesystem: it never writes a payment row, never resolves a manual review, and never mutates financial state. It introduces no new secrets and delivers alerts through the existing admin-bot Telegram pipeline rather than a separate channel.
+The optional monitor service (`MONITOR_ENABLED=false` by default) is isolated from the customer payment path, exactly like the admin bot. Its checks are read-only against `payments`/`payment_events` and the filesystem: no check writes a payment row, resolves a manual review, or mutates financial state. It is not, however, database-read-only overall — the durable incident lifecycle writes/updates `monitor_incidents` rows and, on an open/escalate/resolve transition, enqueues an `admin_alerts` row through the same outbox the rest of the application already uses. This is bounded, non-financial operational state (never a payment row), and it is what makes incident history durable across a restart — see [MONITORING.md](MONITORING.md#incident-lifecycle-and-deduplication). It introduces no new secrets and delivers alerts through the existing admin-bot Telegram pipeline rather than a separate channel.
 
 If PostgreSQL itself is unreachable, database-independent checks (public readiness, backup, disk space) keep running and database-dependent checks degrade to a `database_unavailable` result instead of raising — a real, unrelated code bug in a check is not mislabeled as a database outage. Backup manifest validation reads only the small `.manifest` sidecar, never the dump file's own bytes, so it does not need read access to backup contents to certify recoverability metadata. Gateway/bot failure-burst counting only counts genuine transport/protocol-level failures; an ordinary payer declining or abandoning a payment never trips it.
 
