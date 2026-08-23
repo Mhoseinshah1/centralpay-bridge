@@ -189,6 +189,8 @@ This logging-boundary redaction is required even though callback responses use r
 
 Uvicorn must not be run with a callback-leaking access-log configuration in environments that handle real callback URLs.
 
+**Managed Caddy config upgrades.** The installed `/etc/centralpay-bridge/Caddyfile` has exactly two operator-supplied values (payment domain, TLS/ACME email) — everything security-relevant (the redaction rules above, security headers, request-size cap, route allowlist, `admin off`) is application-managed and always re-rendered from the currently checked-out `deploy/caddy/Caddyfile.template`, never hand-merged. `scripts/render-caddy-config.sh` runs on both `centralpay update` and every `install.sh` invocation (including a "keep existing configuration" rerun) — a mandatory security-directive change in a new release therefore always reaches an already-running installation, closing the gap where a security fix could ship in source but never reach a production host that only ever ran `centralpay update`. The candidate is validated with the real `caddy:2` image before anything on disk changes; the previous file is backed up first; a failed validation leaves the running configuration completely untouched. Caddy's admin API is intentionally disabled and unpublished, so activation is always a container restart (gated on the config having actually changed), never a hot reload.
+
 ### Container/network isolation
 
 Only Caddy publishes host ports.
@@ -238,6 +240,7 @@ CI includes the project's test suites and security/quality gates such as:
 - dependency vulnerability scanning
 - release-flow checks
 - runtime Caddy redaction verification for callback secrets
+- the managed Caddy config upgrade path (old-config -> current-template), validated against the real `caddy:2` image
 
 A required failing check must be fixed, not bypassed.
 
@@ -250,6 +253,7 @@ These are not equivalent to confirmed vulnerabilities:
 - during a full PostgreSQL outage, the monitor cannot durably record its own "database is down" incident or Telegram alert (persisting either requires the very database that is unreachable), and the admin bot's `/monitor` command cannot run at all (its command-audit commit needs the database before any handler runs); `centralpay monitor check` stays usable through the CLI, but only if the `monitor` container was already running before the outage started — see [MONITORING.md](MONITORING.md)
 - release trust binds artifacts to a commit through checksums/`SOURCE_COMMIT`; this is not the same thing as a complete signed-artifact provenance system
 - some audit/review documents in the repository are historical snapshots and intentionally retain the findings/status of their original commit
+- `centralpay rollback` deliberately does NOT re-sync the Caddyfile: rolling application files back to an older commit must never also downgrade a security-relevant Caddy directive that shipped in a version between the rollback target and the version being rolled back from. The installed Caddyfile stays at whatever the most recent successful `centralpay update`/install left it, one-way, the same way database migrations are forward-only
 
 The current risk register is [RELEASE_RISK_REGISTER.md](RELEASE_RISK_REGISTER.md). Do not derive current risk status solely from an older audit snapshot.
 

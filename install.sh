@@ -34,7 +34,6 @@ _configured_backup_dir=$(grep -E '^CENTRALPAY_BACKUP_DIR=' "$ENV_FILE" 2>/dev/nu
 BACKUP_DIR="${_configured_backup_dir:-${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}}"
 export CENTRALPAY_BACKUP_DIR="$BACKUP_DIR"
 unset _configured_backup_dir
-CADDYFILE="${CONFIG_DIR}/Caddyfile"
 DB_PASSWORD_FILE="${CONFIG_DIR}/db_password"
 CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
 # Kept in sync with scripts/centralpay's own MANAGEMENT_BIN so a fresh
@@ -591,8 +590,12 @@ write_configuration() {
     printf '%s' "$POSTGRES_PASSWORD" > "$DB_PASSWORD_FILE"
     chmod 600 "$DB_PASSWORD_FILE"
 
-    render_template "${INSTALL_DIR}/deploy/caddy/Caddyfile.template" "$CADDYFILE"
-    chmod 600 "$CADDYFILE"
+    # The Caddyfile is rendered separately by sync_caddy_config (called from
+    # main() for BOTH a fresh install and a "keep existing configuration"
+    # rerun) -- never here, and never conditional on KEEP_EXISTING. See
+    # scripts/render-caddy-config.sh for why: its mandatory security
+    # directives must never be skipped on a rerun the way a plain
+    # write_configuration() gate would skip them.
 
     cat > "$CREDENTIALS_FILE" <<EOF
 CentralPay Bridge — installation summary ($(date -u +%Y-%m-%dT%H:%M:%SZ))
@@ -613,6 +616,26 @@ EOF
     umask 022
 }
 
+# Renders/upgrades the installed Caddyfile's mandatory security directives
+# via scripts/render-caddy-config.sh -- run for BOTH a fresh install (with
+# PAYMENT_DOMAIN/TLS_EMAIL explicit, no existing file yet) and a "keep
+# existing configuration" rerun (extracted from the existing file instead),
+# never conditional on KEEP_EXISTING. See that script's header for the full
+# ownership model and exit-code contract (0 unchanged / 2 changed, caller
+# must restart caddy / 1 fatal, existing config left untouched).
+CADDY_CONFIG_CHANGED=false
+sync_caddy_config() {
+    log "Syncing mandatory Caddy security configuration..."
+    local rc=0
+    PAYMENT_DOMAIN="${PAYMENT_DOMAIN:-}" TLS_EMAIL="${TLS_EMAIL:-}" \
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" || rc=$?
+    case "$rc" in
+        0) : ;;
+        2) CADDY_CONFIG_CHANGED=true ;;
+        *) fail "Could not render/validate the Caddy configuration. Installation aborted; no service was (re)started." ;;
+    esac
+}
+
 configure_firewall() {
     command -v ufw >/dev/null 2>&1 || return 0
     if ufw status | grep -q "Status: active"; then
@@ -628,10 +651,15 @@ install_management_command() {
     install -m 0755 "${INSTALL_DIR}/scripts/centralpay" "$MANAGEMENT_BIN"
     # Deployment scripts get explicit safe modes: a plain git clone does not
     # guarantee the executable bit, and a non-executable backup.sh broke the
-    # systemd backup timer with "Permission denied" on real hosts.
-    chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay"
+    # systemd backup timer with "Permission denied" on real hosts. (Both
+    # scripts/centralpay and render-caddy-config.sh are still invoked via
+    # `bash <path>` at their call sites regardless, which does not itself
+    # require the executable bit -- this chmod is defense in depth for any
+    # future direct-invocation use.)
+    chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay" \
+        "${INSTALL_DIR}/scripts/render-caddy-config.sh"
     chmod 0750 "${INSTALL_DIR}/scripts/backup.sh"
-    chmod 0755 "${INSTALL_DIR}/scripts/centralpay"
+    chmod 0755 "${INSTALL_DIR}/scripts/centralpay" "${INSTALL_DIR}/scripts/render-caddy-config.sh"
     log "Installed management command: ${MANAGEMENT_BIN}"
 }
 
@@ -821,11 +849,23 @@ main() {
         load_or_generate_secrets
         write_configuration
     fi
+    sync_caddy_config
 
     configure_firewall
     install_management_command
     install_backup_timer
     deploy_stack
+    if [[ "$CADDY_CONFIG_CHANGED" == "true" ]]; then
+        # A brand-new caddy container already starts with the just-written
+        # file (deploy_stack's `up -d --wait` above), so this restart is
+        # only load-bearing on a rerun where caddy was already running --
+        # docker compose does not recreate a service merely because a
+        # bind-mounted file's CONTENTS changed. Harmless (and fast) on a
+        # fresh install where it is a no-op restart of a container that
+        # just started.
+        log "Restarting Caddy to activate the refreshed configuration..."
+        docker compose --project-directory "$INSTALL_DIR" restart caddy
+    fi
     ensure_initial_fee_policy
     verify_deployment
     print_summary

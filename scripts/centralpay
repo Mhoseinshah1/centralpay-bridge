@@ -631,10 +631,36 @@ perform_update() {
     # Pass the captured pre-update commit explicitly so the FIRST update (no
     # version_history file yet) still records a rollback target.
     record_version_history "$(git -C "$INSTALL_DIR" rev-parse HEAD)" "$previous"
+
+    # Bring the installed Caddyfile's mandatory security directives in line
+    # with the commit just checked out, BEFORE building/restarting anything
+    # else. `render-caddy-config.sh` never touches a working configuration
+    # on failure (validates the candidate against the real caddy:2 image
+    # first, backs up before replacing) -- so a Caddy-config problem aborts
+    # the update here, before build/migrate/restart, exactly like a failed
+    # commit-verification above. See that script's header for the full
+    # ownership/activation model and exit-code contract (0 unchanged / 2
+    # changed, restart required / 1 fatal).
+    log "Syncing mandatory Caddy security configuration..."
+    local caddy_sync_rc=0
+    bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" || caddy_sync_rc=$?
+    if [[ "$caddy_sync_rc" -ne 0 && "$caddy_sync_rc" -ne 2 ]]; then
+        fail "Managed Caddy configuration could not be safely synced; update aborted before any build/migration/restart. Existing services and configuration are unchanged. Roll the checked-out source back with: centralpay rollback"
+    fi
+
     log "Building images..."
     compose build --quiet
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
+        if [[ "$caddy_sync_rc" -eq 2 ]]; then
+            # Caddy's admin API is intentionally disabled (no hot reload
+            # possible — see render-caddy-config.sh); only a container
+            # restart activates the refreshed bind-mounted file. Skipped
+            # entirely when the config did not change, so a routine update
+            # never bounces Caddy for no reason.
+            log "Restarting Caddy to activate the refreshed configuration..."
+            compose restart caddy
+        fi
         # Only now is the new commit confirmed running: safe to make its
         # scripts/centralpay the installed command.
         sync_management_wrapper
