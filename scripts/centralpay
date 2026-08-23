@@ -172,6 +172,23 @@ Removal:
 EOF
 }
 
+# True iff `-h` or `--help` appears anywhere in the given arguments. Used to
+# short-circuit a production-mutating command straight to `usage`/exit 0
+# BEFORE any side-effecting code runs -- see the guard in main() below.
+# Deliberately checked as a standalone token (never a substring), so a
+# `--note`/`--resolution` VALUE would have to be the literal two-or-four
+# character string "-h"/"--help" to match; that is far safer than silently
+# proceeding into a real update/restore/migration/etc. on ambiguous input.
+wants_help() {
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -h | --help) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 require_root() {
     [[ "$(id -u)" -eq 0 ]] || fail "This command requires root. Use: sudo centralpay $*"
 }
@@ -1342,6 +1359,31 @@ cmd_uninstall() {
 main() {
     local cmd="${1:-}"
     shift || true
+
+    # Every production-mutating (or otherwise side-effecting: service
+    # lifecycle, deployment, destructive) top-level command must have a
+    # help path with ZERO side effects: no network fetch, git operation,
+    # backup, DB migration, docker build/pull/restart, compose operation,
+    # config change, file replacement, service restart, or other mutation.
+    # Checked HERE, before any command-specific parsing or dispatch, so a
+    # bare `-h`/`--help` anywhere in the remaining arguments always wins
+    # over the real action -- this is what fixes the real incident where
+    # `centralpay update --help` ran a full production update instead of
+    # printing help. A handful of these commands have read-only
+    # subcommands too (e.g. `fee status`, `migrate current`, `db-check`);
+    # guarding the whole top-level command anyway is a harmless, strictly
+    # safer default, not a behavior regression for anything that matters.
+    case "$cmd" in
+        update | restart | stop | start | rollback | migrate | backup | restore | \
+        db-check | fee | review | notification | recover-aged-out | admin-bot | \
+        monitor | ssl | uninstall)
+            if wants_help "$@"; then
+                usage
+                exit 0
+            fi
+            ;;
+    esac
+
     case "$cmd" in
         status)        cmd_status "$@" ;;
         logs)          cmd_logs "$@" ;;
