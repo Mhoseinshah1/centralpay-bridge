@@ -34,7 +34,6 @@ _configured_backup_dir=$(grep -E '^CENTRALPAY_BACKUP_DIR=' "$ENV_FILE" 2>/dev/nu
 BACKUP_DIR="${_configured_backup_dir:-${CENTRALPAY_BACKUP_DIR:-/var/backups/centralpay-bridge}}"
 export CENTRALPAY_BACKUP_DIR="$BACKUP_DIR"
 unset _configured_backup_dir
-CADDYFILE="${CONFIG_DIR}/Caddyfile"
 DB_PASSWORD_FILE="${CONFIG_DIR}/db_password"
 CREDENTIALS_FILE="${CONFIG_DIR}/credentials.txt"
 # Kept in sync with scripts/centralpay's own MANAGEMENT_BIN so a fresh
@@ -591,8 +590,12 @@ write_configuration() {
     printf '%s' "$POSTGRES_PASSWORD" > "$DB_PASSWORD_FILE"
     chmod 600 "$DB_PASSWORD_FILE"
 
-    render_template "${INSTALL_DIR}/deploy/caddy/Caddyfile.template" "$CADDYFILE"
-    chmod 600 "$CADDYFILE"
+    # The Caddyfile is rendered separately by sync_caddy_config (called from
+    # main() for BOTH a fresh install and a "keep existing configuration"
+    # rerun) -- never here, and never conditional on KEEP_EXISTING. See
+    # scripts/render-caddy-config.sh for why: its mandatory security
+    # directives must never be skipped on a rerun the way a plain
+    # write_configuration() gate would skip them.
 
     cat > "$CREDENTIALS_FILE" <<EOF
 CentralPay Bridge — installation summary ($(date -u +%Y-%m-%dT%H:%M:%SZ))
@@ -613,6 +616,26 @@ EOF
     umask 022
 }
 
+# Renders/upgrades the installed Caddyfile's mandatory security directives
+# via scripts/render-caddy-config.sh -- run for BOTH a fresh install (with
+# PAYMENT_DOMAIN/TLS_EMAIL explicit, no existing file yet) and a "keep
+# existing configuration" rerun (extracted from the existing file instead),
+# never conditional on KEEP_EXISTING. See that script's header for the full
+# ownership model and exit-code contract (0 unchanged / 2 changed, caller
+# must restart caddy / 1 fatal, existing config left untouched).
+CADDY_CONFIG_CHANGED=false
+sync_caddy_config() {
+    log "Syncing mandatory Caddy security configuration..."
+    local rc=0
+    PAYMENT_DOMAIN="${PAYMENT_DOMAIN:-}" TLS_EMAIL="${TLS_EMAIL:-}" \
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" || rc=$?
+    case "$rc" in
+        0) : ;;
+        2) CADDY_CONFIG_CHANGED=true ;;
+        *) fail "Could not render/validate the Caddy configuration. Installation aborted; no service was (re)started." ;;
+    esac
+}
+
 configure_firewall() {
     command -v ufw >/dev/null 2>&1 || return 0
     if ufw status | grep -q "Status: active"; then
@@ -628,10 +651,15 @@ install_management_command() {
     install -m 0755 "${INSTALL_DIR}/scripts/centralpay" "$MANAGEMENT_BIN"
     # Deployment scripts get explicit safe modes: a plain git clone does not
     # guarantee the executable bit, and a non-executable backup.sh broke the
-    # systemd backup timer with "Permission denied" on real hosts.
-    chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay"
+    # systemd backup timer with "Permission denied" on real hosts. (Both
+    # scripts/centralpay and render-caddy-config.sh are still invoked via
+    # `bash <path>` at their call sites regardless, which does not itself
+    # require the executable bit -- this chmod is defense in depth for any
+    # future direct-invocation use.)
+    chown root:root "${INSTALL_DIR}/scripts/backup.sh" "${INSTALL_DIR}/scripts/centralpay" \
+        "${INSTALL_DIR}/scripts/render-caddy-config.sh"
     chmod 0750 "${INSTALL_DIR}/scripts/backup.sh"
-    chmod 0755 "${INSTALL_DIR}/scripts/centralpay"
+    chmod 0755 "${INSTALL_DIR}/scripts/centralpay" "${INSTALL_DIR}/scripts/render-caddy-config.sh"
     log "Installed management command: ${MANAGEMENT_BIN}"
 }
 
@@ -796,6 +824,17 @@ main() {
     if [[ "$KEEP_EXISTING" == "true" ]]; then
         log "Reusing configuration from ${ENV_FILE}."
         PAYMENT_DOMAIN=$(grep -E '^PUBLIC_BASE_URL=' "$ENV_FILE" | cut -d= -f2- | sed -E 's#^https?://##')
+        # Recovered here (not only from an existing Caddyfile) so a rerun
+        # stays safe even if a PRIOR attempt failed before ever writing one
+        # (e.g. Caddy config validation failed partway through a fresh
+        # install) -- without this, sync_caddy_config's fallback extraction
+        # has neither an env value nor an existing file to read from, and
+        # the default "keep existing configuration" rerun would fail the
+        # same way forever. Empty on a pre-existing install from before this
+        # variable was persisted; sync_caddy_config's Caddyfile-extraction
+        # fallback (which such a host always has, from its actual working
+        # Caddyfile) still covers that case.
+        TLS_EMAIL=$(grep -E '^TLS_EMAIL=' "$ENV_FILE" | cut -d= -f2- || true)
         # print_summary reports the inbound API key; on a "keep existing"
         # rerun load_or_generate_secrets is skipped, so read it from the env
         # file here. Without this the final summary expands an unset variable
@@ -821,11 +860,54 @@ main() {
         load_or_generate_secrets
         write_configuration
     fi
+    sync_caddy_config
 
     configure_firewall
     install_management_command
     install_backup_timer
+
+    # Activate an already-running caddy container's refreshed config HERE,
+    # before deploy_stack, independent of whether deploy_stack succeeds.
+    # This candidate was already validated against the real caddy:2 image
+    # and backed up before being written to disk (sync_caddy_config, above)
+    # -- its safety does not depend on the app images building or passing
+    # health checks. Gating activation on deploy_stack's success left a real
+    # gap: a build/migration/health-check failure after this point would
+    # leave the more-secure config written to disk but never activated, and
+    # install.sh has no separate rollback command that could have closed
+    # that gap either -- only a full rerun, which would leave the config
+    # stranded, written-but-inactive, until the operator happened to retry.
+    # A genuinely FRESH install has no caddy container yet to restart --
+    # CADDY_EXISTING_CONTAINER stays empty, deploy_stack's own `up -d --wait`
+    # below creates caddy directly from the already-correct on-disk file,
+    # and only the durable confirmation (not a restart) is needed after that.
+    CADDY_EXISTING_CONTAINER=""
+    if [[ "$CADDY_CONFIG_CHANGED" == "true" ]]; then
+        CADDY_EXISTING_CONTAINER=$(docker compose --project-directory "$INSTALL_DIR" ps -q caddy 2>/dev/null || true)
+        if [[ -n "$CADDY_EXISTING_CONTAINER" ]]; then
+            log "Restarting Caddy to activate the refreshed configuration..."
+            docker compose --project-directory "$INSTALL_DIR" restart caddy
+            # Durably records that Caddy has actually been restarted with
+            # this exact content -- without this, a crash/interrupt right
+            # here would leave a future rerun seeing unchanged file content
+            # and wrongly reporting "already up to date" while Caddy still
+            # serves the OLD configuration.
+            bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+                || fail "Caddy restarted, but recording activation failed. Rerun the installer to retry."
+        fi
+    fi
+
     deploy_stack
+
+    if [[ "$CADDY_CONFIG_CHANGED" == "true" && -z "$CADDY_EXISTING_CONTAINER" ]]; then
+        # The brand-new caddy container deploy_stack just started already
+        # has the correct, just-written file (bind-mounted, read at
+        # container start) -- no restart needed, only the durable
+        # confirmation, now that the container is actually confirmed up.
+        bash "${INSTALL_DIR}/scripts/render-caddy-config.sh" --confirm-active \
+            || fail "Caddy started, but recording activation failed. Rerun the installer to retry."
+    fi
+
     ensure_initial_fee_policy
     verify_deployment
     print_summary

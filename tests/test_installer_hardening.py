@@ -176,3 +176,78 @@ def test_keep_existing_rerun_loads_inbound_api_key_from_env_file():
     keep_block = source[source.index('if [[ "$KEEP_EXISTING" == "true" ]]'):]
     keep_block = keep_block[: keep_block.index("else")]
     assert "INBOUND_API_KEY=$(grep" in keep_block
+
+
+# --- 3. keep-existing rerun recovers TLS_EMAIL for the Caddy config sync ------
+#
+# Regression: a "keep existing configuration" rerun's sync_caddy_config call
+# must be able to resolve TLS_EMAIL even when NO Caddyfile exists yet (a
+# prior fresh-install attempt that failed partway through the Caddy sync
+# step, before ever creating one). Without persisting TLS_EMAIL somewhere
+# durable, the default ("keep existing configuration") rerun would fail the
+# exact same way forever, since render-caddy-config.sh's only fallback is
+# extracting from an existing Caddyfile that was never written.
+
+
+def test_centralpay_env_template_has_a_tls_email_placeholder():
+    template_text = (PROJECT_ROOT / "deploy" / "centralpay.env.template").read_text()
+    assert "{{TLS_EMAIL}}" in template_text
+
+
+def test_write_configuration_persists_tls_email_in_env_file(tmp_path):
+    """A fresh install (write_configuration) must render TLS_EMAIL into
+    centralpay.env, not only into the Caddyfile -- durable, independent of
+    whether a Caddyfile ever gets successfully created."""
+    template = PROJECT_ROOT / "deploy" / "centralpay.env.template"
+    out = tmp_path / "centralpay.env"
+    result = _render(template, out, _RENDER_REQUIRED)
+    assert result.returncode == 0, result.stderr
+    assert "TLS_EMAIL=ops@example.com" in out.read_text()
+
+
+def test_keep_existing_rerun_recovers_tls_email_from_env_file():
+    """Fix guard: main()'s keep-existing branch must reload TLS_EMAIL from
+    the env file, mirroring the existing PAYMENT_DOMAIN/INBOUND_API_KEY
+    recovery, so sync_caddy_config never gets an empty value."""
+    source = INSTALLER.read_text()
+    keep_block = source[source.index('if [[ "$KEEP_EXISTING" == "true" ]]'):]
+    keep_block = keep_block[: keep_block.index("else")]
+    assert "TLS_EMAIL=$(grep" in keep_block
+
+
+def test_tls_email_extraction_snippet_recovers_the_persisted_value(tmp_path):
+    """The exact grep/cut snippet main() uses, exercised functionally
+    against a synthetic env file (not just a source-text check)."""
+    env_file = tmp_path / "centralpay.env"
+    env_file.write_text(
+        "PUBLIC_BASE_URL=https://pay.example.com\nTLS_EMAIL=recovered@example.com\n"
+    )
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            'ENV_FILE="$1"; '
+            "TLS_EMAIL=$(grep -E '^TLS_EMAIL=' \"$ENV_FILE\" | cut -d= -f2- || true); "
+            'printf "%s" "$TLS_EMAIL"',
+            "_", str(env_file),
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "recovered@example.com"
+
+
+def test_tls_email_extraction_snippet_is_empty_for_a_legacy_env_file_without_it():
+    """A pre-existing install from before this fix has no TLS_EMAIL line at
+    all -- the extraction must resolve to empty (not error under `set -u`),
+    letting sync_caddy_config's Caddyfile-extraction fallback take over,
+    which such a host always has a real, working Caddyfile for."""
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            'set -u; TLS_EMAIL=$(grep -E "^TLS_EMAIL=" /dev/null | cut -d= -f2- || true); '
+            'echo "[$TLS_EMAIL]"',
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"

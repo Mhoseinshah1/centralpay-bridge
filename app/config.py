@@ -552,6 +552,17 @@ class Settings(BaseSettings):
     monitor_bot_failure_warning_count: int = Field(default=3, gt=0)
     monitor_bot_failure_critical_count: int = Field(default=10, gt=0)
 
+    # How long a payment that just exhausted its reconciliation attempts
+    # keeps the "reconciliation" monitor check CRITICAL. Bounds the signal
+    # to "a recent, actionable exhaustion event" instead of "any payment in
+    # this database's entire history that ever exhausted retries" — an old
+    # backlog from months ago that has long since aged out must eventually
+    # stop making an otherwise-healthy system report critical forever. Does
+    # NOT affect app.services.reconciliation_status's
+    # QueueHealth.exhausted_not_aged_out (still-within-lifetime exhaustion),
+    # which always alarms regardless of this window.
+    monitor_reconciliation_exhausted_recent_window_seconds: int = Field(default=86400, gt=0)
+
     # Public readiness check: hits {public_base_url}/health/ready over the
     # real internet (proving external reachability), never an internal URL.
     monitor_public_ready_connect_timeout_seconds: float = Field(default=5.0, gt=0)

@@ -302,22 +302,48 @@ def check_reconciliation(db: Session, settings: Settings, *, now: datetime) -> C
     reconciliation_retry_scheduled activity (a payer simply hasn't paid
     yet) is never itself an incident — it never appears here. Worker
     liveness is reported by the separate worker_heartbeat:reconciliation-
-    worker check, not duplicated here."""
+    worker check, not duplicated here.
+
+    Exhaustion answers "is reconciliation unhealthy now, or has there been
+    a recent unresolved operational exhaustion event" — never "has any
+    payment in this database's history ever exhausted retries". A historical
+    backlog of long-aged-out, long-untouched exhausted payments must not
+    keep an otherwise-healthy system permanently critical; see
+    ReconciliationStatusSnapshot.queue.exhausted_actionable_total /
+    exhausted_recent / exhausted_not_aged_out / exhausted_historical_total
+    below."""
     if not settings.reconciliation_enabled:
         return CheckResult("reconciliation", STATUS_OK, "disabled", {"enabled": False})
     snapshot = build_reconciliation_status_snapshot(db, settings, now_fn=lambda: now)
-    # INCLUDING already-aged-out rows -- unlike the operator-facing
-    # exhausted_not_aged_out bucket, this must never drop a payment reconciliation
-    # already gave up on just because more time also passed and it crossed
-    # the age boundary too; otherwise the incident would falsely "resolve"
-    # for a payment that got MORE stuck, not less.
-    exhausted = snapshot.queue.exhausted_including_aged_out
+    # exhausted_actionable_total is the single authoritative "does this
+    # alarm" count, bounded to "current/actionable" and never the unbounded
+    # all-time historical total. It is the EXACT union (each row counted
+    # once) of two populations that are NOT nested whenever the recent
+    # window is shorter than the reconciliation lifetime -- summing or
+    # max()-ing them separately can double-count or undercount; see
+    # reconciliation.reconciliation_actionable_exhausted_conditions:
+    #   * exhausted_not_aged_out -- still within the reconciliation lifetime
+    #     (age < max_age), so inherently bounded to at most max_age_seconds
+    #     old; always alarms regardless of how recently it happened.
+    #   * exhausted_recent -- aged-out-inclusive (a payment reconciliation
+    #     already gave up on must never falsely "resolve" just because more
+    #     time also passed and it crossed the age boundary too -- that made
+    #     it MORE stuck, not less) but bounded to a recent operational
+    #     window (monitor_reconciliation_exhausted_recent_window_seconds),
+    #     so an old backlog whose last attempt was long ago eventually stops
+    #     keeping an otherwise-healthy system permanently critical.
+    # exhausted_historical_total (unbounded, all-time) is reported
+    # separately for operator context only and never drives severity here.
+    exhausted_actionable = snapshot.queue.exhausted_actionable_total
     oldest_overdue = snapshot.queue.oldest_overdue_seconds
     details = {
-        "exhausted": exhausted,
+        "exhausted_not_aged_out": snapshot.queue.exhausted_not_aged_out,
+        "exhausted_recent": snapshot.queue.exhausted_recent,
+        "exhausted_actionable_total": exhausted_actionable,
+        "exhausted_historical_total": snapshot.queue.exhausted_historical_total,
         "oldest_overdue_seconds": _round_or_none(oldest_overdue),
     }
-    if exhausted > 0:
+    if exhausted_actionable > 0:
         return CheckResult(
             "reconciliation", STATUS_CRITICAL, "reconciliation_exhausted", details
         )

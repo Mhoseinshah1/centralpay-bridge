@@ -356,6 +356,79 @@ def reconciliation_exhausted_ever_conditions(
     )
 
 
+def reconciliation_recently_exhausted_conditions(
+    settings: Settings, *, now: datetime, window_seconds: int
+) -> tuple[Any, ...]:
+    """Same population as :func:`reconciliation_exhausted_ever_conditions`
+    (attempts-exhausted, aged-out-inclusive), further bounded to rows whose
+    LAST reconciliation attempt is within the trailing ``window_seconds``.
+
+    ``reconciliation_last_at`` is set in the SAME claim transaction that
+    increments ``reconciliation_attempts`` (see ``_claim_in_age_range``) and
+    is never touched again once a payment is excluded from every further
+    claim by attempt exhaustion -- so for a genuinely exhausted row it is
+    frozen at exactly the moment reconciliation gave up, making it a free,
+    already-persisted "exhausted_at" timestamp with no new column needed.
+
+    A NULL ``reconciliation_last_at`` never happens on a row that actually
+    reached the exhaustion threshold through the real claim path (attempts
+    and this field are always written together), but a directly-constructed
+    row (tests, or a future data-repair script) could still have it unset.
+    That case is treated as RECENT, not excluded: an unknown attempt time
+    must never let a genuinely current incident silently drop out of this
+    bucket in the operator's favor.
+
+    This is the population :func:`app.services.monitor_checks.
+    check_reconciliation` alarms on for aged-out-inclusive exhaustion.
+    :func:`reconciliation_exhausted_ever_conditions` itself remains an
+    unbounded HISTORICAL total shown for operator context only -- an old
+    backlog of payments that stopped retrying long ago and have long since
+    aged out must not keep the monitor permanently critical once the system
+    is otherwise healthy.
+    """
+    cutoff = now - timedelta(seconds=window_seconds)
+    return (
+        *reconciliation_exhausted_ever_conditions(settings, now=now),
+        or_(
+            Payment.reconciliation_last_at.is_(None),
+            Payment.reconciliation_last_at >= cutoff,
+        ),
+    )
+
+
+def reconciliation_actionable_exhausted_conditions(
+    settings: Settings, *, now: datetime, window_seconds: int
+) -> tuple[Any, ...]:
+    """The EXACT logical union of :func:`reconciliation_exhausted_conditions`
+    (not aged out) and :func:`reconciliation_recently_exhausted_conditions`
+    (aged-out-inclusive, within ``window_seconds``) -- i.e. every row that
+    makes :func:`app.services.monitor_checks.check_reconciliation` alarm,
+    counted exactly once each.
+
+    Those two populations are NOT nested (neither is a subset of the
+    other) whenever ``window_seconds`` is shorter than
+    ``reconciliation_max_age_seconds``: a still-within-lifetime row can have
+    a last attempt older than the window, and a SEPARATE already-aged-out
+    row can have a last attempt inside it. Reporting them as two counts and
+    combining with ``max()`` -- an operator-facing summary briefly did this
+    -- UNDERCOUNTS in exactly that case: two distinct actionable rows collapse
+    to ``max(1, 1) == 1``. A single query over the real union has no such
+    blind spot, since it is built directly from the same base population
+    both narrower queries share (:func:`reconciliation_exhausted_ever_conditions`)
+    with an OR across their two distinguishing predicates, so it can never
+    diverge from what the severity check actually alarms on.
+    """
+    cutoff = now - timedelta(seconds=window_seconds)
+    return (
+        *reconciliation_exhausted_ever_conditions(settings, now=now),
+        or_(
+            not_(aged_out_age_condition(settings, now=now)),
+            Payment.reconciliation_last_at.is_(None),
+            Payment.reconciliation_last_at >= cutoff,
+        ),
+    )
+
+
 def _claim_in_age_range(
     db: Session,
     settings: Settings,

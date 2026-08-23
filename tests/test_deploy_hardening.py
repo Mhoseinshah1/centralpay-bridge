@@ -200,13 +200,30 @@ NEW_WRAPPER = (
 )
 
 
-def _commit_deploy(repo: Path, *, wrapper_content: str, marker: str) -> str:
+def _commit_deploy(
+    repo: Path, *, wrapper_content: str, marker: str, caddy_sync_rc: int = 0
+) -> str:
     (repo / "docker-compose.yml").write_text("services: {}\n")
     scripts_dir = repo / "scripts"
     scripts_dir.mkdir(exist_ok=True)
     backup = scripts_dir / "backup.sh"
     backup.write_text("#!/usr/bin/env bash\nexit 0\n")
     backup.chmod(0o755)
+    # These tests exercise wrapper self-replacement / rollback plumbing, not
+    # the Caddy config sync itself (see test_caddy_config_upgrade.py for
+    # that) -- a stub reporting a fixed exit code (0 "already up to date" by
+    # default; 2 "changed" for the activation-gating tests below) keeps them
+    # focused on their own concern without a real Docker daemon.
+    caddy_sync = scripts_dir / "render-caddy-config.sh"
+    caddy_sync.write_text(
+        "#!/usr/bin/env bash\n"
+        # Mirrors the real script's two invocation modes: `--confirm-active`
+        # (called after a restart) always succeeds here; a bare call reports
+        # the scripted exit code.
+        'if [[ "${1:-}" == "--confirm-active" ]]; then exit 0; fi\n'
+        f"exit {caddy_sync_rc}\n"
+    )
+    caddy_sync.chmod(0o755)
     wrapper = scripts_dir / "centralpay"
     wrapper.write_text(wrapper_content)
     wrapper.chmod(0o755)
@@ -216,12 +233,16 @@ def _commit_deploy(repo: Path, *, wrapper_content: str, marker: str) -> str:
     return git("rev-parse", "HEAD", cwd=repo)
 
 
-def _write_docker_stub(bindir: Path, *, call_log: Path, fail_compose_up: bool) -> None:
+def _write_docker_stub(
+    bindir: Path, *, call_log: Path, fail_compose_up: bool, fail_caddy_restart: bool = False
+) -> None:
     fail_snippet = (
         'if [[ "$*" == *"up"* && "$*" == *"--wait"* ]]; then exit 1; fi\n'
         if fail_compose_up
         else ""
     )
+    if fail_caddy_restart:
+        fail_snippet += 'if [[ "$*" == *"restart"* && "$*" == *"caddy"* ]]; then exit 1; fi\n'
     (bindir / "docker").write_text(
         "#!/usr/bin/env bash\n"
         f"printf '%s\\n' \"$*\" >> {shlex.quote(str(call_log))}\n" + fail_snippet + "exit 0\n"
@@ -271,9 +292,16 @@ def deploy_sandbox(tmp_path):
     }
 
 
-def _env_for(sandbox, *, fail_compose_up: bool = False) -> dict[str, str]:
+def _env_for(
+    sandbox, *, fail_compose_up: bool = False, fail_caddy_restart: bool = False
+) -> dict[str, str]:
     call_log = sandbox["bindir"] / "docker_calls.log"
-    _write_docker_stub(sandbox["bindir"], call_log=call_log, fail_compose_up=fail_compose_up)
+    _write_docker_stub(
+        sandbox["bindir"],
+        call_log=call_log,
+        fail_compose_up=fail_compose_up,
+        fail_caddy_restart=fail_caddy_restart,
+    )
     return {
         "PATH": f"{sandbox['bindir']}:/usr/bin:/bin:/usr/sbin:/sbin",
         "CENTRALPAY_INSTALL_DIR": str(sandbox["install"]),
@@ -397,6 +425,47 @@ def test_update_self_replaces_the_running_wrapper_without_breaking_it(deploy_san
     assert result.returncode == 0, result.stderr
     assert "SELF_UPDATE_SURVIVED" in result.stdout
     assert management_bin.read_text() == NEW_WRAPPER
+
+
+# --- 4. `status`/`diagnose` report UNRESOLVED manual reviews, not a raw
+#    historical status count (production incident: `centralpay status` and
+#    `centralpay diagnose` showed 53 while `centralpay review list` and the
+#    monitor both agreed on 0 -- a resolved payment keeps status=
+#    'manual_review' permanently as history; see review_resolved_at) -------
+
+
+def test_cmd_status_manual_review_query_excludes_resolved_rows():
+    body = CLI.read_text()
+    body = body[body.index("cmd_status()") : body.index("cmd_status()") + 4000]
+    line = next(ln for ln in body.splitlines() if "manual review" in ln.lower())
+    assert "status='manual_review'" in line
+    assert "review_resolved_at IS NULL" in line
+    assert "unresolved" in line.lower()
+
+
+def test_cmd_diagnose_manual_review_query_excludes_resolved_rows():
+    source = CLI.read_text()
+    body = source[source.index("cmd_diagnose()") :]
+    body = body[: body.index("\n}\n")]
+    line = next(ln for ln in body.splitlines() if "manual review" in ln.lower())
+    assert "status='manual_review'" in line
+    assert "review_resolved_at IS NULL" in line
+    assert "unresolved" in line.lower()
+
+
+def test_cmd_status_and_diagnose_manual_review_query_matches_count_open_manual_reviews():
+    """The shell SQL must express the exact same "open" predicate as
+    app.adminbot.queries._open_manual_review_conditions (status=
+    'manual_review' AND review_resolved_at IS NULL) -- the two must never
+    quietly disagree about what counts as unresolved."""
+    source = CLI.read_text()
+    queries_source = (PROJECT_ROOT / "app" / "adminbot" / "queries.py").read_text()
+    assert 'Payment.status == "manual_review"' in queries_source
+    assert "Payment.review_resolved_at.is_(None)" in queries_source
+    for fn in ("cmd_status()", "cmd_diagnose()"):
+        body = source[source.index(fn) :]
+        body = body[: body.index("\n}\n")]
+        assert "status='manual_review' AND review_resolved_at IS NULL" in body, fn
 
 
 def _init_install_with_source(tmp_path: Path, *, source_content: str, source_mode: int) -> Path:
@@ -534,3 +603,82 @@ def test_update_and_rollback_acquire_the_deploy_lock():
         body = source[source.index(fn) :]
         body = body[: body.index("\n}\n")]
         assert "acquire_deploy_lock" in body, f"{fn} must acquire the deploy lock"
+
+
+# --- 5. Caddy config sync activation gating (Issue 2) ------------------------
+#
+# render-caddy-config.sh's own behavioral tests live in
+# test_caddy_config_upgrade.py; these prove perform_update's INTEGRATION
+# with it end-to-end (real git checkout, real perform_update execution),
+# using a scripted stub for render-caddy-config.sh itself so no real Docker
+# daemon is required here either.
+
+
+def test_update_restarts_caddy_when_config_reports_changed(deploy_sandbox):
+    _commit_deploy(
+        deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B", caddy_sync_rc=2
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
+
+    result = cli_call("perform_update", _env_for(deploy_sandbox))
+    assert result.returncode == 0, result.stderr
+
+    call_log = deploy_sandbox["bindir"] / "docker_calls.log"
+    calls = call_log.read_text().splitlines() if call_log.exists() else []
+    # Token-based match, not substring: pytest's own tmp_path embeds this
+    # test's NAME (which itself contains "restart") into every path
+    # argument logged here, so a naive substring check on the whole line
+    # would false-positive/false-negative on that coincidence.
+    assert any("restart" in c.split() and "caddy" in c.split() for c in calls), calls
+
+
+def test_update_does_not_restart_caddy_when_config_unchanged(deploy_sandbox):
+    _commit_deploy(
+        deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B", caddy_sync_rc=0
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
+
+    result = cli_call("perform_update", _env_for(deploy_sandbox))
+    assert result.returncode == 0, result.stderr
+
+    call_log = deploy_sandbox["bindir"] / "docker_calls.log"
+    calls = call_log.read_text().splitlines() if call_log.exists() else []
+    assert not any("restart" in c.split() and "caddy" in c.split() for c in calls), calls
+
+
+def test_update_aborts_before_build_when_caddy_sync_fails(deploy_sandbox):
+    """A fatal Caddy-config sync (exit 1, e.g. failed validation) must abort
+    the whole update BEFORE compose build/migrate/restart -- never a
+    half-applied update, and the installed wrapper must stay unchanged."""
+    _commit_deploy(
+        deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B", caddy_sync_rc=1
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
+
+    result = cli_call("perform_update", _env_for(deploy_sandbox))
+    assert result.returncode != 0
+    assert "Managed Caddy configuration could not be safely synced" in result.stderr
+
+    call_log = deploy_sandbox["bindir"] / "docker_calls.log"
+    calls = call_log.read_text().splitlines() if call_log.exists() else []
+    assert not any("build" in c for c in calls), calls
+    assert not any(("up" in c and "--wait" in c) for c in calls), calls
+    # The installed wrapper is still the OLD one -- never synced on a
+    # failed update.
+    assert deploy_sandbox["management_bin"].read_text() == OLD_WRAPPER
+
+
+def test_update_fails_when_caddy_restart_itself_fails(deploy_sandbox):
+    """Activation failure handling: if restarting caddy to pick up the new
+    config fails, the update must not report success (never silently
+    leave a security-relevant config change unapplied while claiming the
+    update completed)."""
+    _commit_deploy(
+        deploy_sandbox["work"], wrapper_content=NEW_WRAPPER, marker="B", caddy_sync_rc=2
+    )
+    git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=deploy_sandbox["work"])
+
+    result = cli_call(
+        "perform_update", _env_for(deploy_sandbox, fail_caddy_restart=True)
+    )
+    assert result.returncode != 0
