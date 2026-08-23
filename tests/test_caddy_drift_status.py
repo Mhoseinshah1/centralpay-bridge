@@ -53,12 +53,29 @@ def _install_dir(tmp_path) -> Path:
     return install
 
 
+def _root_bindir(tmp_path) -> Path:
+    # A fake `id` reporting uid 0, so these tests exercise the actual
+    # --check path deterministically regardless of the real user the test
+    # process happens to run as (root in a local sandbox, but a regular
+    # unprivileged user on GitHub-hosted CI runners) -- the non-root
+    # degradation path itself is covered separately and explicitly by
+    # test_non_root_gets_a_calm_message_instead_of_a_false_alarm below.
+    bindir = tmp_path / "root_id_bin"
+    bindir.mkdir(exist_ok=True)
+    fake_id = bindir / "id"
+    fake_id.write_text("#!/usr/bin/env bash\n[[ \"$1\" == '-u' ]] && echo 0 || exit 1\n")
+    fake_id.chmod(0o755)
+    return bindir
+
+
 def _call_status_line(tmp_path, install: Path, config: Path) -> subprocess.CompletedProcess[str]:
-    # No docker on PATH at all -- proves the status line never shells out
-    # to it (a real drift-detecting docker validate would fail loudly here
-    # if it were ever reached).
+    # No real docker on PATH -- proves the status line never shells out to
+    # it (a real drift-detecting docker validate would fail loudly here if
+    # it were ever reached). `id` is faked to report root so --check
+    # actually runs, deterministically, on any test runner.
+    root_bin = _root_bindir(tmp_path)
     env = {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": f"{root_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
         "CENTRALPAY_CLI_SOURCE_ONLY": "1",
         "CENTRALPAY_INSTALL_DIR": str(install),
         "CENTRALPAY_CONFIG_DIR": str(config),

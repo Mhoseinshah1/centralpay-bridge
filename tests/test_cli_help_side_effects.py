@@ -219,14 +219,29 @@ def test_opaque_order_id_equal_to_help_flag_is_reachable_via_separator(
     """End-to-end: `centralpay review show -- --help` must reach the real
     command path (never the usage banner), with "--help" passed through
     positionally as the order ID -- proving the fix actually restores
-    reachability, not just that wants_help's own return value changed."""
+    reachability, not just that wants_help's own return value changed.
+
+    `cmd_review` requires root (require_root) before it ever reaches
+    `compose`/`docker` -- a fake `id` reporting uid 0 makes this
+    deterministic regardless of the real user the test process happens to
+    run as (root in a local sandbox, but a regular unprivileged user on
+    GitHub-hosted CI runners)."""
     install_dir = tmp_path / "install"
     install_dir.mkdir()
     (install_dir / "docker-compose.yml").write_text("services: {}\n")
+    fake_bin, _log_file = fake_dangerous_path
+    root_bin = tmp_path / "root_id_bin"
+    root_bin.mkdir()
+    fake_id = root_bin / "id"
+    fake_id.write_text("#!/usr/bin/env bash\n[[ \"$1\" == '-u' ]] && echo 0 || exit 1\n")
+    fake_id.chmod(0o755)
     result, invocations = _run(
         ["review", "show", "--", "--help"],
         fake_dangerous_path,
-        extra_env={"CENTRALPAY_INSTALL_DIR": str(install_dir)},
+        extra_env={
+            "CENTRALPAY_INSTALL_DIR": str(install_dir),
+            "PATH": f"{root_bin}:{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin",
+        },
     )
     assert "Usage: centralpay COMMAND" not in result.stdout
     # Reached the real command path: `compose` shells out to `docker`,
