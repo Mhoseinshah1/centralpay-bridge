@@ -3,7 +3,7 @@
 <div dir="rtl">
 
 CentralPay Bridge یک پل پرداخت بین «درگاه سفارشی» ربات فروش و CentralPay است.
-نسخهٔ فعلی برنامه **0.6.0-rc2** و head فعلی Alembic در این شاخه **0012** است.
+نسخهٔ فعلی برنامه **0.6.0-rc3** و head فعلی Alembic در این شاخه **0012** است.
 
 اولویت‌های پروژه به‌ترتیب: **صحت مالی، امنیت، پایداری، قابلیت بازیابی، مشاهده‌پذیری، سپس دسترس‌پذیری**. هرجا سامانه نتواند با اطمینان مالی تصمیم بگیرد، به‌جای حدس‌زدن fail-closed می‌کند یا پرداخت را به `manual_review` می‌برد.
 
@@ -199,7 +199,7 @@ centralpay rollback
 
 ## سیاست update در production
 
-در production، `CENTRALPAY_UPDATE_REF` باید به‌طور عادی release tag معتبر مثل `v0.6.0-rc2` اشاره کند.
+در production، `CENTRALPAY_UPDATE_REF` باید به‌طور عادی release tag معتبر مثل `v0.6.0-rc3` اشاره کند.
 
 برای release tag، updater این موارد را بررسی می‌کند:
 
@@ -272,6 +272,6 @@ centralpay monitor incidents         # incidentهای باز فعلی
 
 ## وضعیت نسخه
 
-`0.6.0-rc2` هنوز pre-release است. برای تصمیم انتشار/استقرار به source فعلی، CI، `RELEASE_RISK_REGISTER.md` و چک‌لیست عملیاتی فعلی مراجعه کنید؛ نه به یک audit قدیمی.
+`0.6.0-rc3` هنوز pre-release است. برای تصمیم انتشار/استقرار به source فعلی، CI، `RELEASE_RISK_REGISTER.md` و چک‌لیست عملیاتی فعلی مراجعه کنید؛ نه به یک audit قدیمی.
 
 </div>

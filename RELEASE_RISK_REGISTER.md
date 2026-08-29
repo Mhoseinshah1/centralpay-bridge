@@ -689,3 +689,58 @@ deadlock/lock-ordering cycles (none found).
   `0.6.0-rc1` release decision above.
 - No production access, no deployment, and no real CentralPay/Telegram
   call were performed to prepare this version bump.
+
+## Topic 51 — v0.6.0-rc2's first real release.yml run: two pre-existing defects found, fixed on main, rc3 prepared
+
+### 51. `v0.6.0-rc2` tagged; its first real tag-triggered release run failed on two unrelated, pre-existing defects — **FIXED on main; rc2 tag preserved as evidence; rc3 prepared**
+- `v0.6.0-rc2` was tagged at `6e3f33636e7f059086444ee03ec46e38b78c1ded`.
+  Its `release.yml` run (id `33252207603`) was the first real execution
+  of that workflow ever — B5 had been open precisely because no
+  tag-triggered run had happened yet. It found:
+  1. **Documentation checks / Local links resolve (lychee)**: 15
+     table-of-contents anchors in the legacy Persian handbook
+     (`docs/راهنمای_جامع_کاربری_CentralPay_Bridge_FA.md`) linked to
+     headings containing zero-width non-joiners (ZWNJ, U+200C) copied
+     verbatim into the anchor; the actual heading-slug algorithm the
+     link checker uses drops ZWNJ rather than preserving it, so none
+     of those 15 anchors resolved. Root-caused by downloading the
+     exact `lychee v0.24.2` binary the workflow pulls and reproducing
+     the failure locally byte-for-byte, then empirically deriving the
+     real slug algorithm (ZWNJ deleted; Unicode combining marks kept)
+     and regenerating the 15 anchors from it. The other 24 links in
+     the file were already correct and untouched.
+  2. **Docker build, scan, and SBOM / Trivy vulnerability scan**: the
+     scan's `docker run` image reference, `aquasecurity/trivy:0.58.0`,
+     is not a real Docker Hub repository — Aqua Security's Docker Hub
+     namespace is `aquasec`, not `aquasecurity` (that longer name is
+     only the GHCR/GitHub org). Confirmed directly against the Docker
+     Hub v2 registry API (manifest request for `aquasec/trivy:0.58.0`
+     → 200; same request for `aquasecurity/trivy:0.58.0` → 401).
+     `--exit-code 1` / `--severity CRITICAL,HIGH` / `--ignore-unfixed`
+     are unchanged.
+- Because `package` (which drafts the release) `needs: [docs, ...]`,
+  no draft release was ever created for `v0.6.0-rc2` — `docs` failing
+  meant `package` was skipped entirely.
+- Both fixes landed on `main` via PR #82, validated (targeted +
+  full-suite pytest against real PostgreSQL 16, ruff, mypy, shellcheck,
+  both docker-compose profiles, and an independent full local `lychee`
+  run against `**/*.md`: 0 errors) and merged.
+- **`v0.6.0-rc2` was not deleted, moved, or reused.** It remains
+  tagged at the same commit as a preserved historical record of a
+  release-candidate attempt whose *pipeline* (not its application
+  behavior) failed validation; `RELEASE_NOTES_0.6.0_RC2.md` and its
+  `CHANGELOG.md` entry are unchanged. `app/version.py`/`pyproject.toml`
+  were then bumped to `0.6.0-rc3` (same pattern as topic 50) and
+  `RELEASE_NOTES_0.6.0_RC3.md` prepared, describing rc3 as the
+  fixed-pipeline supersession of the rc2 attempt with no application
+  or payment behavior change from rc2.
+- **This does not close, reopen, or change B1/B2/B3.** B5 is
+  **partially addressed but still open**: the two concrete defects
+  rc2's real run found are fixed on `main`, but B5 requires an actual
+  green tag-triggered run, which has not yet happened for any tag —
+  `v0.6.0-rc3` has not been tagged as of this entry. `v0.6.0-rc3` must
+  not be tagged, published, or used for real payments until B1, B2,
+  B3, and a fresh green B5 run are closed and a human approval is
+  recorded.
+- No production access, no deployment, and no real CentralPay/Telegram
+  call occurred while diagnosing or fixing either defect.

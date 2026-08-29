@@ -2,6 +2,38 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
+## [0.6.0-rc3] — 2026-08-29 (release candidate — NOT production-ready)
+
+**Supersedes the `v0.6.0-rc2` tag, whose first real `release.yml` run
+(the first ever real execution of that workflow) failed on two
+pre-existing, unrelated defects: 15 table-of-contents links in the
+legacy Persian handbook pointed at headings containing zero-width
+non-joiners that the link checker's slug algorithm drops rather than
+preserves, and the Trivy scan step's image reference used the wrong
+Docker Hub namespace (`aquasecurity/trivy` instead of `aquasec/trivy`).
+Both are fixed here. The `v0.6.0-rc2` tag itself was not deleted, moved,
+or reused — it remains as historical evidence of that failed attempt;
+`RELEASE_NOTES_0.6.0_RC2.md` is unchanged.** Same known release
+blockers remain open in `RELEASE_RISK_REGISTER.md`, including B2 (the
+real CentralPay contract has still not been observed end-to-end
+against the real/sandbox gateway) and B5 (a green tag-triggered
+release-workflow run for this exact commit — rc2's run found the two
+defects above; rc3 needs its own fresh green run). This version must
+not be used for real payments until they are closed. Release notes:
+`RELEASE_NOTES_0.6.0_RC3.md`. Creating this release does not deploy it
+to production or upgrade any running instance.
+
+### Fixed (release pipeline only — no application/payment behavior change from rc2)
+- Regenerated the 15 broken table-of-contents anchors in the legacy
+  Persian handbook from their headings' actual slugs (ZWNJ deleted,
+  Unicode combining marks kept) instead of copying the ZWNJ character
+  verbatim; verified against the exact `lychee` binary the release
+  workflow downloads.
+- Corrected the release workflow's Trivy scan image reference from the
+  nonexistent `aquasecurity/trivy` to the real Docker Hub namespace
+  `aquasec/trivy`; scan flags (`--exit-code 1`, `--severity
+  CRITICAL,HIGH`, `--ignore-unfixed`) are unchanged.
+
 ## [0.6.0-rc2] — 2026-08-29 (release candidate — NOT production-ready)
 
 **Known release blockers remain open in `RELEASE_RISK_REGISTER.md`,

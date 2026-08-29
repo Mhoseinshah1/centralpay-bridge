@@ -1043,6 +1043,7 @@ _DOCS_WITH_COMMANDS = (
     "REAL_HOST_VALIDATION.md", "STAGING_VALIDATION.md",
     "PRODUCTION_CHECKLIST_FA.md", "MIGRATION_GUIDE.md",
     "RELEASE_NOTES_0.6.0_RC1.md", "RELEASE_NOTES_0.6.0_RC2.md",
+    "RELEASE_NOTES_0.6.0_RC3.md",
 )
 
 
@@ -1229,16 +1230,16 @@ def _resolved_notes_filename(app_version: str) -> str:
     return result.stdout.strip()
 
 
-def test_resolve_release_notes_maps_current_app_version_to_rc2():
+def test_resolve_release_notes_maps_current_app_version_to_rc3():
     """APP_VERSION drives which release-notes file the release workflow
     requires and publishes -- prove the live mapping, not just the
     filename convention. First tag-gate run for rc2 would otherwise have
     silently drafted the release using rc1's notes."""
     from app.version import APP_VERSION
 
-    assert APP_VERSION == "0.6.0-rc2"
+    assert APP_VERSION == "0.6.0-rc3"
     filename = _resolved_notes_filename(APP_VERSION)
-    assert filename == "RELEASE_NOTES_0.6.0_RC2.md"
+    assert filename == "RELEASE_NOTES_0.6.0_RC3.md"
     assert (PROJECT_ROOT / filename).is_file()
 
 
@@ -1251,6 +1252,20 @@ def test_resolve_release_notes_keeps_historical_rc1_mapping():
     path = PROJECT_ROOT / filename
     assert path.is_file()
     assert "0.6.0-rc1" in path.read_text()
+
+
+def test_resolve_release_notes_keeps_historical_rc2_mapping():
+    """The rc2 line's own notes file is still resolvable and still exists
+    -- rc2's tag was never deleted or reused (its first real release.yml
+    run failed on two unrelated pre-existing defects, fixed on main
+    afterwards; rc2 itself was never re-tagged or republished) and its
+    notes file is preserved as historical evidence, only superseded as
+    the *current* line's mapping target."""
+    filename = _resolved_notes_filename("0.6.0-rc2")
+    assert filename == "RELEASE_NOTES_0.6.0_RC2.md"
+    path = PROJECT_ROOT / filename
+    assert path.is_file()
+    assert "0.6.0-rc2" in path.read_text()
 
 
 def test_resolve_release_notes_fails_closed_for_a_version_with_no_notes_file():

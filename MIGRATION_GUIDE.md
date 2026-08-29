@@ -148,7 +148,7 @@ Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_D
 Production updates should use a release tag configured in `/etc/centralpay-bridge/centralpay.env`:
 
 ```env
-CENTRALPAY_UPDATE_REF=v0.6.0-rc2
+CENTRALPAY_UPDATE_REF=v0.6.0-rc3
 ```
 
 Normal flow:
