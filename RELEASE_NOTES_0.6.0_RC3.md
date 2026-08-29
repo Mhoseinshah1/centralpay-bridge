@@ -45,9 +45,14 @@ application or payment behavior change over rc2.
 ## Headline: operational hardening, not a payment-model change
 
 Unlike 0.6.0-rc1 (which introduced the fee model), this release line
-makes no change to how a payment is priced, settled, or reconciled. It
-consolidates the operational, safety, and legacy-compatibility work
-merged since rc1: a durable monitoring/alerting subsystem,
+makes no change to how a payment is priced or settled. It does add
+automatic reconciliation of payments stuck in `link_created` when the
+browser callback never arrives (enabled by default; see "Upgrading
+from 0.6.0-rc1" below) — a new recovery capability rc1 did not have,
+using the exact same verification/settlement path as a callback, not
+a second settlement model. Otherwise it consolidates the operational,
+safety, and legacy-compatibility work merged since rc1: a durable
+monitoring/alerting subsystem,
 application-level rate limiting, admin-bot operational visibility,
 safer production updates, and one confirmed legacy request-body
 compatibility fix.
@@ -176,8 +181,20 @@ real payer-identity history. See `MIGRATION_GUIDE.md` for full detail.
 2. Set `CENTRALPAY_UPDATE_REF=v0.6.0-rc3` in
    `/etc/centralpay-bridge/centralpay.env`.
 3. Run `centralpay update`. Migrations `0007`–`0012` apply
-   automatically before api/worker start; no payment-model behavior
-   changes as part of this upgrade.
+   automatically before api/worker start; pricing/fee behavior is
+   unchanged from rc1. **Gateway-call behavior is not fully
+   unchanged**: the worker's reconciliation thread
+   (`RECONCILIATION_ENABLED=true` by default, both in `app/config.py`
+   and the shipped `deploy/centralpay.env.template`) starts
+   automatically and issues its own CentralPay `verify` calls for
+   payments still `link_created` after their browser callback never
+   arrived — a capability rc1 did not have. It uses the same
+   verification/settlement path as a callback, touches only payments
+   already eligible under the documented age/attempt rules, and never
+   mutates a payment outside that path; disabling it
+   (`RECONCILIATION_ENABLED=false`) stops only the polling, callbacks
+   are unaffected. Review `MIGRATION_GUIDE.md`'s `0010` section before
+   upgrading if this automatic recovery is not wanted immediately.
 4. The optional monitoring subsystem and rate limiting are both
    opt-in/already-safe by default (`MONITOR_ENABLED=false`; rate
    limiting has no production-affecting default-off toggle — review

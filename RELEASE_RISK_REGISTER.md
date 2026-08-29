@@ -747,10 +747,10 @@ deadlock/lock-ordering cycles (none found).
   release workflow only runs on `push: tags` or manual dispatch (see
   B5's own definition above) — so the tag is the mechanism for
   producing that evidence, not something gated behind it. What
-  remains gated on B1, B2, B3, and a green B5 run — plus a recorded
-  human approval — is **publishing** the GitHub release and using
-  this version for any real payment; this register does not authorize
-  either.
+  remains gated on B1, B2, and a green B5 run (and B3 if the optional
+  admin bot is to be enabled) — plus a recorded human approval — is
+  **publishing** the GitHub release and using this version for any
+  real payment; this register does not authorize either.
 - No production access, no deployment, and no real CentralPay/Telegram
   call occurred while diagnosing or fixing either defect.
 
