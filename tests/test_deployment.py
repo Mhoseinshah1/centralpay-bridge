@@ -630,6 +630,80 @@ def test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache():
     )
 
 
+def test_dockerfile_apt_lists_are_removed_in_the_layer_that_creates_them():
+    """A review finding caught an earlier version of this file fetching the
+    apt package lists in the shared `base` stage's RUN (via `apt-get
+    update`) but deleting them only in `runtime`'s own later RUN. Docker
+    layers are immutable, so that later `rm -rf /var/lib/apt/lists/*` only
+    hid the lists from the merged filesystem view -- their bytes stayed
+    committed in the base layer, still shipped with (and paid for on)
+    every pull. curl and the cleanup must live in the exact RUN that
+    fetches the lists."""
+    text = DOCKERFILE.read_text()
+    base_stage = text[text.index("FROM ${BASE_IMAGE} AS base") : text.index("FROM base AS builder")]
+    # Comment prose above discusses these same commands, so compare only
+    # the actual instructions, not the raw (comment-including) text.
+    base_stage_code = "\n".join(_code_lines(base_stage))
+    run_lines = [
+        line for line in base_stage_code.splitlines() if line.strip().startswith("RUN")
+    ]
+    assert len(run_lines) == 1, "update/upgrade/install/cleanup must be a single RUN (one layer)"
+    assert "apt-get install" in base_stage_code
+    assert "rm -rf /var/lib/apt/lists" in base_stage_code
+    update_at = base_stage_code.index("apt-get update")
+    install_at = base_stage_code.index("apt-get install")
+    cleanup_at = base_stage_code.index("rm -rf /var/lib/apt/lists")
+    assert update_at < install_at < cleanup_at
+
+    runtime_stage = text[text.index("FROM base AS runtime") :]
+    assert "apt-get" not in runtime_stage, (
+        "runtime must not run its own apt-get -- curl and the refreshed "
+        "package state already come from the shared `base` stage"
+    )
+
+
+def test_production_build_paths_propagate_the_apt_refresh_cachebust():
+    """CI passes a fresh --build-arg once per UTC day (see
+    test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache), but that
+    only refreshes CI's own images. A review finding caught that
+    docker-compose.yml declared no build.args for this ARG at all, so a
+    production host's `docker compose build` always got the empty default
+    -- once the apt security-refresh layer was cached locally after the
+    first build on a host, `centralpay update`/`rollback` and the
+    installer would keep reusing it forever, silently defeating the whole
+    point of an automatic OS package refresh on every production update."""
+    compose_text = COMPOSE_FILE.read_text()
+    assert re.search(
+        r"args:\s*\n\s*APT_REFRESH_CACHEBUST:\s*\$\{APT_REFRESH_CACHEBUST", compose_text
+    ), (
+        "docker-compose.yml's build.args must pass APT_REFRESH_CACHEBUST "
+        "through from the environment"
+    )
+
+    management_text = MANAGEMENT.read_text()
+    build_calls = re.findall(
+        r"APT_REFRESH_CACHEBUST=\$\(date -u \+%Y-%m-%d\)\n\s*compose build --quiet",
+        management_text,
+    )
+    assert len(build_calls) == 2, (
+        "both perform_update and perform_rollback must set a fresh "
+        "APT_REFRESH_CACHEBUST immediately before their own `compose build` "
+        "call -- a stale/fixed value here would let local Docker build "
+        "cache reuse the apt security-refresh layer forever after the "
+        "first production build on a host"
+    )
+
+    installer_text = INSTALLER.read_text()
+    assert re.search(
+        r'APT_REFRESH_CACHEBUST=\$\(date -u \+%Y-%m-%d\)\n\s*'
+        r'docker compose "\$\{profile_args\[@\]\}" build --quiet',
+        installer_text,
+    ), (
+        "install.sh's deploy_stack must set a fresh APT_REFRESH_CACHEBUST "
+        "immediately before its own compose build call"
+    )
+
+
 def test_dockerfile_properties():
     text = DOCKERFILE.read_text()
     assert text.count("FROM base AS") == 2  # multi-stage, same pinned+refreshed base

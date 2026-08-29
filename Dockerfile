@@ -44,10 +44,21 @@ FROM ${BASE_IMAGE} AS base
 # `Resolve APP_VERSION` in both workflows); referencing it inside the RUN
 # command (not just declaring the ARG) is what actually changes this
 # layer's cache key when the value changes.
+#
+# curl is installed here, in the same RUN as `apt-get update`, and the apt
+# package lists are removed here too -- Docker layers are immutable, so a
+# later `rm -rf /var/lib/apt/lists/*` in a downstream layer only hides the
+# lists from the merged filesystem view; the bytes stay committed in this
+# layer and still ship with (and are pulled/stored as part of) the image.
+# curl only costs the runtime stage anything (it needs it for the
+# HEALTHCHECK below); the discarded `builder` stage also gets it here, but
+# nothing from a discarded stage's own layers reaches the final image.
 ARG APT_REFRESH_CACHEBUST=""
 RUN echo "apt security refresh cache-bust: ${APT_REFRESH_CACHEBUST}" \
     && apt-get update \
-    && apt-get upgrade -y
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
 
 FROM base AS builder
@@ -87,12 +98,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# curl is required for container health checks; nothing else is added.
-# Reuses the apt package lists already fetched and upgraded in the shared
-# `base` stage above -- no second `apt-get update` needed.
-RUN apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 centralpay \
+# curl was already installed in the shared `base` stage above (same layer
+# that fetched the apt lists it needed, and that already removed them).
+RUN groupadd --system --gid 10001 centralpay \
     && useradd --system --uid 10001 --gid centralpay \
         --home-dir /srv/app --shell /usr/sbin/nologin centralpay
 

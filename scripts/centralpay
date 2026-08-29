@@ -758,6 +758,13 @@ perform_update() {
     fi
 
     log "Building images..."
+    # Must actually change on every build: docker-compose.yml passes this
+    # through to the Dockerfile's apt security-refresh layer (see its
+    # `base` stage), and Docker's local build cache would otherwise reuse
+    # that layer forever after the very first image built on this host,
+    # silently defeating the OS package refresh on every future update.
+    export APT_REFRESH_CACHEBUST
+    APT_REFRESH_CACHEBUST=$(date -u +%Y-%m-%d)
     compose build --quiet
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
@@ -791,6 +798,11 @@ perform_rollback() {
     git -C "$INSTALL_DIR" checkout -q "$previous" \
         || fail "Cannot check out ${previous}."
     record_version_history "$previous"
+    # See the matching cache-bust in perform_update above: without a
+    # changing value here too, a rollback build would silently reuse
+    # whatever apt security-refresh layer local Docker cache already has.
+    export APT_REFRESH_CACHEBUST
+    APT_REFRESH_CACHEBUST=$(date -u +%Y-%m-%d)
     compose build --quiet
     if compose up -d --wait; then
         # The rolled-back commit is now confirmed running: the installed
