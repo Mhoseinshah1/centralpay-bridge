@@ -870,10 +870,16 @@ deadlock/lock-ordering cycles (none found).
   fix months ago, and the test suite had since grown two dummy-credential
   fixture shapes (`tests/test_phase3_app.py`'s `alias-secret-...`,
   `tests/test_logging_redaction.py`'s `attacker-guessed-key-...`) that
-  `.gitleaks.toml`'s allowlist did not yet cover. A fix is proposed via
-  a separate, dedicated PR (**#86, open, not yet merged as of this
-  entry**) — unrelated to the container CVE, no shared root cause, not
-  bundled into PR #85.
+  `.gitleaks.toml`'s allowlist did not yet cover. Fixed via a separate,
+  dedicated PR (**#86, merged**, merge commit
+  `6577aaf4d38e54b9ebe4afd6010146df2c8ebbd0`) — unrelated to the
+  container CVE, no shared root cause, not bundled into PR #85. A
+  further review finding on #86 caught that its regression test never
+  asserted `.gitleaks.toml`'s `regexTarget` value itself (only its
+  effects), so a regression back to the cross-suppression-prone `"line"`
+  setting the fix moved away from would have left the test green;
+  fixed by asserting the value explicitly plus a mixed real-secret/
+  fixture-line case.
 - Three follow-up review findings landed on PR #85 after it had already
   merged (so they could not be pushed into it): the apt refresh above
   originally covered only the runtime stage, leaving the builder stage's
@@ -882,22 +888,69 @@ deadlock/lock-ordering cycles (none found).
   both workflows' own shell-validation steps; and the apt refresh RUN
   layer's GitHub Actions cache key never changed on its own, so it could
   have silently served the same pre-upgrade layer forever after the
-  first cached build. All three verified and fixed via a separate PR
-  (**#88, open, not yet merged as of this entry**).
-- **`v0.6.0-rc4` must not be tagged until PR #86 and PR #88 have both
-  merged** — otherwise a tag-triggered `release.yml` run against rc4
-  would either repeat rc1/rc2's gitleaks full-history failure class or
-  ship a container image whose security-refresh guarantee is weaker
-  than described above. A review finding correctly pointed out that
-  merely opening #86/#88, or writing this sentence, does not itself
-  stop a tag from being cut early: `main` (and this PR's own head) does
-  not yet contain either fix as of this entry. The concrete sequencing
-  that makes this hold is: merge #86, then #88, then rebase this
-  release-prep branch (`release/0.6.0-rc4`) onto the resulting `main`
-  so both fixes are actual ancestors of the version-bump commit, and
-  only then merge this PR — the `v0.6.0-rc4` tag must be created from
-  a commit descended from all three merges, never from this PR's
-  current head or from `main` before #86/#88 land on it.
+  first cached build. All three fixed via a separate PR (**#88, merged**,
+  merge commit `29ae4bd5c8e0f8096caee03bbbf0e1206a453366`).
+- Five further review findings landed on PR #88 itself, each caught and
+  fixed before merge:
+  1. The apt package lists were fetched in the shared `base` stage's
+     `RUN` but only deleted in a later, separate `runtime`-stage `RUN`;
+     Docker layers are immutable, so that later deletion only hid the
+     lists from the merged filesystem view without shrinking the image.
+     Fixed by moving `curl`'s install and the cleanup into the exact
+     `RUN` that fetches the lists.
+  2. `docker-compose.yml` declared no `build.args` for
+     `APT_REFRESH_CACHEBUST` at all, so every production
+     `docker compose build` (`centralpay update`/`rollback`, the
+     installer) silently got the empty default and could serve a stale
+     apt-refresh layer indefinitely once one image had been built on a
+     host — CI's own `--build-arg` never reached production. Fixed by
+     adding the `args:` passthrough and setting a fresh value directly
+     via `--build-arg` at each production build call site.
+  3. That value was date-only (like `ci.yml`'s), so a second same-day
+     `update`/`rollback`/install would reuse the first build's cache key
+     even if a Debian security fix shipped in between. Fixed by
+     switching production call sites to a full UTC timestamp (second
+     granularity).
+  4. `--build-arg` only busts a layer's cache when that layer actually
+     *references* the ARG — silently a no-op for caching (harmless for
+     build success, achieves nothing for freshness) against a checked-
+     out Dockerfile old enough to predate the ARG entirely, which a
+     rollback target can be. Fixed: `perform_rollback` builds with
+     `--no-cache` instead (rollback is rare and safety-critical, so an
+     unconditional full rebuild is the right trade).
+  5. `perform_update`'s own comment assumed it "always builds the
+     just-checked-out target commit, whose Dockerfile always references
+     this ARG" — but `CENTRALPAY_UPDATE_ALLOW_DEV_REF` (an explicitly
+     supported development-ref mode) and an explicit downgrade to an old
+     release tag can both target a commit whose Dockerfile predates the
+     ARG entirely, the same risk as finding 4. Blanket `--no-cache`
+     isn't right for `perform_update` (the common, frequent path — a
+     full rebuild on every routine update would be a real cost
+     regression). Fixed with a shared `build_with_apt_refresh_cachebust`
+     helper (`scripts/centralpay`) that greps the checked-out Dockerfile
+     for the ARG's literal name (PR #85 always shipped its declaration
+     and RUN reference together, so presence is a reliable signal) and
+     picks the fast `--build-arg` path when present, `--no-cache` only
+     when absent; both `perform_update` and `perform_rollback` now call
+     it. `install.sh`'s `deploy_stack` has the identical exposure via
+     `CENTRALPAY_REF` on a rerun against an existing install, so it runs
+     the same detect-then-branch logic inline. A sixth, related finding
+     — `release.yml`'s own cache-bust was still date-only, so a same-day
+     manual retry of a release after a real Trivy finding is fixed
+     upstream would keep reusing that day's pre-fix layer — was fixed by
+     switching it to `github.run_id`-`github.run_attempt` (unique per
+     execution attempt, including a "re-run failed jobs" click);
+     `ci.yml`'s daily value is unchanged, a deliberate, different
+     tradeoff for its much higher push frequency.
+- **`v0.6.0-rc4` tag sequencing is now satisfied, but the tag itself has
+  not been created.** Both #86 and #88 have merged into `main`
+  (`29ae4bd5c8e0f8096caee03bbbf0e1206a453366`), and this release-prep
+  branch (`release/0.6.0-rc4`) has been rebased onto that `main` (a
+  clean rebase, no conflicts) so both fixes are actual ancestors of the
+  version-bump commit — not merely referenced by open PR numbers. The
+  `v0.6.0-rc4` tag must still be created from a commit descended from
+  all these merges (never from an older commit), and remains a
+  separate, explicit action reserved for the operator.
 - **This does not close, reopen, or change B1/B2/B3.** B5 made real,
   verified progress but is **not yet closed**: rc3's tag-triggered run
   passed every job except Trivy, and that finding is now fixed and

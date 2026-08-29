@@ -37,23 +37,38 @@ not deploy it to production or upgrade any running instance.
   with a newer build in Debian's own security repo by build time is
   picked up — closing the specific CVE-2026-14456 gap and the general
   class of "pinned base image trails upstream security fixes" without
-  waiting on the next base-image publish. Its GitHub Actions build-layer
-  cache is busted daily so the refresh cannot silently stop re-running
-  after the first cached build.
+  waiting on the next base-image publish. `ci.yml`'s build-layer cache
+  is busted daily (the actual `apt-get` cost paid once a day rather than
+  on every PR push); `release.yml`'s is busted per `github.run_id`/
+  `run_attempt` instead, since a release run is rare enough that a
+  same-day retry deserves its own fresh refresh rather than reusing that
+  day's cache.
 - Extracted the Trivy scan's image reference, digest pin, and severity
   policy into one shared script (`.github/scripts/trivy-scan.sh`), and
   added the same fail-closed scan to `ci.yml`'s `docker` job — this
   exact class of issue reached a release tag undetected specifically
   because pull-request CI had no equivalent scan; it now does, for
   every future PR before a release is ever tagged. (Follow-up review
-  findings on the above landed as a separate PR, #88, open and not yet
-  merged as of this writing.)
+  findings landed as a separate PR, **#88, merged**.)
+- Propagated the apt-refresh cache-bust to production builds: it
+  originally only reached CI images (`docker-compose.yml` declared no
+  `args:` for it), so `centralpay update`/`rollback` and the installer
+  always built with an empty value and could serve a stale apt-refresh
+  layer indefinitely on an already-built host. `scripts/centralpay` now
+  has a shared `build_with_apt_refresh_cachebust` helper (used by both
+  `perform_update` and `perform_rollback`) and `install.sh`'s
+  `deploy_stack` runs matching logic: each detects whether the checked-
+  out Dockerfile actually references the cache-bust ARG — a rollback
+  target, an explicit `CENTRALPAY_UPDATE_REF`/
+  `CENTRALPAY_UPDATE_ALLOW_DEV_REF` downgrade, or an installer rerun
+  against a different `CENTRALPAY_REF` can all target a commit old
+  enough to predate it — using the fast `--build-arg` path when present
+  and falling back to a full `--no-cache` rebuild only when absent.
 - Found a separate, pre-existing gap in `.gitleaks.toml`'s full-history
   secret-scan allowlist (two dummy test-fixture value shapes added to
   the test suite since the original rc1 fix were never covered, because
   nothing had re-run the full-history scan since); unrelated to the
-  container CVE. A fix is proposed in a separate PR, #86, open and not
-  yet merged as of this writing.
+  container CVE. Fixed in a separate PR, **#86, merged**.
 
 ## [0.6.0-rc3] — 2026-08-29 (release candidate — NOT production-ready)
 

@@ -60,14 +60,34 @@ Landed on `main` via #85:
   this one can ever reach a release tag again.
 
 Three follow-up review findings on #85 (that PR had already merged, so
-these landed as a separate PR, **#88, open, not yet merged as of this
-writing**): the apt refresh above originally covered only the runtime
-stage, not the builder stage's own network operations, now fixed via a
-shared refreshed base stage both derive from; `trivy-scan.sh` itself
-was missing from both workflows' shell-validation steps; and the apt
-refresh layer's GitHub Actions cache key never changed on its own, so
-without an explicit daily cache-bust it could have silently served the
-same pre-upgrade layer on every future build.
+these landed as a separate PR, **#88, merged**): the apt refresh above
+originally covered only the runtime stage, not the builder stage's own
+network operations, now fixed via a shared refreshed `base` stage both
+derive from; `trivy-scan.sh` itself was missing from both workflows'
+shell-validation steps, now added; and the apt refresh layer's GitHub
+Actions cache key never changed on its own, now fixed with a cache-bust
+`ARG` referenced inside the `RUN` command.
+
+Further review on #88 itself found the initial cache-bust fix never
+reached production builds: `docker-compose.yml` declared no `args:` for
+it, so `centralpay update`/`rollback` and the installer always built
+with an empty value, and could keep serving a stale apt-refresh layer
+indefinitely on an already-built host. Fixed with a shared
+`build_with_apt_refresh_cachebust` helper (`scripts/centralpay`) and
+matching logic in `install.sh`'s `deploy_stack`: each detects whether
+the just-checked-out Dockerfile actually references the cache-bust ARG
+(a rollback target, an explicit `CENTRALPAY_UPDATE_REF`/
+`CENTRALPAY_UPDATE_ALLOW_DEV_REF` downgrade, or an installer rerun
+against a different `CENTRALPAY_REF` can all target a commit old enough
+to predate it) — using the fast `--build-arg` path when present,
+falling back to a full, unconditional `--no-cache` rebuild only when
+absent. `release.yml`'s own cache-bust was also switched from a daily
+value to one unique per `github.run_id`/`run_attempt` (`ci.yml`'s stays
+daily, a deliberate, different tradeoff for its much higher push
+frequency), so a same-day manual retry of a release run after a real
+Trivy finding is fixed upstream doesn't keep reusing that day's pre-fix
+layer. Trivy's own policy (`--exit-code 1`, `--severity CRITICAL,HIGH`,
+`--ignore-unfixed`) is unchanged throughout.
 
 The `v0.6.0-rc3` tag itself was **not** deleted, moved, or reused — it
 remains a failed/unpublished release-candidate attempt, preserved as
@@ -80,10 +100,13 @@ A separate, pre-existing gap was also found while verifying this
 release manually: `release.yml`'s full-history secret scan (`gitleaks`)
 had never been re-run since the very first release attempt months ago,
 and the test suite had since grown two dummy-credential fixture shapes
-its allowlist did not yet cover. **A fix is proposed in a separate PR
-(#86, open, not yet merged as of this writing)**; unrelated to the
-container CVE and not part of the Docker/Trivy fix above. This tag must
-not be created until both #86 and #88 have merged.
+its allowlist did not yet cover. **Fixed in a separate PR (#86,
+merged)**; unrelated to the container CVE and not part of the
+Docker/Trivy fix above. Both #86 and #88 have merged into `main`, and
+this release-prep branch has been rebased onto the resulting `main` so
+both fixes are actual ancestors of this version bump — not merely
+referenced by an open PR number. No `v0.6.0-rc4` tag has been created
+yet; that remains a separate, explicit step.
 
 ## Headline: operational hardening, not a payment-model change
 
