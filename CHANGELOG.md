@@ -2,6 +2,62 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
+## [0.6.0-rc2] — Unreleased / prepared (release candidate — NOT production-ready)
+
+**This entry prepares package/source metadata for the next release
+candidate. The `v0.6.0-rc2` tag does not exist yet and will be created
+only after this change merges onto `main`, pointing at the final merge
+commit — no deployment has been performed. Known release blockers
+remain open in `RELEASE_RISK_REGISTER.md`, including B2 (the real
+CentralPay contract has still not been observed end-to-end against the
+real/sandbox gateway); this version must not be used for real payments
+until they are closed.**
+
+### Added
+- Optional monitoring and alerting subsystem (`app.monitor`,
+  `MONITOR_ENABLED=false` by default; see `MONITORING.md`).
+- Application-level rate limiting / abuse protection across the inbound
+  payment API (trusted-proxy client-IP resolution, per-endpoint sliding
+  windows, structured log events on limit hits).
+- Admin-bot operational visibility and payment-operations commands
+  (system overview, stuck/reconciliation visibility, payment lookup +
+  events, manual-review visibility, notification visibility).
+
+### Fixed
+- Monitoring hardening: gateway/bot-notification failure-burst
+  detection no longer produces false positives on unrelated errors,
+  backup manifests are validated before being trusted, and monitor
+  checks degrade gracefully instead of crashing during a brief
+  PostgreSQL outage.
+- Production update/Caddy hardening: decoupled Caddy managed-config
+  activation from overall app-deploy success (closing a first-upgrade
+  bootstrap gap), added drift detection surfaced through
+  `centralpay status`/`diagnose`, corrected admin-bot manual-review
+  counts, removed a `centralpay update --help` side effect, and
+  preserved opaque `order_id` values that collide with `-h`/`--help`
+  through the host CLI's argument handling.
+- Closed a notification-worker stale identity-map read after a fresh
+  row-lock reload, and a create-payment safe-replay exemption that
+  treated "a row already exists" as "safe to replay" without an
+  identity-shape match.
+- Caddy access logs no longer leak the callback `ct`/`sig` query
+  parameters via the `Referer` header.
+- Legacy `application/x-www-form-urlencoded` payment-body
+  compatibility: a raw (non-percent-encoded) JSON object used as the
+  form key, containing an unescaped internal `=`, no longer produces
+  the intermittent `HTTP 422` seen by the legacy sales-bot integration.
+  Confirmed against production rejection-log diagnostics
+  (`raw_pair_equals_count=2`, matching the diagnostics added for the
+  sibling shape in the previous release) and recovered through the
+  same normalize/validate/auth/rate-limit/idempotency pipeline as every
+  other request representation — no weaker path.
+
+### Documentation
+- Reconciled living-doc/audit contradictions surfaced after the
+  monitoring-hardening and update-hardening work landed.
+
+Release notes for this line will be written when the tag is cut.
+
 ## [0.6.0-rc1] — 2026-07-18 (release candidate — NOT production-ready)
 
 **Known release blockers remain open in `RELEASE_RISK_REGISTER.md`;
