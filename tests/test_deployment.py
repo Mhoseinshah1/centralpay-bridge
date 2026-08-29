@@ -1042,7 +1042,7 @@ _DOCS_WITH_COMMANDS = (
     "README.md", "README_FA.md", "INSTALL_FA.md", "OPERATIONS_FA.md",
     "REAL_HOST_VALIDATION.md", "STAGING_VALIDATION.md",
     "PRODUCTION_CHECKLIST_FA.md", "MIGRATION_GUIDE.md",
-    "RELEASE_NOTES_0.6.0_RC1.md",
+    "RELEASE_NOTES_0.6.0_RC1.md", "RELEASE_NOTES_0.6.0_RC2.md",
 )
 
 
@@ -1125,6 +1125,80 @@ def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     assert not pattern.search('API_KEY = "sk-live-4242424242"')
     # No path-based allowlisting: app/deploy/docs stay fully scanned.
     assert "paths" not in config["allowlist"]
+
+
+# --- release-gate regression: dynamic release-notes resolution --------------
+
+RESOLVE_RELEASE_NOTES = PROJECT_ROOT / "scripts" / "resolve-release-notes.sh"
+
+
+def _resolved_notes_filename(app_version: str) -> str:
+    result = subprocess.run(
+        ["bash", str(RESOLVE_RELEASE_NOTES), app_version],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_resolve_release_notes_maps_current_app_version_to_rc2():
+    """APP_VERSION drives which release-notes file the release workflow
+    requires and publishes -- prove the live mapping, not just the
+    filename convention. First tag-gate run for rc2 would otherwise have
+    silently drafted the release using rc1's notes."""
+    from app.version import APP_VERSION
+
+    assert APP_VERSION == "0.6.0-rc2"
+    filename = _resolved_notes_filename(APP_VERSION)
+    assert filename == "RELEASE_NOTES_0.6.0_RC2.md"
+    assert (PROJECT_ROOT / filename).is_file()
+
+
+def test_resolve_release_notes_keeps_historical_rc1_mapping():
+    """The rc1 line's own notes file is still resolvable and still exists
+    -- the historical file was not deleted or renamed, only superseded as
+    the *current* line's mapping target."""
+    filename = _resolved_notes_filename("0.6.0-rc1")
+    assert filename == "RELEASE_NOTES_0.6.0_RC1.md"
+    path = PROJECT_ROOT / filename
+    assert path.is_file()
+    assert "0.6.0-rc1" in path.read_text()
+
+
+def test_resolve_release_notes_fails_closed_for_a_version_with_no_notes_file():
+    """A future RC whose notes file has not been written yet must make the
+    release workflow fail closed, exactly like the package job's own guard
+    (`if [ ! -f "$notes_file" ]; then exit 1; fi`)."""
+    filename = _resolved_notes_filename("0.6.0-rc99")
+    assert filename == "RELEASE_NOTES_0.6.0_RC99.md"
+    assert not (PROJECT_ROOT / filename).exists()
+    guard = f"""
+        notes_file=$(bash "{RESOLVE_RELEASE_NOTES}" 0.6.0-rc99)
+        if [ ! -f "$notes_file" ]; then
+            echo "would fail closed: $notes_file"
+            exit 1
+        fi
+        echo "unexpectedly found $notes_file"
+    """
+    result = run_bash(guard)
+    assert result.returncode == 1
+    assert "would fail closed: RELEASE_NOTES_0.6.0_RC99.md" in result.stdout
+
+
+def test_release_workflow_never_hardcodes_a_specific_rc_notes_filename():
+    """release.yml used to hardcode RELEASE_NOTES_0.6.0_RC1.md in both the
+    required-documents check and the draft-release creation step. Neither
+    RC1's nor RC2's filename may appear as a literal in the workflow --
+    only as the resolved output of scripts/resolve-release-notes.sh --
+    or a future rc3 would face the exact same bug again."""
+    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "RELEASE_NOTES_0.6.0_RC1.md" not in text
+    assert "RELEASE_NOTES_0.6.0_RC2.md" not in text
+    assert "scripts/resolve-release-notes.sh" in text
+    assert '--notes-file "${{ steps.version.outputs.notes_file }}"' in text
+    assert '"${{ steps.notes.outputs.file }}"' in text
 
 
 # --- PUBLIC_BASE_URL contract: Caddy consistency and installer regression ----

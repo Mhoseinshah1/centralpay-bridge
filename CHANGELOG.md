@@ -2,16 +2,14 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
-## [0.6.0-rc2] — Unreleased / prepared (release candidate — NOT production-ready)
+## [0.6.0-rc2] — 2026-08-29 (release candidate — NOT production-ready)
 
-**This entry prepares package/source metadata for the next release
-candidate. The `v0.6.0-rc2` tag does not exist yet and will be created
-only after this change merges onto `main`, pointing at the final merge
-commit — no deployment has been performed. Known release blockers
-remain open in `RELEASE_RISK_REGISTER.md`, including B2 (the real
-CentralPay contract has still not been observed end-to-end against the
-real/sandbox gateway); this version must not be used for real payments
-until they are closed.**
+**Known release blockers remain open in `RELEASE_RISK_REGISTER.md`,
+including B2 (the real CentralPay contract has still not been observed
+end-to-end against the real/sandbox gateway); this version must not be
+used for real payments until they are closed.** Release notes:
+`RELEASE_NOTES_0.6.0_RC2.md`. Creating this release does not deploy it
+to production or upgrade any running instance.
 
 ### Added
 - Optional monitoring and alerting subsystem (`app.monitor`,
@@ -56,7 +54,12 @@ until they are closed.**
 - Reconciled living-doc/audit contradictions surfaced after the
   monitoring-hardening and update-hardening work landed.
 
-Release notes for this line will be written when the tag is cut.
+### Migration
+- `0007`–`0012`: payer identity isolation, hybrid identity scope,
+  explicit identity derivation scheme, reconciliation bookkeeping,
+  monitor incidents, and monitor incident alert-delivery tracking. No
+  existing financial data is rewritten by any of them. See
+  `MIGRATION_GUIDE.md`.
 
 ## [0.6.0-rc1] — 2026-07-18 (release candidate — NOT production-ready)
 
