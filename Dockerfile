@@ -13,7 +13,44 @@
 # when a newer base is needed, not by accident.
 ARG BASE_IMAGE=python:3.12-slim-trixie@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
 
-FROM ${BASE_IMAGE} AS builder
+# Shared `base` stage: both `builder` and `runtime` derive from this, not
+# from `${BASE_IMAGE}` directly, so the apt security refresh below runs
+# exactly once and both stages get it -- an earlier version of this file
+# refreshed only the runtime stage, leaving `builder`'s `pip install .`
+# (a network operation) running against the same unrefreshed snapshot
+# identified as carrying the vulnerable OpenSSL package, and meant Trivy
+# (which only scans the final shipped image) could never have reported
+# on the discarded builder stage's own exposure.
+FROM ${BASE_IMAGE} AS base
+
+# General Debian security refresh, not a one-CVE hardcoded package pin: the
+# pinned base digest above is a point-in-time snapshot, so any package with a
+# newer build in Debian's own security repo by the time *this* image is
+# built (e.g. the libssl3t64/openssl fix for CVE-2026-14456) is picked up
+# here instead of waiting on the next upstream python:3.12-slim-trixie
+# publish. Plain `apt-get upgrade` — never the more aggressive variant that
+# can also add or remove packages — only ever replaces an existing package
+# with a newer build of itself, so it cannot introduce anything Trivy
+# hasn't already scanned this base for.
+#
+# Cache-busting: BuildKit caches this RUN layer keyed on its own literal
+# command text and the parent layer -- neither the pinned base digest nor
+# this instruction's text changes on their own, so with GHA layer caching
+# enabled (cache-from/cache-to: type=gha in both ci.yml and release.yml)
+# this layer would otherwise be reused unchanged forever after the first
+# successful build, silently never re-running `apt-get update`/`upgrade`
+# again and defeating the whole point of a build-time security refresh.
+# CI supplies a fresh value once per UTC day via --build-arg (see
+# `Resolve APP_VERSION` in both workflows); referencing it inside the RUN
+# command (not just declaring the ARG) is what actually changes this
+# layer's cache key when the value changes.
+ARG APT_REFRESH_CACHEBUST=""
+RUN echo "apt security refresh cache-bust: ${APT_REFRESH_CACHEBUST}" \
+    && apt-get update \
+    && apt-get upgrade -y
+
+
+FROM base AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -27,7 +64,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install .
 
 
-FROM ${BASE_IMAGE} AS runtime
+FROM base AS runtime
 
 # Build metadata (populated by CI; empty defaults keep local builds working).
 # APP_VERSION is supplied by CI/release from app.version.APP_VERSION — never a
@@ -50,19 +87,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# General Debian security refresh, not a one-CVE hardcoded package pin: the
-# pinned base digest above is a point-in-time snapshot, so any package with a
-# newer build in Debian's own security repo by the time *this* image is
-# built (e.g. the libssl3t64/openssl fix for CVE-2026-14456) is picked up
-# here instead of waiting on the next upstream python:3.12-slim-trixie
-# publish. Plain `apt-get upgrade` — never the more aggressive variant that
-# can also add or remove packages — only ever replaces an existing package
-# with a newer build of itself, so it cannot introduce anything Trivy
-# hasn't already scanned this base for. curl is required for container
-# health checks; nothing else is added.
-RUN apt-get update \
-    && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends curl \
+# curl is required for container health checks; nothing else is added.
+# Reuses the apt package lists already fetched and upgraded in the shared
+# `base` stage above -- no second `apt-get update` needed.
+RUN apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 centralpay \
     && useradd --system --uid 10001 --gid centralpay \

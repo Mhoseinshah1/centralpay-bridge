@@ -571,13 +571,20 @@ def test_dockerfile_base_image_uses_an_explicit_distro_variant():
 
 
 def test_dockerfile_builder_and_runtime_share_the_same_base_image():
-    """Builder and runtime must use the identical pinned base (same
-    variable, not two independently hardcoded references) unless there is
-    a concrete, documented reason to diverge -- otherwise the two stages'
-    OS package versions can silently drift apart from each other."""
+    """Builder and runtime must use the identical pinned, security-refreshed
+    base (a single shared `base` stage), not two independently hardcoded
+    references -- otherwise the two stages' OS package versions can
+    silently drift apart from each other. A review finding caught an
+    earlier version of this file where only `runtime` was refreshed:
+    `builder`'s own network operations (`pip install .`) still ran
+    against the unrefreshed snapshot, and Trivy -- which only scans the
+    final shipped image -- could never have reported on that gap."""
     text = DOCKERFILE.read_text()
-    assert text.count("FROM ${BASE_IMAGE}") == 2, (
-        "both stages must reference the same ARG BASE_IMAGE, not a separately hardcoded tag"
+    assert text.count("FROM ${BASE_IMAGE} AS base") == 1, (
+        "exactly one stage should pull the pinned base image directly"
+    )
+    assert text.count("FROM base AS") == 2, (
+        "both builder and runtime must derive from the shared, refreshed `base` stage"
     )
 
 
@@ -597,9 +604,35 @@ def test_dockerfile_runtime_applies_a_general_security_refresh():
     assert not re.search(r"apt-get install[^\n]*=\d", text)
 
 
+def test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache():
+    """A review finding caught that the apt security-refresh RUN layer's
+    cache key never changes on its own (same base digest, same literal
+    command text), so with GHA layer caching enabled
+    (cache-from/cache-to: type=gha in both ci.yml and release.yml) it
+    would be reused unchanged after the first successful build --
+    silently never re-running `apt-get update`/`upgrade` again and
+    defeating the whole point of a build-time security refresh. The fix
+    must declare a cache-bust ARG and actually reference it inside the
+    RUN command (declaring but not using it would not change the layer's
+    cache key)."""
+    text = DOCKERFILE.read_text()
+    assert re.search(r'^ARG APT_REFRESH_CACHEBUST=', text, re.MULTILINE), (
+        "Dockerfile must declare a cache-bust ARG for the apt refresh layer"
+    )
+    match = re.search(
+        r"RUN\s+echo[^\n]*\$\{?APT_REFRESH_CACHEBUST\}?[^\n]*\n(?:[^\n]*\n)*?[^\n]*apt-get upgrade",
+        text,
+    )
+    assert match, (
+        "the cache-bust ARG must be referenced inside the RUN command that "
+        "runs apt-get upgrade, not just declared -- an unused ARG does not "
+        "change that layer's BuildKit cache key"
+    )
+
+
 def test_dockerfile_properties():
     text = DOCKERFILE.read_text()
-    assert text.count("FROM ${BASE_IMAGE}") == 2  # multi-stage, same pinned base
+    assert text.count("FROM base AS") == 2  # multi-stage, same pinned+refreshed base
     assert "USER centralpay" in text  # non-root runtime
     assert "PYTHONDONTWRITEBYTECODE=1" in text
     assert "PYTHONUNBUFFERED=1" in text
@@ -1275,6 +1308,38 @@ def test_release_and_ci_workflows_share_the_same_trivy_scan_script():
             "aquasec/trivy" in line or "aquasecurity/trivy" in line
             for line in code_lines
         ), f"{name} must not duplicate the trivy image reference outside the shared script"
+
+
+def test_shell_validation_covers_the_trivy_scan_script():
+    """A review finding caught that .github/scripts/trivy-scan.sh -- a
+    security-gate script both workflows now depend on -- was never added
+    to either workflow's own `bash -n`/ShellCheck command lists, so a
+    defect in it could bypass the repository's required shell validation
+    and only surface while actually building or releasing an image."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    ci_text = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for name, text in (("release.yml", release_text), ("ci.yml", ci_text)):
+        assert "bash -n .github/scripts/trivy-scan.sh" in text, (
+            f"{name} must syntax-check the shared trivy-scan.sh script"
+        )
+        shellcheck_lines = [
+            line for line in text.splitlines() if line.strip().startswith("run: shellcheck")
+        ]
+        assert any(
+            ".github/scripts/trivy-scan.sh" in line for line in shellcheck_lines
+        ), f"{name} must run ShellCheck against the shared trivy-scan.sh script"
+
+
+def test_ci_and_release_workflows_bust_the_apt_refresh_build_cache():
+    """Companion to test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache:
+    the Dockerfile's cache-bust ARG only works if CI actually supplies a
+    fresh value on every build via --build-arg. Both `ci.yml`'s single
+    build and `release.yml`'s amd64 *and* arm64 builds must pass it."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    ci_text = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert ci_text.count("APT_REFRESH_CACHEBUST=") == 1
+    # release.yml builds both amd64 and arm64 -- both must be refreshed.
+    assert release_text.count("APT_REFRESH_CACHEBUST=") == 2
 
 
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
