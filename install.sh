@@ -714,15 +714,27 @@ deploy_stack() {
     if grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
         profile_args+=(--profile monitor)
     fi
-    # See scripts/centralpay's perform_update/perform_rollback for why
-    # this must actually change and go via --build-arg (not an exported
-    # var relying on docker-compose.yml's `args:` passthrough): local
-    # Docker build cache would otherwise reuse the Dockerfile's apt
-    # security-refresh layer forever after this very first build.
-    local apt_cachebust
-    apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    docker compose "${profile_args[@]}" build --quiet \
-        --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
+    # Bust the Dockerfile's apt security-refresh layer (see scripts/
+    # centralpay's build_with_apt_refresh_cachebust for the full
+    # reasoning) so local Docker build cache doesn't silently reuse a
+    # stale one. --build-arg only busts a layer's cache when that layer
+    # actually *references* the ARG -- silently a no-op for caching
+    # against a checked-out Dockerfile old enough to predate this whole
+    # mechanism, which this "safe to rerun" installer can hit on a
+    # rerun against an existing install with a different CENTRALPAY_REF,
+    # not just a genuinely first-ever install. PR #85 always shipped the
+    # ARG declaration and its RUN reference together, so checking for
+    # the literal name in the checked-out Dockerfile is a reliable
+    # signal; fall back to --no-cache (a full, unconditional rebuild)
+    # only when it's absent.
+    if grep -q 'APT_REFRESH_CACHEBUST' Dockerfile 2>/dev/null; then
+        local apt_cachebust
+        apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        docker compose "${profile_args[@]}" build --quiet \
+            --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
+    else
+        docker compose "${profile_args[@]}" build --quiet --no-cache
+    fi
     if ! docker compose "${profile_args[@]}" up -d --wait; then
         docker compose "${profile_args[@]}" ps >&2 || true
         echo >&2

@@ -683,6 +683,35 @@ sync_management_wrapper() {
     log "Installed management command synced: ${MANAGEMENT_BIN} ($(git -C "$INSTALL_DIR" rev-parse --short HEAD))"
 }
 
+build_with_apt_refresh_cachebust() {
+    # Busts the Dockerfile's apt security-refresh layer (see its `base`
+    # stage) so Docker's local build cache doesn't silently reuse a
+    # stale one -- used by both perform_update and perform_rollback,
+    # since either can end up building a checked-out commit whose
+    # Dockerfile predates this ARG entirely (an explicit CENTRALPAY_
+    # UPDATE_REF/CENTRALPAY_UPDATE_ALLOW_DEV_REF downgrade for update;
+    # any sufficiently old target for rollback).
+    #
+    # --build-arg only busts a layer's cache when that layer actually
+    # *references* the ARG -- it is silently a no-op for caching
+    # (harmless for build success, but achieves nothing) against a
+    # Dockerfile that doesn't. Detect that directly rather than assume
+    # it: PR #85 always shipped the ARG declaration and its RUN
+    # reference together, so checking for the literal name in the
+    # checked-out Dockerfile is a reliable signal. When present, use the
+    # fast, cache-preserving --build-arg path (the common case for both
+    # callers). When absent, fall back to --no-cache: a full,
+    # unconditional rebuild, but the only way to guarantee freshness
+    # against a Dockerfile this mechanism doesn't exist in yet.
+    if grep -q 'APT_REFRESH_CACHEBUST' "${INSTALL_DIR}/Dockerfile" 2>/dev/null; then
+        local apt_cachebust
+        apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        compose build --quiet --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
+    else
+        compose build --quiet --no-cache
+    fi
+}
+
 cmd_update() {
     require_root update
     require_install
@@ -758,22 +787,7 @@ perform_update() {
     fi
 
     log "Building images..."
-    # Must actually change on every build: the Dockerfile's apt security-
-    # refresh layer (see its `base` stage) is keyed on this, and Docker's
-    # local build cache would otherwise reuse it forever after the first
-    # image built on this host, silently defeating the OS package refresh
-    # on every future update. Passed directly via --build-arg rather than
-    # relying on docker-compose.yml's own `args:` passthrough, with
-    # second-granularity so running `update` more than once in a day
-    # still gets a fresh refresh. `update` always builds the just-checked-
-    # out target_commit (resolved above from the live ref, never an
-    # arbitrary historical one), whose Dockerfile always references this
-    # ARG -- unlike a rollback target, which can predate the ARG
-    # entirely; see perform_rollback below, which needs --no-cache
-    # instead for exactly that reason.
-    local apt_cachebust
-    apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    compose build --quiet --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
+    build_with_apt_refresh_cachebust
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
         # Only now is the new commit confirmed running: safe to make its
@@ -806,21 +820,11 @@ perform_rollback() {
     git -C "$INSTALL_DIR" checkout -q "$previous" \
         || fail "Cannot check out ${previous}."
     record_version_history "$previous"
-    # --no-cache here, not the --build-arg cache-bust used by
-    # perform_update above: the checkout above may have replaced the
-    # Dockerfile with a commit that predates the apt security-refresh ARG
-    # entirely, and Docker only busts a layer's cache on an ARG that
-    # layer actually *references* -- a --build-arg value for an ARG the
-    # Dockerfile never declares/uses is silently ignored for caching
-    # purposes (harmless for build success, but achieves nothing towards
-    # freshness; see test_dockerfile_apt_refresh_layer_busts_the_gha_
-    # build_cache's own finding that an unreferenced ARG doesn't change a
-    # cache key). --no-cache sidesteps needing to know what the rollback
-    # target's Dockerfile does or doesn't reference: every layer rebuilds
-    # unconditionally. Rollback is rare and safety-critical, so the extra
-    # build time is the right trade for guaranteed freshness regardless
-    # of how old the target commit is.
-    compose build --quiet --no-cache
+    # See build_with_apt_refresh_cachebust: a rollback target is exactly
+    # the kind of checkout that can predate the apt security-refresh ARG
+    # entirely, so this detects that and falls back to --no-cache rather
+    # than assuming --build-arg alone is enough.
+    build_with_apt_refresh_cachebust
     if compose up -d --wait; then
         # The rolled-back commit is now confirmed running: the installed
         # command must match IT, not whatever was deployed before the

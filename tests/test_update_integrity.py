@@ -351,7 +351,10 @@ def test_update_command_aborts_before_side_effects_on_mismatch():
     for later in (
         "scripts/backup.sh",
         'checkout -q "$target_commit"',
-        "compose build",
+        # The actual `compose build` call lives inside the extracted
+        # build_with_apt_refresh_cachebust helper now; this call site is
+        # the equivalent "the build happens here" marker.
+        "build_with_apt_refresh_cachebust",
         "compose up",
         "record_version_history",
     ):

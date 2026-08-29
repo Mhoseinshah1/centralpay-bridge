@@ -669,20 +669,19 @@ def test_production_build_paths_propagate_the_apt_refresh_cachebust():
     docker-compose.yml declared no build.args for this ARG at all, so a
     production host's `docker compose build` always got the empty
     default. Follow-up findings caught that a day-only value lets a
-    second same-day `update` reuse a pre-refresh layer, and that an
-    exported env var relying on docker-compose.yml's `args:` passthrough
-    is silently ignored when the build's checked-out commit predates
-    that passthrough. `perform_update` and `install.sh`'s `deploy_stack`
-    must therefore set a fresh, second-granularity value and pass it
-    directly via --build-arg (they always build the just-resolved target
-    commit, whose Dockerfile always references this ARG). `perform_
-    rollback` cannot rely on --build-arg at all: Docker only busts a
-    layer's cache on an ARG that layer actually *references*, so a
-    --build-arg value is silently a no-op for caching (though harmless
-    for build success) against a rollback target old enough to predate
-    the ARG entirely -- it must use --no-cache instead, which rebuilds
-    every layer unconditionally regardless of what the target Dockerfile
-    does or doesn't reference."""
+    second same-day `update` reuse a pre-refresh layer, and that
+    --build-arg only busts a layer's cache when that layer actually
+    *references* the ARG -- silently a no-op for caching (though
+    harmless for build success) against a checked-out Dockerfile old
+    enough to predate this whole mechanism, which an explicit
+    CENTRALPAY_UPDATE_REF/CENTRALPAY_UPDATE_ALLOW_DEV_REF downgrade, a
+    rollback target, or an install.sh rerun against a different
+    CENTRALPAY_REF can all hit. Each production build site must
+    therefore detect that case (checking for the ARG's literal name,
+    since PR #85 always shipped its declaration and RUN reference
+    together) and fall back to --no-cache -- a full, unconditional
+    rebuild -- only then, keeping the fast --build-arg path for the
+    common case where the checked-out Dockerfile has it."""
     compose_text = COMPOSE_FILE.read_text()
     assert re.search(
         r"args:\s*\n\s*APT_REFRESH_CACHEBUST:\s*\$\{APT_REFRESH_CACHEBUST", compose_text
@@ -692,46 +691,44 @@ def test_production_build_paths_propagate_the_apt_refresh_cachebust():
         "not going through the --build-arg call sites below"
     )
 
+    detect_arg = r"grep -q 'APT_REFRESH_CACHEBUST' "
     cachebust_assign = r"apt_cachebust=\$\(date -u \+%Y-%m-%dT%H:%M:%SZ\)"
     build_arg_flag = r'--build-arg "APT_REFRESH_CACHEBUST=\$\{apt_cachebust\}"'
 
     management_text = MANAGEMENT.read_text()
-    build_calls = re.findall(
-        cachebust_assign + r"\n\s*compose build --quiet " + build_arg_flag,
+    assert re.search(
+        detect_arg
+        + r'"\$\{INSTALL_DIR\}/Dockerfile"[^\n]*\n(?:.*\n)*?\s*'
+        + cachebust_assign
+        + r"\n\s*compose build --quiet "
+        + build_arg_flag
+        + r"\n(?:.*\n)*?\s*else\n\s*compose build --quiet --no-cache",
         management_text,
+    ), (
+        "scripts/centralpay must define a helper that detects whether the "
+        "checked-out Dockerfile references APT_REFRESH_CACHEBUST, using "
+        "--build-arg with a fresh second-granularity value when it does "
+        "and falling back to --no-cache when it doesn't"
     )
-    assert len(build_calls) == 1, (
-        "perform_update must set a fresh, second-granularity "
-        "APT_REFRESH_CACHEBUST immediately before its own `compose "
-        "build` call and pass it via --build-arg"
-    )
-
-    rollback_body = management_text[management_text.index("\nperform_rollback() {") :]
-    # Comment prose above discusses --build-arg (to explain why it is
-    # *not* used here), so compare only the actual instructions.
-    rollback_code = "\n".join(_code_lines(rollback_body))
-    assert "compose build --quiet --no-cache" in rollback_code, (
-        "perform_rollback must build with --no-cache -- the checked-out "
-        "rollback target's Dockerfile may predate the apt security-"
-        "refresh ARG entirely, in which case a --build-arg for it is "
-        "silently ignored for caching purposes"
-    )
-    assert "--build-arg" not in rollback_code, (
-        "perform_rollback should not also pass --build-arg for this ARG: "
-        "--no-cache already rebuilds every layer unconditionally, so a "
-        "cache-bust value alongside it would be dead, misleading weight"
+    assert management_text.count("build_with_apt_refresh_cachebust") >= 3, (
+        "the detection helper must be defined once and called by both "
+        "perform_update and perform_rollback"
     )
 
     installer_text = INSTALLER.read_text()
     assert re.search(
-        cachebust_assign
-        + r'\n\s*docker compose "\$\{profile_args\[@\]\}" build --quiet \\\n\s*'
-        + build_arg_flag,
+        detect_arg
+        + r"Dockerfile[^\n]*\n(?:.*\n)*?\s*"
+        + cachebust_assign
+        + r'\n(?:.*\n)*?\s*docker compose "\$\{profile_args\[@\]\}" build --quiet \\\n\s*'
+        + build_arg_flag
+        + r"\n\s*else\n\s*"
+        + r'docker compose "\$\{profile_args\[@\]\}" build --quiet --no-cache',
         installer_text,
     ), (
-        "install.sh's deploy_stack must set a fresh, second-granularity "
-        "APT_REFRESH_CACHEBUST and pass it via --build-arg immediately "
-        "before its own compose build call"
+        "install.sh's deploy_stack must run the same detect-then-build-arg-"
+        "or-no-cache logic, since CENTRALPAY_REF can also target a commit "
+        "that predates the ARG on a rerun against an existing install"
     )
 
 
