@@ -1101,10 +1101,79 @@ def test_release_workflow_does_not_use_unresolvable_trivy_action():
     text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
     uses = [line for line in text.splitlines() if "uses:" in line]
     assert not any("trivy-action" in line for line in uses)
-    assert "aquasecurity/trivy:" in text
     # The scan still fails the release on findings, with the same scope.
     assert "--exit-code 1" in text
     assert "--severity CRITICAL,HIGH" in text
+    assert "--ignore-unfixed" in text
+
+
+def _github_heading_slug(heading_text: str) -> str:
+    """Reimplements the fragment-id algorithm the release workflow's lychee
+    link checker actually uses for a Markdown ATX heading (GitHub-flavored):
+    lowercase, drop zero-width non-joiners (U+200C) entirely -- NOT replace
+    them with a hyphen or keep them -- keep letters/digits/underscore/
+    hyphen/space and Unicode combining marks, drop everything else, then
+    collapse whitespace to hyphens. Empirically verified against the exact
+    lychee v0.24.2 binary the release workflow downloads (every one of the
+    15 broken anchors below was confirmed to resolve against a real heading
+    only under this exact rule set; no other variant tried -- keeping the
+    ZWNJ, replacing it with a hyphen, or dropping combining marks -- made
+    all 15 resolve)."""
+    import unicodedata
+
+    out = []
+    for ch in heading_text.lower():
+        if ch == "‌":
+            continue
+        if ch.isalnum() or ch in "_- " or unicodedata.category(ch) == "Mn":
+            out.append(ch)
+    return re.sub(r"\s+", "-", "".join(out).strip())
+
+
+def test_legacy_persian_handbook_internal_anchors_resolve():
+    """First real release.yml run's docs job failed at 'Local links
+    resolve' (lychee): 15 table-of-contents entries in the legacy Persian
+    handbook linked to `#<heading-with-zwnj-kept>`, but the zero-width
+    non-joiners (used for correct Persian word-joining, e.g. `قدم‌به‌قدم`)
+    inside those headings are dropped by the actual slug algorithm, not
+    preserved -- so none of those 15 anchors matched any real heading.
+    Fixed by regenerating the 15 anchors from their headings' actual
+    slugs. This test protects against the fix drifting out of sync again:
+    every self-referencing `(#...)` link in the file must resolve to some
+    heading's real slug."""
+    text = (PROJECT_ROOT / "docs" / "راهنمای_جامع_کاربری_CentralPay_Bridge_FA.md").read_text()
+    seen: dict[str, int] = {}
+    valid_slugs: set[str] = set()
+    for match in re.finditer(r"^#{1,6}\s+(.*)$", text, re.MULTILINE):
+        base = _github_heading_slug(match.group(1))
+        n = seen.get(base, 0)
+        valid_slugs.add(f"{base}-{n}" if n else base)
+        seen[base] = n + 1
+    anchors = re.findall(r"\]\(#([^)\s]+)\)", text)
+    assert anchors, "expected at least one internal anchor link in this document"
+    broken = [a for a in anchors if a not in valid_slugs]
+    assert not broken, f"anchors with no matching heading slug: {broken}"
+
+
+def test_release_workflow_uses_the_real_trivy_docker_hub_image():
+    """Second real release run failed at the Trivy step itself: the image
+    reference was `aquasecurity/trivy`, which is not a real Docker Hub
+    repository (Aqua Security's Docker Hub namespace is `aquasec`; the
+    longer `aquasecurity` name is only the GHCR/GitHub org) -- `docker run`
+    failed with "pull access denied ... repository does not exist" before
+    any scanning happened. Confirmed against the Docker Hub v2 registry API
+    directly: a manifest request for aquasec/trivy:0.58.0 succeeds (200)
+    and the same request for aquasecurity/trivy:0.58.0 does not (401)."""
+    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "aquasec/trivy:" in text
+    # Only the executable `docker run` image reference matters here; the
+    # broken name is still legitimately mentioned in explanatory comments
+    # (the historical `aquasecurity/trivy-action` marketplace action, and
+    # this fix's own postmortem of the wrong Docker Hub namespace).
+    code_lines = [
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    ]
+    assert not any("aquasecurity/trivy" in line for line in code_lines)
 
 
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
