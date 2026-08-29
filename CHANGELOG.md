@@ -33,6 +33,11 @@ to production or upgrade any running instance.
   nonexistent `aquasecurity/trivy` to the real Docker Hub namespace
   `aquasec/trivy`; scan flags (`--exit-code 1`, `--severity
   CRITICAL,HIGH`, `--ignore-unfixed`) are unchanged.
+- Pinned that same Trivy image by a verified `@sha256` digest in
+  addition to its tag: the scan step mounts the host Docker socket, so
+  a tag alone was the wrong trust boundary for a release-integrity-
+  critical job (a silent tag republish could otherwise run different,
+  unreviewed code with that access).
 
 ## [0.6.0-rc2] — 2026-08-29 (release candidate — NOT production-ready)
 

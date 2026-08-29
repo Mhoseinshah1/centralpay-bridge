@@ -2,9 +2,11 @@
 
 Release candidate. **Not production-ready**: the release blockers in
 `RELEASE_RISK_REGISTER.md` (real-host install B1, real-CentralPay
-staging evidence B2, live Telegram admin-bot run B3, green
-tag-triggered release workflow B5) remain open. This tag must not be
-deployed and no real payment may be processed until they are closed
+staging evidence B2, green tag-triggered release workflow B5) remain
+open, as does live Telegram admin-bot validation B3 if the optional
+admin bot is to be enabled (the payment path itself does not depend on
+it). This tag must not be deployed and no real payment may be
+processed until the blockers that apply to your deployment are closed
 and a human approval is recorded. Creating this GitHub release does
 **not** upgrade any running production instance.
 
@@ -25,12 +27,17 @@ anything rc2's version-prep changed:
   (Aqua Security's Docker Hub namespace is `aquasec`, not
   `aquasecurity`) — the scan failed to even start.
 
-Both were root-caused, reproduced locally, and fixed on `main`. The
-`v0.6.0-rc2` tag itself was **not** deleted, moved, or reused — it
-remains a failed/unpublished release-candidate attempt, preserved as
-evidence. `v0.6.0-rc3` is the same source content as rc2 plus these two
-release-pipeline fixes; it introduces **no** application or payment
-behavior change over rc2.
+Both were root-caused, reproduced locally, and fixed on `main`.
+A follow-up automated code review then flagged that the Trivy scan
+step, which mounts the host Docker socket, was trusting a mutable
+image tag rather than a content digest; the image reference now also
+carries a verified `@sha256` digest pin, so a future republish of that
+tag cannot silently swap in different, unreviewed code with that
+access. The `v0.6.0-rc2` tag itself was **not** deleted, moved, or
+reused — it remains a failed/unpublished release-candidate attempt,
+preserved as evidence. `v0.6.0-rc3` is the same source content as rc2
+plus these three release-pipeline fixes; it introduces **no**
+application or payment behavior change over rc2.
 
 ## Headline: operational hardening, not a payment-model change
 
@@ -52,7 +59,12 @@ gateway/bot-notification failure bursts (counted as affected payments,
 never raw retry attempts). Incident state (migrations `0011`/`0012`)
 persists across restarts and is deduplicated with a PostgreSQL partial
 unique index, so two racing monitor instances can never open a
-duplicate incident or send a duplicate alert. New `centralpay monitor
+duplicate incident row or enqueue a duplicate alert for one. Delivery
+to Telegram itself is at-least-once by design, like the rest of this
+codebase's notification paths: if a send succeeds but its HTTP response
+is lost, a retry can still produce a second operator-visible message on
+the wire — the guarantee is no duplicate incident bookkeeping, not an
+exactly-once delivery promise. New `centralpay monitor
 check [--json]` / `centralpay monitor incidents [--all]` host commands
 and a read-only `/monitor` admin-bot command. See `MONITORING.md`.
 
