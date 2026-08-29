@@ -188,12 +188,20 @@ jobs:
         # run before any step executed. The official Trivy CLI image is
         # used instead: Docker Hub version tags are immutable, and the
         # scan flags below mirror the old action inputs exactly.
+        #
+        # Second real release run then failed here too: "aquasecurity/trivy"
+        # is not a real Docker Hub repository (pull access denied / does not
+        # exist) -- Aqua Security's Docker Hub namespace is "aquasec", not
+        # "aquasecurity" (that longer name is only the GHCR/GitHub org).
+        # Verified against the Docker Hub v2 registry API before this fix:
+        # a manifest HEAD for aquasec/trivy:0.58.0 returns 200; the same
+        # request for aquasecurity/trivy:0.58.0 returns 401.
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
-            aquasecurity/trivy:0.58.0 image \
+            aquasec/trivy:0.58.0 image \
             --format table \
             --exit-code 1 \
             --severity CRITICAL,HIGH \
