@@ -242,9 +242,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Resolve current release-notes file
+        id: notes
+        run: |
+          # Derived from app/version.py's APP_VERSION via the shared
+          # scripts/resolve-release-notes.sh, not hardcoded here -- a later
+          # release candidate must never be gated on an older RC's notes
+          # file. Historical RELEASE_NOTES_*.md files are untouched.
+          app_version=$(grep -oE '^APP_VERSION = "[^"]+"' app/version.py \
+            | sed -E 's/^APP_VERSION = "(.*)"$/\1/')
+          echo "file=$(bash scripts/resolve-release-notes.sh "$app_version")" >> "$GITHUB_OUTPUT"
       - name: Required release documents exist
         run: |
-          for f in CHANGELOG.md RELEASE_NOTES_0.6.0_RC1.md RELEASE_RISK_REGISTER.md \
+          for f in CHANGELOG.md "${{ steps.notes.outputs.file }}" RELEASE_RISK_REGISTER.md \
                    MIGRATION_GUIDE.md REAL_HOST_VALIDATION.md STAGING_VALIDATION.md \
                    ADMIN_BOT_VALIDATION.md PRODUCTION_CHECKLIST_FA.md \
                    README.md README_FA.md INSTALL_FA.md OPERATIONS_FA.md \
@@ -272,8 +282,17 @@ jobs:
         id: version
         run: |
           pip install -e . >/dev/null
-          echo "version=$(python -c 'from app.version import APP_VERSION; print(APP_VERSION)')" \
-            >> "$GITHUB_OUTPUT"
+          version=$(python -c 'from app.version import APP_VERSION; print(APP_VERSION)')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          # Same shared derivation as the docs job (scripts/resolve-release-
+          # notes.sh): a later RC's draft release must never silently pick
+          # up an older RC's notes file. Fails closed if the file is missing.
+          notes_file=$(bash scripts/resolve-release-notes.sh "$version")
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::expected release-notes file ${notes_file} does not exist"
+            exit 1
+          fi
+          echo "notes_file=${notes_file}" >> "$GITHUB_OUTPUT"
       - name: Build source artifact (tracked files only)
         run: |
           version="${{ steps.version.outputs.version }}"
@@ -323,7 +342,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --draft \
             --title "centralpay-bridge ${version}" \
-            --notes-file "RELEASE_NOTES_0.6.0_RC1.md" \
+            --notes-file "${{ steps.version.outputs.notes_file }}" \
             "centralpay-bridge-${version}.tar.gz" \
             SOURCE_COMMIT \
             sbom-centralpay-bridge.spdx.json \

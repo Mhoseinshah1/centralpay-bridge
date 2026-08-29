@@ -162,7 +162,9 @@ def installed_head(sandbox) -> str:
 # --- is_release_tag grammar --------------------------------------------------
 
 
-@pytest.mark.parametrize("ref", ["v1.2.3", "v1.2.3-rc1", "v0.6.0-rc1", "v10.20.30"])
+@pytest.mark.parametrize(
+    "ref", ["v1.2.3", "v1.2.3-rc1", "v0.6.0-rc1", "v0.6.0-rc2", "v10.20.30"]
+)
 def test_is_release_tag_accepts_supported_grammar(ref):
     r = subprocess.run(
         ["bash", "-c", 'source "$1"; is_release_tag "$2"', "_", str(CLI), ref],

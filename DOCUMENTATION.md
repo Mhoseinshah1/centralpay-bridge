@@ -81,9 +81,14 @@ These files record or define validation work for a particular release/host/integ
 | File | Role |
 | --- | --- |
 | `RELEASE_NOTES_0.5.0_RC1.md` | Historical release notes for 0.5.0-rc1 |
-| `RELEASE_NOTES_0.6.0_RC1.md` | Release notes for the 0.6.0-rc1 line; update when preparing a new RC if still applicable |
+| `RELEASE_NOTES_0.6.0_RC1.md` | Historical release notes for the 0.6.0-rc1 line |
+| `RELEASE_NOTES_0.6.0_RC2.md` | Current release notes for the 0.6.0-rc2 line |
 
 Release notes describe a release line, not every later `main` commit.
+The release workflow (`.github/workflows/release.yml`) resolves which
+file is "current" from `APP_VERSION` via
+`scripts/resolve-release-notes.sh` — it is never hardcoded to one RC,
+so this table is the only place that needs a new row for a new line.
 
 ## Incident/postmortem documentation
 
