@@ -141,6 +141,16 @@ jobs:
           expected='${{ steps.appver.outputs.value }}'
           echo "image version label: '${label}' (expected '${expected}')"
           test "$label" = "$expected"
+      - name: Trivy vulnerability scan (image)
+        # Catches this class of issue (CVE-2026-14456, a base-image OpenSSL
+        # package one Debian security point-release behind its own fix) on
+        # every pull request, before it can ever reach a release tag --
+        # v0.6.0-rc3 only found it at release time because this job had no
+        # such scan yet. Runs the exact same script, same digest-pinned
+        # Trivy image, and same fail-closed policy as release.yml's own
+        # scan (.github/scripts/trivy-scan.sh is the single source of truth
+        # for both) so the two workflows' vulnerability gate cannot diverge.
+        run: bash .github/scripts/trivy-scan.sh centralpay-bridge:ci
       - name: Validate Caddyfile template
         run: |
           sed -e 's/{{PAYMENT_DOMAIN}}/pay.example.com/' -e 's/{{TLS_EMAIL}}/ops@example.com/' \

@@ -183,40 +183,14 @@ jobs:
           docker run --rm -v /tmp/Caddyfile:/etc/caddy/Caddyfile:ro caddy:2 \
             caddy validate --config /etc/caddy/Caddyfile
       - name: Trivy vulnerability scan (image)
-        # The marketplace pin aquasecurity/trivy-action@0.28.0 stopped
-        # resolving ("unable to find version") and broke the first release
-        # run before any step executed. The official Trivy CLI image is
-        # used instead: Docker Hub version tags are immutable, and the
-        # scan flags below mirror the old action inputs exactly.
-        #
-        # Second real release run then failed here too: "aquasecurity/trivy"
-        # is not a real Docker Hub repository (pull access denied / does not
-        # exist) -- Aqua Security's Docker Hub namespace is "aquasec", not
-        # "aquasecurity" (that longer name is only the GHCR/GitHub org).
-        # Verified against the Docker Hub v2 registry API before this fix:
-        # a manifest HEAD for aquasec/trivy:0.58.0 returns 200; the same
-        # request for aquasecurity/trivy:0.58.0 returns 401.
-        #
-        # Pinned by digest (in addition to the readable tag) per automated
-        # review: this job mounts the host Docker socket, so a tag that got
-        # silently republished (compromise or otherwise) would run different,
-        # unreviewed code with that access -- the required vulnerability scan
-        # itself could then be bypassed. The digest below is the manifest-list
-        # digest for aquasec/trivy:0.58.0 (covers all published platforms;
-        # Docker resolves it to the runner's architecture at pull time, same
-        # as the tag would), confirmed via the Docker Hub v2 registry API
-        # `Docker-Content-Digest` response header for that exact tag.
-        run: |
-          mkdir -p "$RUNNER_TEMP/trivy-cache"
-          docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
-            aquasec/trivy:0.58.0@sha256:b88012e2a0a309d6a8a00463d4e63e5e513377fb74eccbc8f9b0f8f81940ebeb image \
-            --format table \
-            --exit-code 1 \
-            --severity CRITICAL,HIGH \
-            --ignore-unfixed \
-            centralpay-bridge:release
+        # Root causes of the two earlier failures here (marketplace action
+        # pin stopped resolving; then the wrong Docker Hub namespace) and the
+        # digest-pin rationale are documented once, at the source of truth,
+        # in .github/scripts/trivy-scan.sh -- ci.yml's docker job runs the
+        # exact same script against every pull request's image, so this
+        # policy (image, digest, severity, --ignore-unfixed, fail-closed
+        # --exit-code 1) cannot silently diverge between the two workflows.
+        run: bash .github/scripts/trivy-scan.sh centralpay-bridge:release
       - name: Syft SBOM (SPDX JSON)
         uses: anchore/sbom-action@v0
         with:

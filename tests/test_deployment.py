@@ -533,9 +533,73 @@ def test_systemd_timer_schedule():
 # --- Dockerfile -------------------------------------------------------------
 
 
+def _dockerfile_base_image() -> str:
+    text = DOCKERFILE.read_text()
+    match = re.search(r'^ARG BASE_IMAGE=(\S+)$', text, re.MULTILINE)
+    assert match, (
+        "Dockerfile must declare ARG BASE_IMAGE=<image>@sha256:<digest> "
+        "before the first FROM"
+    )
+    return match.group(1)
+
+
+def test_dockerfile_base_image_is_not_a_floating_tag():
+    """v0.6.0-rc3's release build used a bare `python:3.12-slim` (no
+    digest): a rebuild days later silently picked up a newer upstream
+    Debian snapshot whose libssl3t64/openssl package was one Debian
+    security point-release behind its own fix (CVE-2026-14456, HIGH),
+    without any change on our side. The base image must always carry a
+    `@sha256:<digest>` pin so a rebuild is reproducible instead of
+    silently drifting to whatever Docker Hub last published."""
+    base_image = _dockerfile_base_image()
+    assert base_image != "python:3.12-slim", "must not be the bare floating tag"
+    assert "@sha256:" in base_image, f"base image must be digest-pinned: {base_image}"
+    assert re.fullmatch(r"[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}", base_image), base_image
+
+
+def test_dockerfile_base_image_uses_an_explicit_distro_variant():
+    """Prefer an explicit distro tag (e.g. `python:3.12-slim-trixie`) over
+    the ambiguous floating alias (`python:3.12-slim`) even though a digest
+    pin alone would already be reproducible: the explicit name makes which
+    Debian release backs the image legible from the Dockerfile itself,
+    without having to resolve the digest against the registry first."""
+    base_image = _dockerfile_base_image()
+    tag = base_image.split("@", 1)[0]
+    assert re.search(r"-(trixie|bookworm|bullseye)(-slim)?$", tag) or re.search(
+        r"-slim-(trixie|bookworm|bullseye)$", tag
+    ), f"base image tag should name an explicit Debian release, got: {tag}"
+
+
+def test_dockerfile_builder_and_runtime_share_the_same_base_image():
+    """Builder and runtime must use the identical pinned base (same
+    variable, not two independently hardcoded references) unless there is
+    a concrete, documented reason to diverge -- otherwise the two stages'
+    OS package versions can silently drift apart from each other."""
+    text = DOCKERFILE.read_text()
+    assert text.count("FROM ${BASE_IMAGE}") == 2, (
+        "both stages must reference the same ARG BASE_IMAGE, not a separately hardcoded tag"
+    )
+
+
+def test_dockerfile_runtime_applies_a_general_security_refresh():
+    """The digest pin above freezes a point-in-time base snapshot; without
+    an apt upgrade at build time, a fix published in Debian's own security
+    repo after that snapshot (like the one for CVE-2026-14456) would never
+    reach the image until the next manual base-digest bump. `apt-get
+    upgrade` (never `dist-upgrade`, and never a single hardcoded package
+    pin) only replaces existing packages with newer builds of themselves,
+    so it stays a general refresh rather than a brittle one-CVE hack."""
+    text = DOCKERFILE.read_text()
+    assert "apt-get upgrade" in text
+    assert "dist-upgrade" not in text
+    # No single hardcoded `package=version` pin standing in for a real
+    # upgrade (e.g. `libssl3t64=3.5.7-1~deb13u2`).
+    assert not re.search(r"apt-get install[^\n]*=\d", text)
+
+
 def test_dockerfile_properties():
     text = DOCKERFILE.read_text()
-    assert text.count("FROM python:3.12-slim") == 2  # multi-stage
+    assert text.count("FROM ${BASE_IMAGE}") == 2  # multi-stage, same pinned base
     assert "USER centralpay" in text  # non-root runtime
     assert "PYTHONDONTWRITEBYTECODE=1" in text
     assert "PYTHONUNBUFFERED=1" in text
@@ -1098,14 +1162,11 @@ def test_pyproject_version_matches_app_version():
 def test_release_workflow_does_not_use_unresolvable_trivy_action():
     """First tag-gate run failed at job setup: aquasecurity/trivy-action's
     0.28.0 tag no longer resolves. The scan now runs the official Trivy
-    CLI image (Docker Hub version tags are immutable)."""
+    CLI image (Docker Hub version tags are immutable), via the shared
+    .github/scripts/trivy-scan.sh (see the tests below)."""
     text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
     uses = [line for line in text.splitlines() if "uses:" in line]
     assert not any("trivy-action" in line for line in uses)
-    # The scan still fails the release on findings, with the same scope.
-    assert "--exit-code 1" in text
-    assert "--severity CRITICAL,HIGH" in text
-    assert "--ignore-unfixed" in text
 
 
 def _github_heading_slug(heading_text: str) -> str:
@@ -1156,7 +1217,14 @@ def test_legacy_persian_handbook_internal_anchors_resolve():
     assert not broken, f"anchors with no matching heading slug: {broken}"
 
 
-def test_release_workflow_uses_the_real_trivy_docker_hub_image():
+TRIVY_SCAN_SCRIPT = PROJECT_ROOT / ".github" / "scripts" / "trivy-scan.sh"
+
+
+def _code_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if not line.strip().startswith("#")]
+
+
+def test_trivy_scan_script_uses_the_real_pinned_trivy_image():
     """Second real release run failed at the Trivy step itself: the image
     reference was `aquasecurity/trivy`, which is not a real Docker Hub
     repository (Aqua Security's Docker Hub namespace is `aquasec`; the
@@ -1164,34 +1232,49 @@ def test_release_workflow_uses_the_real_trivy_docker_hub_image():
     failed with "pull access denied ... repository does not exist" before
     any scanning happened. Confirmed against the Docker Hub v2 registry API
     directly: a manifest request for aquasec/trivy:0.58.0 succeeds (200)
-    and the same request for aquasecurity/trivy:0.58.0 does not (401)."""
-    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
-    assert "aquasec/trivy:" in text
-    # Only the executable `docker run` image reference matters here; the
-    # broken name is still legitimately mentioned in explanatory comments
-    # (the historical `aquasecurity/trivy-action` marketplace action, and
-    # this fix's own postmortem of the wrong Docker Hub namespace).
-    code_lines = [
-        line for line in text.splitlines() if not line.strip().startswith("#")
-    ]
+    and the same request for aquasecurity/trivy:0.58.0 does not (401).
+    Also covers the follow-up automated-review finding: this step mounts
+    the host Docker socket, so a tag alone is not enough -- the image
+    reference must carry a verified `@sha256:...` digest pin too."""
+    text = TRIVY_SCAN_SCRIPT.read_text()
+    code_lines = _code_lines(text)
+    assert any("aquasec/trivy:" in line for line in code_lines)
     assert not any("aquasecurity/trivy" in line for line in code_lines)
-
-
-def test_release_workflow_pins_trivy_image_by_digest():
-    """Automated review finding on the aquasec/trivy fix above: this step
-    mounts the host Docker socket, so a tag alone is not enough -- if the
-    tag were ever silently republished (compromise or otherwise), the
-    release job would run different, unreviewed code with that access,
-    and the required vulnerability scan itself could be bypassed. The
-    image reference must carry a `@sha256:...` digest pin in addition to
-    the human-readable tag; confirmed against the Docker Hub v2 registry
-    API's `Docker-Content-Digest` response header for aquasec/trivy:0.58.0."""
-    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
-    code_lines = [line for line in text.splitlines() if not line.strip().startswith("#")]
     assert any(
-        re.search(r"aquasec/trivy:0\.58\.0@sha256:[0-9a-f]{64}\s", line)
+        re.search(r"aquasec/trivy:0\.58\.0@sha256:[0-9a-f]{64}", line)
         for line in code_lines
-    ), "the executable docker run line must pin aquasec/trivy:0.58.0 with a @sha256:<digest> suffix"
+    ), "the trivy image reference must pin aquasec/trivy:0.58.0 with a @sha256:<digest> suffix"
+
+
+def test_trivy_scan_script_is_fail_closed():
+    """The vulnerability gate must fail the build on any CRITICAL/HIGH
+    finding with an available fix, exactly as it did (correctly) for
+    CVE-2026-14456 in the v0.6.0-rc3 tag -- these flags must never be
+    loosened to make a red build green instead of fixing the image."""
+    text = TRIVY_SCAN_SCRIPT.read_text()
+    assert "--exit-code 1" in text
+    assert "--severity CRITICAL,HIGH" in text
+    assert "--ignore-unfixed" in text
+
+
+def test_release_and_ci_workflows_share_the_same_trivy_scan_script():
+    """v0.6.0-rc3's container CVE (CVE-2026-14456) reached a release tag
+    undetected specifically because release.yml had a Trivy gate and
+    ci.yml (every pull request) did not -- the two workflows' vulnerability
+    policy had already diverged once. Both must now invoke the exact same
+    script, and neither may carry its own independent inline `docker run
+    ... image` scan that could drift out of sync with it again."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    ci_text = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for name, text in (("release.yml", release_text), ("ci.yml", ci_text)):
+        assert ".github/scripts/trivy-scan.sh" in text, (
+            f"{name} must invoke the shared trivy-scan.sh script"
+        )
+        code_lines = _code_lines(text)
+        assert not any(
+            "aquasec/trivy" in line or "aquasecurity/trivy" in line
+            for line in code_lines
+        ), f"{name} must not duplicate the trivy image reference outside the shared script"
 
 
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
