@@ -1210,6 +1210,13 @@ def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     with open(PROJECT_ROOT / ".gitleaks.toml", "rb") as fh:
         config = tomllib.load(fh)
     assert config["extend"]["useDefault"] is True
+    # regexTarget="match" tests only the specific substring gitleaks flags as
+    # a secret; "line" (the setting this commit moved away from) tests the
+    # whole source line instead, so an unrelated real secret sharing a line
+    # with an allowlisted fixture value would be silently suppressed too.
+    # Without this assertion, reverting to "line" -- the exact cross-
+    # suppression regression this commit fixes -- would leave this test green.
+    assert config["allowlist"]["regexTarget"] == "match"
     patterns = [re.compile(r) for r in config["allowlist"]["regexes"]]
 
     def matches_any(line: str) -> bool:
@@ -1227,6 +1234,19 @@ def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     assert not matches_any('CALLBACK_SECRET = "prod-alias-secret-deadbeef1234"')
     # No path-based allowlisting: app/deploy/docs stay fully scanned.
     assert "paths" not in config["allowlist"]
+    # Mixed real-secret/fixture line: with regexTarget="match" (asserted
+    # above), gitleaks tests only each flagged substring on its own, so the
+    # fixture value on this line may match (and be allowlisted) while the
+    # unrelated real-looking secret sharing the same line must not -- if
+    # regexTarget ever regressed to "line", gitleaks would test the whole
+    # line and silently allowlist the real secret too.
+    mixed_line = (
+        'TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6" '
+        'REAL_LEAKED_KEY = "sk-live-51H8AnythingRealLookingSecretValue123456"'
+    )
+    real_secret_substring = "sk-live-51H8AnythingRealLookingSecretValue123456"
+    assert matches_any(mixed_line)
+    assert not matches_any(real_secret_substring)
 
 
 # --- release-gate regression: dynamic release-notes resolution --------------
