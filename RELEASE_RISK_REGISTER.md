@@ -888,7 +888,16 @@ deadlock/lock-ordering cycles (none found).
   merged** — otherwise a tag-triggered `release.yml` run against rc4
   would either repeat rc1/rc2's gitleaks full-history failure class or
   ship a container image whose security-refresh guarantee is weaker
-  than described above.
+  than described above. A review finding correctly pointed out that
+  merely opening #86/#88, or writing this sentence, does not itself
+  stop a tag from being cut early: `main` (and this PR's own head) does
+  not yet contain either fix as of this entry. The concrete sequencing
+  that makes this hold is: merge #86, then #88, then rebase this
+  release-prep branch (`release/0.6.0-rc4`) onto the resulting `main`
+  so both fixes are actual ancestors of the version-bump commit, and
+  only then merge this PR — the `v0.6.0-rc4` tag must be created from
+  a commit descended from all three merges, never from this PR's
+  current head or from `main` before #86/#88 land on it.
 - **This does not close, reopen, or change B1/B2/B3.** B5 made real,
   verified progress but is **not yet closed**: rc3's tag-triggered run
   passed every job except Trivy, and that finding is now fixed and
