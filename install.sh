@@ -714,13 +714,15 @@ deploy_stack() {
     if grep -qE '^MONITOR_ENABLED=true$' "$ENV_FILE" 2>/dev/null; then
         profile_args+=(--profile monitor)
     fi
-    # See scripts/centralpay's perform_update for why this must actually
-    # change: docker-compose.yml passes it to the Dockerfile's apt
-    # security-refresh layer, and local Docker build cache would otherwise
-    # reuse that layer forever after this very first build on the host.
-    export APT_REFRESH_CACHEBUST
-    APT_REFRESH_CACHEBUST=$(date -u +%Y-%m-%d)
-    docker compose "${profile_args[@]}" build --quiet
+    # See scripts/centralpay's perform_update/perform_rollback for why
+    # this must actually change and go via --build-arg (not an exported
+    # var relying on docker-compose.yml's `args:` passthrough): local
+    # Docker build cache would otherwise reuse the Dockerfile's apt
+    # security-refresh layer forever after this very first build.
+    local apt_cachebust
+    apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    docker compose "${profile_args[@]}" build --quiet \
+        --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
     if ! docker compose "${profile_args[@]}" up -d --wait; then
         docker compose "${profile_args[@]}" ps >&2 || true
         echo >&2

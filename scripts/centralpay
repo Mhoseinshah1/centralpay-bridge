@@ -758,14 +758,17 @@ perform_update() {
     fi
 
     log "Building images..."
-    # Must actually change on every build: docker-compose.yml passes this
-    # through to the Dockerfile's apt security-refresh layer (see its
-    # `base` stage), and Docker's local build cache would otherwise reuse
-    # that layer forever after the very first image built on this host,
-    # silently defeating the OS package refresh on every future update.
-    export APT_REFRESH_CACHEBUST
-    APT_REFRESH_CACHEBUST=$(date -u +%Y-%m-%d)
-    compose build --quiet
+    # Must actually change on every build: the Dockerfile's apt security-
+    # refresh layer (see its `base` stage) is keyed on this, and Docker's
+    # local build cache would otherwise reuse it forever after the first
+    # image built on this host, silently defeating the OS package refresh
+    # on every future update. Passed directly via --build-arg rather than
+    # relying on docker-compose.yml's own `args:` passthrough (see
+    # perform_rollback below for why), with second-granularity so running
+    # `update` more than once in a day still gets a fresh refresh.
+    local apt_cachebust
+    apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    compose build --quiet --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
     log "Applying migrations and restarting services (configuration in ${CONFIG_DIR} is preserved)..."
     if compose up -d --wait; then
         # Only now is the new commit confirmed running: safe to make its
@@ -798,12 +801,18 @@ perform_rollback() {
     git -C "$INSTALL_DIR" checkout -q "$previous" \
         || fail "Cannot check out ${previous}."
     record_version_history "$previous"
-    # See the matching cache-bust in perform_update above: without a
-    # changing value here too, a rollback build would silently reuse
-    # whatever apt security-refresh layer local Docker cache already has.
-    export APT_REFRESH_CACHEBUST
-    APT_REFRESH_CACHEBUST=$(date -u +%Y-%m-%d)
-    compose build --quiet
+    # See the matching cache-bust in perform_update above -- and note this
+    # one must go via --build-arg, not an exported var relying on
+    # docker-compose.yml's `args:` passthrough: the checkout above may
+    # have replaced docker-compose.yml (and the Dockerfile) with a commit
+    # that predates that passthrough, or predates this whole mechanism,
+    # in which case an exported var would be silently ignored and the
+    # rollback build would keep reusing whatever apt layer is cached.
+    # --build-arg reaches the build directly and is harmless even against
+    # a Dockerfile that does not declare this ARG at all.
+    local apt_cachebust
+    apt_cachebust=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    compose build --quiet --build-arg "APT_REFRESH_CACHEBUST=${apt_cachebust}"
     if compose up -d --wait; then
         # The rolled-back commit is now confirmed running: the installed
         # command must match IT, not whatever was deployed before the

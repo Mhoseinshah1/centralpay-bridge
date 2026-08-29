@@ -667,40 +667,49 @@ def test_production_build_paths_propagate_the_apt_refresh_cachebust():
     test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache), but that
     only refreshes CI's own images. A review finding caught that
     docker-compose.yml declared no build.args for this ARG at all, so a
-    production host's `docker compose build` always got the empty default
-    -- once the apt security-refresh layer was cached locally after the
-    first build on a host, `centralpay update`/`rollback` and the
-    installer would keep reusing it forever, silently defeating the whole
-    point of an automatic OS package refresh on every production update."""
+    production host's `docker compose build` always got the empty
+    default. A second round of findings caught that a day-only value lets
+    a second same-day `update` reuse a pre-refresh layer, and that an
+    exported env var relying on docker-compose.yml's `args:` passthrough
+    is silently ignored when the build's checked-out commit (as a
+    rollback target can be) predates that passthrough -- or the whole
+    ARG -- entirely. Each production build site must therefore set a
+    fresh, second-granularity value and pass it directly via
+    --build-arg, which reaches the build regardless of what the
+    currently-checked-out docker-compose.yml/Dockerfile know about it."""
     compose_text = COMPOSE_FILE.read_text()
     assert re.search(
         r"args:\s*\n\s*APT_REFRESH_CACHEBUST:\s*\$\{APT_REFRESH_CACHEBUST", compose_text
     ), (
-        "docker-compose.yml's build.args must pass APT_REFRESH_CACHEBUST "
-        "through from the environment"
+        "docker-compose.yml's build.args must still pass APT_REFRESH_CACHEBUST "
+        "through from the environment, as a fallback default for any build "
+        "not going through the --build-arg call sites below"
     )
+
+    cachebust_assign = r"apt_cachebust=\$\(date -u \+%Y-%m-%dT%H:%M:%SZ\)"
+    build_arg_flag = r'--build-arg "APT_REFRESH_CACHEBUST=\$\{apt_cachebust\}"'
 
     management_text = MANAGEMENT.read_text()
     build_calls = re.findall(
-        r"APT_REFRESH_CACHEBUST=\$\(date -u \+%Y-%m-%d\)\n\s*compose build --quiet",
+        cachebust_assign + r"\n\s*compose build --quiet " + build_arg_flag,
         management_text,
     )
     assert len(build_calls) == 2, (
-        "both perform_update and perform_rollback must set a fresh "
-        "APT_REFRESH_CACHEBUST immediately before their own `compose build` "
-        "call -- a stale/fixed value here would let local Docker build "
-        "cache reuse the apt security-refresh layer forever after the "
-        "first production build on a host"
+        "both perform_update and perform_rollback must set a fresh, "
+        "second-granularity APT_REFRESH_CACHEBUST immediately before "
+        "their own `compose build` call and pass it via --build-arg"
     )
 
     installer_text = INSTALLER.read_text()
     assert re.search(
-        r'APT_REFRESH_CACHEBUST=\$\(date -u \+%Y-%m-%d\)\n\s*'
-        r'docker compose "\$\{profile_args\[@\]\}" build --quiet',
+        cachebust_assign
+        + r'\n\s*docker compose "\$\{profile_args\[@\]\}" build --quiet \\\n\s*'
+        + build_arg_flag,
         installer_text,
     ), (
-        "install.sh's deploy_stack must set a fresh APT_REFRESH_CACHEBUST "
-        "immediately before its own compose build call"
+        "install.sh's deploy_stack must set a fresh, second-granularity "
+        "APT_REFRESH_CACHEBUST and pass it via --build-arg immediately "
+        "before its own compose build call"
     )
 
 
