@@ -834,10 +834,12 @@ deadlock/lock-ordering cycles (none found).
   - `Dockerfile`: both build stages now pull the same pinned
     `python:3.12-slim-trixie@sha256:...` base via a shared `ARG
     BASE_IMAGE`, instead of the floating tag.
-  - Runtime stage now runs a general `apt-get upgrade` (never
+  - Runtime stage runs a general `apt-get upgrade` (never
     `dist-upgrade`, never a single hardcoded package pin) before
     installing `curl`, closing not just this CVE but the general class
     of "pinned base trails Debian's own security repo by build time."
+    (A follow-up finding on PR #85 caught that only the runtime stage
+    was refreshed this way, not the builder stage; see below.)
   - The Trivy scan's image reference, digest pin, and severity policy
     were extracted into `.github/scripts/trivy-scan.sh`, and `ci.yml`'s
     `docker` job now runs the identical scan on every pull request —
@@ -862,15 +864,31 @@ deadlock/lock-ordering cycles (none found).
   `RELEASE_NOTES_0.6.0_RC4.md` prepared, describing rc4 as the
   fixed-image supersession of the rc3 attempt with no application or
   payment behavior change from rc3.
-- A separate, pre-existing gap was found and fixed while manually
-  verifying the container fix: `release.yml`'s full-history `gitleaks`
-  secret scan (job `secret-scan`) had not been re-run since the
-  original topic-19-era fix months ago, and the test suite had since
-  grown two dummy-credential fixture shapes (`tests/test_phase3_app.py`'s
-  `alias-secret-...`, `tests/test_logging_redaction.py`'s
-  `attacker-guessed-key-...`) that `.gitleaks.toml`'s allowlist did not
-  yet cover. Fixed via a separate, dedicated PR (#86) — unrelated to the
-  container CVE, no shared root cause, not bundled into PR #85.
+- A separate, pre-existing gap was found while manually verifying the
+  container fix: `release.yml`'s full-history `gitleaks` secret scan
+  (job `secret-scan`) had not been re-run since the original topic-19-era
+  fix months ago, and the test suite had since grown two dummy-credential
+  fixture shapes (`tests/test_phase3_app.py`'s `alias-secret-...`,
+  `tests/test_logging_redaction.py`'s `attacker-guessed-key-...`) that
+  `.gitleaks.toml`'s allowlist did not yet cover. A fix is proposed via
+  a separate, dedicated PR (**#86, open, not yet merged as of this
+  entry**) — unrelated to the container CVE, no shared root cause, not
+  bundled into PR #85.
+- Three follow-up review findings landed on PR #85 after it had already
+  merged (so they could not be pushed into it): the apt refresh above
+  originally covered only the runtime stage, leaving the builder stage's
+  own network operations (`pip install .`) running against the
+  unrefreshed snapshot; `.github/scripts/trivy-scan.sh` was missing from
+  both workflows' own shell-validation steps; and the apt refresh RUN
+  layer's GitHub Actions cache key never changed on its own, so it could
+  have silently served the same pre-upgrade layer forever after the
+  first cached build. All three verified and fixed via a separate PR
+  (**#88, open, not yet merged as of this entry**).
+- **`v0.6.0-rc4` must not be tagged until PR #86 and PR #88 have both
+  merged** — otherwise a tag-triggered `release.yml` run against rc4
+  would either repeat rc1/rc2's gitleaks full-history failure class or
+  ship a container image whose security-refresh guarantee is weaker
+  than described above.
 - **This does not close, reopen, or change B1/B2/B3.** B5 made real,
   verified progress but is **not yet closed**: rc3's tag-triggered run
   passed every job except Trivy, and that finding is now fixed and

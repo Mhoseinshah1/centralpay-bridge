@@ -31,23 +31,29 @@ not deploy it to production or upgrade any running instance.
   `python:3.12-slim` tag, for both the builder and runtime stages, so a
   rebuild is reproducible instead of silently drifting to whatever
   Debian snapshot Docker Hub last published.
-- Added a general `apt-get upgrade` security refresh to the runtime
-  stage (never `dist-upgrade`, never a single hardcoded package pin),
-  so any package with a newer build in Debian's own security repo by
-  build time is picked up — closing the specific CVE-2026-14456 gap and
-  the general class of "pinned base image trails upstream security
-  fixes" without waiting on the next base-image publish.
+- Added a general `apt-get upgrade` security refresh (never
+  `dist-upgrade`, never a single hardcoded package pin) to a shared base
+  stage both the builder and runtime stages derive from, so any package
+  with a newer build in Debian's own security repo by build time is
+  picked up — closing the specific CVE-2026-14456 gap and the general
+  class of "pinned base image trails upstream security fixes" without
+  waiting on the next base-image publish. Its GitHub Actions build-layer
+  cache is busted daily so the refresh cannot silently stop re-running
+  after the first cached build.
 - Extracted the Trivy scan's image reference, digest pin, and severity
   policy into one shared script (`.github/scripts/trivy-scan.sh`), and
   added the same fail-closed scan to `ci.yml`'s `docker` job — this
   exact class of issue reached a release tag undetected specifically
   because pull-request CI had no equivalent scan; it now does, for
-  every future PR before a release is ever tagged.
-- Closed a separate, pre-existing gap in `.gitleaks.toml`'s full-history
+  every future PR before a release is ever tagged. (Follow-up review
+  findings on the above landed as a separate PR, #88, open and not yet
+  merged as of this writing.)
+- Found a separate, pre-existing gap in `.gitleaks.toml`'s full-history
   secret-scan allowlist (two dummy test-fixture value shapes added to
   the test suite since the original rc1 fix were never covered, because
   nothing had re-run the full-history scan since); unrelated to the
-  container CVE.
+  container CVE. A fix is proposed in a separate PR, #86, open and not
+  yet merged as of this writing.
 
 ## [0.6.0-rc3] — 2026-08-29 (release candidate — NOT production-ready)
 

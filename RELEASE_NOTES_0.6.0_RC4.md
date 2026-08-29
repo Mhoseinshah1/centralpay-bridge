@@ -41,7 +41,7 @@ security point-release behind its own OpenSSL fix — a rebuild days
 apart from the last one can silently pick up a different, less-patched
 snapshot with no change on our side.
 
-Fixed on `main`:
+Landed on `main` via #85:
 
 - `Dockerfile`: both build stages now pull the same
   `python:3.12-slim-trixie@sha256:...`-pinned base (an explicit,
@@ -59,6 +59,16 @@ Fixed on `main`:
   on every pull request**, before a build with a vulnerability like
   this one can ever reach a release tag again.
 
+Three follow-up review findings on #85 (that PR had already merged, so
+these landed as a separate PR, **#88, open, not yet merged as of this
+writing**): the apt refresh above originally covered only the runtime
+stage, not the builder stage's own network operations, now fixed via a
+shared refreshed base stage both derive from; `trivy-scan.sh` itself
+was missing from both workflows' shell-validation steps; and the apt
+refresh layer's GitHub Actions cache key never changed on its own, so
+without an explicit daily cache-bust it could have silently served the
+same pre-upgrade layer on every future build.
+
 The `v0.6.0-rc3` tag itself was **not** deleted, moved, or reused — it
 remains a failed/unpublished release-candidate attempt, preserved as
 evidence, exactly like `v0.6.0-rc2` before it. `v0.6.0-rc4` is the same
@@ -66,13 +76,14 @@ source content as rc3 plus this container-security fix and the new
 PR-time vulnerability gate; it introduces **no** application or payment
 behavior change over rc3.
 
-A separate, pre-existing gap was also found and fixed while verifying
-this release manually: `release.yml`'s full-history secret scan
-(`gitleaks`) had never been re-run since the very first release attempt
-months ago, and the test suite had since grown two dummy-credential
-fixture shapes its allowlist did not yet cover. Fixed in
-`.gitleaks.toml`; unrelated to the container CVE and not part of the
-Docker/Trivy fix above.
+A separate, pre-existing gap was also found while verifying this
+release manually: `release.yml`'s full-history secret scan (`gitleaks`)
+had never been re-run since the very first release attempt months ago,
+and the test suite had since grown two dummy-credential fixture shapes
+its allowlist did not yet cover. **A fix is proposed in a separate PR
+(#86, open, not yet merged as of this writing)**; unrelated to the
+container CVE and not part of the Docker/Trivy fix above. This tag must
+not be created until both #86 and #88 have merged.
 
 ## Headline: operational hardening, not a payment-model change
 
