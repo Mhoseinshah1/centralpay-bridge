@@ -689,3 +689,111 @@ deadlock/lock-ordering cycles (none found).
   `0.6.0-rc1` release decision above.
 - No production access, no deployment, and no real CentralPay/Telegram
   call were performed to prepare this version bump.
+
+## Topic 51 — v0.6.0-rc2's first real release.yml run: two pre-existing defects found, fixed on main, rc3 prepared
+
+### 51. `v0.6.0-rc2` tagged; its first real tag-triggered release run failed on two unrelated, pre-existing defects — **FIXED on main; rc2 tag preserved as evidence; rc3 prepared**
+- `v0.6.0-rc2` was tagged at `6e3f33636e7f059086444ee03ec46e38b78c1ded`.
+  Its `release.yml` run (id `33252207603`) was the first *tag-triggered*
+  execution of that workflow — B5 had been open precisely because no
+  tag-triggered run had happened yet. (An earlier `workflow_dispatch`
+  run on `main`, before `v0.6.0-rc1` was even tagged, had already
+  caught and fixed two different pipeline defects — an unresolvable
+  Trivy Action pin and a gitleaks full-history false positive — via
+  commit `88090fc`; that run was not tag-triggered.) It found:
+  1. **Documentation checks / Local links resolve (lychee)**: 15
+     table-of-contents anchors in the legacy Persian handbook
+     (`docs/راهنمای_جامع_کاربری_CentralPay_Bridge_FA.md`) linked to
+     headings containing zero-width non-joiners (ZWNJ, U+200C) copied
+     verbatim into the anchor; the actual heading-slug algorithm the
+     link checker uses drops ZWNJ rather than preserving it, so none
+     of those 15 anchors resolved. Root-caused by downloading the
+     exact `lychee v0.24.2` binary the workflow pulls and reproducing
+     the failure locally byte-for-byte, then empirically deriving the
+     real slug algorithm (ZWNJ deleted; Unicode combining marks kept)
+     and regenerating the 15 anchors from it. The other 24 links in
+     the file were already correct and untouched.
+  2. **Docker build, scan, and SBOM / Trivy vulnerability scan**: the
+     scan's `docker run` image reference, `aquasecurity/trivy:0.58.0`,
+     is not a real Docker Hub repository — Aqua Security's Docker Hub
+     namespace is `aquasec`, not `aquasecurity` (that longer name is
+     only the GHCR/GitHub org). Confirmed directly against the Docker
+     Hub v2 registry API (manifest request for `aquasec/trivy:0.58.0`
+     → 200; same request for `aquasecurity/trivy:0.58.0` → 401).
+     `--exit-code 1` / `--severity CRITICAL,HIGH` / `--ignore-unfixed`
+     are unchanged.
+- Because `package` (which drafts the release) `needs: [docs, ...]`,
+  no draft release was ever created for `v0.6.0-rc2` — `docs` failing
+  meant `package` was skipped entirely.
+- Both fixes landed on `main` via PR #82, validated (targeted +
+  full-suite pytest against real PostgreSQL 16, ruff, mypy, shellcheck,
+  both docker-compose profiles, and an independent full local `lychee`
+  run against `**/*.md`: 0 errors) and merged.
+- **`v0.6.0-rc2` was not deleted, moved, or reused.** It remains
+  tagged at the same commit as a preserved historical record of a
+  release-candidate attempt whose *pipeline* (not its application
+  behavior) failed validation; `RELEASE_NOTES_0.6.0_RC2.md` and its
+  `CHANGELOG.md` entry are unchanged. `app/version.py`/`pyproject.toml`
+  were then bumped to `0.6.0-rc3` (same pattern as topic 50) and
+  `RELEASE_NOTES_0.6.0_RC3.md` prepared, describing rc3 as the
+  fixed-pipeline supersession of the rc2 attempt with no application
+  or payment behavior change from rc2.
+- **This does not close, reopen, or change B1/B2/B3.** B5 is
+  **partially addressed but still open**: the two concrete defects
+  rc2's real run found are fixed on `main`, but B5 requires an actual
+  green tag-triggered run, which has not yet happened for any tag —
+  `v0.6.0-rc3` has not been tagged as of this entry. Closing B5
+  necessarily requires creating the `v0.6.0-rc3` tag first — the
+  release workflow only runs on `push: tags` or manual dispatch (see
+  B5's own definition above) — so the tag is the mechanism for
+  producing that evidence, not something gated behind it. What
+  remains gated on B1, B2, and a green B5 run (and B3 if the optional
+  admin bot is to be enabled) — plus a recorded human approval — is
+  **publishing** the GitHub release and using this version for any
+  real payment; this register does not authorize either.
+- No production access, no deployment, and no real CentralPay/Telegram
+  call occurred while diagnosing or fixing either defect.
+
+## Topic 52 — migration `0007`'s downgrade has no `CENTRALPAY_DROP_*` guard, unlike `0008`–`0012` — **KNOWN GAP; NOT FIXED; NON-BLOCKING FOR THIS RELEASE**
+
+### 52. `alembic/versions/0007_payer_identity.py::downgrade` unconditionally drops payer-identity data — no opt-in required
+- Migrations `0008`, `0009`, `0010`, `0011`, and `0012` all gate their
+  destructive downgrade path behind an explicit `CENTRALPAY_DROP_*`
+  environment opt-in (`CENTRALPAY_DROP_PAYER_IDENTITY`,
+  `CENTRALPAY_DROP_RECONCILIATION`, `CENTRALPAY_DROP_MONITOR_INCIDENTS`,
+  `CENTRALPAY_DROP_MONITOR_INCIDENT_LAST_ALERT`). `0007` — which
+  originally created `centralpay_payer_identities` and the payment
+  snapshot columns those later migrations extend — has no such guard:
+  its `downgrade()` unconditionally drops the FK, both snapshot
+  columns, and the entire mapping table the moment `alembic downgrade`
+  is run past it.
+- `centralpay rollback` never exercises this path (it is
+  application-only and never calls `alembic downgrade`), so no
+  supported CLI workflow can trigger it. The risk is limited to an
+  operator manually running raw `alembic downgrade` below `0007`
+  against a database with real payer-identity history.
+- Found by an automated review of PR #84 (`chatgpt-codex-connector`),
+  which correctly flagged that `RELEASE_NOTES_0.6.0_RC3.md` and
+  `CHANGELOG.md` previously promised this was guarded for every
+  migration without exception. Those documents are corrected in the
+  same commit that adds this topic, to stop overpromising and instead
+  name `0007` as the explicit exception with a directly-stated
+  operational warning.
+- **This is a pre-existing gap, not introduced by rc3**: `0007` shipped
+  as part of the rc2 line and has read this way since it merged. It is
+  recorded here for the first time because this is the first review to
+  have caught it.
+- **Not fixed in this branch.** `release/0.6.0-rc3`'s own stated scope
+  is metadata/pipeline-adjacent only, with no `app/` or migration code
+  touched beyond the version string, and this project's own
+  `MIGRATION_GUIDE.md` rule is to never edit an already-deployed
+  migration revision for schema changes — adding a guard to `0007`'s
+  downgrade is exactly that kind of change and belongs in a dedicated,
+  reviewed follow-up (e.g. a `CENTRALPAY_DROP_PAYER_IDENTITY_MAPPING`
+  guard on `0007` itself, matching the naming and behavior of
+  `0008`/`0009`'s own `CENTRALPAY_DROP_PAYER_IDENTITY`). Until then,
+  operators must not run manual `alembic downgrade` past `0007` on any
+  database holding real payer-identity history.
+- Does not close, reopen, or change B1/B2/B3/B5, and does not block
+  this release line — no supported production path exercises the
+  unguarded downgrade.
