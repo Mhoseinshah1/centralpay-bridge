@@ -1242,7 +1242,7 @@ _DOCS_WITH_COMMANDS = (
     "REAL_HOST_VALIDATION.md", "STAGING_VALIDATION.md",
     "PRODUCTION_CHECKLIST_FA.md", "MIGRATION_GUIDE.md",
     "RELEASE_NOTES_0.6.0_RC1.md", "RELEASE_NOTES_0.6.0_RC2.md",
-    "RELEASE_NOTES_0.6.0_RC3.md",
+    "RELEASE_NOTES_0.6.0_RC3.md", "RELEASE_NOTES_0.6.0_RC4.md",
 )
 
 
@@ -1534,16 +1534,16 @@ def _resolved_notes_filename(app_version: str) -> str:
     return result.stdout.strip()
 
 
-def test_resolve_release_notes_maps_current_app_version_to_rc3():
+def test_resolve_release_notes_maps_current_app_version_to_rc4():
     """APP_VERSION drives which release-notes file the release workflow
     requires and publishes -- prove the live mapping, not just the
     filename convention. First tag-gate run for rc2 would otherwise have
     silently drafted the release using rc1's notes."""
     from app.version import APP_VERSION
 
-    assert APP_VERSION == "0.6.0-rc3"
+    assert APP_VERSION == "0.6.0-rc4"
     filename = _resolved_notes_filename(APP_VERSION)
-    assert filename == "RELEASE_NOTES_0.6.0_RC3.md"
+    assert filename == "RELEASE_NOTES_0.6.0_RC4.md"
     assert (PROJECT_ROOT / filename).is_file()
 
 
@@ -1572,6 +1572,21 @@ def test_resolve_release_notes_keeps_historical_rc2_mapping():
     assert "0.6.0-rc2" in path.read_text()
 
 
+def test_resolve_release_notes_keeps_historical_rc3_mapping():
+    """The rc3 line's own notes file is still resolvable and still exists
+    -- rc3's tag was never deleted or reused (its Docker image correctly
+    failed the Trivy vulnerability gate on CVE-2026-14456, a base-image
+    OpenSSL package; the fix landed on main afterwards; rc3 itself was
+    never re-tagged or republished) and its notes file is preserved as
+    historical evidence, only superseded as the *current* line's mapping
+    target."""
+    filename = _resolved_notes_filename("0.6.0-rc3")
+    assert filename == "RELEASE_NOTES_0.6.0_RC3.md"
+    path = PROJECT_ROOT / filename
+    assert path.is_file()
+    assert "0.6.0-rc3" in path.read_text()
+
+
 def test_resolve_release_notes_fails_closed_for_a_version_with_no_notes_file():
     """A future RC whose notes file has not been written yet must make the
     release workflow fail closed, exactly like the package job's own guard
@@ -1595,12 +1610,14 @@ def test_resolve_release_notes_fails_closed_for_a_version_with_no_notes_file():
 def test_release_workflow_never_hardcodes_a_specific_rc_notes_filename():
     """release.yml used to hardcode RELEASE_NOTES_0.6.0_RC1.md in both the
     required-documents check and the draft-release creation step. Neither
-    RC1's nor RC2's filename may appear as a literal in the workflow --
-    only as the resolved output of scripts/resolve-release-notes.sh --
-    or a future rc3 would face the exact same bug again."""
+    RC1's, RC2's, nor RC3's filename may appear as a literal in the
+    workflow -- only as the resolved output of
+    scripts/resolve-release-notes.sh -- or a future rc would face the
+    exact same bug again."""
     text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
     assert "RELEASE_NOTES_0.6.0_RC1.md" not in text
     assert "RELEASE_NOTES_0.6.0_RC2.md" not in text
+    assert "RELEASE_NOTES_0.6.0_RC3.md" not in text
     assert "scripts/resolve-release-notes.sh" in text
     assert '--notes-file "${{ steps.version.outputs.notes_file }}"' in text
     assert '"${{ steps.notes.outputs.file }}"' in text

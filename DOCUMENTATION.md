@@ -83,7 +83,8 @@ These files record or define validation work for a particular release/host/integ
 | `RELEASE_NOTES_0.5.0_RC1.md` | Historical release notes for 0.5.0-rc1 |
 | `RELEASE_NOTES_0.6.0_RC1.md` | Historical release notes for the 0.6.0-rc1 line |
 | `RELEASE_NOTES_0.6.0_RC2.md` | Historical release notes for the 0.6.0-rc2 line — tagged, but its first real `release.yml` run failed on two unrelated pre-existing defects (doc-anchor and Trivy-image); rc2 was never re-tagged or published, superseded by 0.6.0-rc3 |
-| `RELEASE_NOTES_0.6.0_RC3.md` | Current release notes for the 0.6.0-rc3 line |
+| `RELEASE_NOTES_0.6.0_RC3.md` | Historical release notes for the 0.6.0-rc3 line — tagged, its pipeline defects were already fixed, but its Docker image itself then correctly failed the Trivy vulnerability gate (CVE-2026-14456, a base-image OpenSSL package); rc3 was never re-tagged or published, superseded by 0.6.0-rc4 |
+| `RELEASE_NOTES_0.6.0_RC4.md` | Current release notes for the 0.6.0-rc4 line |
 
 Release notes describe a release line, not every later `main` commit.
 The release workflow (`.github/workflows/release.yml`) resolves which
@@ -132,7 +133,7 @@ Their Git history remains available permanently, so deleting them from the curre
 
 At the time this map was added, important current facts include:
 
-- application version `0.6.0-rc3`
+- application version `0.6.0-rc4`
 - Alembic head `0012`
 - production update refs fail closed unless they are release tags, unless the explicit development opt-in is enabled
 - admin bot is no longer accurately described as blanket read-only because `/resend_failed confirm` is a narrowly gated mutation

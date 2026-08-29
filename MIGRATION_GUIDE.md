@@ -2,7 +2,7 @@
 
 CentralPay Bridge migrations are designed for a financial system: **forward-only by default**, non-destructive where practical, and gated by backup + integrity checks.
 
-Current application version: **0.6.0-rc3**.  
+Current application version: **0.6.0-rc4**.  
 Current Alembic head in this branch: **0012**.
 
 ## General rules
@@ -148,7 +148,7 @@ Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_D
 Production updates should use a release tag configured in `/etc/centralpay-bridge/centralpay.env`:
 
 ```env
-CENTRALPAY_UPDATE_REF=v0.6.0-rc3
+CENTRALPAY_UPDATE_REF=v0.6.0-rc4
 ```
 
 Normal flow:
