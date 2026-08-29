@@ -540,7 +540,10 @@ def test_perform_update_aborts_before_build_on_caddy_sync_failure():
     body = source[source.index("perform_update() {") :]
     body = body[: body.index("\nperform_rollback() {")]
     sync_call_i = body.index("render-caddy-config.sh")
-    build_i = body.index("compose build")
+    # The actual `compose build` call lives inside the extracted
+    # build_with_apt_refresh_cachebust helper now; its call site here is
+    # the equivalent "the build happens here" marker for perform_update.
+    build_i = body.index("build_with_apt_refresh_cachebust")
     assert sync_call_i < build_i
 
 
@@ -577,7 +580,10 @@ def test_perform_update_activates_caddy_before_build_not_gated_on_deploy_success
 
     restart_i = body.index("compose restart caddy")
     confirm_i = body.index('render-caddy-config.sh" --confirm-active')
-    build_i = body.index("compose build")
+    # The actual `compose build` call lives inside the extracted
+    # build_with_apt_refresh_cachebust helper now; its call site here is
+    # the equivalent "the build happens here" marker for perform_update.
+    build_i = body.index("build_with_apt_refresh_cachebust")
     up_wait_i = body.index('if compose up -d --wait; then')
 
     # Both activation calls happen before the build step...

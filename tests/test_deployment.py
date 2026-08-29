@@ -571,13 +571,20 @@ def test_dockerfile_base_image_uses_an_explicit_distro_variant():
 
 
 def test_dockerfile_builder_and_runtime_share_the_same_base_image():
-    """Builder and runtime must use the identical pinned base (same
-    variable, not two independently hardcoded references) unless there is
-    a concrete, documented reason to diverge -- otherwise the two stages'
-    OS package versions can silently drift apart from each other."""
+    """Builder and runtime must use the identical pinned, security-refreshed
+    base (a single shared `base` stage), not two independently hardcoded
+    references -- otherwise the two stages' OS package versions can
+    silently drift apart from each other. A review finding caught an
+    earlier version of this file where only `runtime` was refreshed:
+    `builder`'s own network operations (`pip install .`) still ran
+    against the unrefreshed snapshot, and Trivy -- which only scans the
+    final shipped image -- could never have reported on that gap."""
     text = DOCKERFILE.read_text()
-    assert text.count("FROM ${BASE_IMAGE}") == 2, (
-        "both stages must reference the same ARG BASE_IMAGE, not a separately hardcoded tag"
+    assert text.count("FROM ${BASE_IMAGE} AS base") == 1, (
+        "exactly one stage should pull the pinned base image directly"
+    )
+    assert text.count("FROM base AS") == 2, (
+        "both builder and runtime must derive from the shared, refreshed `base` stage"
     )
 
 
@@ -597,9 +604,137 @@ def test_dockerfile_runtime_applies_a_general_security_refresh():
     assert not re.search(r"apt-get install[^\n]*=\d", text)
 
 
+def test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache():
+    """A review finding caught that the apt security-refresh RUN layer's
+    cache key never changes on its own (same base digest, same literal
+    command text), so with GHA layer caching enabled
+    (cache-from/cache-to: type=gha in both ci.yml and release.yml) it
+    would be reused unchanged after the first successful build --
+    silently never re-running `apt-get update`/`upgrade` again and
+    defeating the whole point of a build-time security refresh. The fix
+    must declare a cache-bust ARG and actually reference it inside the
+    RUN command (declaring but not using it would not change the layer's
+    cache key)."""
+    text = DOCKERFILE.read_text()
+    assert re.search(r'^ARG APT_REFRESH_CACHEBUST=', text, re.MULTILINE), (
+        "Dockerfile must declare a cache-bust ARG for the apt refresh layer"
+    )
+    match = re.search(
+        r"RUN\s+echo[^\n]*\$\{?APT_REFRESH_CACHEBUST\}?[^\n]*\n(?:[^\n]*\n)*?[^\n]*apt-get upgrade",
+        text,
+    )
+    assert match, (
+        "the cache-bust ARG must be referenced inside the RUN command that "
+        "runs apt-get upgrade, not just declared -- an unused ARG does not "
+        "change that layer's BuildKit cache key"
+    )
+
+
+def test_dockerfile_apt_lists_are_removed_in_the_layer_that_creates_them():
+    """A review finding caught an earlier version of this file fetching the
+    apt package lists in the shared `base` stage's RUN (via `apt-get
+    update`) but deleting them only in `runtime`'s own later RUN. Docker
+    layers are immutable, so that later `rm -rf /var/lib/apt/lists/*` only
+    hid the lists from the merged filesystem view -- their bytes stayed
+    committed in the base layer, still shipped with (and paid for on)
+    every pull. curl and the cleanup must live in the exact RUN that
+    fetches the lists."""
+    text = DOCKERFILE.read_text()
+    base_stage = text[text.index("FROM ${BASE_IMAGE} AS base") : text.index("FROM base AS builder")]
+    # Comment prose above discusses these same commands, so compare only
+    # the actual instructions, not the raw (comment-including) text.
+    base_stage_code = "\n".join(_code_lines(base_stage))
+    run_lines = [
+        line for line in base_stage_code.splitlines() if line.strip().startswith("RUN")
+    ]
+    assert len(run_lines) == 1, "update/upgrade/install/cleanup must be a single RUN (one layer)"
+    assert "apt-get install" in base_stage_code
+    assert "rm -rf /var/lib/apt/lists" in base_stage_code
+    update_at = base_stage_code.index("apt-get update")
+    install_at = base_stage_code.index("apt-get install")
+    cleanup_at = base_stage_code.index("rm -rf /var/lib/apt/lists")
+    assert update_at < install_at < cleanup_at
+
+    runtime_stage = text[text.index("FROM base AS runtime") :]
+    assert "apt-get" not in runtime_stage, (
+        "runtime must not run its own apt-get -- curl and the refreshed "
+        "package state already come from the shared `base` stage"
+    )
+
+
+def test_production_build_paths_propagate_the_apt_refresh_cachebust():
+    """CI passes a fresh --build-arg once per UTC day (see
+    test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache), but that
+    only refreshes CI's own images. A review finding caught that
+    docker-compose.yml declared no build.args for this ARG at all, so a
+    production host's `docker compose build` always got the empty
+    default. Follow-up findings caught that a day-only value lets a
+    second same-day `update` reuse a pre-refresh layer, and that
+    --build-arg only busts a layer's cache when that layer actually
+    *references* the ARG -- silently a no-op for caching (though
+    harmless for build success) against a checked-out Dockerfile old
+    enough to predate this whole mechanism, which an explicit
+    CENTRALPAY_UPDATE_REF/CENTRALPAY_UPDATE_ALLOW_DEV_REF downgrade, a
+    rollback target, or an install.sh rerun against a different
+    CENTRALPAY_REF can all hit. Each production build site must
+    therefore detect that case (checking for the ARG's literal name,
+    since PR #85 always shipped its declaration and RUN reference
+    together) and fall back to --no-cache -- a full, unconditional
+    rebuild -- only then, keeping the fast --build-arg path for the
+    common case where the checked-out Dockerfile has it."""
+    compose_text = COMPOSE_FILE.read_text()
+    assert re.search(
+        r"args:\s*\n\s*APT_REFRESH_CACHEBUST:\s*\$\{APT_REFRESH_CACHEBUST", compose_text
+    ), (
+        "docker-compose.yml's build.args must still pass APT_REFRESH_CACHEBUST "
+        "through from the environment, as a fallback default for any build "
+        "not going through the --build-arg call sites below"
+    )
+
+    detect_arg = r"grep -q 'APT_REFRESH_CACHEBUST' "
+    cachebust_assign = r"apt_cachebust=\$\(date -u \+%Y-%m-%dT%H:%M:%SZ\)"
+    build_arg_flag = r'--build-arg "APT_REFRESH_CACHEBUST=\$\{apt_cachebust\}"'
+
+    management_text = MANAGEMENT.read_text()
+    assert re.search(
+        detect_arg
+        + r'"\$\{INSTALL_DIR\}/Dockerfile"[^\n]*\n(?:.*\n)*?\s*'
+        + cachebust_assign
+        + r"\n\s*compose build --quiet "
+        + build_arg_flag
+        + r"\n(?:.*\n)*?\s*else\n\s*compose build --quiet --no-cache",
+        management_text,
+    ), (
+        "scripts/centralpay must define a helper that detects whether the "
+        "checked-out Dockerfile references APT_REFRESH_CACHEBUST, using "
+        "--build-arg with a fresh second-granularity value when it does "
+        "and falling back to --no-cache when it doesn't"
+    )
+    assert management_text.count("build_with_apt_refresh_cachebust") >= 3, (
+        "the detection helper must be defined once and called by both "
+        "perform_update and perform_rollback"
+    )
+
+    installer_text = INSTALLER.read_text()
+    assert re.search(
+        detect_arg
+        + r"Dockerfile[^\n]*\n(?:.*\n)*?\s*"
+        + cachebust_assign
+        + r'\n(?:.*\n)*?\s*docker compose "\$\{profile_args\[@\]\}" build --quiet \\\n\s*'
+        + build_arg_flag
+        + r"\n\s*else\n\s*"
+        + r'docker compose "\$\{profile_args\[@\]\}" build --quiet --no-cache',
+        installer_text,
+    ), (
+        "install.sh's deploy_stack must run the same detect-then-build-arg-"
+        "or-no-cache logic, since CENTRALPAY_REF can also target a commit "
+        "that predates the ARG on a rerun against an existing install"
+    )
+
+
 def test_dockerfile_properties():
     text = DOCKERFILE.read_text()
-    assert text.count("FROM ${BASE_IMAGE}") == 2  # multi-stage, same pinned base
+    assert text.count("FROM base AS") == 2  # multi-stage, same pinned+refreshed base
     assert "USER centralpay" in text  # non-root runtime
     assert "PYTHONDONTWRITEBYTECODE=1" in text
     assert "PYTHONUNBUFFERED=1" in text
@@ -1275,6 +1410,57 @@ def test_release_and_ci_workflows_share_the_same_trivy_scan_script():
             "aquasec/trivy" in line or "aquasecurity/trivy" in line
             for line in code_lines
         ), f"{name} must not duplicate the trivy image reference outside the shared script"
+
+
+def test_shell_validation_covers_the_trivy_scan_script():
+    """A review finding caught that .github/scripts/trivy-scan.sh -- a
+    security-gate script both workflows now depend on -- was never added
+    to either workflow's own `bash -n`/ShellCheck command lists, so a
+    defect in it could bypass the repository's required shell validation
+    and only surface while actually building or releasing an image."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    ci_text = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    for name, text in (("release.yml", release_text), ("ci.yml", ci_text)):
+        assert "bash -n .github/scripts/trivy-scan.sh" in text, (
+            f"{name} must syntax-check the shared trivy-scan.sh script"
+        )
+        shellcheck_lines = [
+            line for line in text.splitlines() if line.strip().startswith("run: shellcheck")
+        ]
+        assert any(
+            ".github/scripts/trivy-scan.sh" in line for line in shellcheck_lines
+        ), f"{name} must run ShellCheck against the shared trivy-scan.sh script"
+
+
+def test_ci_and_release_workflows_bust_the_apt_refresh_build_cache():
+    """Companion to test_dockerfile_apt_refresh_layer_busts_the_gha_build_cache:
+    the Dockerfile's cache-bust ARG only works if CI actually supplies a
+    fresh value on every build via --build-arg. Both `ci.yml`'s single
+    build and `release.yml`'s amd64 *and* arm64 builds must pass it."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    ci_text = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert ci_text.count("APT_REFRESH_CACHEBUST=") == 1
+    # release.yml builds both amd64 and arm64 -- both must be refreshed.
+    assert release_text.count("APT_REFRESH_CACHEBUST=") == 2
+
+
+def test_release_workflow_cachebust_is_per_run_not_per_day():
+    """A review finding caught that release.yml's cache-bust was still
+    date-only (like ci.yml, deliberately, to keep the apt-get cost paid
+    once per day rather than on every PR push). A release run is rare and
+    consequential, and can get manually retried the same day after a real
+    Trivy finding (the rc3 incident this whole mechanism exists for) gets
+    fixed upstream -- a date-only value would keep serving that same
+    day's pre-fix apt layer across such retries. release.yml must use a
+    value unique per actual execution attempt (run_id AND run_attempt, so
+    a "re-run failed jobs" click on the same run -- which keeps run_id
+    but bumps run_attempt -- still gets a fresh one), not a UTC date.
+    ci.yml's daily value is intentionally left as-is -- frequent, lower-
+    stakes PR pushes are a different cost/benefit tradeoff."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "date -u +%Y-%m-%d" not in release_text
+    assert "github.run_id" in release_text
+    assert "github.run_attempt" in release_text
 
 
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():

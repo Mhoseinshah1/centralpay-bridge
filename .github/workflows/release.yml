@@ -109,8 +109,9 @@ jobs:
           bash -n install.sh
           bash -n scripts/centralpay
           bash -n scripts/backup.sh
+          bash -n .github/scripts/trivy-scan.sh
       - name: ShellCheck
-        run: shellcheck install.sh scripts/centralpay scripts/backup.sh
+        run: shellcheck install.sh scripts/centralpay scripts/backup.sh .github/scripts/trivy-scan.sh
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -139,7 +140,22 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Resolve APP_VERSION
         id: appver
-        run: echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
+          # Per-run (not per-day) cache-bust for the Dockerfile's apt
+          # security-refresh layer (see Dockerfile's `base` stage): unlike
+          # ci.yml (frequent PR pushes, where a daily value keeps the
+          # actual apt-get cost paid once per day rather than on every
+          # build), a release run is rare and consequential -- exactly the
+          # kind of run that gets manually retried the same day after a
+          # real Trivy finding is fixed upstream (the rc3 incident this
+          # whole mechanism exists for). A date-only value would keep
+          # reusing that same day's pre-fix apt layer across such retries,
+          # staying red until the UTC date rolls over. run_id+run_attempt
+          # is unique per actual execution, including a "re-run failed
+          # jobs" click on the same run (which keeps run_id but bumps
+          # run_attempt), so every release attempt gets its own refresh.
+          echo "apt_cachebust=${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
       - name: Build image (amd64, loaded for testing)
         uses: docker/build-push-action@v6
         with:
@@ -150,6 +166,7 @@ jobs:
           build-args: |
             APP_VERSION=${{ steps.appver.outputs.value }}
             BUILD_REVISION=${{ github.sha }}
+            APT_REFRESH_CACHEBUST=${{ steps.appver.outputs.apt_cachebust }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build image (arm64, build-only validation)
@@ -162,6 +179,7 @@ jobs:
           build-args: |
             APP_VERSION=${{ steps.appver.outputs.value }}
             BUILD_REVISION=${{ github.sha }}
+            APT_REFRESH_CACHEBUST=${{ steps.appver.outputs.apt_cachebust }}
           cache-from: type=gha
       - name: Image smoke test (non-root, version, label, imports)
         run: |

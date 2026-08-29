@@ -84,8 +84,9 @@ jobs:
           bash -n scripts/backup.sh
           bash -n scripts/render-caddy-config.sh
           bash -n .github/scripts/pg-client-wrapper.sh
+          bash -n .github/scripts/trivy-scan.sh
       - name: ShellCheck
-        run: shellcheck install.sh scripts/centralpay scripts/backup.sh scripts/render-caddy-config.sh .github/scripts/pg-client-wrapper.sh
+        run: shellcheck install.sh scripts/centralpay scripts/backup.sh scripts/render-caddy-config.sh .github/scripts/pg-client-wrapper.sh .github/scripts/trivy-scan.sh
 
   docker:
     name: Docker build and compose validation
@@ -104,7 +105,14 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - name: Resolve APP_VERSION
         id: appver
-        run: echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "value=$(python3 -c 'from app.version import APP_VERSION; print(APP_VERSION)')" >> "$GITHUB_OUTPUT"
+          # Daily cache-bust for the Dockerfile's apt security-refresh layer
+          # (see Dockerfile's `base` stage): without this, GHA layer caching
+          # below would silently reuse the same unrefreshed layer forever
+          # after the first successful build. Daily (not per-run) keeps the
+          # actual apt-get cost paid once per day rather than on every build.
+          echo "apt_cachebust=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
       - name: Build image (amd64)
         uses: docker/build-push-action@v6
         with:
@@ -114,6 +122,7 @@ jobs:
           tags: centralpay-bridge:ci
           build-args: |
             APP_VERSION=${{ steps.appver.outputs.value }}
+            APT_REFRESH_CACHEBUST=${{ steps.appver.outputs.apt_cachebust }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Image smoke test (non-root, version, label, static assets, clean exit)

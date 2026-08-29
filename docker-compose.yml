@@ -11,6 +11,14 @@ x-app-image: &app-image
   build:
     context: .
     dockerfile: Dockerfile
+    # Set by `centralpay update`/`rollback` and install.sh before each
+    # `compose build` (see scripts/centralpay and install.sh) so the
+    # Dockerfile's apt security-refresh layer actually re-runs on every
+    # production build instead of being reused forever from local build
+    # cache once one image has been built on a host (see Dockerfile's
+    # `base` stage for why this ARG exists).
+    args:
+      APT_REFRESH_CACHEBUST: ${APT_REFRESH_CACHEBUST:-}
   image: centralpay-bridge:latest
 
 x-app-env: &app-env
