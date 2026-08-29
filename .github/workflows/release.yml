@@ -196,12 +196,22 @@ jobs:
         # Verified against the Docker Hub v2 registry API before this fix:
         # a manifest HEAD for aquasec/trivy:0.58.0 returns 200; the same
         # request for aquasecurity/trivy:0.58.0 returns 401.
+        #
+        # Pinned by digest (in addition to the readable tag) per automated
+        # review: this job mounts the host Docker socket, so a tag that got
+        # silently republished (compromise or otherwise) would run different,
+        # unreviewed code with that access -- the required vulnerability scan
+        # itself could then be bypassed. The digest below is the manifest-list
+        # digest for aquasec/trivy:0.58.0 (covers all published platforms;
+        # Docker resolves it to the runner's architecture at pull time, same
+        # as the tag would), confirmed via the Docker Hub v2 registry API
+        # `Docker-Content-Digest` response header for that exact tag.
         run: |
           mkdir -p "$RUNNER_TEMP/trivy-cache"
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$RUNNER_TEMP/trivy-cache:/root/.cache/trivy" \
-            aquasec/trivy:0.58.0 image \
+            aquasec/trivy:0.58.0@sha256:b88012e2a0a309d6a8a00463d4e63e5e513377fb74eccbc8f9b0f8f81940ebeb image \
             --format table \
             --exit-code 1 \
             --severity CRITICAL,HIGH \

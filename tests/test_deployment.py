@@ -1176,6 +1176,23 @@ def test_release_workflow_uses_the_real_trivy_docker_hub_image():
     assert not any("aquasecurity/trivy" in line for line in code_lines)
 
 
+def test_release_workflow_pins_trivy_image_by_digest():
+    """Automated review finding on the aquasec/trivy fix above: this step
+    mounts the host Docker socket, so a tag alone is not enough -- if the
+    tag were ever silently republished (compromise or otherwise), the
+    release job would run different, unreviewed code with that access,
+    and the required vulnerability scan itself could be bypassed. The
+    image reference must carry a `@sha256:...` digest pin in addition to
+    the human-readable tag; confirmed against the Docker Hub v2 registry
+    API's `Docker-Content-Digest` response header for aquasec/trivy:0.58.0."""
+    text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    code_lines = [line for line in text.splitlines() if not line.strip().startswith("#")]
+    assert any(
+        re.search(r"aquasec/trivy:0\.58\.0@sha256:[0-9a-f]{64}\s", line)
+        for line in code_lines
+    ), "the executable docker run line must pin aquasec/trivy:0.58.0 with a @sha256:<digest> suffix"
+
+
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     """First tag-gate run failed on a full-history gitleaks scan flagging
     the deliberate TEST_* dummy credentials. The allowlist must keep
