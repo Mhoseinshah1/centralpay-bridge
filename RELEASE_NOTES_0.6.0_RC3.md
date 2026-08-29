@@ -13,10 +13,13 @@ and a human approval is recorded. Creating this GitHub release does
 ## Why rc3 exists: rc2's tag attempt failed its own release pipeline
 
 `v0.6.0-rc2` was tagged and its release workflow (`release.yml`) ran
-for the first time ever against real content — B5, "green tag-triggered
-release workflow," had been an open blocker until then. That first
-real run found two genuine, pre-existing defects, unrelated to
-anything rc2's version-prep changed:
+for the first time as a tag-triggered run — B5, "green tag-triggered
+release workflow," had been an open blocker until then. (An earlier
+`workflow_dispatch` run on `main`, before `v0.6.0-rc1` was even
+tagged, had already caught and fixed two different pipeline defects
+in commit `88090fc`; that run was not tag-triggered.) This
+tag-triggered run found two genuine, pre-existing defects, unrelated
+to anything rc2's version-prep changed:
 
 - **Documentation checks**: 15 table-of-contents links in the legacy
   Persian handbook pointed at headings containing zero-width
@@ -159,9 +162,12 @@ financial history:
   alert is correctly re-queued instead of looking "already alerted"
   forever.
 
-Every migration's downgrade is non-destructive by default; explicit
-schema removal requires the documented per-migration
-`CENTRALPAY_DROP_*` opt-in. See `MIGRATION_GUIDE.md` for full detail.
+Every migration's downgrade **except `0007`** is non-destructive by
+default, gated behind the documented per-migration `CENTRALPAY_DROP_*`
+opt-in. `0007` has no such guard: its downgrade unconditionally drops
+`centralpay_payer_identities` and both payment snapshot columns —
+never run `alembic downgrade` past `0007` against a database holding
+real payer-identity history. See `MIGRATION_GUIDE.md` for full detail.
 
 ## Upgrading from 0.6.0-rc1
 
@@ -185,10 +191,17 @@ rc2 would have been.
 ## Rollback limitations
 
 - The database schema is **never downgraded** by `centralpay
-  rollback`; it rolls back the application only.
-- Payer-identity mappings, reconciliation bookkeeping, and monitor
-  incident state are operational/financial-adjacent history and are
-  never rewritten by any rollback or repair tooling.
+  rollback`; it rolls back the application only, so this limitation
+  does not apply to a normal `centralpay rollback` — only to an
+  operator running raw `alembic downgrade` directly.
+- Reconciliation bookkeeping and monitor incident state are
+  operational/financial-adjacent history and are never rewritten by
+  any rollback or repair tooling. Payer-identity mappings share that
+  guarantee from migration `0008` onward (guarded behind
+  `CENTRALPAY_DROP_PAYER_IDENTITY=1`), but **not** for `0007` itself:
+  its downgrade unconditionally drops the mapping table and both
+  payment snapshot columns, with no opt-in guard — see the migrations
+  section above.
 
 ## Real-provider validation status
 

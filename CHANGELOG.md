@@ -5,8 +5,10 @@ All notable changes to centralpay-bridge. Dates are UTC.
 ## [0.6.0-rc3] — 2026-08-29 (release candidate — NOT production-ready)
 
 **Supersedes the `v0.6.0-rc2` tag, whose first real `release.yml` run
-(the first ever real execution of that workflow) failed on two
-pre-existing, unrelated defects: 15 table-of-contents links in the
+(the first *tag-triggered* run of that workflow — an earlier
+`workflow_dispatch` run on `main` had already caught and fixed two
+different pipeline defects, commit `88090fc`, before `v0.6.0-rc1` was
+even tagged) failed on two pre-existing, unrelated defects: 15 table-of-contents links in the
 legacy Persian handbook pointed at headings containing zero-width
 non-joiners that the link checker's slug algorithm drops rather than
 preserves, and the Trivy scan step's image reference used the wrong

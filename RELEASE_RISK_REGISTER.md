@@ -694,9 +694,13 @@ deadlock/lock-ordering cycles (none found).
 
 ### 51. `v0.6.0-rc2` tagged; its first real tag-triggered release run failed on two unrelated, pre-existing defects — **FIXED on main; rc2 tag preserved as evidence; rc3 prepared**
 - `v0.6.0-rc2` was tagged at `6e3f33636e7f059086444ee03ec46e38b78c1ded`.
-  Its `release.yml` run (id `33252207603`) was the first real execution
-  of that workflow ever — B5 had been open precisely because no
-  tag-triggered run had happened yet. It found:
+  Its `release.yml` run (id `33252207603`) was the first *tag-triggered*
+  execution of that workflow — B5 had been open precisely because no
+  tag-triggered run had happened yet. (An earlier `workflow_dispatch`
+  run on `main`, before `v0.6.0-rc1` was even tagged, had already
+  caught and fixed two different pipeline defects — an unresolvable
+  Trivy Action pin and a gitleaks full-history false positive — via
+  commit `88090fc`; that run was not tag-triggered.) It found:
   1. **Documentation checks / Local links resolve (lychee)**: 15
      table-of-contents anchors in the legacy Persian handbook
      (`docs/راهنمای_جامع_کاربری_CentralPay_Bridge_FA.md`) linked to
@@ -738,9 +742,58 @@ deadlock/lock-ordering cycles (none found).
   **partially addressed but still open**: the two concrete defects
   rc2's real run found are fixed on `main`, but B5 requires an actual
   green tag-triggered run, which has not yet happened for any tag —
-  `v0.6.0-rc3` has not been tagged as of this entry. `v0.6.0-rc3` must
-  not be tagged, published, or used for real payments until B1, B2,
-  B3, and a fresh green B5 run are closed and a human approval is
-  recorded.
+  `v0.6.0-rc3` has not been tagged as of this entry. Closing B5
+  necessarily requires creating the `v0.6.0-rc3` tag first — the
+  release workflow only runs on `push: tags` or manual dispatch (see
+  B5's own definition above) — so the tag is the mechanism for
+  producing that evidence, not something gated behind it. What
+  remains gated on B1, B2, B3, and a green B5 run — plus a recorded
+  human approval — is **publishing** the GitHub release and using
+  this version for any real payment; this register does not authorize
+  either.
 - No production access, no deployment, and no real CentralPay/Telegram
   call occurred while diagnosing or fixing either defect.
+
+## Topic 52 — migration `0007`'s downgrade has no `CENTRALPAY_DROP_*` guard, unlike `0008`–`0012` — **KNOWN GAP; NOT FIXED; NON-BLOCKING FOR THIS RELEASE**
+
+### 52. `alembic/versions/0007_payer_identity.py::downgrade` unconditionally drops payer-identity data — no opt-in required
+- Migrations `0008`, `0009`, `0010`, `0011`, and `0012` all gate their
+  destructive downgrade path behind an explicit `CENTRALPAY_DROP_*`
+  environment opt-in (`CENTRALPAY_DROP_PAYER_IDENTITY`,
+  `CENTRALPAY_DROP_RECONCILIATION`, `CENTRALPAY_DROP_MONITOR_INCIDENTS`,
+  `CENTRALPAY_DROP_MONITOR_INCIDENT_LAST_ALERT`). `0007` — which
+  originally created `centralpay_payer_identities` and the payment
+  snapshot columns those later migrations extend — has no such guard:
+  its `downgrade()` unconditionally drops the FK, both snapshot
+  columns, and the entire mapping table the moment `alembic downgrade`
+  is run past it.
+- `centralpay rollback` never exercises this path (it is
+  application-only and never calls `alembic downgrade`), so no
+  supported CLI workflow can trigger it. The risk is limited to an
+  operator manually running raw `alembic downgrade` below `0007`
+  against a database with real payer-identity history.
+- Found by an automated review of PR #84 (`chatgpt-codex-connector`),
+  which correctly flagged that `RELEASE_NOTES_0.6.0_RC3.md` and
+  `CHANGELOG.md` previously promised this was guarded for every
+  migration without exception. Those documents are corrected in the
+  same commit that adds this topic, to stop overpromising and instead
+  name `0007` as the explicit exception with a directly-stated
+  operational warning.
+- **This is a pre-existing gap, not introduced by rc3**: `0007` shipped
+  as part of the rc2 line and has read this way since it merged. It is
+  recorded here for the first time because this is the first review to
+  have caught it.
+- **Not fixed in this branch.** `release/0.6.0-rc3`'s own stated scope
+  is metadata/pipeline-adjacent only, with no `app/` or migration code
+  touched beyond the version string, and this project's own
+  `MIGRATION_GUIDE.md` rule is to never edit an already-deployed
+  migration revision for schema changes — adding a guard to `0007`'s
+  downgrade is exactly that kind of change and belongs in a dedicated,
+  reviewed follow-up (e.g. a `CENTRALPAY_DROP_PAYER_IDENTITY_MAPPING`
+  guard on `0007` itself, matching the naming and behavior of
+  `0008`/`0009`'s own `CENTRALPAY_DROP_PAYER_IDENTITY`). Until then,
+  operators must not run manual `alembic downgrade` past `0007` on any
+  database holding real payer-identity history.
+- Does not close, reopen, or change B1/B2/B3/B5, and does not block
+  this release line — no supported production path exercises the
+  unguarded downgrade.
