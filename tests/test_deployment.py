@@ -1425,6 +1425,25 @@ def test_ci_and_release_workflows_bust_the_apt_refresh_build_cache():
     assert release_text.count("APT_REFRESH_CACHEBUST=") == 2
 
 
+def test_release_workflow_cachebust_is_per_run_not_per_day():
+    """A review finding caught that release.yml's cache-bust was still
+    date-only (like ci.yml, deliberately, to keep the apt-get cost paid
+    once per day rather than on every PR push). A release run is rare and
+    consequential, and can get manually retried the same day after a real
+    Trivy finding (the rc3 incident this whole mechanism exists for) gets
+    fixed upstream -- a date-only value would keep serving that same
+    day's pre-fix apt layer across such retries. release.yml must use a
+    value unique per actual execution attempt (run_id AND run_attempt, so
+    a "re-run failed jobs" click on the same run -- which keeps run_id
+    but bumps run_attempt -- still gets a fresh one), not a UTC date.
+    ci.yml's daily value is intentionally left as-is -- frequent, lower-
+    stakes PR pushes are a different cost/benefit tradeoff."""
+    release_text = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text()
+    assert "date -u +%Y-%m-%d" not in release_text
+    assert "github.run_id" in release_text
+    assert "github.run_attempt" in release_text
+
+
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     """First tag-gate run failed on a full-history gitleaks scan flagging
     the deliberate TEST_* dummy credentials. The allowlist must keep
