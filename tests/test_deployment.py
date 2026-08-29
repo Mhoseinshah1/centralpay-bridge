@@ -668,15 +668,21 @@ def test_production_build_paths_propagate_the_apt_refresh_cachebust():
     only refreshes CI's own images. A review finding caught that
     docker-compose.yml declared no build.args for this ARG at all, so a
     production host's `docker compose build` always got the empty
-    default. A second round of findings caught that a day-only value lets
-    a second same-day `update` reuse a pre-refresh layer, and that an
+    default. Follow-up findings caught that a day-only value lets a
+    second same-day `update` reuse a pre-refresh layer, and that an
     exported env var relying on docker-compose.yml's `args:` passthrough
-    is silently ignored when the build's checked-out commit (as a
-    rollback target can be) predates that passthrough -- or the whole
-    ARG -- entirely. Each production build site must therefore set a
-    fresh, second-granularity value and pass it directly via
-    --build-arg, which reaches the build regardless of what the
-    currently-checked-out docker-compose.yml/Dockerfile know about it."""
+    is silently ignored when the build's checked-out commit predates
+    that passthrough. `perform_update` and `install.sh`'s `deploy_stack`
+    must therefore set a fresh, second-granularity value and pass it
+    directly via --build-arg (they always build the just-resolved target
+    commit, whose Dockerfile always references this ARG). `perform_
+    rollback` cannot rely on --build-arg at all: Docker only busts a
+    layer's cache on an ARG that layer actually *references*, so a
+    --build-arg value is silently a no-op for caching (though harmless
+    for build success) against a rollback target old enough to predate
+    the ARG entirely -- it must use --no-cache instead, which rebuilds
+    every layer unconditionally regardless of what the target Dockerfile
+    does or doesn't reference."""
     compose_text = COMPOSE_FILE.read_text()
     assert re.search(
         r"args:\s*\n\s*APT_REFRESH_CACHEBUST:\s*\$\{APT_REFRESH_CACHEBUST", compose_text
@@ -694,10 +700,26 @@ def test_production_build_paths_propagate_the_apt_refresh_cachebust():
         cachebust_assign + r"\n\s*compose build --quiet " + build_arg_flag,
         management_text,
     )
-    assert len(build_calls) == 2, (
-        "both perform_update and perform_rollback must set a fresh, "
-        "second-granularity APT_REFRESH_CACHEBUST immediately before "
-        "their own `compose build` call and pass it via --build-arg"
+    assert len(build_calls) == 1, (
+        "perform_update must set a fresh, second-granularity "
+        "APT_REFRESH_CACHEBUST immediately before its own `compose "
+        "build` call and pass it via --build-arg"
+    )
+
+    rollback_body = management_text[management_text.index("\nperform_rollback() {") :]
+    # Comment prose above discusses --build-arg (to explain why it is
+    # *not* used here), so compare only the actual instructions.
+    rollback_code = "\n".join(_code_lines(rollback_body))
+    assert "compose build --quiet --no-cache" in rollback_code, (
+        "perform_rollback must build with --no-cache -- the checked-out "
+        "rollback target's Dockerfile may predate the apt security-"
+        "refresh ARG entirely, in which case a --build-arg for it is "
+        "silently ignored for caching purposes"
+    )
+    assert "--build-arg" not in rollback_code, (
+        "perform_rollback should not also pass --build-arg for this ARG: "
+        "--no-cache already rebuilds every layer unconditionally, so a "
+        "cache-bust value alongside it would be dead, misleading weight"
     )
 
     installer_text = INSTALLER.read_text()
