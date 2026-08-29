@@ -667,3 +667,25 @@ deadlock/lock-ordering cycles (none found).
   `CENTRALPAY_UPDATE_ALLOW_UNVERIFIED=true` escape hatch (topic 19/48), which
   only applies when the ref IS a release tag but its assets can't be
   downloaded.
+
+## Topic 50 — 0.6.0-rc2 version preparation
+
+### 50. Package/source metadata bumped to `0.6.0-rc2` ahead of tagging — **NOT A DEFECT; PROCESS NOTE**
+- `app/version.py` (`APP_VERSION`) and `pyproject.toml` (`version`) bumped
+  from the `0.6.0-rc1` line to `0.6.0-rc2`, following this project's
+  established practice of preparing source/metadata for the next release
+  candidate ahead of its tag (the same pattern used for `v0.6.0-rc1` itself
+  per `FINAL_FINANCIAL_AUDIT.md`'s verdict section). Living docs and the
+  shipped `deploy/centralpay.env.template` / `CENTRALPAY_UPDATE_REF` example
+  values were updated in lockstep; historical audit/validation snapshots
+  (this register's own earlier topics included) were deliberately **not**
+  rewritten, per `DOCUMENTATION.md`'s documentation-maintenance rules.
+- **This does not close, reopen, or change the status of any blocker
+  above.** B1 (real-host install), B2 (real CentralPay contract
+  validation), B3 (live Telegram admin-bot validation), and B5 (release
+  workflow run for this exact commit) remain open exactly as recorded.
+  `v0.6.0-rc2` must not be tagged, published, or used for real payments
+  until they are closed and a human approval is recorded — same as the
+  `0.6.0-rc1` release decision above.
+- No production access, no deployment, and no real CentralPay/Telegram
+  call were performed to prepare this version bump.

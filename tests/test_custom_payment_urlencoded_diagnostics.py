@@ -33,9 +33,18 @@ client receives (still the same fixed sanitized 422) or about any other
 rejection/acceptance path.
 
 This is diagnostic-only: it does not attempt to recover any of these
-shapes. The next production occurrence will carry enough structural
-information in the log to identify which shape it is, informing a targeted
-follow-up fix instead of another guess.
+shapes. The "unescaped internal '='" hypothesis below is exactly the shape
+production subsequently confirmed via this fingerprint
+(``raw_pair_equals_count == 2`` with the other three fields unchanged); the
+CLEAN version of it (raw text, minus only the trailing '=' separator,
+parses directly to a JSON object) is now recovered by
+``_try_recover_raw_json_key_with_unescaped_equals`` in ``app/api/payments.py``
+-- see tests/test_custom_payment_urlencoded_unescaped_equals.py. The
+diagnostics here remain load-bearing for any OTHER shape, and for malformed
+variants of the confirmed one (e.g. trailing garbage after the JSON object)
+that still cannot be safely recovered: the next production occurrence will
+carry enough structural information in the log to identify which shape it
+is, informing a targeted follow-up fix instead of another guess.
 """
 
 import json
@@ -158,8 +167,19 @@ def test_unescaped_internal_equals_truncates_key(
 ):
     """Hypothesis 2: the sender fails to percent-encode an '=' that is part
     of the JSON content, so parse_qsl splits on the FIRST '=' and truncates
-    the key mid-JSON. raw_pair_equals_count > 1 is the smoking gun."""
-    body = '{"a":"x=y"}='  # literal, un-percent-encoded '=' inside the JSON
+    the key mid-JSON. raw_pair_equals_count > 1 is the smoking gun.
+
+    Production evidence subsequently confirmed this hypothesis, and the
+    CLEAN version of this shape (the raw text, minus only the trailing '='
+    separator, parses directly to a JSON object) is now recovered by
+    ``_try_recover_raw_json_key_with_unescaped_equals`` -- see
+    tests/test_custom_payment_urlencoded_unescaped_equals.py. This test
+    keeps exercising the diagnostics path with a body that carries the exact
+    same fingerprint but trailing garbage (``TRAILING``) after the JSON
+    object, which survives trimming only the final '=' and so is still
+    genuinely unrecoverable -- confirming the recovery boundary is no wider
+    than the confirmed shape."""
+    body = '{"a":"x=y"}TRAILING='  # unescaped internal '=', plus trailing garbage
     with caplog.at_level(logging.DEBUG, logger="app.api.payments"):
         response = _post_form(client, body)
     assert response.status_code == 422

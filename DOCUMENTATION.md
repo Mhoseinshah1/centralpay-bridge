@@ -126,7 +126,7 @@ Their Git history remains available permanently, so deleting them from the curre
 
 At the time this map was added, important current facts include:
 
-- application version `0.6.0-rc1`
+- application version `0.6.0-rc2`
 - Alembic head `0012`
 - production update refs fail closed unless they are release tags, unless the explicit development opt-in is enabled
 - admin bot is no longer accurately described as blanket read-only because `/resend_failed confirm` is a narrowly gated mutation

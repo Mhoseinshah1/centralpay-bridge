@@ -268,6 +268,58 @@ def _try_recover_json_key_form(pairs: list[tuple[str, str]]) -> dict[str, Any] |
     return parsed if isinstance(parsed, dict) else None
 
 
+def _try_recover_raw_json_key_with_unescaped_equals(
+    text: str, pairs: list[tuple[str, str]]
+) -> dict[str, Any] | None:
+    """Recover the sibling legacy shape confirmed by production evidence: a
+    complete raw JSON OBJECT is sent, unencoded, as a single form key,
+    followed by the normal trailing ``=`` form separator -- but a literal
+    ``=`` INSIDE the JSON content itself was not percent-encoded. ``parse_qsl``
+    splits on the FIRST unescaped ``=``, truncating the key mid-document and
+    leaving the rest of the JSON (plus the real trailing separator) in the
+    value, so the parsed pair is useless for recovery. Instead this
+    reconstructs the candidate from the COMPLETE raw wire TEXT, stripping
+    ONLY the one known trailing ``=`` form separator -- never searching for
+    or unwrapping anything else, and never touching the percent-decoded
+    pair.
+
+    Returns the parsed JSON object ONLY when ALL of the following hold --
+    otherwise returns None and the caller falls through to the unchanged
+    ordinary parsing/rejection path (including PR #56's diagnostics, for a
+    body that is still genuinely unrecovered):
+      * exactly one parsed pair
+      * the pair's key is not one of the required/alias field names (i.e.
+        none of api_key/amount/order_id was matched as a real form field)
+      * the pair's value is non-empty (an empty value is the sibling shape
+        already handled by ``_try_recover_json_key_form`` above)
+      * the raw wire text has MORE than one literal ``=`` -- a single ``=``
+        is the ordinary, already-handled case; more than one is the
+        fingerprint (PR #56's ``raw_pair_equals_count``) that something
+        inside the JSON was left unescaped
+      * the raw wire text ends with exactly the trailing ``=`` separator
+      * the text obtained by removing ONLY that final ``=`` parses directly
+        to a JSON object (dict) -- not an array, string, number, boolean,
+        null, or malformed JSON
+
+    Exactly one ``json.loads`` call, on a candidate built by trimming one
+    fixed trailing character from the COMPLETE original raw body: no
+    substring search, no recursive/extra-layer decoding, no guessing where
+    an internal ``=`` belongs.
+    """
+    if len(pairs) != 1:
+        return None
+    key, value = pairs[0]
+    if value == "" or key in _REQUIRED_FIELDS or key in _ALIAS_FIELD_SET:
+        return None
+    if text.count("=") <= 1 or not text.endswith("="):
+        return None
+    try:
+        parsed = json.loads(text[:-1])
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _json_shape_label(text: str) -> str:
     """Classify TEXT's JSON-decodability into a fixed, non-secret vocabulary
     ("object" / "array" / "string" / "scalar" / "invalid") — NEVER returns
@@ -286,20 +338,23 @@ def _json_shape_label(text: str) -> str:
 
 
 def _unrecovered_single_pair_diagnostics(pair: tuple[str, str], raw_text: str) -> dict[str, Any]:
-    """SAFE, non-secret structural diagnostics for the one remaining
-    unresolved legacy shape reported in production: application/
-    x-www-form-urlencoded, exactly one parsed pair, none of the three
-    required field names present, and ``_try_recover_json_key_form``
-    declined to recover it (PR #55 fixed the "whole JSON object as the key,
-    empty value" case; at least one other customer's wire shape is not
-    that).
+    """SAFE, non-secret structural diagnostics for a legacy urlencoded body
+    that is STILL genuinely unrecovered: application/x-www-form-urlencoded,
+    exactly one parsed pair, none of the three required field names present,
+    and neither ``_try_recover_json_key_form`` (PR #55: whole JSON object as
+    the key, empty value) nor ``_try_recover_raw_json_key_with_unescaped_equals``
+    (production evidence identified this second shape via the
+    ``raw_pair_equals_count > 1`` fingerprint these diagnostics produced:
+    a raw, non-percent-encoded JSON object as the key with an unescaped
+    internal ``=``) could recover it.
 
     Every value here is a length, a boolean, or a fixed-vocabulary
     classification — NEVER the raw key, the raw value, the raw request
     body, api_key, order_id, or any other attacker/customer-supplied
     content. Intended as a temporary aid: once production confirms which
     shape is actually occurring, a targeted compatibility branch replaces
-    this diagnostic-only addition.
+    this diagnostic-only addition — as it did for the unescaped-``=``
+    variant.
     """
     key, value = pair
     return {
@@ -354,6 +409,16 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     recovered = _try_recover_json_key_form(pairs)
     if recovered is not None:
         return "urlencoded_json_key", recovered
+    # Sibling shape, now confirmed by production evidence (PR #56's
+    # diagnostics below, fingerprint raw_pair_equals_count > 1): a raw
+    # (non-percent-encoded) JSON object used as the form key, with a
+    # literal '=' inside the JSON content itself left unescaped, so
+    # parse_qsl splits the JSON apart at that internal '=' instead of the
+    # trailing separator. Fed through the SAME normalize/validate pipeline
+    # as every other representation — never a separate, weaker path.
+    recovered = _try_recover_raw_json_key_with_unescaped_equals(text, pairs)
+    if recovered is not None:
+        return "urlencoded_raw_json_key", recovered
     # Count occurrences of the REQUIRED fields; also capture optional aliases.
     # Every other extra field is dropped here (name/value neither retained nor
     # logged).
