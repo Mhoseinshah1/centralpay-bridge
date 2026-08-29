@@ -1279,22 +1279,57 @@ def test_release_and_ci_workflows_share_the_same_trivy_scan_script():
 
 def test_gitleaks_config_allowlists_only_test_fixture_shapes():
     """First tag-gate run failed on a full-history gitleaks scan flagging
-    the deliberate TEST_* dummy credentials. The allowlist must keep
-    default rules enabled and match only the fixture value shape."""
+    the deliberate TEST_* dummy credentials. A later manual `release.yml`
+    dispatch (the first full-history scan run since that fix) found the
+    allowlist did not yet cover two other dummy-value shapes the test
+    suite had grown since then (tests/test_phase3_app.py's
+    "alias-secret-..." and tests/test_logging_redaction.py's
+    "attacker-guessed-key-..."). The allowlist must keep default rules
+    enabled and match only these fixture value shapes -- never a
+    real-looking value, and never by file path."""
     import re
     import tomllib
 
     with open(PROJECT_ROOT / ".gitleaks.toml", "rb") as fh:
         config = tomllib.load(fh)
     assert config["extend"]["useDefault"] is True
-    [pattern] = [re.compile(r) for r in config["allowlist"]["regexes"]]
-    assert pattern.search('TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"')
-    assert pattern.search('TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6"')
-    # A real-looking value never matches, even under a TEST_ name.
-    assert not pattern.search('TEST_KEY = "AKIA1234REALKEY"')
-    assert not pattern.search('API_KEY = "sk-live-4242424242"')
+    # regexTarget="match" tests only the specific substring gitleaks flags as
+    # a secret; "line" (the setting this commit moved away from) tests the
+    # whole source line instead, so an unrelated real secret sharing a line
+    # with an allowlisted fixture value would be silently suppressed too.
+    # Without this assertion, reverting to "line" -- the exact cross-
+    # suppression regression this commit fixes -- would leave this test green.
+    assert config["allowlist"]["regexTarget"] == "match"
+    patterns = [re.compile(r) for r in config["allowlist"]["regexes"]]
+
+    def matches_any(line: str) -> bool:
+        return any(p.search(line) for p in patterns)
+
+    assert matches_any('TEST_INBOUND_API_KEY = "test-inbound-api-key-cf1fd2f7e2a94"')
+    assert matches_any('TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6"')
+    assert matches_any('monkeypatch.setenv("CALLBACK_SECRET", "alias-secret-0123456789abcdef")')
+    assert matches_any('assert loaded.callback_hmac_secret == "alias-secret-0123456789abcdef"')
+    assert matches_any('create_order(client, settings, api_key="attacker-guessed-key-000")')
+    # A real-looking value never matches, even under a TEST_ name or a
+    # superficially similar shape.
+    assert not matches_any('TEST_KEY = "AKIA1234REALKEY"')
+    assert not matches_any('API_KEY = "sk-live-4242424242"')
+    assert not matches_any('CALLBACK_SECRET = "prod-alias-secret-deadbeef1234"')
     # No path-based allowlisting: app/deploy/docs stay fully scanned.
     assert "paths" not in config["allowlist"]
+    # Mixed real-secret/fixture line: with regexTarget="match" (asserted
+    # above), gitleaks tests only each flagged substring on its own, so the
+    # fixture value on this line may match (and be allowlisted) while the
+    # unrelated real-looking secret sharing the same line must not -- if
+    # regexTarget ever regressed to "line", gitleaks would test the whole
+    # line and silently allowlist the real secret too.
+    mixed_line = (
+        'TEST_ADMIN_BOT_TOKEN = "1234567890:TEST-admin-token-a1b2c3d4e5f6" '
+        'REAL_LEAKED_KEY = "sk-live-51H8AnythingRealLookingSecretValue123456"'
+    )
+    real_secret_substring = "sk-live-51H8AnythingRealLookingSecretValue123456"
+    assert matches_any(mixed_line)
+    assert not matches_any(real_secret_substring)
 
 
 # --- release-gate regression: dynamic release-notes resolution --------------

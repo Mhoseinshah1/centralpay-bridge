@@ -1,12 +1,26 @@
 # Gitleaks configuration.
 #
-# Default rules stay fully enabled. The single allowlist entry exists for
-# the FIRST tag-triggered release run finding: a full-history scan (unlike
-# CI's push-diff scans) flags the deliberate dummy credentials the test
-# suite defines to PROVE redaction works. Those values are self-evidently
-# placeholders (TEST_* constants whose values start with "test-"); a real
-# credential would never match this shape. Nothing else is allowlisted —
-# in particular, no application, deployment, or documentation path.
+# Default rules stay fully enabled. A full-history scan (unlike CI's
+# push-diff scans, and unlike any scan actually run between the first
+# release attempt and a later manual `release.yml` dispatch that finally
+# re-exercised this path) flags deliberate dummy credentials the test
+# suite defines to PROVE redaction works. Every allowlisted value is
+# self-evidently a placeholder by its own naming convention — a real
+# credential would never match any of these specific shapes. Nothing else
+# is allowlisted — in particular, no application, deployment, or
+# documentation path, and no `paths`-based allowlisting (every entry must
+# stand on the value's shape alone, auditable independent of location).
+#
+# regexTarget = "match" (not "line"): a review finding correctly pointed
+# out that "line" would test the regex against a finding's *entire*
+# source line, which could allowlist an unrelated real secret that
+# merely happens to share a line with one of these fixture values (e.g.
+# a real credential followed by a comment mentioning one of these
+# shapes). "match" tests the regex only against the specific substring
+# gitleaks flagged as the secret, so it can never suppress a different
+# finding on the same line. Verified against the real gitleaks v8.24.3
+# binary: both regexes below still correctly allowlist every existing
+# and new fixture value under "match" targeting, with no regression.
 
 title = "centralpay-bridge"
 
@@ -14,8 +28,15 @@ title = "centralpay-bridge"
 useDefault = true
 
 [allowlist]
-description = "Dummy TEST_* fixture constants in the test suite (values prefixed test-/TEST-); used by the redaction tests themselves"
-regexTarget = "line"
+description = "Dummy fixture constants in the test suite, by self-evidently-fake value shape; used by the redaction tests themselves"
+regexTarget = "match"
 regexes = [
+  # TEST_* env-style constants, e.g. TEST_INBOUND_API_KEY = "test-...".
   '''TEST_[A-Z0-9_]+ = "(test-[a-z0-9-]+|1234567890:TEST-[A-Za-z0-9-]+)"''',
+  # Other established dummy-value prefixes used across the test suite for
+  # secrets that are neither TEST_*-named nor env-style assignments (a
+  # monkeypatch.setenv call, an attribute comparison, a function kwarg):
+  # "alias-secret-..." (callback-secret-alias tests) and
+  # "attacker-guessed-key-..." (auth-failure log-redaction test).
+  '''"(alias-secret|attacker-guessed-key)-[a-z0-9-]+"''',
 ]
