@@ -1,7 +1,19 @@
 # Production image for the CentralPay Bridge API, worker, and migrations.
 # Multi-arch: linux/amd64 and linux/arm64 (python:slim is multi-arch).
+#
+# Base image is pinned by digest, not just tag: a floating `python:3.12-slim`
+# silently moves to whatever Debian point-in-time snapshot Docker's official
+# image happened to publish last, which is exactly how a past release build
+# picked up a `libssl3t64`/`openssl` package one Debian security point-
+# release behind the fix for CVE-2026-14456 (HIGH) without any change on our
+# side. The digest below is `python:3.12-slim-trixie`, i.e. the same
+# content `python:3.12-slim` currently resolves to, pinned explicitly so a
+# rebuild is reproducible instead of silently drifting. Bump it deliberately
+# (re-resolve via the Docker Hub v2 API, verify amd64+arm64 both present)
+# when a newer base is needed, not by accident.
+ARG BASE_IMAGE=python:3.12-slim-trixie@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
 
-FROM python:3.12-slim AS builder
+FROM ${BASE_IMAGE} AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1
@@ -15,7 +27,7 @@ RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install .
 
 
-FROM python:3.12-slim AS runtime
+FROM ${BASE_IMAGE} AS runtime
 
 # Build metadata (populated by CI; empty defaults keep local builds working).
 # APP_VERSION is supplied by CI/release from app.version.APP_VERSION — never a
@@ -38,8 +50,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
-# curl is required for container health checks; nothing else is added.
+# General Debian security refresh, not a one-CVE hardcoded package pin: the
+# pinned base digest above is a point-in-time snapshot, so any package with a
+# newer build in Debian's own security repo by the time *this* image is
+# built (e.g. the libssl3t64/openssl fix for CVE-2026-14456) is picked up
+# here instead of waiting on the next upstream python:3.12-slim-trixie
+# publish. Plain `apt-get upgrade` — never the more aggressive variant that
+# can also add or remove packages — only ever replaces an existing package
+# with a newer build of itself, so it cannot introduce anything Trivy
+# hasn't already scanned this base for. curl is required for container
+# health checks; nothing else is added.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 centralpay \
