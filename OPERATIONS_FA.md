@@ -310,7 +310,7 @@ Production باید به release tag اشاره کند:
 <div dir="ltr">
 
 ```env
-CENTRALPAY_UPDATE_REF=v0.6.0-rc3
+CENTRALPAY_UPDATE_REF=v0.6.0-rc4
 ```
 
 ```bash

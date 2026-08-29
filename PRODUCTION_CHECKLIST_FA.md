@@ -1,10 +1,10 @@
-# چک‌لیست Production — CentralPay Bridge 0.6.0-rc3
+# چک‌لیست Production — CentralPay Bridge 0.6.0-rc4
 
 <div dir="rtl">
 
 این فایل یک **چک‌لیست عملیاتی جاری** است؛ auditهای قدیمی ممکن است blockerهایی را نشان دهند که فقط مربوط به snapshot همان زمان بوده‌اند. برای تاریخچهٔ ریسک‌ها به `RELEASE_RISK_REGISTER.md` و برای دسته‌بندی مستندات به [DOCUMENTATION.md](DOCUMENTATION.md) مراجعه کنید.
 
-نسخهٔ `0.6.0-rc3` هنوز Release Candidate است؛ قبل از هر deployment یا تغییر مهم، وضعیت واقعی source/CI/سرور را بررسی کنید.
+نسخهٔ `0.6.0-rc4` هنوز Release Candidate است؛ قبل از هر deployment یا تغییر مهم، وضعیت واقعی source/CI/سرور را بررسی کنید.
 
 ## ۱) نسخه و update source
 

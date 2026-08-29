@@ -797,3 +797,171 @@ deadlock/lock-ordering cycles (none found).
 - Does not close, reopen, or change B1/B2/B3/B5, and does not block
   this release line — no supported production path exercises the
   unguarded downgrade.
+
+## Topic 53 — v0.6.0-rc3's tag-triggered release.yml run passed every job but Trivy; CVE-2026-14456 fixed; rc4 prepared
+
+### 53. `v0.6.0-rc3` tagged; its release.yml run correctly failed the Trivy image scan (CVE-2026-14456, HIGH) — **FIXED on main; rc3 tag preserved as evidence; rc4 prepared**
+- `v0.6.0-rc3` was tagged at `a963f295e3e1b28733a8e77105bdc780e27f399d`.
+  Its `release.yml` run (id `33256093589`) was the furthest any
+  tag-triggered run of this workflow has gotten: every job passed —
+  `docs`, `quality` (both OS legs), `shell`, `secret-scan`,
+  `dependency-scan` — except `docker`. That job's `Trivy vulnerability
+  scan (image)` step correctly failed on a real, fixable finding in the
+  built image:
+  ```
+  libssl3t64 / openssl / openssl-provider-legacy
+  CVE-2026-14456   HIGH   status: fixed
+  Installed: 3.5.6-1~deb13u2   Fixed: 3.5.7-1~deb13u2
+  ```
+  This is categorically different from rc2's two failures: it was not a
+  pipeline defect (a broken action pin, a wrong image namespace) but the
+  fail-closed vulnerability gate doing exactly its job — stopping a real,
+  actionable, fixable HIGH-severity finding from ever being packaged. No
+  release-notes/gate weakening of any kind occurred or was considered.
+- Because `package` (which drafts the release) `needs: [..., docker,
+  ...]`, no draft release was ever created for `v0.6.0-rc3` — `docker`
+  failing meant `package` was skipped entirely, same mechanism as rc2's
+  `docs` failure before it.
+- Root cause, verified directly against the Docker Hub v2 registry API
+  (not just the Trivy scan text): `Dockerfile` pinned `FROM
+  python:3.12-slim`, a floating tag. At build time it resolved to
+  `python:3.12.14-slim-trixie` (built 2026-08-25), one Debian security
+  point-release behind its own OpenSSL fix. Confirmed identical content
+  under the explicit `python:3.12-slim-trixie` tag, and confirmed both
+  `amd64` (`sha256:a249c9f4…`) and `arm64` (`sha256:dcac2e6d…`) exist
+  under the same multi-arch index (`sha256:09f7da3b…`).
+- Fixed on `main` via PR #85:
+  - `Dockerfile`: both build stages now pull the same pinned
+    `python:3.12-slim-trixie@sha256:...` base via a shared `ARG
+    BASE_IMAGE`, instead of the floating tag.
+  - Runtime stage runs a general `apt-get upgrade` (never
+    `dist-upgrade`, never a single hardcoded package pin) before
+    installing `curl`, closing not just this CVE but the general class
+    of "pinned base trails Debian's own security repo by build time."
+    (A follow-up finding on PR #85 caught that only the runtime stage
+    was refreshed this way, not the builder stage; see below.)
+  - The Trivy scan's image reference, digest pin, and severity policy
+    were extracted into `.github/scripts/trivy-scan.sh`, and `ci.yml`'s
+    `docker` job now runs the identical scan on every pull request —
+    this exact class of issue reached a release tag undetected
+    specifically because pull-request CI had no equivalent gate; it now
+    does, for every future PR before a release is ever tagged.
+  - Validated via a manual `workflow_dispatch` of `release.yml` against
+    the fix branch (run `33270153365`, not a tag push — the draft-release
+    step is `if: startsWith(github.ref, 'refs/tags/v')` and correctly
+    showed `skipped`): `amd64` build, `arm64` build, image smoke test,
+    Syft SBOM, and the exact pinned Trivy command all passed, reporting
+    `HIGH: 0, CRITICAL: 0`. The build log independently confirms the
+    package upgrade: `Unpacking libssl3t64:amd64 (3.5.7-1~deb13u2) over
+    (3.5.6-1~deb13u2)`.
+- **`v0.6.0-rc3` was not deleted, moved, or reused.** It remains tagged
+  at the same commit as a preserved historical record of a
+  release-candidate attempt whose *container image*, not its release
+  pipeline configuration or application behavior, failed validation;
+  `RELEASE_NOTES_0.6.0_RC3.md` and its `CHANGELOG.md` entry are
+  unchanged. `app/version.py`/`pyproject.toml` were then bumped to
+  `0.6.0-rc4` (same pattern as topics 50/51) and
+  `RELEASE_NOTES_0.6.0_RC4.md` prepared, describing rc4 as the
+  fixed-image supersession of the rc3 attempt with no application or
+  payment behavior change from rc3.
+- A separate, pre-existing gap was found while manually verifying the
+  container fix: `release.yml`'s full-history `gitleaks` secret scan
+  (job `secret-scan`) had not been re-run since the original topic-19-era
+  fix months ago, and the test suite had since grown two dummy-credential
+  fixture shapes (`tests/test_phase3_app.py`'s `alias-secret-...`,
+  `tests/test_logging_redaction.py`'s `attacker-guessed-key-...`) that
+  `.gitleaks.toml`'s allowlist did not yet cover. Fixed via a separate,
+  dedicated PR (**#86, merged**, merge commit
+  `6577aaf4d38e54b9ebe4afd6010146df2c8ebbd0`) — unrelated to the
+  container CVE, no shared root cause, not bundled into PR #85. A
+  further review finding on #86 caught that its regression test never
+  asserted `.gitleaks.toml`'s `regexTarget` value itself (only its
+  effects), so a regression back to the cross-suppression-prone `"line"`
+  setting the fix moved away from would have left the test green;
+  fixed by asserting the value explicitly plus a mixed real-secret/
+  fixture-line case.
+- Three follow-up review findings landed on PR #85 after it had already
+  merged (so they could not be pushed into it): the apt refresh above
+  originally covered only the runtime stage, leaving the builder stage's
+  own network operations (`pip install .`) running against the
+  unrefreshed snapshot; `.github/scripts/trivy-scan.sh` was missing from
+  both workflows' own shell-validation steps; and the apt refresh RUN
+  layer's GitHub Actions cache key never changed on its own, so it could
+  have silently served the same pre-upgrade layer forever after the
+  first cached build. All three fixed via a separate PR (**#88, merged**,
+  merge commit `29ae4bd5c8e0f8096caee03bbbf0e1206a453366`).
+- Five further review findings landed on PR #88 itself, each caught and
+  fixed before merge:
+  1. The apt package lists were fetched in the shared `base` stage's
+     `RUN` but only deleted in a later, separate `runtime`-stage `RUN`;
+     Docker layers are immutable, so that later deletion only hid the
+     lists from the merged filesystem view without shrinking the image.
+     Fixed by moving `curl`'s install and the cleanup into the exact
+     `RUN` that fetches the lists.
+  2. `docker-compose.yml` declared no `build.args` for
+     `APT_REFRESH_CACHEBUST` at all, so every production
+     `docker compose build` (`centralpay update`/`rollback`, the
+     installer) silently got the empty default and could serve a stale
+     apt-refresh layer indefinitely once one image had been built on a
+     host — CI's own `--build-arg` never reached production. Fixed by
+     adding the `args:` passthrough and setting a fresh value directly
+     via `--build-arg` at each production build call site.
+  3. That value was date-only (like `ci.yml`'s), so a second same-day
+     `update`/`rollback`/install would reuse the first build's cache key
+     even if a Debian security fix shipped in between. Fixed by
+     switching production call sites to a full UTC timestamp (second
+     granularity).
+  4. `--build-arg` only busts a layer's cache when that layer actually
+     *references* the ARG — silently a no-op for caching (harmless for
+     build success, achieves nothing for freshness) against a checked-
+     out Dockerfile old enough to predate the ARG entirely, which a
+     rollback target can be. Fixed: `perform_rollback` builds with
+     `--no-cache` instead (rollback is rare and safety-critical, so an
+     unconditional full rebuild is the right trade).
+  5. `perform_update`'s own comment assumed it "always builds the
+     just-checked-out target commit, whose Dockerfile always references
+     this ARG" — but `CENTRALPAY_UPDATE_ALLOW_DEV_REF` (an explicitly
+     supported development-ref mode) and an explicit downgrade to an old
+     release tag can both target a commit whose Dockerfile predates the
+     ARG entirely, the same risk as finding 4. Blanket `--no-cache`
+     isn't right for `perform_update` (the common, frequent path — a
+     full rebuild on every routine update would be a real cost
+     regression). Fixed with a shared `build_with_apt_refresh_cachebust`
+     helper (`scripts/centralpay`) that greps the checked-out Dockerfile
+     for the ARG's literal name (PR #85 always shipped its declaration
+     and RUN reference together, so presence is a reliable signal) and
+     picks the fast `--build-arg` path when present, `--no-cache` only
+     when absent; both `perform_update` and `perform_rollback` now call
+     it. `install.sh`'s `deploy_stack` has the identical exposure via
+     `CENTRALPAY_REF` on a rerun against an existing install, so it runs
+     the same detect-then-branch logic inline. A sixth, related finding
+     — `release.yml`'s own cache-bust was still date-only, so a same-day
+     manual retry of a release after a real Trivy finding is fixed
+     upstream would keep reusing that day's pre-fix layer — was fixed by
+     switching it to `github.run_id`-`github.run_attempt` (unique per
+     execution attempt, including a "re-run failed jobs" click);
+     `ci.yml`'s daily value is unchanged, a deliberate, different
+     tradeoff for its much higher push frequency.
+- **`v0.6.0-rc4` tag sequencing is now satisfied, but the tag itself has
+  not been created.** Both #86 and #88 have merged into `main`
+  (`29ae4bd5c8e0f8096caee03bbbf0e1206a453366`), and this release-prep
+  branch (`release/0.6.0-rc4`) has been rebased onto that `main` (a
+  clean rebase, no conflicts) so both fixes are actual ancestors of the
+  version-bump commit — not merely referenced by open PR numbers. The
+  `v0.6.0-rc4` tag must still be created from a commit descended from
+  all these merges (never from an older commit), and remains a
+  separate, explicit action reserved for the operator.
+- **This does not close, reopen, or change B1/B2/B3.** B5 made real,
+  verified progress but is **not yet closed**: rc3's tag-triggered run
+  passed every job except Trivy, and that finding is now fixed and
+  independently confirmed (see above), but B5 still requires an actual
+  green run against `v0.6.0-rc4`'s own tag — closing B5 necessarily
+  requires creating that tag first (the release workflow only runs on
+  `push: tags` or manual dispatch), so the tag is the mechanism for
+  producing that evidence, not something gated behind it. What remains
+  gated on B1, B2, and a green B5 run (and B3 if the optional admin bot
+  is to be enabled) — plus a recorded human approval — is **publishing**
+  the GitHub release and using this version for any real payment; this
+  register does not authorize either.
+- No production access, no deployment, and no real CentralPay/Telegram
+  call occurred while diagnosing or fixing any of this.

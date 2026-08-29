@@ -2,7 +2,7 @@
 
 Production-grade payment bridge between a Telegram bot custom-payment API and CentralPay.
 
-Current application version: **0.6.0-rc3**. Current Alembic head on this branch: **0012**.
+Current application version: **0.6.0-rc4**. Current Alembic head on this branch: **0012**.
 
 The project is intentionally conservative: **financial correctness > security > reliability > recoverability > observability > availability**. If the system cannot prove that a payment is safe to continue, it fails closed or moves the payment to manual review instead of guessing.
 
@@ -271,6 +271,6 @@ GitHub Actions additionally builds the image and runs secret/dependency scans.
 
 ## Release state
 
-`0.6.0-rc3` is a pre-release. Do not infer go-live readiness from an old checklist or audit snapshot; use current source, current CI, the current operational checklist, and the cumulative risk history together.
+`0.6.0-rc4` is a pre-release. Do not infer go-live readiness from an old checklist or audit snapshot; use current source, current CI, the current operational checklist, and the cumulative risk history together.
 
 For documentation ownership and which files are authoritative, start with [DOCUMENTATION.md](DOCUMENTATION.md).

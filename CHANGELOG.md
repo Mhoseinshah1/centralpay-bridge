@@ -2,6 +2,74 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
+## [0.6.0-rc4] — 2026-08-29 (release candidate — NOT production-ready)
+
+**Supersedes the `v0.6.0-rc3` tag: its tag-triggered `release.yml` run
+passed every job except one — the `Docker build, scan, and SBOM` job's
+Trivy vulnerability scan correctly failed on a real, fixable HIGH-severity
+finding in the built image itself (`libssl3t64`/`openssl`,
+CVE-2026-14456, installed `3.5.6-1~deb13u2`, fixed `3.5.7-1~deb13u2`).
+This was not a pipeline defect like rc2's two failures — it was the
+fail-closed gate correctly stopping a vulnerable image from ever being
+packaged into a draft release; no draft release was created and nothing
+was published for `v0.6.0-rc3`. The `v0.6.0-rc3` tag itself was not
+deleted, moved, or reused — it remains as historical evidence of that
+failed attempt; `RELEASE_NOTES_0.6.0_RC3.md` is unchanged.** Same known
+release blockers remain open in `RELEASE_RISK_REGISTER.md`, including B2
+(the real CentralPay contract has still not been observed end-to-end
+against the real/sandbox gateway) and B5 (a green tag-triggered
+release-workflow run for this exact commit — rc3's run passed every job
+but Trivy; rc4 needs its own fresh green run, now independently confirmed
+via a manual `release.yml` dispatch reporting `HIGH: 0, CRITICAL: 0`).
+This version must not be used for real payments until they are closed.
+Release notes: `RELEASE_NOTES_0.6.0_RC4.md`. Creating this release does
+not deploy it to production or upgrade any running instance.
+
+### Fixed (release pipeline only — no application/payment behavior change from rc3)
+- Pinned the Docker base image by verified digest
+  (`python:3.12-slim-trixie@sha256:...`) instead of the floating
+  `python:3.12-slim` tag, for both the builder and runtime stages, so a
+  rebuild is reproducible instead of silently drifting to whatever
+  Debian snapshot Docker Hub last published.
+- Added a general `apt-get upgrade` security refresh (never
+  `dist-upgrade`, never a single hardcoded package pin) to a shared base
+  stage both the builder and runtime stages derive from, so any package
+  with a newer build in Debian's own security repo by build time is
+  picked up — closing the specific CVE-2026-14456 gap and the general
+  class of "pinned base image trails upstream security fixes" without
+  waiting on the next base-image publish. `ci.yml`'s build-layer cache
+  is busted daily (the actual `apt-get` cost paid once a day rather than
+  on every PR push); `release.yml`'s is busted per `github.run_id`/
+  `run_attempt` instead, since a release run is rare enough that a
+  same-day retry deserves its own fresh refresh rather than reusing that
+  day's cache.
+- Extracted the Trivy scan's image reference, digest pin, and severity
+  policy into one shared script (`.github/scripts/trivy-scan.sh`), and
+  added the same fail-closed scan to `ci.yml`'s `docker` job — this
+  exact class of issue reached a release tag undetected specifically
+  because pull-request CI had no equivalent scan; it now does, for
+  every future PR before a release is ever tagged. (Follow-up review
+  findings landed as a separate PR, **#88, merged**.)
+- Propagated the apt-refresh cache-bust to production builds: it
+  originally only reached CI images (`docker-compose.yml` declared no
+  `args:` for it), so `centralpay update`/`rollback` and the installer
+  always built with an empty value and could serve a stale apt-refresh
+  layer indefinitely on an already-built host. `scripts/centralpay` now
+  has a shared `build_with_apt_refresh_cachebust` helper (used by both
+  `perform_update` and `perform_rollback`) and `install.sh`'s
+  `deploy_stack` runs matching logic: each detects whether the checked-
+  out Dockerfile actually references the cache-bust ARG — a rollback
+  target, an explicit `CENTRALPAY_UPDATE_REF`/
+  `CENTRALPAY_UPDATE_ALLOW_DEV_REF` downgrade, or an installer rerun
+  against a different `CENTRALPAY_REF` can all target a commit old
+  enough to predate it — using the fast `--build-arg` path when present
+  and falling back to a full `--no-cache` rebuild only when absent.
+- Found a separate, pre-existing gap in `.gitleaks.toml`'s full-history
+  secret-scan allowlist (two dummy test-fixture value shapes added to
+  the test suite since the original rc1 fix were never covered, because
+  nothing had re-run the full-history scan since); unrelated to the
+  container CVE. Fixed in a separate PR, **#86, merged**.
+
 ## [0.6.0-rc3] — 2026-08-29 (release candidate — NOT production-ready)
 
 **Supersedes the `v0.6.0-rc2` tag, whose first real `release.yml` run
