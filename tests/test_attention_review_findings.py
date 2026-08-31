@@ -342,8 +342,12 @@ def test_needs_attention_is_exact_beyond_the_materialization_cap(
 
     with session_factory() as db:
         overview = stuck_payments_overview(db, settings)
-        exact = queries.count_open_delivery_attention(db, now=datetime.now(UTC))
-    assert exact == over_cap
+        snapshot = queries.open_attention_snapshot(
+            db, now=datetime.now(UTC), limit=_QUERY_CAP
+        )
+    # The total is exact and unbounded; only the ENTRIES are capped.
+    assert snapshot.total == over_cap
+    assert len(snapshot.entries) == _QUERY_CAP
     assert overview.total_counts["needs_attention"] == over_cap  # not _QUERY_CAP
 
     with session_factory() as db:
@@ -390,3 +394,155 @@ def test_the_cli_and_the_admin_bot_still_agree_beyond_the_cap(
             + count_other_attention(db, settings, now=now)
         )
     assert cli_total == bot_total == over_cap
+
+
+# --- entries and their exact total must come from ONE statement ----------
+
+
+def test_delivery_attention_entries_and_total_come_from_one_statement(
+    session_factory,
+):
+    """`queries.bot_delivery_snapshot` documents this hazard at length and
+    solves it with a window function; the overview's reused bucket briefly
+    reintroduced it as a capped list PLUS a separate COUNT.
+
+    Two statements are two READ COMMITTED snapshots, so a worker delivering a
+    stale pending payment (or an operator resolving a review) between them
+    could leave the overview carrying a detail entry while reporting
+    `needs_attention: 0` — self-contradictory now that those fields are
+    published as exact. Asserted structurally: the snapshot's total and its
+    entries are produced by a single call, and the total is exact while the
+    entries are capped.
+    """
+    review_at = datetime.now(UTC) - timedelta(hours=1)
+    with session_factory() as db:
+        for index in range(_QUERY_CAP + 12):
+            db.add(
+                Payment(
+                    bot_order_id=f"one-stmt-{index}",
+                    gateway_order_id=992000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=10000,
+                    payable_amount=10000,
+                    status=PaymentStatus.MANUAL_REVIEW.value,
+                    manual_review_at=review_at,
+                    bot_notify_reason="retry_limit_reached",
+                    bot_notify_attempts=5,
+                    gateway_verified_at=review_at,
+                    reference_id=f"REF-one-stmt-{index}",
+                )
+            )
+        db.commit()
+
+    with session_factory() as db:
+        snapshot = queries.open_attention_snapshot(
+            db, now=datetime.now(UTC), limit=_QUERY_CAP
+        )
+    assert snapshot.total == _QUERY_CAP + 12  # exact, unbounded
+    assert len(snapshot.entries) == _QUERY_CAP  # capped
+
+
+def test_the_overview_never_reports_fewer_than_it_renders(
+    client, settings, session_factory
+):
+    """The concrete self-contradiction the fused statement rules out: a
+    rendered NEEDS_ATTENTION entry that the summary count does not include."""
+    review_at = datetime.now(UTC) - timedelta(hours=1)
+    with session_factory() as db:
+        for index in range(5):
+            db.add(
+                Payment(
+                    bot_order_id=f"consistent-{index}",
+                    gateway_order_id=993000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=10000,
+                    payable_amount=10000,
+                    status=PaymentStatus.MANUAL_REVIEW.value,
+                    manual_review_at=review_at,
+                    bot_notify_reason="retry_limit_reached",
+                    bot_notify_attempts=5,
+                    gateway_verified_at=review_at,
+                    reference_id=f"REF-consistent-{index}",
+                )
+            )
+        db.commit()
+
+    with session_factory() as db:
+        overview = stuck_payments_overview(db, settings)
+    rendered = [
+        entry for entry in overview.ordered() if entry.category.value == "needs_attention"
+    ]
+    assert len(rendered) == 5
+    assert overview.total_counts["needs_attention"] >= len(rendered)
+    assert overview.total_counts["needs_attention"] == 5
+
+
+# --- historical attention listing shows the NEWEST resolutions -----------
+
+
+def test_attention_list_resolved_shows_the_most_recent_decisions_first(
+    ops_env, session_factory, capsys
+):
+    """Ordering history by `created_at` ascending meant that past `--limit`
+    resolutions an operator only ever saw the OLDEST payments by creation date
+    and could never reach the decisions just made — with no pagination to get
+    there. "What did we just close?" is the question this view answers."""
+    base = datetime.now(UTC) - timedelta(days=10)
+    with session_factory() as db:
+        for index in range(8):
+            db.add(
+                Payment(
+                    bot_order_id=f"hist-{index}",
+                    gateway_order_id=994000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=1000,
+                    payable_amount=1000,
+                    status=PaymentStatus.GETLINK_FAILED.value,
+                    # Created oldest-first...
+                    created_at=base + timedelta(hours=index),
+                    # ...but resolved in the REVERSE order.
+                    attention_resolved_at=base + timedelta(days=1, hours=8 - index),
+                    attention_resolution="stale_getlink_failure",
+                    attention_resolved_by="host-cli",
+                    attention_resolution_note=f"note {index}",
+                )
+            )
+        db.commit()
+
+    assert ops_main(["attention", "list", "--resolved", "--limit", "3"]) == 0
+    rows = _json_lines(capsys)
+    # Newest RESOLUTION first -> hist-0, hist-1, hist-2 were resolved last.
+    assert [row["bot_order_id"] for row in rows] == ["hist-0", "hist-1", "hist-2"]
+
+    resolved_times = [row["attention_resolved_at"] for row in rows]
+    assert resolved_times == sorted(resolved_times, reverse=True)
+
+
+def test_the_open_attention_listing_stays_oldest_first(
+    ops_env, session_factory, capsys
+):
+    """The worklist keeps most-urgent-first ordering: only the HISTORICAL
+    branch was reordered."""
+    base = datetime.now(UTC) - timedelta(days=5)
+    with session_factory() as db:
+        for index in range(3):
+            db.add(
+                Payment(
+                    bot_order_id=f"open-order-{index}",
+                    gateway_order_id=995000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=1000,
+                    payable_amount=1000,
+                    status=PaymentStatus.GETLINK_FAILED.value,
+                    created_at=base + timedelta(hours=index),
+                )
+            )
+        db.commit()
+
+    assert ops_main(["attention", "list"]) == 0
+    rows = _json_lines(capsys)
+    assert [row["bot_order_id"] for row in rows] == [
+        "open-order-0",
+        "open-order-1",
+        "open-order-2",
+    ]

@@ -67,6 +67,16 @@ released, not deployed.
   stamped before the call began, and SQLite resolves `CURRENT_TIMESTAMP` to
   whole seconds. Both writers serialize on the payment row lock, so id order
   is exact.
+- The reused delivery-attention bucket's detail rows and its exact total now
+  come from ONE windowed statement (`queries.open_attention_snapshot`). A
+  capped list plus a separate `COUNT` is two READ COMMITTED snapshots, so a
+  worker delivering a stale pending payment between them could leave the
+  overview carrying a detail entry while reporting `needs_attention: 0` — the
+  same hazard `queries.bot_delivery_snapshot` already documents and solves.
+- `centralpay attention list --resolved` orders newest-resolution-first, so
+  past `--limit` an operator sees recent decisions rather than only the oldest
+  payments by creation date. The open worklist keeps oldest-first (most
+  urgent) ordering.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`

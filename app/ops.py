@@ -1164,6 +1164,18 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                 conditions: tuple[Any, ...] = (
                     attention_service.resolved_attention_condition(),
                 )
+                # NEWEST RESOLUTION FIRST. Ordering history by `created_at`
+                # ascending (the open view's ordering) means that once more
+                # resolutions exist than `--limit`, an operator only ever sees
+                # the oldest payments by CREATION date and can never reach the
+                # decisions just made, with no pagination to get there. The
+                # question this view answers is "what did we recently close",
+                # so it sorts the way `queries.resolved_review_payments`
+                # already does. Ties break on descending id for determinism.
+                order: tuple[Any, ...] = (
+                    Payment.attention_resolved_at.desc(),
+                    Payment.id.desc(),
+                )
             else:
                 # OPEN view: compose the CANONICAL current-attention predicate
                 # (grace period and unresolved filter included) rather than a
@@ -1181,11 +1193,15 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                     *unexpected_status_conditions(now=now),
                     Payment.status.in_(sorted(attention_service.RESOLVABLE_STATUSES)),
                 )
+                # OLDEST FIRST: a worklist is ordered most-urgent-first, and
+                # the longest-unattended item is the most urgent — the same
+                # ordering `centralpay stuck` uses for its attention rows.
+                order = (Payment.created_at.asc(), Payment.id.asc())
             payments = list(
                 db.execute(
                     select(Payment)
                     .where(*conditions)
-                    .order_by(Payment.created_at.asc())
+                    .order_by(*order)
                     .limit(args.limit)
                 ).scalars()
             )

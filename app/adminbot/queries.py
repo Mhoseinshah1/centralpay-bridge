@@ -356,37 +356,88 @@ def bot_delivery_snapshot(
     return BotDeliverySnapshot(total=total, entries=entries)
 
 
-def count_open_delivery_attention(
-    db: Session, *, now: datetime, pending_age_minutes: int = 30
-) -> int:
-    """EXACT count of the population :func:`stuck_payments` MATERIALIZES:
-    every open manual review (delivery-caused or not) plus every stale
-    ``bot_notify_pending`` row.
+@dataclass(frozen=True)
+class OpenAttentionSnapshot:
+    # EXACT total matching the predicate (unbounded -- never reduced by
+    # `limit`; the window function computes it BEFORE LIMIT applies).
+    total: int
+    entries: list[StuckEntry]
 
-    :func:`stuck_payments` returns a capped LIST, so
-    ``len(stuck_payments(...))`` saturates at its ``limit`` and understates
-    the real number once there are more than that many rows.
-    ``app.services.stuck_payments.stuck_payments_overview`` used that length
-    as its ``needs_attention`` component, which was tolerable while the field
-    was only a display hint but is not once ``centralpay stuck --json``
-    publishes it as an exact total (and derives ``total``/``truncated`` from
-    it). This is the unbounded count for that purpose.
 
-    ONE statement, not a sum of two: the two halves key off disjoint
-    ``Payment.status`` values so they are mutually exclusive at any instant,
-    and reading them together makes it impossible for a row transitioning
-    between them mid-read to be counted twice or dropped — the same reasoning
-    ``app.services.stuck_payments.count_other_attention`` documents.
+def open_attention_snapshot(
+    db: Session,
+    *,
+    now: datetime,
+    pending_age_minutes: int = 30,
+    claim_timeout_seconds: float = 120.0,
+    limit: int = 30,
+) -> OpenAttentionSnapshot:
+    """The population :func:`stuck_payments` materializes -- every OPEN manual
+    review (delivery-caused or not) plus every stale ``bot_notify_pending``
+    row -- with its EXACT total and its detail rows read from ONE statement.
+
+    Why one statement rather than a list plus a separate ``COUNT``: this is
+    the same hazard :func:`bot_delivery_snapshot` documents at length. Under
+    PostgreSQL's default READ COMMITTED isolation two statements are two
+    snapshots, so a notification worker completing a stale pending payment --
+    or an operator resolving a manual review -- between them makes the count
+    and the rendered rows describe different states. ``len(stuck_payments())``
+    additionally saturates at its ``limit``.
+
+    Both defects matter now that ``centralpay stuck --json`` publishes
+    ``needs_attention`` as an exact category total and derives ``total`` and
+    ``truncated`` from it: an overview could otherwise report
+    ``needs_attention: 0`` while carrying a detail entry, or count a row that
+    has no entry. ``func.count().over()`` computes the exact total over every
+    matching row BEFORE ``LIMIT`` is applied, in the statement that fetches
+    the rows.
+
+    Classification and ordering reproduce :func:`stuck_payments` exactly --
+    open manual reviews first (by ``manual_review_at`` ascending, NULLS
+    FIRST), then stale/old pending rows (by the notification-age anchor),
+    ties broken by ascending ``Payment.id`` -- so
+    ``app.services.stuck_payments``' rendered entries are unchanged. The
+    predicates themselves are the SHARED builders
+    (:func:`open_manual_review_conditions`,
+    ``_stale_bot_notify_pending_conditions``), never re-derived here.
     """
     pending_cutoff = now - timedelta(minutes=pending_age_minutes)
-    return db.execute(
-        select(func.count(Payment.id)).where(
+    is_manual_review = and_(*open_manual_review_conditions())
+    priority = case((is_manual_review, 0), else_=1)
+    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=_notification_age_anchor())
+    total_col = func.count().over().label("total")
+    stmt = (
+        select(Payment, priority.label("priority"), total_col)
+        .where(
             or_(
-                and_(*open_manual_review_conditions()),
+                is_manual_review,
                 and_(*_stale_bot_notify_pending_conditions(pending_cutoff)),
             )
         )
-    ).scalar_one()
+        .order_by(priority.asc(), sort_ts.asc().nulls_first(), Payment.id.asc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).all()
+    total = rows[0].total if rows else 0
+
+    claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
+    entries: list[StuckEntry] = []
+    for payment, priority_value, _total in rows:
+        if priority_value == 0:
+            reason = payment.bot_notify_reason or payment.last_error or "manual_review"
+            entries.append(StuckEntry(payment, f"manual_review:{reason}"))
+            continue
+        claimed_at = payment.notification_claimed_at
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+            if claimed_at <= claim_cutoff:
+                entries.append(StuckEntry(payment, "stale_notification_claim"))
+                continue
+        entries.append(
+            StuckEntry(payment, payment.bot_notify_reason or "bot_notify_pending_old")
+        )
+    return OpenAttentionSnapshot(total=total, entries=entries)
 
 
 def stuck_payments(

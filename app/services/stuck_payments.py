@@ -77,12 +77,12 @@ UNEXPECTED_STATE_GRACE_SECONDS = 60
 # caller-facing --limit/display truncation, which happens further down in
 # the CLI/bot renderers. `StuckOverview.total_counts` is computed with plain
 # COUNT queries and stays EXACT regardless of this cap, including the reused
-# manual-review/bot-notification bucket: its count comes from
-# `queries.count_open_delivery_attention` (one unbounded COUNT over the same
-# population `_reused_needs_attention` materializes), never from the length
-# of the capped list. `centralpay stuck --json` publishes those counts as
-# exact totals, so a saturating value there would silently understate the
-# operator's worklist.
+# manual-review/bot-notification bucket: that bucket's rows and its exact
+# total come from ONE windowed statement (`queries.open_attention_snapshot`),
+# never from the length of the capped list and never from a separate COUNT
+# that would read a different snapshot. `centralpay stuck --json` publishes
+# those counts as exact totals, so either shortcut would silently understate
+# the operator's worklist or contradict the rendered rows.
 _QUERY_CAP = 200
 
 # PaymentStatus values no current code path ever persists: verification
@@ -199,21 +199,41 @@ def _gateway_state(payment: Payment) -> str:
     return payment.reconciliation_last_error_code or "pending"
 
 
-def _reused_needs_attention(db: Session, settings: Settings) -> list[StuckEntry]:
-    """Manual review + bot-notification failures: existing logic, untouched."""
-    entries = queries.stuck_payments(
+def _reused_needs_attention(
+    db: Session, settings: Settings, *, now: datetime
+) -> tuple[list[StuckEntry], int]:
+    """Manual review + bot-notification failures: the same classification as
+    before, but its detail rows and its EXACT total now come from ONE
+    statement (``queries.open_attention_snapshot``).
+
+    This used to call ``queries.stuck_payments`` for a capped list and, since
+    the exact-total change, a separate COUNT. Two statements are two READ
+    COMMITTED snapshots: a notification worker completing a stale pending
+    payment, or an operator resolving a manual review, between them could make
+    the overview carry a detail entry while reporting ``needs_attention: 0``
+    (or count a row with no entry) — self-contradictory now that
+    ``centralpay stuck --json`` publishes these as exact. It is the identical
+    hazard ``queries.bot_delivery_snapshot`` already documents and solves with
+    a window function; this now uses that same shape.
+
+    The total is EXACT and unbounded; only the returned entries are capped at
+    ``_QUERY_CAP``.
+    """
+    snapshot = queries.open_attention_snapshot(
         db,
+        now=now,
         claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
         limit=_QUERY_CAP,
     )
-    return [
+    entries = [
         StuckEntry(
             payment=entry.payment,
             category=StuckCategory.NEEDS_ATTENTION,
             reason=entry.category,
         )
-        for entry in entries
+        for entry in snapshot.entries
     ]
+    return entries, snapshot.total
 
 
 def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
@@ -495,14 +515,11 @@ def stuck_payments_overview(
     including concurrently with the reconciliation worker.
     """
     now = now_fn()
-    reused_attention = _reused_needs_attention(db, settings)
-    # EXACT, unbounded count of the population `_reused_needs_attention`
-    # materializes -- NOT `len(reused_attention)`, which saturates at
-    # `_QUERY_CAP`. `centralpay stuck --json` publishes this as an exact
-    # category total and derives `total`/`truncated` from it, so a saturating
-    # value would understate `needs_attention`, understate `total`, and could
-    # even report `truncated: false` while rows were hidden.
-    reused_total = queries.count_open_delivery_attention(db, now=now)
+    # Entries AND their exact total from one statement -- never
+    # `len(reused_attention)`, which saturates at `_QUERY_CAP`, and never a
+    # separate COUNT, which would be a second snapshot (see
+    # `_reused_needs_attention`).
+    reused_attention, reused_total = _reused_needs_attention(db, settings, now=now)
     exhausted_attention, waiting, expired, link_counts = _link_created_buckets(db, settings, now)
     unexpected_attention, unexpected_total = _unexpected_status_entries(db, now)
 
