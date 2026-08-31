@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from app.adminbot import queries
 from app.cli import _cmd_stuck
+from app.cli import main as cli_main
 from app.models import Payment, PaymentEvent, PaymentStatus
 from app.ops import main as ops_main
 from app.services import attention
@@ -32,6 +33,16 @@ def ops_env(settings, session_factory, monkeypatch):
     monkeypatch.setattr(ops_module, "Settings", lambda: settings)
     monkeypatch.setattr(ops_module, "create_session_factory", lambda url: session_factory)
     monkeypatch.setattr(ops_module, "configure_logging", lambda s: None)
+    return settings
+
+
+@pytest.fixture
+def cli_env(settings, session_factory, monkeypatch):
+    import app.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "Settings", lambda: settings)
+    monkeypatch.setattr(cli_module, "create_session_factory", lambda url: session_factory)
+    monkeypatch.setattr(cli_module, "configure_logging", lambda s: None)
     return settings
 
 
@@ -683,3 +694,102 @@ def test_the_resolve_guard_and_the_worklist_share_one_grace_period(
             attention.refuse_reason(payment, now=datetime.now(UTC))
             is attention.AttentionRefusal.NOT_YET_STALE
         )
+
+
+# --- historical review listings filter on HISTORY, not current status ----
+
+
+def _resend_eligible_review(session_factory, *, order_id: str, gateway_order_id: int):
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id=order_id,
+            gateway_order_id=gateway_order_id,
+            gateway_user_id=55501234,
+            amount=10000,
+            payable_amount=10000,
+            status=PaymentStatus.MANUAL_REVIEW.value,
+            manual_review_at=datetime(2026, 8, 1, tzinfo=UTC),
+            bot_notify_reason="retry_limit_reached",
+            bot_notify_attempts=5,
+            gateway_verified_at=datetime(2026, 8, 1, tzinfo=UTC),
+            reference_id=f"REF-{order_id}",
+            review_resolved_at=datetime(2026, 8, 2, tzinfo=UTC),
+            review_resolution="confirmed_by_bot_operator",
+        )
+        db.add(payment)
+        db.commit()
+        return payment.id
+
+
+@pytest.mark.parametrize("command", ["cli", "ops"])
+def test_history_keeps_a_resolved_review_that_was_later_resent(
+    ops_env, cli_env, session_factory, capsys, command
+):
+    """`review resend` moves a review to `bot_notify_pending` while KEEPING
+    its `review_resolved_at`/`review_resolution`. A history view filtered on
+    the current status therefore dropped exactly the rows an operator most
+    wants to look back at — a review that was resolved and then successfully
+    redelivered — while its own docs promised to print resolved rows.
+
+    Same class as `attention list --resolved` filtering by status: a
+    historical view filters on what HAPPENED, never on where the row is now.
+    """
+    payment_id = _resend_eligible_review(
+        session_factory, order_id=f"resent-{command}", gateway_order_id=997000000000
+        + (0 if command == "cli" else 1)
+    )
+    # The resend outcome: status moves on, review history stays.
+    with session_factory() as db:
+        payment = db.get(Payment, payment_id)
+        payment.status = PaymentStatus.BOT_NOTIFY_PENDING.value
+        db.commit()
+
+    if command == "cli":
+        assert cli_main(["manual-review", "--all"]) == 0
+    else:
+        assert ops_main(["review", "list", "--all"]) == 0
+    orders = [row["bot_order_id"] for row in _json_lines(capsys)]
+    assert orders == [f"resent-{command}"]
+
+
+@pytest.mark.parametrize("command", ["cli", "ops"])
+def test_the_open_listing_still_excludes_a_resent_review(
+    ops_env, cli_env, session_factory, capsys, command
+):
+    """Widening HISTORY must not widen the active worklist: once resent, the
+    row is the notification queue's problem, not an open review."""
+    payment_id = _resend_eligible_review(
+        session_factory, order_id=f"open-resent-{command}",
+        gateway_order_id=997100000000 + (0 if command == "cli" else 1),
+    )
+    with session_factory() as db:
+        db.get(Payment, payment_id).status = PaymentStatus.BOT_NOTIFY_PENDING.value
+        db.commit()
+
+    if command == "cli":
+        assert cli_main(["manual-review"]) == 0
+    else:
+        assert ops_main(["review", "list"]) == 0
+    assert _json_lines(capsys) == []
+
+
+def test_both_history_listings_share_one_predicate():
+    """`app.cli manual-review --all` and `app.ops review list --all` compose
+    the SAME builder, so they can never disagree about what history is."""
+    import inspect
+
+    from app.adminbot import queries as q
+
+    for module_source in (
+        inspect.getsource(__import__("app.cli", fromlist=["_cmd_manual_review"])
+                          ._cmd_manual_review),
+        inspect.getsource(__import__("app.ops", fromlist=["_cmd_review"])._cmd_review),
+    ):
+        assert "manual_review_history_conditions()" in module_source
+    # And it selects on history, never on the current status.
+    rendered = " ".join(
+        str(c.compile(compile_kwargs={"literal_binds": True}))
+        for c in q.manual_review_history_conditions()
+    )
+    assert "manual_review_at IS NOT NULL" in rendered
+    assert "status" not in rendered

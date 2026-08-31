@@ -44,6 +44,39 @@ def open_manual_review_conditions() -> tuple[Any, ...]:
     )
 
 
+def manual_review_history_conditions() -> tuple[Any, ...]:
+    """THE canonical "this payment has manual-review HISTORY" predicate, for
+    `--all`/historical listings.
+
+    Deliberately NOT ``status == manual_review``. That status is the CURRENT
+    state, and a payment can legitimately leave it while keeping its review
+    history: ``app.ops`` "review resend" moves a review to
+    ``bot_notify_pending`` and retains ``review_resolved_at`` /
+    ``review_resolution``, and ``app.services.bulk_resend`` does the same for
+    unresolved ones. A history view filtered on the current status therefore
+    DROPS exactly the rows an operator most wants to look back at — a review
+    that was resolved and then successfully redelivered — while its own
+    documentation promises to print resolved rows.
+
+    ``manual_review_at`` is stamped by every path that enters manual review
+    (``app.services.notification._move_to_manual_review`` and
+    ``app.services.verification``), so it is an exact "ever entered manual
+    review" marker regardless of where the payment ended up.
+    ``review_resolved_at`` is ORed in as a belt-and-braces second marker: a
+    directly-constructed or data-repaired row carrying a resolution but no
+    entry timestamp still shows up rather than silently vanishing.
+
+    Same lesson as ``app.ops``' ``attention list --resolved``: a historical
+    view filters on what HAPPENED, never on where the row happens to be now.
+    """
+    return (
+        or_(
+            Payment.manual_review_at.is_not(None),
+            Payment.review_resolved_at.is_not(None),
+        ),
+    )
+
+
 def count_open_manual_reviews(db: Session) -> int:
     """count_by_status("manual_review") counts ALL rows ever left in that
     status; this counts only the unresolved ones operators must act on."""

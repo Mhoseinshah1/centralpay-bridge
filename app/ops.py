@@ -871,7 +871,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
             # ones in Python: one definition of "open", and no unbounded read
             # of permanently-accumulating resolved history just to discard it.
             conditions: tuple[Any, ...] = (
-                (Payment.status == PaymentStatus.MANUAL_REVIEW.value,)
+                queries.manual_review_history_conditions()
                 if args.all
                 else queries.open_manual_review_conditions()
             )

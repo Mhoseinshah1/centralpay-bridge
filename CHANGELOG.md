@@ -89,6 +89,14 @@ released, not deployed.
   decision), and `ck_payments_attention_resolution_fields_not_empty` is the
   database backstop — the consistency CHECK alone rejects only NULL, so an
   empty-string note satisfied it while recording no justification.
+- Historical review listings (`centralpay manual-review --all`, `centralpay
+  review list --all`) select on manual-review HISTORY via one shared
+  `queries.manual_review_history_conditions`, not on the current status.
+  `review resend` moves a review to `bot_notify_pending` while keeping its
+  `review_resolved_at`/`review_resolution`, so a status filter dropped exactly
+  the rows an operator most wants to look back at — a review that was resolved
+  and then successfully redelivered — while the docs promised to print
+  resolved rows.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`

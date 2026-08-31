@@ -275,9 +275,15 @@ def _cmd_manual_review(db: Session, *, include_resolved: bool) -> int:
     resolved rows remain in the database permanently and stay reachable via
     ``--all``, ``centralpay payment ORDER_ID``, and the admin bot's
     ``/resolved_reviews``.
+
+    ``--all`` selects on manual-review HISTORY
+    (``queries.manual_review_history_conditions``), not on the current status:
+    ``review resend`` moves a review to ``bot_notify_pending`` while keeping
+    its ``review_resolved_at``/``review_resolution``, so a status filter would
+    drop exactly the rows an operator most wants to look back at.
     """
     conditions: tuple[Any, ...] = (
-        (Payment.status == PaymentStatus.MANUAL_REVIEW.value,)
+        queries.manual_review_history_conditions()
         if include_resolved
         else queries.open_manual_review_conditions()
     )
