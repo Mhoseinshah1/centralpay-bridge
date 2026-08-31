@@ -126,7 +126,7 @@ centralpay review show ORDER_ID
 centralpay review acknowledge ORDER_ID --note TEXT
 centralpay review resolve ORDER_ID --resolution VALUE --note TEXT
 centralpay review resolve-many ORDER_ID [ORDER_ID ...] \
-    --resolution VALUE --note TEXT [--yes]
+    --resolution VALUE --note TEXT [--yes]   # delivery failures only
 centralpay review resend ORDER_ID --confirm-idempotent-bot --yes
 centralpay notification accept ORDER_ID --note TEXT --yes
 

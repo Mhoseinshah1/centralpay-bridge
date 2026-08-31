@@ -205,7 +205,7 @@ Allowed operator actions are explicit and audited:
 
 - acknowledge a review
 - resolve with an allowlisted non-financial resolution
-- resolve an EXPLICIT list of reviews in one all-or-nothing batch, where every row independently passes the same checks and a financially mixed set is refused
+- resolve an EXPLICIT list of reviews in one all-or-nothing batch, restricted to allowlisted downstream-delivery failures: a financial/verification review is never bulk-resolvable and must be handled individually after investigation. Every row independently passes the same checks, re-evaluated under the row lock, and a financially mixed set is refused
 - gated resend for a verified payment when idempotent mode is configured
 - manual notification acceptance only when the operator has independently confirmed the selling bot already processed the order
 - bounded aged-out reconciliation recovery through the canonical verification path

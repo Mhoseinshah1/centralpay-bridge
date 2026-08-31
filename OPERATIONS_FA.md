@@ -126,6 +126,10 @@ Resolve کردن review یک تصمیم عملیاتی را ثبت می‌کند
 
 ### تعیین‌تکلیف گروهی (bulk)
 
+> **دامنه:** این دستور **فقط** برای خطاهای تحویل به ربات فروش (downstream delivery) است، آن هم فقط با دلایل allowlistشدهٔ `retry_limit_reached` و `bot_timeout_ambiguous`.
+>
+> reviewهای **مالی/verification** (یعنی `bot_notify_reason IS NULL` — عدم تطابق مبلغ، عدم تطابق userId، مشکل reference_id، خطای callback یا پیکربندی) **پذیرفته نمی‌شوند** و batch را کامل رد می‌کنند. آن‌ها باید تک‌به‌تک و پس از بررسی، با `centralpay review resolve` تعیین‌تکلیف شوند — چون تصمیم اشتباه روی آن‌ها پیامد مالی دارد.
+
 وقتی چند review دقیقاً یک وضعیت مالی و یک توجیه مشترک دارند (مثلاً ۱۵ سفارش gateway-verified با `retry_limit_reached` که اپراتور مستقل تأیید کرده ربات فروش همه را شارژ کرده)، به‌جای حلقهٔ shell روی دستور تک‌سفارشی:
 
 <div dir="ltr">
@@ -147,6 +151,7 @@ centralpay review resolve-many ORDER_A ORDER_B ORDER_C \
 قواعد ایمنی این دستور:
 
 - فقط **لیست صریح ORDER_ID**؛ هیچ حالت «resolve all» یا انتخاب مبتنی بر فیلتر وجود ندارد
+- فقط خطاهای تحویل allowlistشده؛ review مالی/verification کل batch را رد می‌کند (`financial_review_requires_individual_resolution`) و دلیل تحویلِ خارج از allowlist هم رد می‌شود (`delivery_reason_not_bulk_eligible`)
 - بدون `--yes` فقط preview است و هیچ نوشتنی انجام نمی‌دهد
 - هر ردیف جداگانه دقیقاً همان بررسی‌های ایمنی تک‌سفارشی را می‌گذراند
 - **all-or-nothing**: یک ردیف نامعتبر کل batch را رد می‌کند و هیچ چیزی resolve نمی‌شود

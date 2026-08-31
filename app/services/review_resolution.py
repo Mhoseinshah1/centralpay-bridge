@@ -31,6 +31,15 @@ Safety contract
 * **Every row passes the SAME check, individually.** :func:`refuse_reason` is
   one pure function; the preview and the execute path both call it, and the
   execute path re-calls it under the row lock.
+* **Financial/verification reviews are refused outright.** Bulk resolution is
+  ONLY for allowlisted downstream-DELIVERY failures
+  (:data:`BULK_ELIGIBLE_DELIVERY_REASONS`). A financial/verification manual
+  review — ``bot_notify_reason IS NULL``, the amount, user-id, reference-id,
+  callback, and configuration mismatches ``app.services.verification`` raises,
+  which never reach notification and so never set a reason — needs an operator
+  to look at that specific payment, because a wrong blanket judgement there has
+  financial consequences. The bulk path fails CLOSED on them; they stay
+  resolvable individually.
 * **Financial-mismatch sets are rejected.** A resolution code that asserts the
   downstream bot already credited the order (``confirmed_by_bot_operator``,
   ``duplicate_notification_confirmed_safe``) may only be applied to
@@ -88,6 +97,12 @@ from sqlalchemy.orm import Session
 
 from app.audit import record_event
 from app.models import Payment, PaymentStatus
+
+# THE canonical delivery-failure allowlist, imported rather than restated.
+# `app.services.bulk_resend` owns the single definition (and its own tests);
+# re-declaring the same two reason codes here would be exactly the kind of
+# duplicate that silently drifts the day one side is broadened.
+from app.services.bulk_resend import ELIGIBLE_RESEND_REASONS
 from app.services.payment_lookup import AmbiguousOrderIdError, find_payment_by_order_id
 
 logger = logging.getLogger("app.services.review_resolution")
@@ -107,6 +122,19 @@ RESOLUTIONS_REQUIRING_GATEWAY_VERIFIED: frozenset[str] = frozenset(
     {"confirmed_by_bot_operator", "duplicate_notification_confirmed_safe"}
 )
 
+# The ONLY manual-review reasons a BULK resolution may touch. Deliberately the
+# very same object `app.services.bulk_resend` gates its bulk requeue on: both
+# commands act blanket-style on a set the operator asserts is homogeneous, so
+# both must be confined to the same narrow population of customer-bot DELIVERY
+# outcomes on already-gateway-verified payments.
+#
+# An allowlist, NOT merely `bot_notify_reason IS NOT NULL`. Non-NULL alone
+# would admit every other delivery reason too — an explicit bot 4xx
+# (`bot_http_403`), a misconfiguration (`bot_invalid_configuration`) — none of
+# which the "the bot already credited these" bulk workflow was designed around
+# and none of which an operator should close without looking at individually.
+BULK_ELIGIBLE_DELIVERY_REASONS: frozenset[str] = ELIGIBLE_RESEND_REASONS
+
 
 class BulkReviewRefusal(enum.StrEnum):
     """Exactly why one row (or the whole set) may not be bulk-resolved."""
@@ -115,6 +143,10 @@ class BulkReviewRefusal(enum.StrEnum):
     AMBIGUOUS_ORDER_ID = "ambiguous_order_id"
     NOT_MANUAL_REVIEW = "not_manual_review"
     ALREADY_RESOLVED = "already_resolved"
+    FINANCIAL_REVIEW_REQUIRES_INDIVIDUAL_RESOLUTION = (
+        "financial_review_requires_individual_resolution"
+    )
+    DELIVERY_REASON_NOT_BULK_ELIGIBLE = "delivery_reason_not_bulk_eligible"
     REQUIRES_GATEWAY_VERIFIED = "requires_gateway_verified"
     # Set-level.
     DUPLICATE_ORDER_ID = "duplicate_order_id"
@@ -133,6 +165,18 @@ REFUSAL_MESSAGE: Mapping[BulkReviewRefusal, str] = {
     BulkReviewRefusal.ALREADY_RESOLVED: (
         "already resolved ({resolution} at {resolved_at}); use the "
         "single-payment `review resolve` to re-record one deliberately"
+    ),
+    BulkReviewRefusal.FINANCIAL_REVIEW_REQUIRES_INDIVIDUAL_RESOLUTION: (
+        "this is a FINANCIAL/verification manual review (bot_notify_reason is "
+        "NULL: an amount, user-id, reference-id, callback, or configuration "
+        "problem), not a downstream-delivery failure. Bulk resolution is only "
+        "for allowlisted delivery failures. Investigate and resolve it "
+        "individually with `centralpay review resolve`."
+    ),
+    BulkReviewRefusal.DELIVERY_REASON_NOT_BULK_ELIGIBLE: (
+        "delivery reason {reason} is not bulk-eligible (only "
+        "{eligible_reasons} are). Resolve it individually with `centralpay "
+        "review resolve` after investigating."
     ),
     BulkReviewRefusal.REQUIRES_GATEWAY_VERIFIED: (
         "resolution asserts the downstream bot processed this order, but the "
@@ -203,6 +247,8 @@ def _message(refusal: BulkReviewRefusal, payment: Payment | None = None) -> str:
         resolved_at=(
             payment.review_resolved_at.isoformat() if payment.review_resolved_at else None
         ),
+        reason=payment.bot_notify_reason,
+        eligible_reasons=", ".join(sorted(BULK_ELIGIBLE_DELIVERY_REASONS)),
     )
 
 
@@ -210,18 +256,41 @@ def refuse_reason(payment: Payment, *, resolution: str) -> BulkReviewRefusal | N
     """THE per-row eligibility guard. Pure, so the preview and the locked
     execute path evaluate literally the same predicate.
 
-    Stricter than the single-payment ``app.ops review resolve`` command in
-    exactly one respect: an ALREADY-resolved review is refused here. Bulk
-    resolution is a blanket action over a set the operator asserts is
-    homogeneous, so silently re-stamping a review someone already decided —
-    overwriting the earlier actor's resolution code — is not an outcome bulk
-    should ever produce. Correcting one previously-recorded resolution stays
-    available, deliberately, through the single-payment command.
+    Stricter than the single-payment ``app.ops review resolve`` command in two
+    deliberate respects, both because bulk is a BLANKET action over a set the
+    operator asserts is homogeneous:
+
+    1. An ALREADY-resolved review is refused. Silently re-stamping a review
+       someone already decided — overwriting the earlier actor's resolution
+       code — is not an outcome bulk should ever produce.
+    2. Only an allowlisted DOWNSTREAM-DELIVERY failure is eligible. A
+       financial/verification manual review (``bot_notify_reason IS NULL`` —
+       ``app.services.verification``'s amount, user-id, reference-id,
+       callback, and configuration mismatches, which never reach notification
+       and so never set a reason) requires an operator to investigate that
+       specific payment. Those are exactly the reviews where a wrong blanket
+       judgement has financial consequences, so the bulk path fails CLOSED on
+       them.
+
+    Both restrictions apply ONLY to bulk. The single-payment ``app.ops review
+    resolve`` command is unchanged and remains the way to resolve a
+    financial/verification review, or to re-record one previously resolved,
+    after investigation.
+
+    ``app.adminbot.queries`` owns the authoritative delivery-vs-financial
+    distinction (``_bot_delivery_manual_review_conditions`` /
+    ``non_delivery_manual_review_conditions``, partitioning open manual review
+    on exactly ``bot_notify_reason IS NOT NULL``); this is the same split,
+    narrowed further to :data:`BULK_ELIGIBLE_DELIVERY_REASONS`.
     """
     if payment.status != PaymentStatus.MANUAL_REVIEW.value:
         return BulkReviewRefusal.NOT_MANUAL_REVIEW
     if payment.review_resolved_at is not None:
         return BulkReviewRefusal.ALREADY_RESOLVED
+    if payment.bot_notify_reason is None:
+        return BulkReviewRefusal.FINANCIAL_REVIEW_REQUIRES_INDIVIDUAL_RESOLUTION
+    if payment.bot_notify_reason not in BULK_ELIGIBLE_DELIVERY_REASONS:
+        return BulkReviewRefusal.DELIVERY_REASON_NOT_BULK_ELIGIBLE
     if (
         resolution in RESOLUTIONS_REQUIRING_GATEWAY_VERIFIED
         and payment.gateway_verified_at is None
@@ -254,6 +323,15 @@ def _set_refusal(rows: Sequence[BulkReviewRow]) -> BulkReviewRefusal | None:
     financial situations (one has a confirmed gateway payment behind it, the
     other does not). Forcing them into separate invocations keeps each recorded
     justification truthful about what it actually covers.
+
+    Honest note on reachability: now that :func:`refuse_reason` admits only
+    :data:`BULK_ELIGIBLE_DELIVERY_REASONS`, every row reaching this check has
+    been through the notification path, which the delivery invariants only
+    allow AFTER gateway verification is committed — so a genuine production
+    batch is homogeneous by construction and this rule should never fire. It
+    is kept as defense in depth for a directly-constructed or data-repaired
+    row, and is covered by a test that builds exactly that shape. Do not read
+    it as the primary financial guard; :func:`refuse_reason` is.
     """
     verified = {row.gateway_verified for row in rows}
     if len(verified) > 1:

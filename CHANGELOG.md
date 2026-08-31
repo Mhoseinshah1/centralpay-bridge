@@ -39,6 +39,19 @@ released, not deployed.
   gateway HTTP, no downstream-bot HTTP, no financial mutation. The
   single-payment workflow is unchanged.
 
+  Bulk eligibility is restricted to allowlisted downstream-DELIVERY failures,
+  reusing `app.services.bulk_resend.ELIGIBLE_RESEND_REASONS` (the same object,
+  imported — not a second copy that could drift). A financial/verification
+  manual review (`bot_notify_reason IS NULL` — the amount, user-id,
+  reference-id, callback, and configuration mismatches
+  `app.services.verification` raises, which never reach notification and so
+  never set a reason) fails CLOSED with
+  `financial_review_requires_individual_resolution`, and a non-allowlisted
+  delivery reason with `delivery_reason_not_bulk_eligible`. Either refusal
+  rejects the ENTIRE batch. Those reviews are exactly the ones where a wrong
+  blanket judgement has financial consequences; they remain resolvable
+  individually with `centralpay review resolve`, which is unchanged.
+
 ### Changed
 - **Attention resolution is scoped to the incident, not the payment.**
   `create_payment` deliberately retries `getLink` for an existing

@@ -62,7 +62,11 @@ Manual review (host-only; never changes financial records):
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resolve-many ORDER_ID [ORDER_ID ...] --resolution VALUE --note TEXT [--yes]
                           All-or-nothing bulk resolution of an EXPLICIT list of
-                          open manual reviews. Preview-only without --yes; a
+                          open DELIVERY-failure manual reviews. Only
+                          retry_limit_reached / bot_timeout_ambiguous are
+                          eligible; financial/verification reviews are refused
+                          and must be resolved individually with
+                          `review resolve`. Preview-only without --yes; a
                           single ineligible order blocks the whole batch. Never
                           "resolve all", never contacts CentralPay or the
                           selling bot, never changes a financial field.

@@ -13,8 +13,12 @@ Commands:
   review resolve ORDER_ID --resolution VALUE --note TEXT
   review resolve-many ORDER_ID [ORDER_ID ...] --resolution VALUE --note TEXT [--yes]
       All-or-nothing bulk resolution of an EXPLICIT list of open manual
-      reviews. Preview-only without --yes. Never "resolve all", never any
-      gateway or downstream-bot request, never a financial mutation.
+      reviews. ONLY allowlisted downstream-DELIVERY failures
+      (retry_limit_reached / bot_timeout_ambiguous) are eligible;
+      financial/verification reviews (bot_notify_reason IS NULL) are refused
+      and must be resolved individually with `review resolve`.
+      Preview-only without --yes. Never "resolve all", never any gateway or
+      downstream-bot request, never a financial mutation.
       See app.services.review_resolution.
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
   attention list [--resolved] | show ORDER_ID
@@ -999,6 +1003,12 @@ def _bulk_row_line(row: review_resolution.BulkReviewRow) -> str:
 
 def _print_bulk_report(report: review_resolution.BulkReviewReport) -> None:
     print(f"Bulk manual-review resolution preview (resolution={report.resolution})")
+    print(
+        "  SCOPE: allowlisted downstream-DELIVERY failures only "
+        f"({', '.join(sorted(review_resolution.BULK_ELIGIBLE_DELIVERY_REASONS))}). "
+        "Financial/verification reviews must be resolved individually with "
+        "`centralpay review resolve`."
+    )
     print(f"  orders listed: {len(report.rows)}")
     for row in report.rows:
         print(_bulk_row_line(row))
@@ -1010,6 +1020,9 @@ def _bulk_resolve_warning(count: int, resolution: str) -> str:
     return (
         f"About to resolve {count} manual review(s) with "
         f"resolution={resolution}.\n"
+        "  - Only allowlisted downstream-DELIVERY failures are eligible; "
+        "financial/verification reviews are refused and must be handled "
+        "individually.\n"
         "  - Does NOT contact CentralPay.\n"
         "  - Does NOT contact the selling bot.\n"
         "  - Does NOT credit any customer.\n"
@@ -1401,7 +1414,9 @@ def build_parser() -> argparse.ArgumentParser:
     review_resolve_many = review_sub.add_parser(
         "resolve-many",
         help="all-or-nothing bulk resolution of an EXPLICIT list of open "
-        "manual reviews (preview-only without --yes)",
+        "DELIVERY-failure manual reviews (preview-only without --yes); "
+        "financial/verification reviews are refused and must be resolved "
+        "individually with `review resolve`",
     )
     review_resolve_many.add_argument(
         "order_ids",

@@ -559,3 +559,88 @@ def test_migration_0013_downgrade_is_non_destructive_by_default(migrated_engine)
 
     _alembic("upgrade", "head")
     assert _alembic_version(migrated_engine) == ALEMBIC_HEAD
+
+
+def test_bulk_rolls_back_when_a_row_becomes_ineligible_before_the_lock(
+    pg_session_factory, monkeypatch
+):
+    """Execution-time re-check under FOR UPDATE, on real PostgreSQL.
+
+    `resolve_reviews` evaluates eligibility once to build its report and AGAIN
+    against the freshly-locked rows. This proves the second evaluation is what
+    actually decides: a row that is eligible when the report is built, and
+    becomes a financial/verification review before the lock is taken, must
+    reject the WHOLE batch and mutate nothing.
+
+    The interleaving is made deterministic by wrapping `build_report` so that a
+    SEPARATE session commits the change after the report is computed and before
+    the locking statement runs — the same window a concurrent operator or
+    worker would occupy.
+    """
+    ids = [
+        _make_payment(
+            pg_session_factory,
+            order_id=f"race-elig-{index}",
+            gateway_order_id=910000006000 + index,
+            status=PaymentStatus.MANUAL_REVIEW.value,
+            gateway_verified_at=datetime.now(UTC),
+            reference_id=f"REF-RACEELIG-{index}",
+            manual_review_at=datetime.now(UTC),
+            bot_notify_reason="retry_limit_reached",
+            bot_notify_attempts=5,
+        )
+        for index in range(3)
+    ]
+
+    real_build_report = review_resolution.build_report
+    fired = {"done": False}
+
+    def build_report_then_mutate(db, *, order_ids, resolution):
+        report = real_build_report(db, order_ids=order_ids, resolution=resolution)
+        if not fired["done"]:
+            fired["done"] = True
+            assert report.eligible, "the batch must start out fully eligible"
+            # A concurrent transaction turns row 1 into a financial/verification
+            # review (bot_notify_reason IS NULL) and commits.
+            with pg_session_factory() as other:
+                other.get(Payment, ids[1]).bot_notify_reason = None
+                other.commit()
+        return report
+
+    monkeypatch.setattr(review_resolution, "build_report", build_report_then_mutate)
+
+    with pg_session_factory() as db:
+        result = review_resolution.resolve_reviews(
+            db,
+            order_ids=[f"race-elig-{index}" for index in range(3)],
+            resolution="confirmed_by_bot_operator",
+            note="operator confirmed",
+            actor="host-cli",
+            now=datetime.now(UTC),
+        )
+
+    assert result.resolved is False
+    assert result.resolved_count == 0
+    blocked = {row.order_id: row.refusal for row in result.report.blocked_rows}
+    assert blocked == {
+        "race-elig-1": (
+            review_resolution.BulkReviewRefusal
+            .FINANCIAL_REVIEW_REQUIRES_INDIVIDUAL_RESOLUTION
+        )
+    }
+
+    with pg_session_factory() as db:
+        # Every row — including the two that never became ineligible — is
+        # untouched, and no event of either kind was written.
+        for payment_id in ids:
+            assert db.get(Payment, payment_id).review_resolved_at is None
+        assert (
+            db.execute(
+                select(func.count(PaymentEvent.id)).where(
+                    PaymentEvent.event_type.in_(
+                        ("manual_review_resolved", "manual_review_bulk_resolved")
+                    )
+                )
+            ).scalar_one()
+            == 0
+        )
