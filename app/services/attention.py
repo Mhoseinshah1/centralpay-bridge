@@ -153,7 +153,7 @@ of one small local transaction with no network call inside it.
 
 import enum
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -428,6 +428,62 @@ def _latest_event_id(db: Session, payment_id: int, event_type: str) -> int | Non
     ).scalar_one_or_none()
 
 
+def latest_link_failure_codes(
+    db: Session, payment_ids: Sequence[int]
+) -> dict[int, str | None]:
+    """The safe internal error code of each payment's most recent
+    ``centralpay_getlink_failed`` event, keyed by payment id.
+
+    ``create_payment`` stores the failure's ``exc.code`` ONLY in that event's
+    data; ``Payment.last_error`` holds the gateway's MESSAGE, and
+    ``bot_last_error_code`` / ``reconciliation_last_error_code`` are written
+    exclusively by the notification and reconciliation flows — neither of
+    which an attention-resolvable row ever reaches. Reading those columns for
+    this population therefore always yields ``None``, which is how the
+    snapshot's ``last_error_code`` came to be structurally empty for exactly
+    the payments this module exists for.
+
+    That code is operationally load-bearing, not decoration: a connection
+    timeout means the request WAS delivered and CentralPay may hold a link we
+    never saw, whereas an explicit rejection means no link exists. That is the
+    distinction an operator weighs before recording a resolution, and it is
+    the same residual this module documents.
+
+    Only the fixed internal reason-code vocabulary is returned. The gateway's
+    raw message text is deliberately NOT surfaced — AGENTS.md forbids
+    gateway-controlled content escaping the CentralPay client boundary into
+    operator tooling, and a non-string payload value is dropped rather than
+    passed through.
+
+    One statement for the whole batch, so ``attention list`` does not issue a
+    query per row.
+    """
+    if not payment_ids:
+        return {}
+    latest_ids = (
+        select(func.max(PaymentEvent.id))
+        .where(
+            PaymentEvent.payment_id.in_(payment_ids),
+            PaymentEvent.event_type == LINK_FAILURE_EVENT_TYPE,
+        )
+        .group_by(PaymentEvent.payment_id)
+    )
+    codes: dict[int, str | None] = {}
+    for event in db.execute(
+        select(PaymentEvent).where(PaymentEvent.id.in_(latest_ids))
+    ).scalars():
+        if event.payment_id is None:
+            continue
+        raw = (event.data or {}).get("error_code")
+        codes[event.payment_id] = raw if isinstance(raw, str) else None
+    return codes
+
+
+def latest_link_failure_code(db: Session, payment_id: int) -> str | None:
+    """Single-payment convenience over :func:`latest_link_failure_codes`."""
+    return latest_link_failure_codes(db, [payment_id]).get(payment_id)
+
+
 def resolution_superseded_in_db(db: Session, payment: Payment) -> bool:
     """Scalar counterpart of the second clause of
     :func:`unresolved_attention_condition` for one payment — used wherever the
@@ -547,7 +603,11 @@ def refuse_reason(
 
 
 def snapshot(
-    payment: Payment, *, now: datetime, superseded: bool = False
+    payment: Payment,
+    *,
+    now: datetime,
+    superseded: bool = False,
+    link_failure_code: str | None = None,
 ) -> AttentionSnapshot:
     """Build the read-only operator view of one payment's attention state.
 
@@ -574,7 +634,12 @@ def snapshot(
         callback_token_issued=payment.callback_token_hash is not None,
         bot_notify_attempts=payment.bot_notify_attempts,
         manual_review_at=payment.manual_review_at,
-        last_error_code=payment.bot_last_error_code
+        # The getLink failure's safe internal code, supplied by the caller from
+        # `latest_link_failure_codes` (it lives in the audit event, not on the
+        # row). The bot/reconciliation columns remain as fallbacks for
+        # completeness, but never carry a value for a resolvable status.
+        last_error_code=link_failure_code
+        or payment.bot_last_error_code
         or payment.reconciliation_last_error_code,
         created_at=payment.created_at,
         attention_resolved_at=payment.attention_resolved_at,

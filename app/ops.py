@@ -1205,6 +1205,11 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                     .limit(args.limit)
                 ).scalars()
             )
+            # One batched query for every row's getLink failure code, rather
+            # than a query per row.
+            failure_codes = attention_service.latest_link_failure_codes(
+                db, [payment.id for payment in payments]
+            )
             shown = 0
             for payment in payments:
                 print(
@@ -1213,6 +1218,7 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                             attention_service.snapshot(
                                 payment,
                                 now=now,
+                                link_failure_code=failure_codes.get(payment.id),
                                 # Same supersession rule the worklist predicate
                                 # applies, so this listing and `centralpay
                                 # stuck` can never disagree about a row.
@@ -1249,6 +1255,9 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                     found,
                     now=datetime.now(UTC),
                     superseded=attention_service.resolution_superseded_in_db(db, found),
+                    link_failure_code=attention_service.latest_link_failure_code(
+                        db, found.id
+                    ),
                 )
             )
             db.rollback()

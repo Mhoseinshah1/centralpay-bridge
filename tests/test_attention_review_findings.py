@@ -933,3 +933,91 @@ def test_overview_counts_match_the_rendered_entries_for_every_category(
     assert overview.total_counts["needs_attention"] == rendered.get("needs_attention", 0) == 4
     assert overview.total_counts["expired"] == rendered.get("expired", 0) == 6
     assert overview.total_counts["waiting_gateway"] == rendered.get("waiting_gateway", 0) == 0
+
+
+# --- the snapshot must report the REAL getLink failure code --------------
+
+
+def test_attention_snapshot_reports_the_getlink_failure_code(
+    ops_env, client, settings, session_factory, stub, capsys
+):
+    """`snapshot.last_error_code` read `bot_last_error_code` /
+    `reconciliation_last_error_code`, which are written ONLY by the
+    notification and reconciliation flows — neither of which an
+    attention-resolvable row ever reaches. `create_payment` puts the failure's
+    safe `exc.code` in the `centralpay_getlink_failed` EVENT and the gateway's
+    message in `Payment.last_error`, so the field was structurally always null
+    for exactly the population this feature exists for.
+
+    It is operationally load-bearing: a connection timeout means the request
+    WAS delivered and CentralPay may hold a link we never saw, whereas an
+    explicit rejection means no link exists — the distinction an operator
+    weighs before resolving.
+    """
+    stub.getlink_result = httpx.ReadTimeout("read timed out")
+    assert create_order(client, settings, order_id="code-1").status_code >= 400
+    _age_created(session_factory, "code-1", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+
+    # The code really is only in the event, not on the row.
+    with session_factory() as db:
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "code-1")
+        ).scalar_one()
+        assert payment.bot_last_error_code is None
+        assert payment.reconciliation_last_error_code is None
+        event = db.execute(
+            select(PaymentEvent).where(
+                PaymentEvent.payment_id == payment.id,
+                PaymentEvent.event_type == "centralpay_getlink_failed",
+            )
+        ).scalar_one()
+        expected = event.data["error_code"]
+    assert expected == "centralpay_connection_error"
+
+    assert ops_main(["attention", "show", "code-1"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["last_error_code"] == expected
+
+    assert ops_main(["attention", "list"]) == 0
+    rows = _json_lines(capsys)
+    assert [row["last_error_code"] for row in rows] == [expected]
+
+
+def test_the_snapshot_never_exposes_the_raw_gateway_message(
+    ops_env, client, settings, session_factory, stub, capsys
+):
+    """Only the fixed internal reason-code vocabulary may surface.
+    `Payment.last_error` holds gateway-controlled text, which AGENTS.md
+    forbids escaping the CentralPay client boundary into operator tooling."""
+    stub.getlink_result = httpx.ReadTimeout("a very distinctive gateway message")
+    assert create_order(client, settings, order_id="code-2").status_code >= 400
+    _age_created(session_factory, "code-2", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+
+    assert ops_main(["attention", "show", "code-2"]) == 0
+    out = capsys.readouterr().out
+    assert "a very distinctive gateway message" not in out
+    assert json.loads(out)["last_error_code"] == "centralpay_connection_error"
+
+
+def test_a_created_row_with_no_failure_event_reports_no_code(
+    ops_env, session_factory, capsys
+):
+    """A `created` row never had a getLink failure, so None is correct there —
+    the fix must not invent a code."""
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="code-3",
+                gateway_order_id=999000000001,
+                gateway_user_id=55501234,
+                amount=1000,
+                payable_amount=1000,
+                status=PaymentStatus.CREATED.value,
+                created_at=datetime.now(UTC)
+                - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60),
+            )
+        )
+        db.commit()
+
+    assert ops_main(["attention", "show", "code-3"]) == 0
+    assert json.loads(capsys.readouterr().out)["last_error_code"] is None

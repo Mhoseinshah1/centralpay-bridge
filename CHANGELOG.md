@@ -108,6 +108,13 @@ released, not deployed.
   spaces followed by real text passed the non-blank guard, truncated to blanks,
   and satisfied the `<> ''` constraint, committing a resolution with no usable
   justification.
+- `attention show`/`list` report the real getLink failure code. The snapshot
+  read `bot_last_error_code`/`reconciliation_last_error_code`, which only the
+  notification and reconciliation flows write — neither reachable by an
+  attention-resolvable row — so the field was structurally always null for the
+  exact population the feature exists for. It now comes from the
+  `centralpay_getlink_failed` event's safe internal code (one batched query for
+  a listing). The gateway's raw message stays unexposed.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`
