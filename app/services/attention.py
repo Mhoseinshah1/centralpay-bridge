@@ -119,7 +119,7 @@ import enum
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -138,6 +138,17 @@ ACTOR_MAX_LENGTH = 128
 # Default actor label for the host CLI, matching app.ops' existing
 # "operator": "host-cli" audit convention.
 ACTOR_HOST_CLI = "host-cli"
+
+# How long a payment may sit in a status nothing automatically revisits before
+# it counts as a genuine anomaly rather than an in-flight request.
+#
+# Lives HERE, not in `app.services.stuck_payments`, purely for import
+# direction: stuck_payments imports this module, so the reverse would be a
+# cycle. It re-exports the name, which is where the read-only worklist reads
+# it from and where tests import it. Both the worklist predicate and the
+# mutating guard below therefore share one threshold and cannot disagree about
+# when an item becomes attention-worthy.
+UNEXPECTED_STATE_GRACE_SECONDS = 60
 
 
 # THE allowlist. Each key is a machine-readable resolution code; each value is
@@ -168,6 +179,8 @@ class AttentionRefusal(enum.StrEnum):
     never free text and never raw external content."""
 
     ALREADY_RESOLVED = "already_resolved"
+    NOT_YET_STALE = "not_yet_stale"
+    EMPTY_NOTE = "empty_note"
     STATUS_NOT_ELIGIBLE = "status_not_eligible"
     RESOLUTION_NOT_VALID_FOR_STATUS = "resolution_not_valid_for_status"
     GATEWAY_VERIFIED = "gateway_verified"
@@ -182,6 +195,17 @@ REFUSAL_MESSAGE: Mapping[AttentionRefusal, str] = {
         "refused: this payment's attention item is already resolved "
         "(resolution={resolution}, at={resolved_at}, by={resolved_by}). "
         "Attention resolution is recorded once and never overwritten."
+    ),
+    AttentionRefusal.NOT_YET_STALE: (
+        "refused: this payment is younger than the {grace}s grace period, so "
+        "it is still in flight, not a stale failure. `centralpay stuck` and "
+        "`centralpay attention list` deliberately do not show it yet — "
+        "creation may still be in progress. Wait, then re-check."
+    ),
+    AttentionRefusal.EMPTY_NOTE: (
+        "refused: --note and the actor must be non-empty. The note is one of "
+        "the four fields that record WHY this incident was closed; a blank "
+        "one would leave an unauditable resolution."
     ),
     AttentionRefusal.STATUS_NOT_ELIGIBLE: (
         "refused: status={status} is not an attention-resolvable state. "
@@ -396,6 +420,10 @@ def resolved_attention_condition() -> ColumnElement[bool]:
     return Payment.attention_resolved_at.is_not(None)
 
 
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def eligible_resolutions_for_status(status: str) -> tuple[str, ...]:
     """Allowlisted resolution codes applicable to ``status``, sorted for a
     stable operator-facing listing."""
@@ -411,6 +439,7 @@ def eligible_resolutions_for_status(status: str) -> tuple[str, ...]:
 def refuse_reason(
     payment: Payment,
     *,
+    now: datetime,
     resolution: str | None = None,
     superseded: bool = False,
 ) -> AttentionRefusal | None:
@@ -458,6 +487,22 @@ def refuse_reason(
     # --- allowlist guards ---
     if payment.status not in RESOLVABLE_STATUSES:
         return AttentionRefusal.STATUS_NOT_ELIGIBLE
+
+    # The SAME grace period the canonical worklist predicate applies
+    # (`app.services.stuck_payments.unexpected_status_conditions`). Without it
+    # the mutating path could close an item no read-only surface even shows:
+    # `app.services.payments._ensure_payment_row` COMMITS the `created` row
+    # and releases its lock before `create_payment` re-acquires it to attempt
+    # getLink, so a brand-new row is briefly visible and lock-free. Resolving
+    # in that window records a judgment about an incident that has not
+    # happened yet — and if creation then dies hard, without writing a
+    # `centralpay_getlink_failed` event, the supersession rule never fires and
+    # the abandoned row stays hidden. Refusing here keeps the mutating path
+    # and the worklist in exact agreement about what is attention-worthy.
+    if _as_utc(payment.created_at) > now - timedelta(
+        seconds=UNEXPECTED_STATE_GRACE_SECONDS
+    ):
+        return AttentionRefusal.NOT_YET_STALE
     if resolution is not None and payment.status not in ATTENTION_RESOLUTIONS.get(
         resolution, frozenset()
     ):
@@ -465,7 +510,9 @@ def refuse_reason(
     return None
 
 
-def snapshot(payment: Payment, *, superseded: bool = False) -> AttentionSnapshot:
+def snapshot(
+    payment: Payment, *, now: datetime, superseded: bool = False
+) -> AttentionSnapshot:
     """Build the read-only operator view of one payment's attention state.
 
     ``superseded`` lets the caller report whether a newer link failure has
@@ -498,7 +545,7 @@ def snapshot(payment: Payment, *, superseded: bool = False) -> AttentionSnapshot
         attention_resolution=payment.attention_resolution,
         attention_resolved_by=payment.attention_resolved_by,
         attention_resolution_note=payment.attention_resolution_note,
-        refusal=refuse_reason(payment, superseded=superseded),
+        refusal=refuse_reason(payment, now=now, superseded=superseded),
         eligible_resolutions=eligible_resolutions_for_status(payment.status),
         attention_resolution_superseded=superseded,
     )
@@ -512,6 +559,7 @@ def snapshot_refusal_message(snapshot: AttentionSnapshot) -> str | None:
     if snapshot.refusal is None:
         return None
     return REFUSAL_MESSAGE[snapshot.refusal].format(
+        grace=UNEXPECTED_STATE_GRACE_SECONDS,
         status=snapshot.status,
         resolution=snapshot.attention_resolution,
         resolved_at=(
@@ -535,6 +583,7 @@ def outcome_refusal_message(outcome: AttentionOutcome) -> str:
     """
     assert outcome.refusal is not None
     return REFUSAL_MESSAGE[outcome.refusal].format(
+        grace=UNEXPECTED_STATE_GRACE_SECONDS,
         status=outcome.status,
         resolution=outcome.existing_resolution,
         resolved_at=(
@@ -581,6 +630,21 @@ def resolve_attention(
     ``scalar_one()`` below cannot legitimately miss; if it ever did, raising
     is the correct fail-closed outcome rather than silently reporting success.
     """
+    # Validated BEFORE any lock or read: a blank note or actor is a caller
+    # error, not a payment state, and there is no reason to hold a row lock to
+    # discover it. The CLI already refuses these, but this module is the one
+    # that claims to own every safety decision, and the database CHECK only
+    # rejects NULL -- an empty string would otherwise satisfy it and record a
+    # resolution with no recorded justification.
+    if not note.strip() or not actor.strip():
+        return AttentionOutcome(
+            resolved=False,
+            bot_order_id="",
+            status="",
+            resolution=None,
+            refusal=AttentionRefusal.EMPTY_NOTE,
+        )
+
     payment = db.execute(
         select(Payment)
         .where(Payment.id == payment_id)
@@ -593,7 +657,9 @@ def resolve_attention(
     # exactly when the worklist says it is open.
     superseded = resolution_superseded_in_db(db, payment)
     previous_resolution = payment.attention_resolution
-    refusal = refuse_reason(payment, resolution=resolution, superseded=superseded)
+    refusal = refuse_reason(
+        payment, now=now, resolution=resolution, superseded=superseded
+    )
     if refusal is not None:
         outcome = AttentionOutcome(
             resolved=False,

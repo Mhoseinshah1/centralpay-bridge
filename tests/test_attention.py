@@ -42,6 +42,17 @@ def _make_getlink_failed(client, settings, session_factory, stub, *, order_id="g
     stub.getlink_result = httpx.ReadTimeout("read timed out")
     response = create_order(client, settings, order_id=order_id, amount=230000)
     assert response.status_code >= 400
+    # Age it past the grace period: a STALE failure is what this feature
+    # closes, and `refuse_reason` now enforces the same grace period the
+    # worklist predicate does, so a brand-new row is correctly not resolvable.
+    with session_factory() as db:
+        row = db.execute(
+            select(Payment).where(Payment.bot_order_id == order_id)
+        ).scalar_one()
+        row.created_at = datetime.now(UTC) - timedelta(
+            seconds=attention.UNEXPECTED_STATE_GRACE_SECONDS + 3600
+        )
+        db.commit()
     payment = get_payment(session_factory, order_id)
     assert payment.status == PaymentStatus.GETLINK_FAILED.value
     assert payment.redirect_url is None
@@ -316,6 +327,8 @@ def test_a_created_row_uses_its_own_resolution_code(session_factory):
             amount=1000,
             payable_amount=1000,
             status=PaymentStatus.CREATED.value,
+            created_at=datetime.now(UTC)
+            - timedelta(seconds=attention.UNEXPECTED_STATE_GRACE_SECONDS + 3600),
         )
         db.add(payment)
         db.commit()
@@ -344,7 +357,7 @@ def test_snapshot_never_exposes_the_redirect_url(client, settings, session_facto
         payment = db.execute(
             select(Payment).where(Payment.bot_order_id == "snap-1")
         ).scalar_one()
-        snapshot = attention.snapshot(payment)
+        snapshot = attention.snapshot(payment, now=datetime.now(UTC))
         assert payment.redirect_url is not None
     assert snapshot.redirect_url_present is True
     for value in vars(snapshot).values():
@@ -356,7 +369,9 @@ def test_snapshot_reports_eligibility_and_a_reason(
 ):
     payment = _make_getlink_failed(client, settings, session_factory, stub)
     with session_factory() as db:
-        snapshot = attention.snapshot(db.get(Payment, payment.id))
+        snapshot = attention.snapshot(
+            db.get(Payment, payment.id), now=datetime.now(UTC)
+        )
     assert snapshot.refusal is None
     assert attention.snapshot_refusal_message(snapshot) is None
     assert snapshot.eligible_resolutions == ("stale_getlink_failure",)

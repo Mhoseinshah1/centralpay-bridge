@@ -1212,6 +1212,7 @@ def _cmd_attention(args: argparse.Namespace) -> int:
                         _attention_summary(
                             attention_service.snapshot(
                                 payment,
+                                now=now,
                                 # Same supersession rule the worklist predicate
                                 # applies, so this listing and `centralpay
                                 # stuck` can never disagree about a row.
@@ -1246,6 +1247,7 @@ def _cmd_attention(args: argparse.Namespace) -> int:
             summary = _attention_summary(
                 attention_service.snapshot(
                     found,
+                    now=datetime.now(UTC),
                     superseded=attention_service.resolution_superseded_in_db(db, found),
                 )
             )

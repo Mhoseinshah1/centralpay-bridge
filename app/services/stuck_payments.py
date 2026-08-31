@@ -55,6 +55,7 @@ from app.config import Settings
 from app.models import Payment, PaymentStatus
 from app.services.attention import (
     RESOLVABLE_STATUSES,
+    UNEXPECTED_STATE_GRACE_SECONDS,
     unresolved_attention_condition,
 )
 from app.services.reconciliation import (
@@ -71,7 +72,14 @@ NowFn = Callable[[], datetime]
 # original create-payment call ever attempts getLink, and reconciliation
 # only ever selects link_created (see reconciliation.py's module docstring).
 # Past this age they are a genuine anomaly, not just an in-flight request.
-UNEXPECTED_STATE_GRACE_SECONDS = 60
+#
+# RE-EXPORTED from app.services.attention, which owns the definition purely
+# for import direction (this module imports that one, so the reverse would be
+# a cycle). The name stays importable here because this is where the
+# read-only worklist and its tests have always read it from — and, crucially,
+# because the mutating resolve path enforces the SAME constant, so the
+# worklist and the guard can never disagree about when an item is stale.
+__all__ = ["UNEXPECTED_STATE_GRACE_SECONDS"]
 
 # Defensive cap on rows materialized per bucket — independent of the
 # caller-facing --limit/display truncation, which happens further down in

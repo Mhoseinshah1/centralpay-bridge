@@ -322,6 +322,19 @@ class Payment(Base):
             " AND attention_resolution_note IS NOT NULL)",
             name="ck_payments_attention_resolution_consistent",
         ),
+        # ...and the recorded fields are never BLANK. The consistency check
+        # above only rejects NULL, so an empty-string note would satisfy it
+        # and leave a resolution that records no justification at all — the
+        # note is one of the four fields whose whole purpose is to say WHY the
+        # incident was closed. Same shape as ck_fee_policies_note_not_empty.
+        # app.services.attention refuses a blank note or actor before taking
+        # any lock; this is the database-level backstop under it.
+        CheckConstraint(
+            "attention_resolved_at IS NULL"
+            " OR (attention_resolution <> '' AND attention_resolved_by <> ''"
+            " AND attention_resolution_note <> '')",
+            name="ck_payments_attention_resolution_fields_not_empty",
+        ),
         # DELIBERATELY ABSENT: a constraint forbidding an attention
         # resolution on a gateway-verified row. It looks like a useful
         # backstop and is in fact a financial-correctness hazard.

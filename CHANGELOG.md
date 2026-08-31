@@ -77,6 +77,18 @@ released, not deployed.
   past `--limit` an operator sees recent decisions rather than only the oldest
   payments by creation date. The open worklist keeps oldest-first (most
   urgent) ordering.
+- `attention resolve` now enforces the SAME grace period the worklist
+  predicate applies, sharing one constant. `_ensure_payment_row` commits the
+  `created` row and releases its lock before `create_payment` re-acquires it
+  to attempt getLink, so a brand-new row is briefly visible and lock-free: the
+  mutating path could close an item `attention list` and `stuck` both
+  correctly hide as in-flight, and if creation then died without recording a
+  failure event the supersession rule would never reopen it.
+- A blank `--note` or actor is refused by the service before any lock (the CLI
+  already refused it, but the service is what claims to own every safety
+  decision), and `ck_payments_attention_resolution_fields_not_empty` is the
+  database backstop — the consistency CHECK alone rejects only NULL, so an
+  empty-string note satisfied it while recording no justification.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`

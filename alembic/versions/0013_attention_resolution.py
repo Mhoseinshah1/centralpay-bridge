@@ -18,11 +18,15 @@ This migration adds the four columns that record that decision durably:
 * ``attention_resolved_by``      — the acting operator/actor label;
 * ``attention_resolution_note``  — the operator's mandatory justification.
 
-plus one CHECK constraint and one partial index:
+plus two CHECK constraints and one partial index:
 
 * ``ck_payments_attention_resolution_consistent`` — all four columns are set
   together or not at all, so a row can never claim to be resolved without
   recording by whom, when, on what grounds, and why;
+* ``ck_payments_attention_resolution_fields_not_empty`` — and none of those
+  recorded fields is blank. The consistency check alone rejects only NULL, so
+  an empty-string note would satisfy it while recording no justification at
+  all. Same shape as the existing ``ck_fee_policies_note_not_empty``;
 * ``ix_payments_attention_unresolved`` — partial index on
   ``(status, created_at) WHERE attention_resolved_at IS NULL``, matching the
   canonical unresolved-attention predicate every operator surface now shares.
@@ -86,6 +90,7 @@ _COLUMNS: tuple[tuple[str, sa.types.TypeEngine[object]], ...] = (
     ("attention_resolution_note", sa.Text()),
 )
 _CK_CONSISTENT = "ck_payments_attention_resolution_consistent"
+_CK_NOT_EMPTY = "ck_payments_attention_resolution_fields_not_empty"
 _INDEX = "ix_payments_attention_unresolved"
 
 _CONSISTENT_SQL = (
@@ -93,6 +98,12 @@ _CONSISTENT_SQL = (
     " AND attention_resolved_by IS NULL AND attention_resolution_note IS NULL)"
     " OR (attention_resolved_at IS NOT NULL AND attention_resolution IS NOT NULL"
     " AND attention_resolved_by IS NOT NULL AND attention_resolution_note IS NOT NULL)"
+)
+
+_NOT_EMPTY_SQL = (
+    "attention_resolved_at IS NULL"
+    " OR (attention_resolution <> '' AND attention_resolved_by <> ''"
+    " AND attention_resolution_note <> '')"
 )
 
 
@@ -122,6 +133,8 @@ def upgrade() -> None:
 
     if not _has_constraint(bind, _TABLE, _CK_CONSISTENT):
         op.create_check_constraint(_CK_CONSISTENT, _TABLE, sa.text(_CONSISTENT_SQL))
+    if not _has_constraint(bind, _TABLE, _CK_NOT_EMPTY):
+        op.create_check_constraint(_CK_NOT_EMPTY, _TABLE, sa.text(_NOT_EMPTY_SQL))
 
     if not _has_index(bind, _TABLE, _INDEX):
         if bind.dialect.name == "postgresql":
@@ -149,8 +162,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     if _has_index(bind, _TABLE, _INDEX):
         op.drop_index(_INDEX, table_name=_TABLE)
-    if _has_constraint(bind, _TABLE, _CK_CONSISTENT):
-        op.drop_constraint(_CK_CONSISTENT, _TABLE, type_="check")
+    for name in (_CK_NOT_EMPTY, _CK_CONSISTENT):
+        if _has_constraint(bind, _TABLE, name):
+            op.drop_constraint(name, _TABLE, type_="check")
     for name, _type in reversed(_COLUMNS):
         if _has_column(bind, _TABLE, name):
             op.drop_column(_TABLE, name)

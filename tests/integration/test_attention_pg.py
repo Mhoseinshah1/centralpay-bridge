@@ -644,3 +644,33 @@ def test_bulk_rolls_back_when_a_row_becomes_ineligible_before_the_lock(
             ).scalar_one()
             == 0
         )
+
+
+def test_a_blank_resolution_field_is_rejected_by_postgresql(pg_session_factory):
+    """`ck_payments_attention_resolution_fields_not_empty`: the consistency
+    constraint alone rejects only NULL, so an empty-string note would satisfy
+    it while recording no justification at all. Same shape as the existing
+    `ck_fee_policies_note_not_empty`. `app.services.attention` refuses a blank
+    note or actor before taking any lock; this is the backstop under it."""
+    for blank_field in (
+        "attention_resolution_note",
+        "attention_resolved_by",
+        "attention_resolution",
+    ):
+        payment_id = _make_payment(
+            pg_session_factory,
+            order_id=f"blank-{blank_field}",
+            gateway_order_id=910000007000 + len(blank_field),
+        )
+        fields = {
+            "attention_resolved_at": datetime.now(UTC),
+            "attention_resolution": "stale_getlink_failure",
+            "attention_resolved_by": "host-cli",
+            "attention_resolution_note": "closed",
+        }
+        fields[blank_field] = ""
+        with pytest.raises(IntegrityError), pg_session_factory() as db:
+            payment = db.get(Payment, payment_id)
+            for name, value in fields.items():
+                setattr(payment, name, value)
+            db.commit()

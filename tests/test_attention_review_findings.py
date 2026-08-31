@@ -115,6 +115,7 @@ def test_the_operator_can_resolve_the_reopened_incident(
     worklist predicate does."""
     stub.getlink_result = httpx.ReadTimeout("read timed out")
     assert create_order(client, settings, order_id="reopen-2").status_code >= 400
+    _age_created(session_factory, "reopen-2", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
     with session_factory() as db:
         payment_id = db.execute(
             select(Payment).where(Payment.bot_order_id == "reopen-2")
@@ -128,6 +129,7 @@ def test_the_operator_can_resolve_the_reopened_incident(
             now=datetime.now(UTC),
         )
     assert create_order(client, settings, order_id="reopen-2").status_code >= 400
+    _age_created(session_factory, "reopen-2", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
 
     with session_factory() as db:
         outcome = attention.resolve_attention(
@@ -165,6 +167,7 @@ def test_a_resolution_with_no_later_failure_is_still_refused(
     case: with no NEW failure, a second resolve is still refused."""
     stub.getlink_result = httpx.ReadTimeout("read timed out")
     assert create_order(client, settings, order_id="reopen-3").status_code >= 400
+    _age_created(session_factory, "reopen-3", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
     with session_factory() as db:
         payment_id = db.execute(
             select(Payment).where(Payment.bot_order_id == "reopen-3")
@@ -237,6 +240,7 @@ def test_attention_list_resolved_keeps_a_payment_that_settled_afterwards(
 
     stub.getlink_result = httpx.ReadTimeout("read timed out")
     assert create_order(client, settings, order_id="late-1").status_code >= 400
+    _age_created(session_factory, "late-1", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
     with session_factory() as db:
         payment = db.execute(
             select(Payment).where(Payment.bot_order_id == "late-1")
@@ -546,3 +550,136 @@ def test_the_open_attention_listing_stays_oldest_first(
         "open-order-1",
         "open-order-2",
     ]
+
+
+# --- a blank note must never produce an unauditable resolution -----------
+
+
+def test_the_service_refuses_a_blank_note_or_actor(
+    client, settings, session_factory, stub
+):
+    """The CLI already rejected `--note "   "`, but `resolve_attention` only
+    TRUNCATED it. This module claims to own every safety decision, and the
+    consistency CHECK rejects only NULL — an empty string satisfied it and
+    recorded a resolution with no stated justification, even though the note
+    is one of the four fields whose purpose is to say WHY."""
+    stub.getlink_result = httpx.ReadTimeout("read timed out")
+    assert create_order(client, settings, order_id="blank-1").status_code >= 400
+    _age_created(session_factory, "blank-1", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+    with session_factory() as db:
+        payment_id = db.execute(
+            select(Payment).where(Payment.bot_order_id == "blank-1")
+        ).scalar_one().id
+
+    for note, actor in (("", "host-cli"), ("   ", "host-cli"), ("ok", "  ")):
+        with session_factory() as db:
+            outcome = attention.resolve_attention(
+                db,
+                payment_id=payment_id,
+                resolution="stale_getlink_failure",
+                note=note,
+                actor=actor,
+                now=datetime.now(UTC),
+            )
+        assert outcome.resolved is False
+        assert outcome.refusal is attention.AttentionRefusal.EMPTY_NOTE
+
+    with session_factory() as db:
+        assert db.get(Payment, payment_id).attention_resolved_at is None
+
+
+# --- the mutating path honours the same grace period as the worklist -----
+
+
+def test_a_brand_new_row_cannot_be_resolved_before_it_is_stale(session_factory):
+    """`app.services.payments._ensure_payment_row` COMMITS the `created` row
+    and releases its lock before `create_payment` re-acquires it to attempt
+    getLink, so a brand-new row is briefly visible and lock-free.
+
+    `attention list` and `centralpay stuck` both hide it for the grace period.
+    The mutating path must agree: otherwise it could close an incident that has
+    not happened yet, and if creation then died hard without writing a
+    `centralpay_getlink_failed` event, the supersession rule would never fire
+    and the abandoned row would stay hidden."""
+    with session_factory() as db:
+        payment = Payment(
+            bot_order_id="fresh-1",
+            gateway_order_id=996000000001,
+            gateway_user_id=55501234,
+            amount=1000,
+            payable_amount=1000,
+            status=PaymentStatus.CREATED.value,
+            created_at=datetime.now(UTC),  # just committed, mid-creation
+        )
+        db.add(payment)
+        db.commit()
+        payment_id = payment.id
+
+    with session_factory() as db:
+        outcome = attention.resolve_attention(
+            db,
+            payment_id=payment_id,
+            resolution="stale_incomplete_creation",
+            note="closing early",
+            actor="host-cli",
+            now=datetime.now(UTC),
+        )
+    assert outcome.resolved is False
+    assert outcome.refusal is attention.AttentionRefusal.NOT_YET_STALE
+    with session_factory() as db:
+        assert db.get(Payment, payment_id).attention_resolved_at is None
+
+    # Past the grace period the SAME payment becomes resolvable, and the
+    # worklist agrees it is attention-worthy.
+    with session_factory() as db:
+        db.get(Payment, payment_id).created_at = datetime.now(UTC) - timedelta(
+            seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60
+        )
+        db.commit()
+    with session_factory() as db:
+        assert attention.resolve_attention(
+            db,
+            payment_id=payment_id,
+            resolution="stale_incomplete_creation",
+            note="now genuinely stale",
+            actor="host-cli",
+            now=datetime.now(UTC),
+        ).resolved is True
+
+
+def test_the_resolve_guard_and_the_worklist_share_one_grace_period(
+    client, settings, session_factory
+):
+    """Not merely 'both have a grace period' — the SAME constant, so they can
+    never drift. `stuck_payments` re-exports it from `attention`."""
+    from app.services import stuck_payments as stuck_service
+
+    assert (
+        stuck_service.UNEXPECTED_STATE_GRACE_SECONDS
+        is attention.UNEXPECTED_STATE_GRACE_SECONDS
+    )
+
+    with session_factory() as db:
+        db.add(
+            Payment(
+                bot_order_id="agree-grace-1",
+                gateway_order_id=996000000002,
+                gateway_user_id=55501234,
+                amount=1000,
+                payable_amount=1000,
+                status=PaymentStatus.GETLINK_FAILED.value,
+                created_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+
+    # Invisible to the worklist AND unresolvable, together.
+    with session_factory() as db:
+        assert stuck_payments_overview(db, settings).total_counts["needs_attention"] == 0
+        payment = db.execute(
+            select(Payment).where(Payment.bot_order_id == "agree-grace-1")
+        ).scalar_one()
+        assert (
+            attention.refuse_reason(payment, now=datetime.now(UTC))
+            is attention.AttentionRefusal.NOT_YET_STALE
+        )
