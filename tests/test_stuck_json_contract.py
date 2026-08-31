@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from app.cli import _cmd_stuck, _stuck_summary_dict
+from app.cli import _STUCK_DISPLAY_LIMIT_MAX, _cmd_stuck, _stuck_summary_dict
 from app.models import Payment, PaymentStatus
 from app.services.stuck_payments import (
     _QUERY_CAP,
@@ -197,7 +197,7 @@ def test_human_footer_tells_the_truth_when_the_cap_is_the_constraint(
         assert _cmd_stuck(db, settings, limit=_QUERY_CAP, as_json=False) == 0
     out = capsys.readouterr().out
     assert "capped at" in out
-    assert "--limit cannot" in out
+    assert "cannot reveal them" in out
     assert "the summary counts above are still exact" in out
 
 
@@ -210,6 +210,48 @@ def test_human_footer_still_suggests_limit_when_limit_is_the_constraint(
     out = capsys.readouterr().out
     assert "raise --limit to see more" in out
     assert "capped at" not in out
+
+
+def test_human_footer_never_suggests_a_limit_the_command_would_clamp(
+    capsys, client, settings, session_factory
+):
+    """The other half of the same defect.
+
+    Each of the three buckets materializes up to `_QUERY_CAP` INDEPENDENTLY, so
+    `len(overview.ordered())` can exceed the single `--limit` ceiling
+    `_cmd_stuck` clamps to. `ordered_count > shown_count` was therefore true
+    even at the maximum, and an operator already passing `--limit 200` was told
+    to raise a limit the command silently clamps right back.
+    """
+    _bulk_expired(session_factory, settings, _QUERY_CAP + 10)
+    stale = datetime.now(UTC) - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+    with session_factory() as db:
+        for index in range(_QUERY_CAP + 10):
+            db.add(
+                Payment(
+                    bot_order_id=f"attn-{index}",
+                    gateway_order_id=921000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=1000,
+                    payable_amount=1000,
+                    status=PaymentStatus.GETLINK_FAILED.value,
+                    created_at=stale,
+                )
+            )
+        db.commit()
+
+    with session_factory() as db:
+        overview = stuck_payments_overview(db, settings)
+    # More materialized rows than any single --limit may request.
+    assert len(overview.ordered()) > _STUCK_DISPLAY_LIMIT_MAX
+
+    with session_factory() as db:
+        assert (
+            _cmd_stuck(db, settings, limit=_STUCK_DISPLAY_LIMIT_MAX, as_json=False) == 0
+        )
+    out = capsys.readouterr().out
+    assert "raise --limit to see more" not in out
+    assert "cannot reveal them" in out
 
 
 # --- the helper in isolation ---------------------------------------------

@@ -97,6 +97,42 @@ the financial path may later do:
   and is picked up by the ordinary notification/manual-review surfaces, which
   do not consult the attention filter at all.
 
+ACCEPTED RESIDUAL: a retry killed mid-``getLink``
+-------------------------------------------------
+``create_payment`` records ``centralpay_getlink_failed`` only inside its
+``CentralPayError`` handler, and the fresh ``gateway_order_id`` and
+``callback_token_hash`` it assigns for a retry are uncommitted while the
+network call runs. If the process is killed (or the host restarts) after the
+request is sent but before either commit path, PostgreSQL rolls the whole
+attempt back: no failure event is written, so :func:`unresolved_attention_
+condition` does not reopen a previously resolved row.
+
+What that does and does not mean:
+
+* The row reverts to EXACTLY its pre-retry state — the new gateway order id and
+  token hash roll back too — so no new local state is hidden. What is hidden is
+  only the fact that another attempt was made and abandoned.
+* CentralPay may hold a link for a gateway order id our database rolled back.
+  That orphan is pre-existing crash-window behaviour of the retry path,
+  identical with or without attention resolution, and the rolled-back token
+  hash means a callback for it could not validate anyway. It is the same
+  residual this module already states above: resolution never claims CentralPay
+  has no record.
+* The window closes itself in practice. The upstream bot retrying again either
+  succeeds (the row leaves the resolvable statuses) or fails with a caught
+  error (which writes the event and reopens the item). Staying hidden requires
+  the crash AND no further retry ever — at which point the order is abandoned
+  upstream too.
+
+The obvious fix — persisting an attempt marker BEFORE the gateway call — is
+deliberately NOT taken: it would add a commit to the payment-creation path,
+ahead of a network call, changing that path's crash semantics for the sake of
+an operator-worklist signal. AGENTS.md orders financial correctness above
+observability, and this module's whole design rule is that attention
+resolution never reaches into the financial path. Recorded as a bounded,
+accepted residual instead (RELEASE_RISK_REGISTER.md topic 56); an operator who
+needs certainty for a specific order has ``centralpay reconcile ORDER_ID``.
+
 Concurrency
 -----------
 :func:`resolve_attention` re-reads the payment under ``SELECT ... FOR UPDATE``

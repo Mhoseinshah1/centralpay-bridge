@@ -461,15 +461,29 @@ def _print_stuck_truncation_note(
         return
     print()
     remaining = total - shown_count
-    if ordered_count > shown_count:
+    # Suggest `--limit` only when raising it can actually reveal a row: there
+    # must be materialized rows this run did not print, AND the caller must not
+    # already be at the ceiling `_cmd_stuck` clamps to.
+    #
+    # The second half matters because each of the three buckets materializes up
+    # to `_QUERY_CAP` INDEPENDENTLY, so `ordered_count` can reach three times
+    # the largest value a single `--limit` may request. Without it, an operator
+    # already passing `--limit 200` is told to raise a limit the command
+    # silently clamps straight back — the same false advice this footer exists
+    # to stop giving, in its other half.
+    can_raise_limit = (
+        ordered_count > shown_count and shown_count < _STUCK_DISPLAY_LIMIT_MAX
+    )
+    if can_raise_limit:
         print(f"... {remaining} more not shown (raise --limit to see more)")
     else:
-        # Every materialized row is already on screen: the cap, not --limit,
-        # is what is hiding the rest.
         print(
-            f"... {remaining} more not shown. The per-category detail query is "
-            f"capped at {_STUCK_DISPLAY_LIMIT_MAX} rows, so --limit cannot "
-            "reveal them; the summary counts above are still exact."
+            f"... {remaining} more not shown. `--limit` is capped at "
+            f"{_STUCK_DISPLAY_LIMIT_MAX} and each category materializes at most "
+            f"{_STUCK_DISPLAY_LIMIT_MAX} rows, so it cannot reveal them; the "
+            "summary counts above are still exact. Use `centralpay "
+            "reconciliation status`, or the admin bot's /waiting and /expired, "
+            "to page through one category."
         )
 
 

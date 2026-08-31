@@ -1048,3 +1048,39 @@ lost-callback payment without reducing coverage.
 
 **No production access, no deployment, and no real CentralPay call occurred
 while investigating this.**
+
+## Topic 56 (post-rc4 `main`) — attention resolution vs a retry killed mid-`getLink` — **ACCEPTED RESIDUAL; LOW; deliberately not fixed in the financial path**
+
+Raised by automated review on PR #89 and verified against source.
+
+`app.services.payments.create_payment` records `centralpay_getlink_failed`
+only inside its `CentralPayError` handler, and the fresh `gateway_order_id` and
+`callback_token_hash` it assigns for a retry are uncommitted while the network
+call runs. If the process is killed after the request is sent but before either
+commit path, the attempt rolls back with no failure event — so
+`app.services.attention.unresolved_attention_condition`'s supersession clause
+does not reopen a previously resolved item.
+
+**Scope of the exposure.** The row reverts to exactly its pre-retry state (the
+new gateway order id and token hash roll back too), so no new local state is
+hidden; only the fact that an attempt was made and abandoned. CentralPay may
+hold a link for a gateway order id the database rolled back, but that orphan is
+pre-existing crash-window behaviour of the retry path, present with or without
+attention resolution, and the rolled-back token hash means a callback for it
+could not validate regardless. The window also closes itself in practice: a
+further upstream retry either succeeds (the row leaves the resolvable statuses)
+or fails with a caught error (writing the event and reopening the item), so
+staying hidden requires the crash AND no further retry ever.
+
+**Why it is not fixed.** The remedy would be persisting an attempt marker
+before the gateway call — i.e. adding a commit to the payment-creation path,
+ahead of a network call, changing that path's crash semantics for the sake of
+an operator-worklist signal. This contract orders financial correctness above
+observability, and the attention feature's design rule is that resolution never
+reaches into the financial path. Accepting a bounded visibility residual is the
+correct trade here; revisit only alongside a deliberate change to the
+create-payment crash model, which would be its own review.
+
+**Operator recourse.** `centralpay reconcile ORDER_ID` inspects a specific
+payment against local state at any time, and `centralpay attention list
+--resolved` keeps every resolved item permanently visible.
