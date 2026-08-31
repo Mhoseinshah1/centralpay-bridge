@@ -97,6 +97,17 @@ released, not deployed.
   the rows an operator most wants to look back at — a review that was resolved
   and then successfully redelivered — while the docs promised to print
   resolved rows.
+- EVERY `stuck` overview bucket now reads its detail rows and its exact total
+  from one windowed statement (`_rows_with_exact_total`). Four pairs were split
+  across two READ COMMITTED snapshots — the unexpected-status bucket and all
+  three `link_created` buckets — each able to report a category count with no
+  corresponding entry line, contradicting the exact `total`/`shown`/`truncated`
+  contract those fields publish.
+- Operator notes are stripped BEFORE truncation. Validating `note.strip()` and
+  then storing `note[:500]` checks a different string than it writes: 500
+  spaces followed by real text passed the non-blank guard, truncated to blanks,
+  and satisfied the `<> ''` constraint, committing a resolution with no usable
+  justification.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`

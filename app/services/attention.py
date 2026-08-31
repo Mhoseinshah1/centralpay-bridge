@@ -715,8 +715,18 @@ def resolve_attention(
     # column are deliberately absent.
     payment.attention_resolved_at = now
     payment.attention_resolution = resolution
-    payment.attention_resolved_by = actor[:ACTOR_MAX_LENGTH]
-    payment.attention_resolution_note = note[:NOTE_MAX_LENGTH]
+    # STRIP BEFORE TRUNCATING. Validating `note.strip()` above and then storing
+    # `note[:NOTE_MAX_LENGTH]` checks a different string than it writes: a note
+    # of NOTE_MAX_LENGTH spaces followed by a real character passes the
+    # non-blank guard, but truncation keeps only the spaces, and the database's
+    # `<> ''` constraint accepts whitespace. The resolution would then commit
+    # with no usable justification in either the column or the audit event.
+    # Stripping first makes the validated value and the stored value the same
+    # string.
+    safe_actor = actor.strip()[:ACTOR_MAX_LENGTH]
+    safe_note = note.strip()[:NOTE_MAX_LENGTH]
+    payment.attention_resolved_by = safe_actor
+    payment.attention_resolution_note = safe_note
 
     record_event(
         db,
@@ -725,8 +735,8 @@ def resolve_attention(
         level="warning",
         data={
             "resolution": resolution,
-            "note": note[:NOTE_MAX_LENGTH],
-            "operator": actor[:ACTOR_MAX_LENGTH],
+            "note": safe_note,
+            "operator": safe_actor,
             # Recorded so the audit trail proves the status was NOT changed.
             "status": previous_status,
             "gateway_verified": False,
@@ -745,7 +755,7 @@ def resolve_attention(
             "payment_id": payment_id,
             "gateway_order_id": payment.gateway_order_id,
             "resolution": resolution,
-            "operator": actor[:ACTOR_MAX_LENGTH],
+            "operator": safe_actor,
         },
     )
     return AttentionOutcome(

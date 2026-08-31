@@ -451,6 +451,37 @@ def expired_snapshot(
     return ExpiredSnapshot(total=total, entries=entries)
 
 
+def _rows_with_exact_total(
+    db: Session,
+    conditions: tuple[Any, ...],
+    *,
+    order_by: Any,
+    limit: int = _QUERY_CAP,
+) -> tuple[list[Payment], int]:
+    """Detail rows AND their EXACT total from ONE statement.
+
+    Every bucket feeding ``StuckOverview.total_counts`` must use this rather
+    than a separate ``COUNT`` plus a separate ``SELECT ... LIMIT``. Two
+    statements are two READ COMMITTED snapshots: an operator resolving an
+    attention item, or a worker moving a payment, between them makes
+    ``centralpay stuck --json`` report a category count with no corresponding
+    entry line (or the inverse), contradicting the exact ``total``/``shown``/
+    ``truncated`` contract those fields now publish.
+
+    ``func.count().over()`` computes the total over every matching row BEFORE
+    ``LIMIT`` applies — standard window-function semantics — so the total stays
+    exact and unbounded while the rows stay capped. Same shape and same reason
+    as ``app.adminbot.queries.bot_delivery_snapshot`` /
+    ``open_attention_snapshot``.
+    """
+    total_col = func.count().over().label("total")
+    rows = db.execute(
+        select(Payment, total_col).where(*conditions).order_by(order_by).limit(limit)
+    ).all()
+    total = rows[0].total if rows else 0
+    return [payment for payment, _total in rows], total
+
+
 def _link_created_buckets(
     db: Session, settings: Settings, now: datetime
 ) -> tuple[list[StuckEntry], list[StuckEntry], list[StuckEntry], dict[str, int]]:
@@ -465,15 +496,15 @@ def _link_created_buckets(
     waiting_conditions = _waiting_conditions(settings, now=now)
     expired_conditions = _expired_conditions(settings, now=now)
 
-    def count(conditions: tuple[Any, ...]) -> int:
-        return db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
-
-    def rows(conditions: tuple[Any, ...]) -> list[Payment]:
-        return list(
-            db.execute(
-                select(Payment).where(*conditions).order_by(anchor.asc()).limit(_QUERY_CAP)
-            ).scalars()
-        )
+    exhausted_rows, exhausted_total = _rows_with_exact_total(
+        db, exhausted_conditions, order_by=anchor.asc()
+    )
+    waiting_rows, waiting_total = _rows_with_exact_total(
+        db, waiting_conditions, order_by=anchor.asc()
+    )
+    expired_rows, expired_total = _rows_with_exact_total(
+        db, expired_conditions, order_by=anchor.asc()
+    )
 
     attention = [
         StuckEntry(
@@ -485,24 +516,21 @@ def _link_created_buckets(
             ),
             gateway_state=_gateway_state(payment),
         )
-        for payment in rows(exhausted_conditions)
+        for payment in exhausted_rows
     ]
-    waiting = [_waiting_entry(payment) for payment in rows(waiting_conditions)]
-    expired = [_expired_entry(payment) for payment in rows(expired_conditions)]
+    waiting = [_waiting_entry(payment) for payment in waiting_rows]
+    expired = [_expired_entry(payment) for payment in expired_rows]
     counts = {
-        "reconciliation_exhausted": count(exhausted_conditions),
-        "waiting_gateway": count(waiting_conditions),
-        "expired": count(expired_conditions),
+        "reconciliation_exhausted": exhausted_total,
+        "waiting_gateway": waiting_total,
+        "expired": expired_total,
     }
     return attention, waiting, expired, counts
 
 
 def _unexpected_status_entries(db: Session, now: datetime) -> tuple[list[StuckEntry], int]:
     conditions = unexpected_status_conditions(now=now)
-    total = db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
-    payments = db.execute(
-        select(Payment).where(*conditions).order_by(Payment.created_at.asc()).limit(_QUERY_CAP)
-    ).scalars()
+    payments, total = _rows_with_exact_total(db, conditions, order_by=Payment.created_at.asc())
     entries = [
         StuckEntry(
             payment=payment,

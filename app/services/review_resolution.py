@@ -524,8 +524,12 @@ def resolve_reviews(
         db.rollback()
         return BulkReviewResult(resolved=False, resolved_count=0, report=recheck)
 
-    safe_note = note[:NOTE_MAX_LENGTH]
-    safe_actor = actor[:ACTOR_MAX_LENGTH]
+    # Strip before truncating, for the same reason as
+    # app.services.attention.resolve_attention: truncating an unstripped value
+    # can keep only whitespace, storing a justification that is blank in
+    # practice while passing every non-empty check.
+    safe_note = note.strip()[:NOTE_MAX_LENGTH]
+    safe_actor = actor.strip()[:ACTOR_MAX_LENGTH]
     for payment in locked:
         # Operational review metadata ONLY, identical to the single-payment
         # path: status stays `manual_review` as permanent history, and no

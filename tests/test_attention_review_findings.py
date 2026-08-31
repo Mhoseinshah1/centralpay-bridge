@@ -793,3 +793,143 @@ def test_both_history_listings_share_one_predicate():
     )
     assert "manual_review_at IS NOT NULL" in rendered
     assert "status" not in rendered
+
+
+# --- validation must check the string that actually gets stored ----------
+
+
+def test_a_note_that_truncates_to_whitespace_is_refused(
+    client, settings, session_factory, stub
+):
+    """Validation ran on `note.strip()` but the WRITE used
+    `note[:NOTE_MAX_LENGTH]` — two different strings. A note of
+    NOTE_MAX_LENGTH spaces followed by a real character passed the non-blank
+    guard, truncation kept only the spaces, and the database's `<> ''`
+    constraint accepts whitespace, so the resolution committed with no usable
+    justification in either the column or the audit event."""
+    stub.getlink_result = httpx.ReadTimeout("read timed out")
+    assert create_order(client, settings, order_id="trunc-1").status_code >= 400
+    _age_created(session_factory, "trunc-1", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+    with session_factory() as db:
+        payment_id = db.execute(
+            select(Payment).where(Payment.bot_order_id == "trunc-1")
+        ).scalar_one().id
+
+    evil = " " * attention.NOTE_MAX_LENGTH + "actual justification"
+    assert evil.strip()  # passes a naive non-blank check
+    assert not evil[: attention.NOTE_MAX_LENGTH].strip()  # but truncates to blank
+
+    with session_factory() as db:
+        outcome = attention.resolve_attention(
+            db,
+            payment_id=payment_id,
+            resolution="stale_getlink_failure",
+            note=evil,
+            actor="host-cli",
+            now=datetime.now(UTC),
+        )
+    # Stripping BEFORE truncating makes the validated and stored strings the
+    # same, so this now stores the real justification rather than blanks.
+    assert outcome.resolved is True
+    with session_factory() as db:
+        payment = db.get(Payment, payment_id)
+        assert payment.attention_resolution_note == "actual justification"
+        assert payment.attention_resolution_note.strip()
+
+
+def test_a_note_of_only_whitespace_past_the_limit_is_still_refused(
+    client, settings, session_factory, stub
+):
+    """The pure-whitespace case must stay refused, not merely truncated."""
+    stub.getlink_result = httpx.ReadTimeout("read timed out")
+    assert create_order(client, settings, order_id="trunc-2").status_code >= 400
+    _age_created(session_factory, "trunc-2", seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+    with session_factory() as db:
+        payment_id = db.execute(
+            select(Payment).where(Payment.bot_order_id == "trunc-2")
+        ).scalar_one().id
+
+    with session_factory() as db:
+        outcome = attention.resolve_attention(
+            db,
+            payment_id=payment_id,
+            resolution="stale_getlink_failure",
+            note=" " * (attention.NOTE_MAX_LENGTH + 50),
+            actor="host-cli",
+            now=datetime.now(UTC),
+        )
+    assert outcome.resolved is False
+    assert outcome.refusal is attention.AttentionRefusal.EMPTY_NOTE
+
+
+# --- EVERY overview bucket reads rows and total in one statement ---------
+
+
+def test_every_overview_bucket_reads_rows_and_total_atomically():
+    """The delivery-attention bucket was fused two rounds ago; review then
+    found the unexpected-status bucket still split. There were in fact FOUR
+    such pairs (unexpected-status plus all three link_created buckets), every
+    one of them feeding `total_counts`, which `stuck --json` publishes as
+    exact. Asserted structurally so the class cannot reappear in any of them.
+    """
+    import inspect
+
+    from app.services import stuck_payments as stuck_service
+
+    for func_name in ("_unexpected_status_entries", "_link_created_buckets"):
+        source = inspect.getsource(getattr(stuck_service, func_name))
+        assert "_rows_with_exact_total" in source, func_name
+        # No bucket may reach for a standalone COUNT again.
+        assert "func.count(Payment.id)" not in source, func_name
+
+
+def test_overview_counts_match_the_rendered_entries_for_every_category(
+    client, settings, session_factory
+):
+    """The concrete contradiction the fused statements rule out, checked for
+    all three categories at once: a category count must never exceed what a
+    matching, uncapped population would render."""
+    stale = datetime.now(UTC) - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS + 60)
+    expired_anchor = datetime.now(UTC) - timedelta(
+        seconds=settings.reconciliation_max_age_seconds + 3600
+    )
+    with session_factory() as db:
+        for index in range(4):
+            db.add(
+                Payment(
+                    bot_order_id=f"cat-unexpected-{index}",
+                    gateway_order_id=998000000000 + index,
+                    gateway_user_id=55501234,
+                    amount=1000,
+                    payable_amount=1000,
+                    status=PaymentStatus.GETLINK_FAILED.value,
+                    created_at=stale,
+                )
+            )
+        for index in range(6):
+            db.add(
+                Payment(
+                    bot_order_id=f"cat-expired-{index}",
+                    gateway_order_id=998100000000 + index,
+                    gateway_user_id=55501234,
+                    amount=1000,
+                    payable_amount=1000,
+                    status=PaymentStatus.LINK_CREATED.value,
+                    redirect_url="https://gateway.test/pay/x",
+                    callback_token_hash="e" * 64,
+                    callback_token_issued_at=expired_anchor,
+                    created_at=expired_anchor,
+                )
+            )
+        db.commit()
+
+    with session_factory() as db:
+        overview = stuck_payments_overview(db, settings)
+
+    rendered: dict[str, int] = {}
+    for entry in overview.ordered():
+        rendered[entry.category.value] = rendered.get(entry.category.value, 0) + 1
+
+    assert overview.total_counts["needs_attention"] == rendered.get("needs_attention", 0) == 4
+    assert overview.total_counts["expired"] == rendered.get("expired", 0) == 6
+    assert overview.total_counts["waiting_gateway"] == rendered.get("waiting_gateway", 0) == 0
