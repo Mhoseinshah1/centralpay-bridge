@@ -56,11 +56,36 @@ Deployment:
   ssl                    Re-check DNS and retry TLS certificate issuance
 
 Manual review (host-only; never changes financial records):
-  review list [--all]    Unresolved manual-review payments
+  review list [--all]    Unresolved manual-review payments (--all: + resolved)
   review show ORDER_ID   Full review detail
   review acknowledge ORDER_ID --note TEXT
   review resolve ORDER_ID --resolution VALUE --note TEXT
+  review resolve-many ORDER_ID [ORDER_ID ...] --resolution VALUE --note TEXT [--yes]
+                          All-or-nothing bulk resolution of an EXPLICIT list of
+                          open DELIVERY-failure manual reviews. Only
+                          retry_limit_reached / bot_timeout_ambiguous are
+                          eligible; financial/verification reviews are refused
+                          and must be resolved individually with
+                          `review resolve`. Preview-only without --yes; a
+                          single ineligible order blocks the whole batch. Never
+                          "resolve all", never contacts CentralPay or the
+                          selling bot, never changes a financial field.
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
+
+Operational attention (host-only; never changes financial records):
+  attention list [--resolved] [--limit N]
+                          Open (or, with --resolved, already-resolved) stale
+                          NON-FINANCIAL attention items
+  attention show ORDER_ID Attention detail: original financial + failure facts,
+                          eligibility, and any recorded resolution
+  attention resolve ORDER_ID --resolution VALUE --note TEXT --yes
+                          Durably close a stale non-financial failure (e.g. an
+                          old getlink_failed payment that never obtained a
+                          payment link). Preserves the payment row, every
+                          payment event, and every admin alert; never changes
+                          status, amounts, fees, verification facts, reference
+                          ids, or payer identity. Refuses if the payment has
+                          become financially meaningful.
 
 Notification:
   notification accept ORDER_ID --note TEXT [--yes]
@@ -135,7 +160,8 @@ Inspection:
   payment ORDER_ID       One payment with its audit history
   recent                 Most recent payments
   retry-queue            Payments awaiting bot notification
-  manual-review          Payments requiring administrator review
+  manual-review [--all]  DEPRECATED (use `review list`): UNRESOLVED
+                          manual-review payments; --all adds resolved history
   credentials            Show the installation summary (root only)
 
 Monitoring (requires MONITOR_ENABLED=true; see "Monitor service" below):
@@ -875,11 +901,40 @@ cmd_review() {
             [[ "$answer" == "RESOLVE" ]] || fail "Cancelled."
             compose exec -T api python -m app.ops review resolve "$@"
             ;;
+        resolve-many)
+            # No separate shell-level prompt: `python -m app.ops review
+            # resolve-many` is preview-only (and prints the full per-order
+            # report plus the "what this does / does not do" warning) unless
+            # --yes is present, exactly like `notification accept`'s gate.
+            compose exec -T api python -m app.ops review resolve-many "$@"
+            ;;
         resend)
             compose exec -T api python -m app.ops review resend "$@"
             ;;
         *)
-            fail "Unknown review subcommand: ${sub} (list|show|acknowledge|resolve|resend)"
+            fail "Unknown review subcommand: ${sub} (list|show|acknowledge|resolve|resolve-many|resend)"
+            ;;
+    esac
+}
+
+cmd_attention() {
+    require_root attention
+    require_install
+    local sub="${1:-list}"
+    shift || true
+    case "$sub" in
+        list | show)
+            compose exec -T api python -m app.ops attention "$sub" "$@"
+            ;;
+        resolve)
+            # No separate shell-level prompt: `python -m app.ops attention
+            # resolve` already refuses (printing the full "does NOT contact
+            # the gateway / does NOT change status or amounts" explanation)
+            # unless --yes is present, exactly like `notification accept`.
+            compose exec -T api python -m app.ops attention resolve "$@"
+            ;;
+        *)
+            fail "Unknown attention subcommand: ${sub} (list|show|resolve)"
             ;;
     esac
 }
@@ -1495,8 +1550,8 @@ main() {
     # safer default, not a behavior regression for anything that matters.
     case "$cmd" in
         update | restart | stop | start | rollback | migrate | backup | restore | \
-        db-check | fee | review | notification | recover-aged-out | admin-bot | \
-        monitor | ssl | uninstall)
+        db-check | fee | review | attention | notification | recover-aged-out | \
+        admin-bot | monitor | ssl | uninstall)
             if wants_help "$@"; then
                 usage
                 exit 0
@@ -1520,6 +1575,7 @@ main() {
             ;;
         rollback)      cmd_rollback "$@" ;;
         review)        cmd_review "$@" ;;
+        attention)     cmd_attention "$@" ;;
         notification)  cmd_notification "$@" ;;
         migrate)       cmd_migrate "$@" ;;
         backup)        cmd_backup "$@" ;;

@@ -21,7 +21,12 @@ exposes:
   mid-flight — still being polled, gateway not yet paid — is deliberately
   NOT attention-worthy: that is the expected, routine steady state
   (``app.services.verification`` documents this explicitly), so promoting
-  it here would bury real problems in noise.
+  it here would bury real problems in noise. An unexpected-status row an
+  operator has explicitly closed through ``app.services.attention``
+  (``centralpay attention resolve``) drops out of this category — and, via
+  the shared ``unexpected_status_conditions`` builder, out of every other
+  current operational surface at the same instant — while remaining fully
+  visible in historical inspection. Nothing is ever deleted.
 * WAITING_GATEWAY — ``link_created``, unverified, younger than the hard
   reconciliation lifetime, not exhausted: ordinary in-flight polling
   (active or expiring tier, whether never yet checked or checked and not
@@ -48,6 +53,11 @@ from sqlalchemy.orm import Session
 from app.adminbot import queries
 from app.config import Settings
 from app.models import Payment, PaymentStatus
+from app.services.attention import (
+    RESOLVABLE_STATUSES,
+    UNEXPECTED_STATE_GRACE_SECONDS,
+    unresolved_attention_condition,
+)
 from app.services.reconciliation import (
     ERROR_GATEWAY_NOT_PAID,
     aged_out_age_condition,
@@ -62,16 +72,25 @@ NowFn = Callable[[], datetime]
 # original create-payment call ever attempts getLink, and reconciliation
 # only ever selects link_created (see reconciliation.py's module docstring).
 # Past this age they are a genuine anomaly, not just an in-flight request.
-UNEXPECTED_STATE_GRACE_SECONDS = 60
+#
+# RE-EXPORTED from app.services.attention, which owns the definition purely
+# for import direction (this module imports that one, so the reverse would be
+# a cycle). The name stays importable here because this is where the
+# read-only worklist and its tests have always read it from — and, crucially,
+# because the mutating resolve path enforces the SAME constant, so the
+# worklist and the guard can never disagree about when an item is stale.
+__all__ = ["UNEXPECTED_STATE_GRACE_SECONDS"]
 
 # Defensive cap on rows materialized per bucket — independent of the
 # caller-facing --limit/display truncation, which happens further down in
 # the CLI/bot renderers. `StuckOverview.total_counts` is computed with plain
-# COUNT queries and stays exact regardless of this cap, EXCEPT for the
-# reused manual-review/bot-notification bucket (see `_reused_needs_attention`)
-# where an exact count would require re-deriving `queries.stuck_payments`'s
-# stale-claim logic; in the extreme case of more than this many simultaneous
-# stuck deliveries, the count saturates at this cap rather than over-reading.
+# COUNT queries and stays EXACT regardless of this cap, including the reused
+# manual-review/bot-notification bucket: that bucket's rows and its exact
+# total come from ONE windowed statement (`queries.open_attention_snapshot`),
+# never from the length of the capped list and never from a separate COUNT
+# that would read a different snapshot. `centralpay stuck --json` publishes
+# those counts as exact totals, so either shortcut would silently understate
+# the operator's worklist or contradict the rendered rows.
 _QUERY_CAP = 200
 
 # PaymentStatus values no current code path ever persists: verification
@@ -84,6 +103,57 @@ _UNEXPECTED_STATUSES = (
     PaymentStatus.GETLINK_FAILED.value,
     PaymentStatus.GATEWAY_VERIFIED.value,
 )
+
+# Load-time proof that the canonical unresolved-attention filter below covers
+# EVERY attention surface an attention-resolvable payment can appear in.
+#
+# `unexpected_status_conditions` is the only NEEDS_ATTENTION predicate in this
+# codebase that composes `unresolved_attention_condition()`. That is correct
+# exactly as long as no attention-resolvable status can reach a DIFFERENT
+# needs-attention predicate: the reused bot-delivery bucket
+# (`queries.bot_delivery_snapshot`) only ever selects `manual_review` /
+# `bot_notify_pending` rows, and the reconciliation-exhausted bucket only ever
+# selects `link_created` rows. So if every resolvable status lives inside
+# `_UNEXPECTED_STATUSES`, a resolved row is filtered out of the current
+# worklist everywhere, by construction rather than by convention.
+#
+# Broadening `app.services.attention.ATTENTION_RESOLUTIONS` to a status
+# outside this tuple would silently break that guarantee, so it fails loudly
+# at import time instead. (tests/test_attention_canonical.py asserts the same
+# invariant explicitly, so the reason survives even if this line moves.)
+assert set(_UNEXPECTED_STATUSES) >= RESOLVABLE_STATUSES, (
+    "every attention-resolvable status must be an unexpected status, otherwise "
+    "unresolved_attention_condition() would not filter every attention surface"
+)
+
+
+def unexpected_status_conditions(*, now: datetime) -> tuple[Any, ...]:
+    """THE canonical "unexpected status still needing attention" predicate.
+
+    A payment sitting past the grace period in a status nothing ever
+    automatically revisits (`created`, `getlink_failed`, or the
+    never-actually-persisted `gateway_verified`) AND whose attention item an
+    operator has not resolved (`app.services.attention`).
+
+    Built exactly once and shared by `_unexpected_status_entries` (the
+    `centralpay stuck` overview's detail rows) and `count_other_attention`
+    (the admin bot's `/status` and `/stuck` "needs attention" summary
+    numbers). Those two were previously separate, identically-written
+    expressions; a resolution filter added to one and not the other would
+    have made the CLI and the admin bot disagree about the same payment.
+    Deriving both from one builder makes that class of drift impossible.
+
+    Resolved rows leave the CURRENT worklist only — they are never deleted
+    and stay fully visible through `centralpay payment ORDER_ID`,
+    `centralpay attention show ORDER_ID`, and
+    `centralpay attention list --resolved`.
+    """
+    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
+    return (
+        Payment.status.in_(_UNEXPECTED_STATUSES),
+        Payment.created_at <= cutoff,
+        unresolved_attention_condition(),
+    )
 
 
 def utcnow() -> datetime:
@@ -137,21 +207,41 @@ def _gateway_state(payment: Payment) -> str:
     return payment.reconciliation_last_error_code or "pending"
 
 
-def _reused_needs_attention(db: Session, settings: Settings) -> list[StuckEntry]:
-    """Manual review + bot-notification failures: existing logic, untouched."""
-    entries = queries.stuck_payments(
+def _reused_needs_attention(
+    db: Session, settings: Settings, *, now: datetime
+) -> tuple[list[StuckEntry], int]:
+    """Manual review + bot-notification failures: the same classification as
+    before, but its detail rows and its EXACT total now come from ONE
+    statement (``queries.open_attention_snapshot``).
+
+    This used to call ``queries.stuck_payments`` for a capped list and, since
+    the exact-total change, a separate COUNT. Two statements are two READ
+    COMMITTED snapshots: a notification worker completing a stale pending
+    payment, or an operator resolving a manual review, between them could make
+    the overview carry a detail entry while reporting ``needs_attention: 0``
+    (or count a row with no entry) — self-contradictory now that
+    ``centralpay stuck --json`` publishes these as exact. It is the identical
+    hazard ``queries.bot_delivery_snapshot`` already documents and solves with
+    a window function; this now uses that same shape.
+
+    The total is EXACT and unbounded; only the returned entries are capped at
+    ``_QUERY_CAP``.
+    """
+    snapshot = queries.open_attention_snapshot(
         db,
+        now=now,
         claim_timeout_seconds=settings.bot_notify_claim_timeout_seconds,
         limit=_QUERY_CAP,
     )
-    return [
+    entries = [
         StuckEntry(
             payment=entry.payment,
             category=StuckCategory.NEEDS_ATTENTION,
             reason=entry.category,
         )
-        for entry in entries
+        for entry in snapshot.entries
     ]
+    return entries, snapshot.total
 
 
 def _waiting_conditions(settings: Settings, *, now: datetime) -> tuple[Any, ...]:
@@ -232,7 +322,7 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     * open manual-review rows caused by a FINANCIAL/verification mismatch
       (``queries.non_delivery_manual_review_conditions`` — the exact
       complement of ``bot_delivery_snapshot``'s manual-review half, sharing
-      the same ``_open_manual_review_conditions``/
+      the same ``open_manual_review_conditions``/
       ``_bot_delivery_manual_review_conditions`` predicates so a row can
       never be counted in both this function and
       ``bot_delivery_snapshot``, and never dropped from both).
@@ -262,15 +352,11 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     detail rows, so there is no count/list pair to keep consistent here the
     way there is for the bot-delivery, waiting, and expired totals — only
     the union WITHIN this count itself needed to become one statement."""
-    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
     return db.execute(
         select(func.count(Payment.id)).where(
             or_(
                 and_(*reconciliation_exhausted_conditions(settings, now=now)),
-                and_(
-                    Payment.status.in_(_UNEXPECTED_STATUSES),
-                    Payment.created_at <= cutoff,
-                ),
+                and_(*unexpected_status_conditions(now=now)),
                 and_(*queries.non_delivery_manual_review_conditions()),
             )
         )
@@ -365,6 +451,37 @@ def expired_snapshot(
     return ExpiredSnapshot(total=total, entries=entries)
 
 
+def _rows_with_exact_total(
+    db: Session,
+    conditions: tuple[Any, ...],
+    *,
+    order_by: Any,
+    limit: int = _QUERY_CAP,
+) -> tuple[list[Payment], int]:
+    """Detail rows AND their EXACT total from ONE statement.
+
+    Every bucket feeding ``StuckOverview.total_counts`` must use this rather
+    than a separate ``COUNT`` plus a separate ``SELECT ... LIMIT``. Two
+    statements are two READ COMMITTED snapshots: an operator resolving an
+    attention item, or a worker moving a payment, between them makes
+    ``centralpay stuck --json`` report a category count with no corresponding
+    entry line (or the inverse), contradicting the exact ``total``/``shown``/
+    ``truncated`` contract those fields now publish.
+
+    ``func.count().over()`` computes the total over every matching row BEFORE
+    ``LIMIT`` applies — standard window-function semantics — so the total stays
+    exact and unbounded while the rows stay capped. Same shape and same reason
+    as ``app.adminbot.queries.bot_delivery_snapshot`` /
+    ``open_attention_snapshot``.
+    """
+    total_col = func.count().over().label("total")
+    rows = db.execute(
+        select(Payment, total_col).where(*conditions).order_by(order_by).limit(limit)
+    ).all()
+    total = rows[0].total if rows else 0
+    return [payment for payment, _total in rows], total
+
+
 def _link_created_buckets(
     db: Session, settings: Settings, now: datetime
 ) -> tuple[list[StuckEntry], list[StuckEntry], list[StuckEntry], dict[str, int]]:
@@ -379,15 +496,15 @@ def _link_created_buckets(
     waiting_conditions = _waiting_conditions(settings, now=now)
     expired_conditions = _expired_conditions(settings, now=now)
 
-    def count(conditions: tuple[Any, ...]) -> int:
-        return db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
-
-    def rows(conditions: tuple[Any, ...]) -> list[Payment]:
-        return list(
-            db.execute(
-                select(Payment).where(*conditions).order_by(anchor.asc()).limit(_QUERY_CAP)
-            ).scalars()
-        )
+    exhausted_rows, exhausted_total = _rows_with_exact_total(
+        db, exhausted_conditions, order_by=anchor.asc()
+    )
+    waiting_rows, waiting_total = _rows_with_exact_total(
+        db, waiting_conditions, order_by=anchor.asc()
+    )
+    expired_rows, expired_total = _rows_with_exact_total(
+        db, expired_conditions, order_by=anchor.asc()
+    )
 
     attention = [
         StuckEntry(
@@ -399,28 +516,21 @@ def _link_created_buckets(
             ),
             gateway_state=_gateway_state(payment),
         )
-        for payment in rows(exhausted_conditions)
+        for payment in exhausted_rows
     ]
-    waiting = [_waiting_entry(payment) for payment in rows(waiting_conditions)]
-    expired = [_expired_entry(payment) for payment in rows(expired_conditions)]
+    waiting = [_waiting_entry(payment) for payment in waiting_rows]
+    expired = [_expired_entry(payment) for payment in expired_rows]
     counts = {
-        "reconciliation_exhausted": count(exhausted_conditions),
-        "waiting_gateway": count(waiting_conditions),
-        "expired": count(expired_conditions),
+        "reconciliation_exhausted": exhausted_total,
+        "waiting_gateway": waiting_total,
+        "expired": expired_total,
     }
     return attention, waiting, expired, counts
 
 
 def _unexpected_status_entries(db: Session, now: datetime) -> tuple[list[StuckEntry], int]:
-    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
-    conditions: tuple[Any, ...] = (
-        Payment.status.in_(_UNEXPECTED_STATUSES),
-        Payment.created_at <= cutoff,
-    )
-    total = db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
-    payments = db.execute(
-        select(Payment).where(*conditions).order_by(Payment.created_at.asc()).limit(_QUERY_CAP)
-    ).scalars()
+    conditions = unexpected_status_conditions(now=now)
+    payments, total = _rows_with_exact_total(db, conditions, order_by=Payment.created_at.asc())
     entries = [
         StuckEntry(
             payment=payment,
@@ -441,14 +551,18 @@ def stuck_payments_overview(
     including concurrently with the reconciliation worker.
     """
     now = now_fn()
-    reused_attention = _reused_needs_attention(db, settings)
+    # Entries AND their exact total from one statement -- never
+    # `len(reused_attention)`, which saturates at `_QUERY_CAP`, and never a
+    # separate COUNT, which would be a second snapshot (see
+    # `_reused_needs_attention`).
+    reused_attention, reused_total = _reused_needs_attention(db, settings, now=now)
     exhausted_attention, waiting, expired, link_counts = _link_created_buckets(db, settings, now)
     unexpected_attention, unexpected_total = _unexpected_status_entries(db, now)
 
     needs_attention = [*reused_attention, *exhausted_attention, *unexpected_attention]
     total_counts = {
         "needs_attention": (
-            len(reused_attention) + link_counts["reconciliation_exhausted"] + unexpected_total
+            reused_total + link_counts["reconciliation_exhausted"] + unexpected_total
         ),
         "waiting_gateway": link_counts["waiting_gateway"],
         "expired": link_counts["expired"],

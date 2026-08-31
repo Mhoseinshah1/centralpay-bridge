@@ -208,6 +208,27 @@ class Payment(Base):
     review_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     review_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     review_resolution: Mapped[str | None] = mapped_column(String(64))
+    # Operational ATTENTION resolution (migration 0013) — a strictly
+    # non-financial "an operator has looked at this and it needs no further
+    # action" marker for a stale, structurally non-payable failure such as a
+    # `getlink_failed` row (see app/services/attention.py for the exact
+    # eligibility allowlist and refusal guard).
+    #
+    # Deliberately SEPARATE from the review_* fields above: manual review is a
+    # financial ambiguity workflow with its own resolution vocabulary, and
+    # reusing it for rows that never reached a payment link at all would blur
+    # two different operator meanings. These four columns never influence any
+    # financial decision — nothing in the payment, callback, verification,
+    # notification, or reconciliation paths reads them; the ONLY consumers are
+    # read-only operator-attention views (app.services.stuck_payments).
+    #
+    # All four are written together, exactly once, and are never cleared: the
+    # CHECK constraint below (and ck_payments_attention_resolution_consistent
+    # in migration 0013) makes a partially-populated resolution impossible.
+    attention_resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attention_resolution: Mapped[str | None] = mapped_column(String(64))
+    attention_resolved_by: Mapped[str | None] = mapped_column(String(128))
+    attention_resolution_note: Mapped[str | None] = mapped_column(Text)
     # Only the final four card digits may ever be stored.
     card_last4: Mapped[str | None] = mapped_column(String(4))
     last_error: Mapped[str | None] = mapped_column(Text)
@@ -288,6 +309,59 @@ class Payment(Base):
             "payer_identity_type IS NULL"
             " OR payer_identity_type IN ('telegram_user', 'order_fallback')",
             name="ck_payments_payer_identity_type_valid",
+        ),
+        # Attention resolution is all-or-nothing (migration 0013): actor,
+        # time, reason, and note are recorded together or not at all, so a
+        # row can never claim to be operationally resolved without saying by
+        # whom, when, on what grounds, and why.
+        CheckConstraint(
+            "(attention_resolved_at IS NULL AND attention_resolution IS NULL"
+            " AND attention_resolved_by IS NULL AND attention_resolution_note IS NULL)"
+            " OR (attention_resolved_at IS NOT NULL AND attention_resolution IS NOT NULL"
+            " AND attention_resolved_by IS NOT NULL"
+            " AND attention_resolution_note IS NOT NULL)",
+            name="ck_payments_attention_resolution_consistent",
+        ),
+        # ...and the recorded fields are never BLANK. The consistency check
+        # above only rejects NULL, so an empty-string note would satisfy it
+        # and leave a resolution that records no justification at all — the
+        # note is one of the four fields whose whole purpose is to say WHY the
+        # incident was closed. Same shape as ck_fee_policies_note_not_empty.
+        # app.services.attention refuses a blank note or actor before taking
+        # any lock; this is the database-level backstop under it.
+        CheckConstraint(
+            "attention_resolved_at IS NULL"
+            " OR (attention_resolution <> '' AND attention_resolved_by <> ''"
+            " AND attention_resolution_note <> '')",
+            name="ck_payments_attention_resolution_fields_not_empty",
+        ),
+        # DELIBERATELY ABSENT: a constraint forbidding an attention
+        # resolution on a gateway-verified row. It looks like a useful
+        # backstop and is in fact a financial-correctness hazard.
+        # `app.services.verification.process_callback` does NOT gate on
+        # status == link_created: a payment whose getLink call timed out
+        # still holds the callback_token_hash for the signed return URL that
+        # WAS sent to CentralPay, so if CentralPay did create the link and a
+        # payer paid it, a valid browser callback settles the payment
+        # normally. That is a deliberate safety net. Such a constraint would
+        # turn that legitimate settlement into an IntegrityError and fail a
+        # real customer payment to keep an operator worklist tidy — exactly
+        # the trade AGENTS.md forbids. Attention resolution is an operator
+        # OPINION and must never constrain what the financial path may later
+        # do; app.services.attention refuses to resolve an already-verified
+        # payment, and nothing more is enforced here.
+        # Attention-resolution worklist filter: every read-only operator
+        # surface adds `attention_resolved_at IS NULL` to its unexpected-status
+        # predicate (app.services.stuck_payments), so the partial index keeps
+        # that filter cheap as resolved history accumulates.
+        Index(
+            "ix_payments_attention_unresolved",
+            "status",
+            "created_at",
+            postgresql_where=text("attention_resolved_at IS NULL"),
+            # Mirrored so a create_all() database (SQLite unit tests) gets the
+            # same partial index migration 0013 builds, rather than a full one.
+            sqlite_where=text("attention_resolved_at IS NULL"),
         ),
     )
 

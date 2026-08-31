@@ -2,6 +2,212 @@
 
 All notable changes to centralpay-bridge. Dates are UTC.
 
+## [Unreleased] — post-`v0.6.0-rc4` `main`
+
+Operator-tooling and reporting work driven by real production observations
+after the successful rc4 rollout. **No payment, callback, verification,
+notification, or reconciliation behavior changes.** Not tagged, not
+released, not deployed.
+
+### Added
+- **Operational attention resolution** (`app/services/attention.py`,
+  migration `0013`, `centralpay attention list|show|resolve`). Production
+  held a 2026-08-01 payment in `getlink_failed` after a `getLink.php`
+  ReadTimeout: no payment link, no gateway verification, no reference id,
+  no downstream delivery — yet `centralpay stuck` classified it
+  `needs_attention / unexpected_status:getlink_failed` permanently, so the
+  only way to clear the worklist was to delete it and destroy audit
+  history. Resolution instead records time, actor, an allowlisted reason,
+  and a mandatory note in four new `payments` columns, appends a
+  `payment_attention_resolved` audit event, and changes nothing else. The
+  payment row, every payment event, and every admin alert are preserved;
+  `status` is never rewritten; a strict resolution-to-status allowlist
+  (`stale_getlink_failure` for `getlink_failed`, `stale_incomplete_creation`
+  for `created`) plus a financial-inertness guard is re-checked under
+  `SELECT ... FOR UPDATE` with refreshed ORM state; a duplicate operator
+  action is refused rather than overwriting the first record. No gateway or
+  downstream-bot HTTP.
+- **`centralpay review resolve-many ORDER_ID [ORDER_ID ...]`**
+  (`app/services/review_resolution.py`). Production needed to resolve 15
+  gateway-verified `retry_limit_reached` reviews the bot operator had
+  independently confirmed were already credited, which required a shell
+  loop over the single-item command. Explicit order-id list only (no
+  "resolve all", no filter-based selection), preview-only without `--yes`,
+  every row independently passing the same checks, all-or-nothing across the
+  batch, and rejection of a set that mixes gateway-verified and
+  never-verified payments. One audit event per row plus one batch event. No
+  gateway HTTP, no downstream-bot HTTP, no financial mutation. The
+  single-payment workflow is unchanged.
+
+  Bulk eligibility is restricted to allowlisted downstream-DELIVERY failures,
+  reusing `app.services.bulk_resend.ELIGIBLE_RESEND_REASONS` (the same object,
+  imported — not a second copy that could drift). A financial/verification
+  manual review (`bot_notify_reason IS NULL` — the amount, user-id,
+  reference-id, callback, and configuration mismatches
+  `app.services.verification` raises, which never reach notification and so
+  never set a reason) fails CLOSED with
+  `financial_review_requires_individual_resolution`, and a non-allowlisted
+  delivery reason with `delivery_reason_not_bulk_eligible`. Either refusal
+  rejects the ENTIRE batch. Those reviews are exactly the ones where a wrong
+  blanket judgement has financial consequences; they remain resolvable
+  individually with `centralpay review resolve`, which is unchanged.
+
+### Changed
+- **Attention resolution is scoped to the incident, not the payment.**
+  `create_payment` deliberately retries `getLink` for an existing
+  `created`/`getlink_failed` row. If that retry also fails, the row returns to
+  `getlink_failed` while the earlier `attention_resolved_at` still stands, so
+  a plain "resolved" filter hid the new, never-reviewed failure permanently
+  and the operator could not record another resolution. The canonical
+  predicate now also reopens an item whose most recent
+  `centralpay_getlink_failed` event is newer than its most recent
+  `payment_attention_resolved` event. The comparison is on monotonic
+  `payment_events.id`, not timestamps: PostgreSQL's `now()` is
+  transaction-start time, so a slow `getLink` timeout records a failure event
+  stamped before the call began, and SQLite resolves `CURRENT_TIMESTAMP` to
+  whole seconds. Both writers serialize on the payment row lock, so id order
+  is exact.
+- The reused delivery-attention bucket's detail rows and its exact total now
+  come from ONE windowed statement (`queries.open_attention_snapshot`). A
+  capped list plus a separate `COUNT` is two READ COMMITTED snapshots, so a
+  worker delivering a stale pending payment between them could leave the
+  overview carrying a detail entry while reporting `needs_attention: 0` — the
+  same hazard `queries.bot_delivery_snapshot` already documents and solves.
+- `centralpay attention list --resolved` orders newest-resolution-first, so
+  past `--limit` an operator sees recent decisions rather than only the oldest
+  payments by creation date. The open worklist keeps oldest-first (most
+  urgent) ordering.
+- `attention resolve` now enforces the SAME grace period the worklist
+  predicate applies, sharing one constant. `_ensure_payment_row` commits the
+  `created` row and releases its lock before `create_payment` re-acquires it
+  to attempt getLink, so a brand-new row is briefly visible and lock-free: the
+  mutating path could close an item `attention list` and `stuck` both
+  correctly hide as in-flight, and if creation then died without recording a
+  failure event the supersession rule would never reopen it.
+- A blank `--note` or actor is refused by the service before any lock (the CLI
+  already refused it, but the service is what claims to own every safety
+  decision), and `ck_payments_attention_resolution_fields_not_empty` is the
+  database backstop — the consistency CHECK alone rejects only NULL, so an
+  empty-string note satisfied it while recording no justification.
+- Historical review listings (`centralpay manual-review --all`, `centralpay
+  review list --all`) select on manual-review HISTORY via one shared
+  `queries.manual_review_history_conditions`, not on the current status.
+  `review resend` moves a review to `bot_notify_pending` while keeping its
+  `review_resolved_at`/`review_resolution`, so a status filter dropped exactly
+  the rows an operator most wants to look back at — a review that was resolved
+  and then successfully redelivered — while the docs promised to print
+  resolved rows.
+- EVERY `stuck` overview bucket now reads its detail rows and its exact total
+  from one windowed statement (`_rows_with_exact_total`). Four pairs were split
+  across two READ COMMITTED snapshots — the unexpected-status bucket and all
+  three `link_created` buckets — each able to report a category count with no
+  corresponding entry line, contradicting the exact `total`/`shown`/`truncated`
+  contract those fields publish.
+- Operator notes are stripped BEFORE truncation. Validating `note.strip()` and
+  then storing `note[:500]` checks a different string than it writes: 500
+  spaces followed by real text passed the non-blank guard, truncated to blanks,
+  and satisfied the `<> ''` constraint, committing a resolution with no usable
+  justification.
+- `attention show`/`list` report the real getLink failure code. The snapshot
+  read `bot_last_error_code`/`reconciliation_last_error_code`, which only the
+  notification and reconciliation flows write — neither reachable by an
+  attention-resolvable row — so the field was structurally always null for the
+  exact population the feature exists for. It now comes from the
+  `centralpay_getlink_failed` event's safe internal code (one batched query for
+  a listing). The gateway's raw message stays unexposed.
+- **One canonical unresolved-attention predicate.** The unexpected-status
+  half of the needs-attention definition was written out twice — once for
+  `centralpay stuck`'s detail rows and once for the admin bot's `/status`
+  and `/stuck` summary counts — so a filter added to one and not the other
+  would have made the CLI and the bot disagree about the same payment. Both
+  now derive from a single
+  `app.services.stuck_payments.unexpected_status_conditions` builder, and a
+  load-time assertion proves every attention-resolvable status is contained
+  in that predicate's population (so no other attention surface can hold a
+  resolvable row).
+- **`centralpay stuck --json` summary fields.** `total` now reports the TRUE
+  sum of the three exact category counts. It previously reported the size of
+  the internally capped result set, which made the output
+  self-contradictory once any category exceeded that cap — a real
+  production line read `needs_attention: 1, waiting_gateway: 25, expired:
+  5788, shown: 20, total: 226` (= 1 + 25 + 200). The old value is still
+  available under the explicit name `materialized_total`, and a new
+  `truncated` boolean reports whether any matching payment is missing from
+  the entry lines. The three category fields are unchanged. Human mode no
+  longer claims "raise --limit to see more" when the internal cap, not
+  `--limit`, is what is hiding rows.
+- **`centralpay manual-review` lists only UNRESOLVED reviews by default**
+  (`--all` for the historical view), and is documented as deprecated in
+  favour of `centralpay review list`. It previously filtered on
+  `status == manual_review` alone; because `review resolve` deliberately
+  keeps that status as permanent history and records the outcome in
+  `review_resolved_at`/`review_resolution`, every already-resolved review
+  kept printing as though it were still active — contradicting `review
+  list`, the admin bot's `/manual_review` and `/status`, and the
+  `manual_review` monitor check, all of which already excluded them.
+  `centralpay payment`/`recent`/`retry-queue` output additionally gained
+  purely additive review/attention resolution keys, so a resolved row can no
+  longer look identical to an active one.
+- `app.ops review list` filters resolved rows in SQL via the shared
+  predicate instead of selecting every `manual_review` row and discarding
+  them in Python.
+
+### Documentation
+- `OPERATIONS_FA.md`: attention-resolution runbook, bulk review resolution,
+  and a reconciliation polling-cadence diagnosis section.
+- `MIGRATION_GUIDE.md`: migration `0013`, including an honest downgrade
+  limitation and why no constraint ties `attention_resolved_at` to
+  `gateway_verified_at`.
+- `RELEASE_EVIDENCE_0.6.0_RC4_POST_TAG.md` (new): the post-tag
+  release-workflow evidence that closes **B5**, an explicit statement of
+  what is still missing for **B1**, **B2**, and **B3**, and the
+  recommended (unexecuted) remediation for the stale `v0.6.1-rc1`
+  `/releases/latest` pointer.
+
+### Investigated — no change (reconciliation polling load)
+Production showed unverified `link_created` payments with ~100–180
+reconciliation attempts, ages of 1–2 hours, and a next retry roughly 60
+seconds after the last check, against a documented 300-second slow
+interval. Audit result: **the shipped defaults and the scheduler are
+correct.** `app/config.py`, `.env.example`, and
+`deploy/centralpay.env.template` all agree on the documented two-stage
+schedule, and no commit in the repository's history ever shipped a
+60-second value. The attempt arithmetic attributes the observation to a
+deployment-level override: the shipped 300-second interval tops out near
+111 attempts within the 2-hour lifetime and cannot produce 180, while a
+60-second interval spans exactly the observed range. No financial or
+reconciliation behavior was changed. Added
+`tests/test_reconciliation_schedule_defaults.py`, which pins the schedule
+math and asserts the three config surfaces agree — the realistic way this
+could later become a genuine shipped-default defect — plus an
+`OPERATIONS_FA.md` procedure for reading the effective values from
+`centralpay reconciliation status --json` and restoring the documented
+cadence.
+
+### Tests
+- `tests/test_attention_review_findings.py` — regressions for five defects
+  found in review: incident-scoped reopening (and that an unsuperseded
+  duplicate resolve is still refused), the open `attention list` composing the
+  canonical predicate rather than a fourth copy, the historical listing
+  keeping a payment that settled after resolution, bulk rejection of two
+  aliases naming one payment, and `needs_attention` staying exact past the
+  materialization cap.
+- `tests/test_attention.py`, `tests/test_attention_canonical.py`,
+  `tests/integration/test_attention_pg.py` (real PostgreSQL: an 8-way
+  resolution race, an identity-map staleness race, concurrent overlapping
+  bulk batches, the CHECK constraint, and migration `0013` upgrade,
+  idempotency, and non-destructive downgrade).
+- `tests/test_stuck_json_contract.py` — including cases where real category
+  counts exceed the internal query cap, and a replay of both observed
+  production summary lines.
+- `tests/test_operator_cli_resolution.py`,
+  `tests/test_reconciliation_schedule_defaults.py`,
+  `tests/test_migration_chain.py`.
+- The three PostgreSQL migration test files no longer hardcode the head
+  revision; they read it from the real Alembic script directory
+  (`tests/alembic_head.py`), with the exact value pinned in one deliberate
+  place (`tests/test_migration_chain.py`).
+
 ## [0.6.0-rc4] — 2026-08-29 (release candidate — NOT production-ready)
 
 **Supersedes the `v0.6.0-rc3` tag: its tag-triggered `release.yml` run

@@ -3,7 +3,7 @@
 CentralPay Bridge migrations are designed for a financial system: **forward-only by default**, non-destructive where practical, and gated by backup + integrity checks.
 
 Current application version: **0.6.0-rc4**.  
-Current Alembic head in this branch: **0012**.
+Current Alembic head in this branch: **0013**.
 
 ## General rules
 
@@ -31,6 +31,7 @@ Current Alembic head in this branch: **0012**.
 | `0010` | server-side reconciliation bookkeeping/index for recovering paid `link_created` payments when browser callback is missed |
 | `0011` | durable `monitor_incidents` table for the optional monitoring subsystem's cross-restart incident lifecycle |
 | `0012` | `monitor_incidents.last_alert_id` so a permanently failed alert delivery can be detected and re-queued instead of looking "already alerted" forever |
+| `0013` | `payments.attention_resolved_at/_resolution/_resolved_by/_resolution_note` so a stale, non-financial failure (e.g. an old `getlink_failed` row) can be operationally closed with a durable, audited record instead of being deleted |
 
 Run:
 
@@ -142,6 +143,58 @@ Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_D
 Migration `0012` adds `monitor_incidents.last_alert_id`, a foreign key to `admin_alerts.id` recording which outbox row an incident's `last_alerted_at` refers to. Without it, an incident whose opening/escalation alert permanently failed delivery (every Telegram retry exhausted) would look "already alerted" forever; this column lets the catch-up path check the referenced alert's actual delivery status and re-queue a fresh one if it failed.
 
 Downgrade is non-destructive by default; explicit removal requires `CENTRALPAY_DROP_MONITOR_INCIDENT_LAST_ALERT=1`.
+
+## 0013 — operational attention resolution
+
+Migration `0013` adds four nullable columns to `payments`
+(`attention_resolved_at`, `attention_resolution`, `attention_resolved_by`,
+`attention_resolution_note`), one CHECK constraint
+(`ck_payments_attention_resolution_consistent`: all four set together or not
+at all), and one partial index (`ix_payments_attention_unresolved` on
+`(status, created_at) WHERE attention_resolved_at IS NULL`).
+
+Why: a payment whose `getLink` call failed never obtains a payment link, is
+never gateway verified, and is never revisited by any automatic path, so
+`centralpay stuck` classified it `needs_attention` permanently. The only way
+to clear it was to delete the row — destroying permanent financial/audit
+history. These columns record the operator's decision instead. See
+`app/services/attention.py`.
+
+**Forward-safe, no data migration, no invented fact.** Every existing row gets
+`NULL` in all four columns, which means exactly "not resolved" — the same
+operational meaning those rows already had. No financial column, status, event,
+or admin alert is touched, and no row is deleted.
+
+**Deliberately absent constraint.** There is NO constraint tying
+`attention_resolved_at` to `gateway_verified_at`.
+`app.services.verification.process_callback` does not gate on
+`status == link_created`, so a payment whose `getLink` call timed out (the
+request WAS delivered; only the response was lost) can still be settled by a
+valid late browser callback. A constraint there would turn that legitimate
+settlement into an `IntegrityError` and fail a real customer payment. The
+service layer refuses to resolve an already-verified payment; nothing more is
+enforced in the schema.
+
+**Downgrade limitation (honest statement).** `downgrade` is non-destructive by
+default: it moves the Alembic pointer back to `0012` and PRESERVES the columns,
+because the pre-`0013` application simply ignores them and dropping them would
+permanently destroy operator resolution history (actor, time, reason, note)
+that is not reconstructable from anywhere else. The `payment_events` trail
+keeps a `payment_attention_resolved` event per resolution, so the *fact*
+survives a destructive drop, but the structured columns the worklist filters on
+do not. Dropping them requires the explicit
+`CENTRALPAY_DROP_ATTENTION_RESOLUTION=1` opt-in, and doing so makes every
+previously resolved row reappear in `needs_attention` — the correct
+fail-visible direction.
+
+**Application rollback with `0013` already applied** (the normal rollback
+shape, since migrations are forward-only): the older application simply does
+not read these columns, so every previously resolved item reappears in
+`needs_attention`. That is inconvenient but correct and fail-visible — the
+older code has no way to know the item was closed, so it shows it. No
+financial behavior differs, because nothing outside the operator-attention
+views ever reads these columns. Rolling forward again restores the filtering
+with no data loss.
 
 ## Production update procedure
 

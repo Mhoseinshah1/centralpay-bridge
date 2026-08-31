@@ -26,13 +26,54 @@ def count_by_status(db: Session, status: str) -> int:
     ).scalar_one()
 
 
-def _open_manual_review_conditions() -> tuple[Any, ...]:
-    """An OPEN manual review still needs operator attention: the payment is in
-    manual_review AND has not been resolved via ``centralpay review resolve``
-    (which stamps review_resolved_at but keeps the status as history)."""
+def open_manual_review_conditions() -> tuple[Any, ...]:
+    """THE canonical "this manual review still needs operator attention"
+    predicate: the payment is in manual_review AND has not been resolved via
+    ``centralpay review resolve`` (which stamps review_resolved_at but keeps
+    the status as history).
+
+    Public (no leading underscore), like
+    ``non_delivery_manual_review_conditions``: ``app.cli``'s legacy
+    ``manual-review`` command and ``app.ops``' ``review list`` both compose it
+    directly, so no surface can re-derive a subtly different notion of "open"
+    and print resolved history as if it were an active worklist.
+    """
     return (
         Payment.status == "manual_review",
         Payment.review_resolved_at.is_(None),
+    )
+
+
+def manual_review_history_conditions() -> tuple[Any, ...]:
+    """THE canonical "this payment has manual-review HISTORY" predicate, for
+    `--all`/historical listings.
+
+    Deliberately NOT ``status == manual_review``. That status is the CURRENT
+    state, and a payment can legitimately leave it while keeping its review
+    history: ``app.ops`` "review resend" moves a review to
+    ``bot_notify_pending`` and retains ``review_resolved_at`` /
+    ``review_resolution``, and ``app.services.bulk_resend`` does the same for
+    unresolved ones. A history view filtered on the current status therefore
+    DROPS exactly the rows an operator most wants to look back at — a review
+    that was resolved and then successfully redelivered — while its own
+    documentation promises to print resolved rows.
+
+    ``manual_review_at`` is stamped by every path that enters manual review
+    (``app.services.notification._move_to_manual_review`` and
+    ``app.services.verification``), so it is an exact "ever entered manual
+    review" marker regardless of where the payment ended up.
+    ``review_resolved_at`` is ORed in as a belt-and-braces second marker: a
+    directly-constructed or data-repaired row carrying a resolution but no
+    entry timestamp still shows up rather than silently vanishing.
+
+    Same lesson as ``app.ops``' ``attention list --resolved``: a historical
+    view filters on what HAPPENED, never on where the row happens to be now.
+    """
+    return (
+        or_(
+            Payment.manual_review_at.is_not(None),
+            Payment.review_resolved_at.is_not(None),
+        ),
     )
 
 
@@ -40,17 +81,17 @@ def count_open_manual_reviews(db: Session) -> int:
     """count_by_status("manual_review") counts ALL rows ever left in that
     status; this counts only the unresolved ones operators must act on."""
     return db.execute(
-        select(func.count(Payment.id)).where(*_open_manual_review_conditions())
+        select(func.count(Payment.id)).where(*open_manual_review_conditions())
     ).scalar_one()
 
 
 def oldest_open_manual_review_age_seconds(db: Session, *, now: datetime) -> float | None:
     """Age of the longest-open unresolved manual review, or None when there
-    is none. Shares _open_manual_review_conditions with
+    is none. Shares open_manual_review_conditions with
     count_open_manual_reviews so the two can never disagree about which
     rows are "open"."""
     oldest: datetime | None = db.execute(
-        select(func.min(Payment.manual_review_at)).where(*_open_manual_review_conditions())
+        select(func.min(Payment.manual_review_at)).where(*open_manual_review_conditions())
     ).scalar_one()
     if oldest is None:
         return None
@@ -66,7 +107,7 @@ def open_manual_review_reason_buckets(db: Session) -> dict[str, int]:
     id or other customer-identifying data."""
     rows = db.execute(
         select(Payment.bot_notify_reason, func.count(Payment.id))
-        .where(*_open_manual_review_conditions())
+        .where(*open_manual_review_conditions())
         .group_by(Payment.bot_notify_reason)
     ).tuples().all()
     buckets: dict[str, int] = {}
@@ -132,7 +173,7 @@ def manual_review_payments(db: Session, limit: int = 20) -> list[Payment]:
     return list(
         db.execute(
             select(Payment)
-            .where(*_open_manual_review_conditions())
+            .where(*open_manual_review_conditions())
             .order_by(Payment.manual_review_at.asc().nulls_first())
             .limit(limit)
         ).scalars()
@@ -234,7 +275,7 @@ def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
     (typically None, since those payments never reached notification at
     all). Never includes reconciliation-exhausted or unexpected-status
     rows — those never set ``status = manual_review`` in the first place."""
-    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
+    return (*open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
 
 
 def non_delivery_manual_review_conditions() -> tuple[Any, ...]:
@@ -252,13 +293,13 @@ def non_delivery_manual_review_conditions() -> tuple[Any, ...]:
     ``app.services.stuck_payments.count_other_attention`` so its
     non-delivery-manual-review predicate can never drift from this one —
     the same reason ``reconciliation_exhausted_conditions`` is public."""
-    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_(None))
+    return (*open_manual_review_conditions(), Payment.bot_notify_reason.is_(None))
 
 
 def count_non_delivery_manual_reviews(db: Session) -> int:
     """EXACT count of open manual-review rows that are NOT a bot-delivery
     problem (financial/verification mismatches). Shares
-    ``_open_manual_review_conditions`` with ``count_open_manual_reviews``
+    ``open_manual_review_conditions`` with ``count_open_manual_reviews``
     (the /manual_review command's total) and is the exact complement of
     ``bot_delivery_snapshot``'s manual-review half."""
     return db.execute(
@@ -348,6 +389,90 @@ def bot_delivery_snapshot(
     return BotDeliverySnapshot(total=total, entries=entries)
 
 
+@dataclass(frozen=True)
+class OpenAttentionSnapshot:
+    # EXACT total matching the predicate (unbounded -- never reduced by
+    # `limit`; the window function computes it BEFORE LIMIT applies).
+    total: int
+    entries: list[StuckEntry]
+
+
+def open_attention_snapshot(
+    db: Session,
+    *,
+    now: datetime,
+    pending_age_minutes: int = 30,
+    claim_timeout_seconds: float = 120.0,
+    limit: int = 30,
+) -> OpenAttentionSnapshot:
+    """The population :func:`stuck_payments` materializes -- every OPEN manual
+    review (delivery-caused or not) plus every stale ``bot_notify_pending``
+    row -- with its EXACT total and its detail rows read from ONE statement.
+
+    Why one statement rather than a list plus a separate ``COUNT``: this is
+    the same hazard :func:`bot_delivery_snapshot` documents at length. Under
+    PostgreSQL's default READ COMMITTED isolation two statements are two
+    snapshots, so a notification worker completing a stale pending payment --
+    or an operator resolving a manual review -- between them makes the count
+    and the rendered rows describe different states. ``len(stuck_payments())``
+    additionally saturates at its ``limit``.
+
+    Both defects matter now that ``centralpay stuck --json`` publishes
+    ``needs_attention`` as an exact category total and derives ``total`` and
+    ``truncated`` from it: an overview could otherwise report
+    ``needs_attention: 0`` while carrying a detail entry, or count a row that
+    has no entry. ``func.count().over()`` computes the exact total over every
+    matching row BEFORE ``LIMIT`` is applied, in the statement that fetches
+    the rows.
+
+    Classification and ordering reproduce :func:`stuck_payments` exactly --
+    open manual reviews first (by ``manual_review_at`` ascending, NULLS
+    FIRST), then stale/old pending rows (by the notification-age anchor),
+    ties broken by ascending ``Payment.id`` -- so
+    ``app.services.stuck_payments``' rendered entries are unchanged. The
+    predicates themselves are the SHARED builders
+    (:func:`open_manual_review_conditions`,
+    ``_stale_bot_notify_pending_conditions``), never re-derived here.
+    """
+    pending_cutoff = now - timedelta(minutes=pending_age_minutes)
+    is_manual_review = and_(*open_manual_review_conditions())
+    priority = case((is_manual_review, 0), else_=1)
+    sort_ts = case((is_manual_review, Payment.manual_review_at), else_=_notification_age_anchor())
+    total_col = func.count().over().label("total")
+    stmt = (
+        select(Payment, priority.label("priority"), total_col)
+        .where(
+            or_(
+                is_manual_review,
+                and_(*_stale_bot_notify_pending_conditions(pending_cutoff)),
+            )
+        )
+        .order_by(priority.asc(), sort_ts.asc().nulls_first(), Payment.id.asc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).all()
+    total = rows[0].total if rows else 0
+
+    claim_cutoff = now - timedelta(seconds=claim_timeout_seconds)
+    entries: list[StuckEntry] = []
+    for payment, priority_value, _total in rows:
+        if priority_value == 0:
+            reason = payment.bot_notify_reason or payment.last_error or "manual_review"
+            entries.append(StuckEntry(payment, f"manual_review:{reason}"))
+            continue
+        claimed_at = payment.notification_claimed_at
+        if claimed_at is not None:
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=UTC)
+            if claimed_at <= claim_cutoff:
+                entries.append(StuckEntry(payment, "stale_notification_claim"))
+                continue
+        entries.append(
+            StuckEntry(payment, payment.bot_notify_reason or "bot_notify_pending_old")
+        )
+    return OpenAttentionSnapshot(total=total, entries=entries)
+
+
 def stuck_payments(
     db: Session,
     *,
@@ -411,7 +536,7 @@ def retry_queue_snapshot(db: Session, *, limit: int = 30) -> dict[str, list[Paym
         db.execute(
             select(Payment)
             .where(
-                *_open_manual_review_conditions(),
+                *open_manual_review_conditions(),
                 Payment.bot_notify_reason == "retry_limit_reached",
             )
             .order_by(Payment.manual_review_at.desc())

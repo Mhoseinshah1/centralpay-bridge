@@ -75,6 +75,7 @@ These files record or define validation work for a particular release/host/integ
 | `REAL_HOST_VALIDATION.md` | Installer/real-host validation evidence |
 | `STAGING_VALIDATION.md` | Real/staging CentralPay contract validation evidence and cautions |
 | `ADMIN_BOT_VALIDATION.md` | Live Telegram admin-bot validation evidence |
+| `RELEASE_EVIDENCE_0.6.0_RC4_POST_TAG.md` | Post-tag evidence for `v0.6.0-rc4`: the tag-triggered release-workflow run that closes B5, an explicit statement of what B1/B2/B3 each still need, and the recommended (deliberately unexecuted) remediation for the stale `v0.6.1-rc1` `/releases/latest` pointer. Added on `main` AFTER the tag rather than by rewriting the immutable rc4 release notes. |
 
 ## Release snapshots
 
@@ -134,7 +135,18 @@ Their Git history remains available permanently, so deleting them from the curre
 At the time this map was added, important current facts include:
 
 - application version `0.6.0-rc4`
-- Alembic head `0012`
+- Alembic head `0013` (`0012` in the released rc4 artifact; `0013` adds the
+  operational attention-resolution columns on `main` — see `MIGRATION_GUIDE.md`)
+- there is exactly ONE canonical unresolved-attention predicate
+  (`app.services.stuck_payments.unexpected_status_conditions`, which composes
+  `app.services.attention.unresolved_attention_condition`); every surface that
+  displays current operational attention composes it rather than re-deriving an
+  equivalent expression
+- `centralpay stuck --json`'s `total` is the TRUE sum of the category counts;
+  the internally capped result-set size is exposed separately as
+  `materialized_total`, with a `truncated` boolean
+- `centralpay manual-review` is deprecated in favour of `centralpay review
+  list` and lists only UNRESOLVED reviews by default (`--all` for history)
 - production update refs fail closed unless they are release tags, unless the explicit development opt-in is enabled
 - admin bot is no longer accurately described as blanket read-only because `/resend_failed confirm` is a narrowly gated mutation
 - the admin bot's own lightweight built-in health checks (`app/adminbot/health.py`) still keep consecutive-failure/recovery counters in process memory (a restart resets them) — that specific limitation is unchanged and not overclaimed as solved; separately, an optional, dedicated monitoring process (`app.monitor`, `MONITOR_ENABLED=false` by default) now exists with its own, more thorough check set, and its incident state lives in the durable `monitor_incidents` table (migration `0011`/`0012`) and survives a restart — do not describe *all* monitoring/incident state as process-memory-only, and do not describe persistent incident lifecycle as nonexistent

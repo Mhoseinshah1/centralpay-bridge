@@ -9,9 +9,25 @@ Commands:
   backup-event {success|failure} [--size TEXT] [--file-name TEXT]
                                  [--retention-days N] [--detail TEXT]
   test-alert
-  review list | show ORDER_ID | acknowledge ORDER_ID --note TEXT
+  review list [--all] | show ORDER_ID | acknowledge ORDER_ID --note TEXT
   review resolve ORDER_ID --resolution VALUE --note TEXT
+  review resolve-many ORDER_ID [ORDER_ID ...] --resolution VALUE --note TEXT [--yes]
+      All-or-nothing bulk resolution of an EXPLICIT list of open manual
+      reviews. ONLY allowlisted downstream-DELIVERY failures
+      (retry_limit_reached / bot_timeout_ambiguous) are eligible;
+      financial/verification reviews (bot_notify_reason IS NULL) are refused
+      and must be resolved individually with `review resolve`.
+      Preview-only without --yes. Never "resolve all", never any gateway or
+      downstream-bot request, never a financial mutation.
+      See app.services.review_resolution.
   review resend ORDER_ID --confirm-idempotent-bot --yes   (idempotent mode only)
+  attention list [--resolved] | show ORDER_ID
+  attention resolve ORDER_ID --resolution VALUE --note TEXT --yes
+      Durably close a STALE NON-FINANCIAL operator-attention item (e.g. an
+      old getlink_failed payment that never obtained a payment link) without
+      deleting anything. Preserves the payment row, every payment event, and
+      every admin alert; never changes status or any financial fact.
+      See app.services.attention.
   notification accept ORDER_ID --note TEXT --yes
       Mark one already-processed, gateway-verified bot notification (stuck
       in bot_notify_pending) as operator-confirmed accepted. Makes NO bot
@@ -31,6 +47,7 @@ from typing import Any
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from app.adminbot import queries
 from app.adminbot.alerts import configure_alert_creation, create_alert
 from app.audit import record_event
 from app.cli import AmbiguousOrderIdError, _find_payment
@@ -38,7 +55,10 @@ from app.config import Settings
 from app.db import create_session_factory
 from app.logging_setup import configure_logging
 from app.models import FeePolicy, Payment, PaymentStatus
+from app.services import attention as attention_service
+from app.services import review_resolution
 from app.services.notification import ManualAcceptRefusal, execute_manual_accept
+from app.services.stuck_payments import unexpected_status_conditions
 
 # Non-financial operational resolution states only.
 ALLOWED_RESOLUTIONS = (
@@ -845,20 +865,31 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
     with session_factory() as db:
         if args.review_command == "list":
+            # Filtered in SQL via the SHARED predicate every other surface
+            # uses (app.adminbot.queries.open_manual_review_conditions) rather
+            # than selecting every manual_review row and dropping resolved
+            # ones in Python: one definition of "open", and no unbounded read
+            # of permanently-accumulating resolved history just to discard it.
+            conditions: tuple[Any, ...] = (
+                queries.manual_review_history_conditions()
+                if args.all
+                else queries.open_manual_review_conditions()
+            )
             payments = db.execute(
                 select(Payment)
-                .where(Payment.status == PaymentStatus.MANUAL_REVIEW.value)
+                .where(*conditions)
                 .order_by(Payment.manual_review_at.asc().nulls_first())
             ).scalars()
             shown = 0
             for row in payments:
-                if row.review_resolved_at is not None and not args.all:
-                    continue
                 print(json.dumps(_review_summary(row), ensure_ascii=False))
                 shown += 1
             if shown == 0:
                 print("no unresolved manual-review payments" if not args.all else "none")
             return 0
+
+        if args.review_command == "resolve-many":
+            return _cmd_review_resolve_many(db, args)
 
         payment = _load_review_payment(db, args.order_id)
         if payment is None:
@@ -947,6 +978,310 @@ def _cmd_review(args: argparse.Namespace) -> int:
             print(f"requeued {payment.bot_order_id} for bot notification")
             return 0
     return 1
+
+
+# --- review resolve-many: all-or-nothing bulk resolution -------------------
+#
+# All safety logic lives in app.services.review_resolution; this section only
+# renders what that service decides. It never assigns a Payment attribute
+# itself and never resolves an order id on its own.
+
+
+def _bulk_row_line(row: review_resolution.BulkReviewRow) -> str:
+    verified = (
+        "?" if row.gateway_verified is None else ("yes" if row.gateway_verified else "NO")
+    )
+    detail = (
+        f"status={row.status} gateway_verified={verified} "
+        f"reason={row.bot_notify_reason or '—'} amount={row.amount}"
+        if row.payment_id is not None
+        else "—"
+    )
+    verdict = "OK" if row.refusal is None else f"REFUSED ({row.refusal.value}): {row.message}"
+    return f"  {row.order_id}: {verdict}\n      {detail}"
+
+
+def _print_bulk_report(report: review_resolution.BulkReviewReport) -> None:
+    print(f"Bulk manual-review resolution preview (resolution={report.resolution})")
+    print(
+        "  SCOPE: allowlisted downstream-DELIVERY failures only "
+        f"({', '.join(sorted(review_resolution.BULK_ELIGIBLE_DELIVERY_REASONS))}). "
+        "Financial/verification reviews must be resolved individually with "
+        "`centralpay review resolve`."
+    )
+    print(f"  orders listed: {len(report.rows)}")
+    for row in report.rows:
+        print(_bulk_row_line(row))
+    if report.set_message is not None:
+        print(f"  SET REFUSED ({report.set_refusal}): {report.set_message}")
+
+
+def _bulk_resolve_warning(count: int, resolution: str) -> str:
+    return (
+        f"About to resolve {count} manual review(s) with "
+        f"resolution={resolution}.\n"
+        "  - Only allowlisted downstream-DELIVERY failures are eligible; "
+        "financial/verification reviews are refused and must be handled "
+        "individually.\n"
+        "  - Does NOT contact CentralPay.\n"
+        "  - Does NOT contact the selling bot.\n"
+        "  - Does NOT credit any customer.\n"
+        "  - Does NOT change amounts, fees, verification facts, or "
+        "reference ids.\n"
+        "  - Does NOT change payment status (rows stay manual_review as "
+        "permanent history).\n"
+        "  - Records one audited resolution per payment, all-or-nothing.\n"
+        "Re-run with --yes to confirm."
+    )
+
+
+def _cmd_review_resolve_many(db: Session, args: argparse.Namespace) -> int:
+    order_ids: list[str] = list(args.order_ids)
+    if not args.yes:
+        report = review_resolution.preview_bulk_resolution(
+            db, order_ids=order_ids, resolution=args.resolution
+        )
+        _print_bulk_report(report)
+        if not report.eligible:
+            print(
+                "refused: every listed order must individually pass the same "
+                "safety checks; nothing was resolved.",
+                file=sys.stderr,
+            )
+            return 1
+        print(_bulk_resolve_warning(len(report.rows), args.resolution), file=sys.stderr)
+        return 1
+
+    result = review_resolution.resolve_reviews(
+        db,
+        order_ids=order_ids,
+        resolution=args.resolution,
+        note=args.note,
+        actor="host-cli",
+        now=datetime.now(UTC),
+    )
+    if not result.resolved:
+        _print_bulk_report(result.report)
+        print(
+            "refused: nothing was resolved. The batch is all-or-nothing, so a "
+            "single ineligible order blocks the whole set.",
+            file=sys.stderr,
+        )
+        return 1
+    for row in result.report.rows:
+        print(f"resolved {row.bot_order_id}: {args.resolution}")
+    print(f"resolved {result.resolved_count} manual review(s)")
+    return 0
+
+
+# --- attention: durable closure of stale NON-FINANCIAL failures ------------
+#
+# All safety logic lives in app.services.attention; this section only renders
+# what that module decides and reuses app.cli's `_find_payment`/
+# `AmbiguousOrderIdError` for ORDER_ID resolution. It never assigns a Payment
+# attribute itself.
+
+
+def _attention_summary(snapshot: attention_service.AttentionSnapshot) -> dict[str, object]:
+    """Machine-readable attention view. Reports the ORIGINAL financial and
+    failure facts verbatim alongside any resolution — never a summary that
+    could imply the payment succeeded. `redirect_url` is exposed only as a
+    boolean: a full payment redirect URL must never be printed."""
+    return {
+        "bot_order_id": snapshot.bot_order_id,
+        "gateway_order_id": snapshot.gateway_order_id,
+        "status": snapshot.status,
+        "original_bot_invoice": snapshot.amount,
+        "amount": snapshot.amount,
+        "fee_rate_bps": snapshot.fee_rate_bps,
+        "fee_amount": snapshot.fee_amount,
+        "paid_through_gateway": snapshot.payable_amount,
+        "gateway_verified": snapshot.gateway_verified,
+        "gateway_verified_at": _iso(snapshot.gateway_verified_at),
+        "reference_id": snapshot.reference_id,
+        "redirect_url_present": snapshot.redirect_url_present,
+        "callback_token_issued": snapshot.callback_token_issued,
+        "bot_notify_attempts": snapshot.bot_notify_attempts,
+        "manual_review_at": _iso(snapshot.manual_review_at),
+        "last_error_code": snapshot.last_error_code,
+        "created_at": _iso(snapshot.created_at),
+        "attention_resolved": snapshot.attention_resolved_at is not None,
+        "attention_resolved_at": _iso(snapshot.attention_resolved_at),
+        "attention_resolution": snapshot.attention_resolution,
+        "attention_resolved_by": snapshot.attention_resolved_by,
+        "attention_resolution_note": snapshot.attention_resolution_note,
+        "resolvable": snapshot.refusal is None,
+        "attention_resolution_superseded": snapshot.attention_resolution_superseded,
+        "refusal": snapshot.refusal.value if snapshot.refusal else None,
+        "refusal_message": attention_service.snapshot_refusal_message(snapshot),
+        "eligible_resolutions": list(snapshot.eligible_resolutions),
+    }
+
+
+def _attention_resolve_warning(order_id: str, resolution: str) -> str:
+    return (
+        f"About to record an operational attention resolution for {order_id} "
+        f"(resolution={resolution}).\n"
+        "  - Does NOT contact CentralPay.\n"
+        "  - Does NOT contact the selling bot.\n"
+        "  - Does NOT credit any customer.\n"
+        "  - Does NOT change the payment status (a getlink_failed payment "
+        "stays getlink_failed).\n"
+        "  - Does NOT change amounts, fees, verification facts, reference "
+        "ids, or payer identity.\n"
+        "  - Does NOT delete the payment, any payment event, or any admin "
+        "alert.\n"
+        "  - Removes it from the CURRENT needs-attention worklist only; it "
+        "stays fully inspectable.\n"
+        "  - Does NOT block a later legitimate settlement: if CentralPay did "
+        "create a link this bridge never received and a payer pays it, the "
+        "normal callback path still settles the payment and it reappears in "
+        "the ordinary delivery surfaces.\n"
+        "You are asserting only that THIS BRIDGE never delivered a payment "
+        "link for this order and has nothing further to do about it.\n"
+        "Re-run with --yes to confirm."
+    )
+
+
+def _cmd_attention(args: argparse.Namespace) -> int:
+    settings = Settings()
+    configure_logging(settings)
+    configure_alert_creation(settings)
+    session_factory = create_session_factory(settings.database_url)
+
+    with session_factory() as db:
+        if args.attention_command == "list":
+            now = datetime.now(UTC)
+            if args.resolved:
+                # HISTORICAL view: filter ONLY on "a resolution was recorded".
+                # Deliberately NO status filter. A resolved payment can
+                # legitimately settle later through a late callback (see
+                # app.services.attention), which moves it to a notification or
+                # manual-review status while it keeps its resolution columns.
+                # Scoping this to RESOLVABLE_STATUSES would drop exactly that
+                # case from the history — the most interesting one — and break
+                # the durability this feature promises.
+                conditions: tuple[Any, ...] = (
+                    attention_service.resolved_attention_condition(),
+                )
+                # NEWEST RESOLUTION FIRST. Ordering history by `created_at`
+                # ascending (the open view's ordering) means that once more
+                # resolutions exist than `--limit`, an operator only ever sees
+                # the oldest payments by CREATION date and can never reach the
+                # decisions just made, with no pagination to get there. The
+                # question this view answers is "what did we recently close",
+                # so it sorts the way `queries.resolved_review_payments`
+                # already does. Ties break on descending id for determinism.
+                order: tuple[Any, ...] = (
+                    Payment.attention_resolved_at.desc(),
+                    Payment.id.desc(),
+                )
+            else:
+                # OPEN view: compose the CANONICAL current-attention predicate
+                # (grace period and unresolved filter included) rather than a
+                # locally re-derived one, then narrow it to the statuses this
+                # command can actually act on. Without the shared builder's
+                # grace period this listing would show every in-flight payment
+                # creation as a stale attention item: create_payment commits
+                # the `created` row BEFORE attempting getLink, so a plain read
+                # sees it immediately, while `centralpay stuck` and the admin
+                # bot deliberately exclude it for
+                # UNEXPECTED_STATE_GRACE_SECONDS. That is precisely the
+                # cross-surface disagreement the canonical predicate exists to
+                # prevent.
+                conditions = (
+                    *unexpected_status_conditions(now=now),
+                    Payment.status.in_(sorted(attention_service.RESOLVABLE_STATUSES)),
+                )
+                # OLDEST FIRST: a worklist is ordered most-urgent-first, and
+                # the longest-unattended item is the most urgent — the same
+                # ordering `centralpay stuck` uses for its attention rows.
+                order = (Payment.created_at.asc(), Payment.id.asc())
+            payments = list(
+                db.execute(
+                    select(Payment)
+                    .where(*conditions)
+                    .order_by(*order)
+                    .limit(args.limit)
+                ).scalars()
+            )
+            # One batched query for every row's getLink failure code, rather
+            # than a query per row.
+            failure_codes = attention_service.latest_link_failure_codes(
+                db, [payment.id for payment in payments]
+            )
+            shown = 0
+            for payment in payments:
+                print(
+                    json.dumps(
+                        _attention_summary(
+                            attention_service.snapshot(
+                                payment,
+                                now=now,
+                                link_failure_code=failure_codes.get(payment.id),
+                                # Same supersession rule the worklist predicate
+                                # applies, so this listing and `centralpay
+                                # stuck` can never disagree about a row.
+                                superseded=attention_service.
+                                resolution_superseded_in_db(db, payment),
+                            )
+                        ),
+                        ensure_ascii=False,
+                    )
+                )
+                shown += 1
+            if shown == 0:
+                print(
+                    "no resolved attention items"
+                    if args.resolved
+                    else "no open attention items in an attention-resolvable state"
+                )
+            return 0
+
+        try:
+            found = _find_payment(db, args.order_id)
+        except AmbiguousOrderIdError:
+            print(f"ambiguous order id: {args.order_id}", file=sys.stderr)
+            db.rollback()
+            return 1
+        if found is None:
+            print(f"payment not found: {args.order_id}", file=sys.stderr)
+            db.rollback()
+            return 1
+
+        if args.attention_command == "show":
+            summary = _attention_summary(
+                attention_service.snapshot(
+                    found,
+                    now=datetime.now(UTC),
+                    superseded=attention_service.resolution_superseded_in_db(db, found),
+                    link_failure_code=attention_service.latest_link_failure_code(
+                        db, found.id
+                    ),
+                )
+            )
+            db.rollback()
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
+
+        # resolve: every eligibility decision is re-made under the row lock
+        # inside the service, against a freshly reloaded row.
+        outcome = attention_service.resolve_attention(
+            db,
+            payment_id=found.id,
+            resolution=args.resolution,
+            note=args.note,
+            actor=attention_service.ACTOR_HOST_CLI,
+            now=datetime.now(UTC),
+        )
+        if not outcome.resolved:
+            print(attention_service.outcome_refusal_message(outcome), file=sys.stderr)
+            return 1
+        print(
+            f"resolved attention for {outcome.bot_order_id}: {outcome.resolution} "
+            f"(status unchanged: {outcome.status})"
+        )
+        return 0
 
 
 # --- notification accept: manual acceptance of a stuck bot_notify_pending --
@@ -1103,10 +1438,54 @@ def build_parser() -> argparse.ArgumentParser:
     review_resolve.add_argument("order_id")
     review_resolve.add_argument("--resolution", required=True, choices=ALLOWED_RESOLUTIONS)
     review_resolve.add_argument("--note", required=True)
+    review_resolve_many = review_sub.add_parser(
+        "resolve-many",
+        help="all-or-nothing bulk resolution of an EXPLICIT list of open "
+        "DELIVERY-failure manual reviews (preview-only without --yes); "
+        "financial/verification reviews are refused and must be resolved "
+        "individually with `review resolve`",
+    )
+    review_resolve_many.add_argument(
+        "order_ids",
+        nargs="+",
+        metavar="ORDER_ID",
+        help="every order id to resolve, listed explicitly. There is no "
+        "'resolve all' and no filter-based selection.",
+    )
+    review_resolve_many.add_argument(
+        "--resolution", required=True, choices=ALLOWED_RESOLUTIONS
+    )
+    review_resolve_many.add_argument("--note", required=True)
+    review_resolve_many.add_argument("--yes", action="store_true")
     review_resend = review_sub.add_parser("resend")
     review_resend.add_argument("order_id")
     review_resend.add_argument("--confirm-idempotent-bot", action="store_true")
     review_resend.add_argument("--yes", action="store_true")
+
+    attention = sub.add_parser(
+        "attention",
+        help="operational resolution of stale NON-FINANCIAL failures "
+        "(host only; never contacts CentralPay or the selling bot)",
+    )
+    attention_sub = attention.add_subparsers(dest="attention_command", required=True)
+    attention_list = attention_sub.add_parser("list")
+    attention_list.add_argument(
+        "--resolved",
+        action="store_true",
+        help="historical view: items an operator has already resolved",
+    )
+    attention_list.add_argument("--limit", type=int, default=50)
+    attention_show = attention_sub.add_parser("show")
+    attention_show.add_argument("order_id")
+    attention_resolve = attention_sub.add_parser("resolve")
+    attention_resolve.add_argument("order_id")
+    attention_resolve.add_argument(
+        "--resolution",
+        required=True,
+        choices=sorted(attention_service.ATTENTION_RESOLUTIONS),
+    )
+    attention_resolve.add_argument("--note", required=True)
+    attention_resolve.add_argument("--yes", action="store_true")
 
     notification = sub.add_parser(
         "notification",
@@ -1158,10 +1537,29 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        if args.review_command in ("acknowledge", "resolve") and not args.note.strip():
+        if args.review_command in (
+            "acknowledge",
+            "resolve",
+            "resolve-many",
+        ) and not args.note.strip():
             print("a non-empty --note is required", file=sys.stderr)
             return 1
         return _cmd_review(args)
+    if args.command == "attention":
+        if args.attention_command == "resolve":
+            if not args.note.strip():
+                print("a non-empty --note is required", file=sys.stderr)
+                return 1
+            if not args.yes:
+                print(
+                    _attention_resolve_warning(args.order_id, args.resolution),
+                    file=sys.stderr,
+                )
+                return 1
+        if args.attention_command == "list" and args.limit <= 0:
+            print("--limit must be positive", file=sys.stderr)
+            return 1
+        return _cmd_attention(args)
     if args.command == "notification":
         if args.notification_command == "accept" and not args.note.strip():
             print("a non-empty --note is required", file=sys.stderr)
