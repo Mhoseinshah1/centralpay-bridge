@@ -183,6 +183,9 @@ decision instead:
   `getlink_failed`, `stale_incomplete_creation` for `created`) and refuses a
   payment that has become financially meaningful, re-checked under the row
   lock;
+- is scoped to the incident it closed: a later failed link-creation attempt for
+  the same order reopens the item everywhere and lets the operator record a
+  fresh resolution, so a new failure is never silently suppressed;
 - removes the item from CURRENT attention counts on every surface at once (one
   shared predicate, `app.services.stuck_payments.unexpected_status_conditions`)
   while leaving it fully visible historically;

@@ -121,12 +121,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import ScalarSelect
 
 from app.audit import record_event
-from app.models import Payment, PaymentStatus
+from app.models import Payment, PaymentEvent, PaymentStatus
 
 logger = logging.getLogger("app.services.attention")
 
@@ -245,6 +246,10 @@ class AttentionSnapshot:
     # None == currently eligible for at least one allowlisted resolution.
     refusal: AttentionRefusal | None
     eligible_resolutions: tuple[str, ...]
+    # True when a recorded resolution exists but a LATER link-creation failure
+    # has superseded it: the item is simultaneously historically-resolved and
+    # currently open, and the operator must review the new incident.
+    attention_resolution_superseded: bool = False
 
 
 @dataclass(frozen=True)
@@ -260,6 +265,52 @@ class AttentionOutcome:
     existing_resolved_by: str | None = None
 
 
+# The audit event every failed link-creation attempt records, in the SAME
+# transaction as the status write (see app.services.payments.create_payment's
+# CentralPayError branch), and the event this module records for a resolution.
+# `payment_events` is append-only and permanent.
+LINK_FAILURE_EVENT_TYPE = "centralpay_getlink_failed"
+ATTENTION_RESOLVED_EVENT_TYPE = "payment_attention_resolved"
+
+
+def _latest_event_id_expression(event_type: str) -> ScalarSelect[int]:
+    """Correlated scalar subquery: the highest ``payment_events.id`` of the
+    given type for this payment, or NULL if it has none.
+
+    IDS, NOT TIMESTAMPS, deliberately. Two independent problems make
+    ``created_at`` the wrong key here:
+
+    * PostgreSQL's ``now()`` (the column's server default) is TRANSACTION
+      START time. ``create_payment`` holds the row lock across the ``getLink``
+      call, so a slow failure — a ReadTimeout is by definition slow — records
+      its event with a timestamp from before the call even began. That can be
+      EARLIER than a resolution recorded after it, which would hide the newer
+      failure: exactly the bug this supersession rule exists to prevent.
+    * SQLite (unit tests) resolves ``CURRENT_TIMESTAMP`` to whole seconds,
+      so two events in the same second are indistinguishable.
+
+    ``payment_events.id`` is sequence-allocated and strictly increasing, and
+    both writers serialize on the payment row lock (``create_payment`` holds
+    it across ``getLink``; :func:`resolve_attention` takes it ``FOR UPDATE``),
+    so the two operations can never interleave: whichever commits second
+    observes the other's event and is allocated a higher id. Comparing ids is
+    therefore exact, with no dependence on any clock.
+
+    Both ``payment_events.payment_id`` and ``.event_type`` are indexed; this
+    is the same correlated-subquery shape
+    ``app.adminbot.queries._notification_age_anchor`` already uses.
+    """
+    return (
+        select(func.max(PaymentEvent.id))
+        .where(
+            PaymentEvent.payment_id == Payment.id,
+            PaymentEvent.event_type == event_type,
+        )
+        .correlate(Payment)
+        .scalar_subquery()
+    )
+
+
 def unresolved_attention_condition() -> ColumnElement[bool]:
     """THE canonical "this attention item is still open" predicate.
 
@@ -267,19 +318,81 @@ def unresolved_attention_condition() -> ColumnElement[bool]:
     row composes exactly this expression — never a re-derived
     ``attention_resolved_at == None`` written out locally — so a resolved item
     disappears from CURRENT operational alerts everywhere at once while
-    staying fully visible in historical views (which simply omit it).
+    staying fully visible in historical views.
+
+    An item is open when it was never resolved, OR when a link-creation
+    failure was recorded AFTER the most recent resolution.
+
+    That second clause is not defensive padding; without it a resolution
+    silently suppresses a genuinely NEW failure forever.
+    ``app.services.payments.create_payment`` deliberately RETRIES ``getLink``
+    for an existing ``created``/``getlink_failed`` row (allocating a fresh
+    ``gateway_order_id`` first, in case CentralPay half-registered the old
+    one). If that retry also fails, the row returns to ``getlink_failed``
+    while ``attention_resolved_at`` still holds the operator's judgment about
+    the PREVIOUS incident. A plain ``IS NULL`` predicate would then hide the
+    new failure from `centralpay stuck` and every admin summary permanently,
+    and :func:`refuse_reason` would refuse to let the operator record a fresh
+    resolution — a real problem made invisible, which is exactly what an
+    operator-convenience feature must never do.
+
+    Resolution is therefore scoped to the INCIDENT it closed, not to the
+    payment forever. A retry that SUCCEEDS needs no special handling: the row
+    leaves the resolvable statuses entirely and is owned by the ordinary
+    delivery surfaces from then on.
 
     See ``app.services.stuck_payments.unexpected_status_conditions``, the
     single predicate builder both the ``centralpay stuck`` overview and the
     admin bot's ``needs attention`` count are built from.
     """
-    return Payment.attention_resolved_at.is_(None)
+    latest_failure = _latest_event_id_expression(LINK_FAILURE_EVENT_TYPE)
+    latest_resolution = _latest_event_id_expression(ATTENTION_RESOLVED_EVENT_TYPE)
+    return or_(
+        Payment.attention_resolved_at.is_(None),
+        and_(
+            latest_failure.is_not(None),
+            or_(
+                latest_resolution.is_(None),
+                latest_failure > latest_resolution,
+            ),
+        ),
+    )
+
+
+def _latest_event_id(db: Session, payment_id: int, event_type: str) -> int | None:
+    return db.execute(
+        select(func.max(PaymentEvent.id)).where(
+            PaymentEvent.payment_id == payment_id,
+            PaymentEvent.event_type == event_type,
+        )
+    ).scalar_one_or_none()
+
+
+def resolution_superseded_in_db(db: Session, payment: Payment) -> bool:
+    """Scalar counterpart of the second clause of
+    :func:`unresolved_attention_condition` for one payment — used wherever the
+    mutating or rendering path must apply the SAME supersession rule the
+    worklist predicate applies, against a specific row."""
+    if payment.attention_resolved_at is None:
+        return False
+    latest_failure = _latest_event_id(db, payment.id, LINK_FAILURE_EVENT_TYPE)
+    if latest_failure is None:
+        return False
+    latest_resolution = _latest_event_id(db, payment.id, ATTENTION_RESOLVED_EVENT_TYPE)
+    return latest_resolution is None or latest_failure > latest_resolution
 
 
 def resolved_attention_condition() -> ColumnElement[bool]:
-    """The exact complement of :func:`unresolved_attention_condition`, for
-    HISTORICAL views (``centralpay attention list --resolved``). Resolved
-    items never vanish; they only leave the current worklist."""
+    """Every payment carrying a recorded resolution, for HISTORICAL views
+    (``centralpay attention list --resolved``). Resolved items never vanish;
+    they only leave the current worklist.
+
+    Deliberately NOT the boolean complement of
+    :func:`unresolved_attention_condition`: a resolution superseded by a
+    newer failure is BOTH currently-open and historically-resolved, and the
+    history view must keep showing it. Callers must also not add a status
+    filter here — see ``app.ops``' ``attention list --resolved``.
+    """
     return Payment.attention_resolved_at.is_not(None)
 
 
@@ -295,7 +408,12 @@ def eligible_resolutions_for_status(status: str) -> tuple[str, ...]:
     )
 
 
-def refuse_reason(payment: Payment, *, resolution: str | None = None) -> AttentionRefusal | None:
+def refuse_reason(
+    payment: Payment,
+    *,
+    resolution: str | None = None,
+    superseded: bool = False,
+) -> AttentionRefusal | None:
     """The COMPLETE eligibility guard, as a pure function of a Payment row.
 
     Returns ``None`` when the payment may be attention-resolved, otherwise the
@@ -313,7 +431,12 @@ def refuse_reason(payment: Payment, *, resolution: str | None = None) -> Attenti
     resolvable at all?" (used by ``attention list``/``show``), or a specific
     allowlisted code to additionally check that code applies to this status.
     """
-    if payment.attention_resolved_at is not None:
+    # An already-resolved item is refused — UNLESS a newer link-creation
+    # failure has superseded that resolution, in which case this is a fresh,
+    # never-reviewed incident the operator must be able to close. Passing
+    # `superseded=False` (the default, used only where the caller has no
+    # event context) keeps the strict old behaviour.
+    if payment.attention_resolved_at is not None and not superseded:
         return AttentionRefusal.ALREADY_RESOLVED
 
     # --- financially-meaningful guards (any one of these is disqualifying) ---
@@ -342,8 +465,15 @@ def refuse_reason(payment: Payment, *, resolution: str | None = None) -> Attenti
     return None
 
 
-def snapshot(payment: Payment) -> AttentionSnapshot:
-    """Build the read-only operator view of one payment's attention state."""
+def snapshot(payment: Payment, *, superseded: bool = False) -> AttentionSnapshot:
+    """Build the read-only operator view of one payment's attention state.
+
+    ``superseded`` lets the caller report whether a newer link failure has
+    obsoleted this payment's recorded resolution (see
+    :func:`resolution_superseded_in_db`, or the equivalent computed in bulk by
+    ``app.ops``' ``attention list``), so eligibility rendered here matches the
+    worklist predicate exactly.
+    """
     return AttentionSnapshot(
         bot_order_id=payment.bot_order_id,
         gateway_order_id=payment.gateway_order_id,
@@ -368,8 +498,9 @@ def snapshot(payment: Payment) -> AttentionSnapshot:
         attention_resolution=payment.attention_resolution,
         attention_resolved_by=payment.attention_resolved_by,
         attention_resolution_note=payment.attention_resolution_note,
-        refusal=refuse_reason(payment),
+        refusal=refuse_reason(payment, superseded=superseded),
         eligible_resolutions=eligible_resolutions_for_status(payment.status),
+        attention_resolution_superseded=superseded,
     )
 
 
@@ -457,7 +588,12 @@ def resolve_attention(
         .execution_options(populate_existing=True)
     ).scalar_one()
 
-    refusal = refuse_reason(payment, resolution=resolution)
+    # Evaluated under the SAME lock, from the same append-only event trail the
+    # worklist predicate reads, so a superseded resolution is re-openable here
+    # exactly when the worklist says it is open.
+    superseded = resolution_superseded_in_db(db, payment)
+    previous_resolution = payment.attention_resolution
+    refusal = refuse_reason(payment, resolution=resolution, superseded=superseded)
     if refusal is not None:
         outcome = AttentionOutcome(
             resolved=False,
@@ -493,6 +629,11 @@ def resolve_attention(
             "status": previous_status,
             "gateway_verified": False,
             "gateway_order_id": payment.gateway_order_id,
+            # True when this closes a NEW failure that superseded an earlier
+            # resolution; `superseded_resolution` names the one replaced. The
+            # earlier resolution's own event stays in the trail permanently.
+            "superseded_previous_resolution": superseded,
+            "previous_resolution": previous_resolution if superseded else None,
         },
     )
     db.commit()

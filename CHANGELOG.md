@@ -40,6 +40,20 @@ released, not deployed.
   single-payment workflow is unchanged.
 
 ### Changed
+- **Attention resolution is scoped to the incident, not the payment.**
+  `create_payment` deliberately retries `getLink` for an existing
+  `created`/`getlink_failed` row. If that retry also fails, the row returns to
+  `getlink_failed` while the earlier `attention_resolved_at` still stands, so
+  a plain "resolved" filter hid the new, never-reviewed failure permanently
+  and the operator could not record another resolution. The canonical
+  predicate now also reopens an item whose most recent
+  `centralpay_getlink_failed` event is newer than its most recent
+  `payment_attention_resolved` event. The comparison is on monotonic
+  `payment_events.id`, not timestamps: PostgreSQL's `now()` is
+  transaction-start time, so a slow `getLink` timeout records a failure event
+  stamped before the call began, and SQLite resolves `CURRENT_TIMESTAMP` to
+  whole seconds. Both writers serialize on the payment row lock, so id order
+  is exact.
 - **One canonical unresolved-attention predicate.** The unexpected-status
   half of the needs-attention definition was written out twice — once for
   `centralpay stuck`'s detail rows and once for the admin bot's `/status`
@@ -110,6 +124,13 @@ could later become a genuine shipped-default defect — plus an
 cadence.
 
 ### Tests
+- `tests/test_attention_review_findings.py` — regressions for five defects
+  found in review: incident-scoped reopening (and that an unsuperseded
+  duplicate resolve is still refused), the open `attention list` composing the
+  canonical predicate rather than a fourth copy, the historical listing
+  keeping a payment that settled after resolution, bulk rejection of two
+  aliases naming one payment, and `needs_attention` staying exact past the
+  materialization cap.
 - `tests/test_attention.py`, `tests/test_attention_canonical.py`,
   `tests/integration/test_attention_pg.py` (real PostgreSQL: an 8-way
   resolution race, an identity-map staleness race, concurrent overlapping

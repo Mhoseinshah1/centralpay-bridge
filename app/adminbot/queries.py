@@ -356,6 +356,39 @@ def bot_delivery_snapshot(
     return BotDeliverySnapshot(total=total, entries=entries)
 
 
+def count_open_delivery_attention(
+    db: Session, *, now: datetime, pending_age_minutes: int = 30
+) -> int:
+    """EXACT count of the population :func:`stuck_payments` MATERIALIZES:
+    every open manual review (delivery-caused or not) plus every stale
+    ``bot_notify_pending`` row.
+
+    :func:`stuck_payments` returns a capped LIST, so
+    ``len(stuck_payments(...))`` saturates at its ``limit`` and understates
+    the real number once there are more than that many rows.
+    ``app.services.stuck_payments.stuck_payments_overview`` used that length
+    as its ``needs_attention`` component, which was tolerable while the field
+    was only a display hint but is not once ``centralpay stuck --json``
+    publishes it as an exact total (and derives ``total``/``truncated`` from
+    it). This is the unbounded count for that purpose.
+
+    ONE statement, not a sum of two: the two halves key off disjoint
+    ``Payment.status`` values so they are mutually exclusive at any instant,
+    and reading them together makes it impossible for a row transitioning
+    between them mid-read to be counted twice or dropped — the same reasoning
+    ``app.services.stuck_payments.count_other_attention`` documents.
+    """
+    pending_cutoff = now - timedelta(minutes=pending_age_minutes)
+    return db.execute(
+        select(func.count(Payment.id)).where(
+            or_(
+                and_(*open_manual_review_conditions()),
+                and_(*_stale_bot_notify_pending_conditions(pending_cutoff)),
+            )
+        )
+    ).scalar_one()
+
+
 def stuck_payments(
     db: Session,
     *,

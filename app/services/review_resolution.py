@@ -17,9 +17,14 @@ Safety contract
 ---------------
 * **Explicit order ids only.** There is no "resolve all", no filter, no
   ``--reason``-driven selection, and no default set. The operator must name
-  every payment. A duplicate id in the list is rejected rather than silently
-  deduplicated, because a duplicate means the operator's list is not what they
-  think it is.
+  every payment. A duplicate is rejected rather than silently deduplicated,
+  because a duplicate means the operator's list is not what they think it is.
+  Duplicates are detected on the RESOLVED PAYMENT, not just on the raw string:
+  one payment can be named both by its ``bot_order_id`` and by its numeric
+  ``gateway_order_id``, and those two strings differ. Matching on strings
+  alone, a two-alias batch would preview as two eligible reviews, lock and
+  mutate one row, and then print two success lines above ``resolved 1`` —
+  telling the operator the batch covered more payments than it did.
 * **Preview first.** :func:`preview_bulk_resolution` performs no lock and no
   write. The CLI runs it and refuses unless the operator re-runs with the
   explicit confirmation flag.
@@ -133,7 +138,10 @@ REFUSAL_MESSAGE: Mapping[BulkReviewRefusal, str] = {
         "resolution asserts the downstream bot processed this order, but the "
         "payment was never gateway verified (gateway_verified_at is NULL)"
     ),
-    BulkReviewRefusal.DUPLICATE_ORDER_ID: "listed more than once",
+    BulkReviewRefusal.DUPLICATE_ORDER_ID: (
+        "names a payment already listed in this batch (the same payment can "
+        "be named by its bot_order_id and by its numeric gateway_order_id)"
+    ),
     BulkReviewRefusal.MIXED_VERIFICATION_SET: (
         "the set mixes gateway-verified and never-verified payments; one "
         "shared justification cannot cover both. Resolve them separately."
@@ -277,6 +285,9 @@ def build_report(
         )
 
     seen: set[str] = set()
+    # Resolved payment ids, so two DIFFERENT strings naming the SAME payment
+    # (bot_order_id and gateway_order_id) are still caught as a duplicate.
+    seen_payment_ids: set[int] = set()
     rows: list[BulkReviewRow] = []
     for order_id in order_ids:
         if order_id in seen:
@@ -327,6 +338,22 @@ def build_report(
                 )
             )
             continue
+        if payment.id in seen_payment_ids:
+            rows.append(
+                BulkReviewRow(
+                    order_id=order_id,
+                    payment_id=payment.id,
+                    bot_order_id=payment.bot_order_id,
+                    status=payment.status,
+                    gateway_verified=payment.gateway_verified_at is not None,
+                    amount=payment.amount,
+                    bot_notify_reason=payment.bot_notify_reason,
+                    refusal=BulkReviewRefusal.DUPLICATE_ORDER_ID,
+                    message=_message(BulkReviewRefusal.DUPLICATE_ORDER_ID),
+                )
+            )
+            continue
+        seen_payment_ids.add(payment.id)
         rows.append(_row_for(order_id, payment, resolution=resolution))
 
     set_refusal = (

@@ -76,11 +76,13 @@ UNEXPECTED_STATE_GRACE_SECONDS = 60
 # Defensive cap on rows materialized per bucket — independent of the
 # caller-facing --limit/display truncation, which happens further down in
 # the CLI/bot renderers. `StuckOverview.total_counts` is computed with plain
-# COUNT queries and stays exact regardless of this cap, EXCEPT for the
-# reused manual-review/bot-notification bucket (see `_reused_needs_attention`)
-# where an exact count would require re-deriving `queries.stuck_payments`'s
-# stale-claim logic; in the extreme case of more than this many simultaneous
-# stuck deliveries, the count saturates at this cap rather than over-reading.
+# COUNT queries and stays EXACT regardless of this cap, including the reused
+# manual-review/bot-notification bucket: its count comes from
+# `queries.count_open_delivery_attention` (one unbounded COUNT over the same
+# population `_reused_needs_attention` materializes), never from the length
+# of the capped list. `centralpay stuck --json` publishes those counts as
+# exact totals, so a saturating value there would silently understate the
+# operator's worklist.
 _QUERY_CAP = 200
 
 # PaymentStatus values no current code path ever persists: verification
@@ -494,13 +496,20 @@ def stuck_payments_overview(
     """
     now = now_fn()
     reused_attention = _reused_needs_attention(db, settings)
+    # EXACT, unbounded count of the population `_reused_needs_attention`
+    # materializes -- NOT `len(reused_attention)`, which saturates at
+    # `_QUERY_CAP`. `centralpay stuck --json` publishes this as an exact
+    # category total and derives `total`/`truncated` from it, so a saturating
+    # value would understate `needs_attention`, understate `total`, and could
+    # even report `truncated: false` while rows were hidden.
+    reused_total = queries.count_open_delivery_attention(db, now=now)
     exhausted_attention, waiting, expired, link_counts = _link_created_buckets(db, settings, now)
     unexpected_attention, unexpected_total = _unexpected_status_entries(db, now)
 
     needs_attention = [*reused_attention, *exhausted_attention, *unexpected_attention]
     total_counts = {
         "needs_attention": (
-            len(reused_attention) + link_counts["reconciliation_exhausted"] + unexpected_total
+            reused_total + link_counts["reconciliation_exhausted"] + unexpected_total
         ),
         "waiting_gateway": link_counts["waiting_gateway"],
         "expired": link_counts["expired"],

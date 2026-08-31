@@ -222,7 +222,8 @@ Some payments fail before ever becoming financially meaningful — most commonly
 - a strict resolution-to-status allowlist, never an arbitrary status filter and never arbitrary status editing
 - eligibility requires the payment to be provably financially inert on this side, re-checked under `SELECT ... FOR UPDATE` with refreshed ORM state before any write
 - resolution writes only those four columns, appends an audit event, and touches no financial, identity, or status field
-- resolution is recorded once and never overwritten; a duplicate operator action is refused
+- resolution is scoped to the INCIDENT it closed, never to the payment forever: a later failed link-creation attempt for the same order reopens the item on every current surface and lets the operator record a fresh resolution. An operator convenience must never make a new, never-reviewed failure invisible
+- within one incident, resolution is recorded once and never overwritten; a duplicate operator action is refused
 - **resolution never constrains the financial path.** It is an operator opinion, not a settlement fact: no status change, and no database constraint may forbid a resolved payment from later being verified. A payment whose `getLink` response was lost can still be settled by a valid late callback, and that safety net must keep working.
 
 There must be exactly ONE canonical unresolved-attention predicate. Every surface that computes or displays current operational attention — the stuck-payments service, the CLI, the admin bot's summaries, monitor checks, review tooling — composes it rather than re-deriving an equivalent expression. A resolved item leaves every current alert at the same instant and stays visible in historical views.

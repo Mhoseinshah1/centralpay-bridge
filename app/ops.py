@@ -54,6 +54,7 @@ from app.models import FeePolicy, Payment, PaymentStatus
 from app.services import attention as attention_service
 from app.services import review_resolution
 from app.services.notification import ManualAcceptRefusal, execute_manual_accept
+from app.services.stuck_payments import unexpected_status_conditions
 
 # Non-financial operational resolution states only.
 ALLOWED_RESOLUTIONS = (
@@ -1097,6 +1098,7 @@ def _attention_summary(snapshot: attention_service.AttentionSnapshot) -> dict[st
         "attention_resolved_by": snapshot.attention_resolved_by,
         "attention_resolution_note": snapshot.attention_resolution_note,
         "resolvable": snapshot.refusal is None,
+        "attention_resolution_superseded": snapshot.attention_resolution_superseded,
         "refusal": snapshot.refusal.value if snapshot.refusal else None,
         "refusal_message": attention_service.snapshot_refusal_message(snapshot),
         "eligible_resolutions": list(snapshot.eligible_resolutions),
@@ -1136,28 +1138,58 @@ def _cmd_attention(args: argparse.Namespace) -> int:
 
     with session_factory() as db:
         if args.attention_command == "list":
-            # Both listings are scoped to attention-RESOLVABLE statuses, so
-            # this command never claims authority over manual_review or
-            # bot-delivery attention items (those have their own commands).
-            condition = (
-                attention_service.resolved_attention_condition()
-                if args.resolved
-                else attention_service.unresolved_attention_condition()
-            )
-            payments = db.execute(
-                select(Payment)
-                .where(
-                    Payment.status.in_(sorted(attention_service.RESOLVABLE_STATUSES)),
-                    condition,
+            now = datetime.now(UTC)
+            if args.resolved:
+                # HISTORICAL view: filter ONLY on "a resolution was recorded".
+                # Deliberately NO status filter. A resolved payment can
+                # legitimately settle later through a late callback (see
+                # app.services.attention), which moves it to a notification or
+                # manual-review status while it keeps its resolution columns.
+                # Scoping this to RESOLVABLE_STATUSES would drop exactly that
+                # case from the history — the most interesting one — and break
+                # the durability this feature promises.
+                conditions: tuple[Any, ...] = (
+                    attention_service.resolved_attention_condition(),
                 )
-                .order_by(Payment.created_at.asc())
-                .limit(args.limit)
-            ).scalars()
+            else:
+                # OPEN view: compose the CANONICAL current-attention predicate
+                # (grace period and unresolved filter included) rather than a
+                # locally re-derived one, then narrow it to the statuses this
+                # command can actually act on. Without the shared builder's
+                # grace period this listing would show every in-flight payment
+                # creation as a stale attention item: create_payment commits
+                # the `created` row BEFORE attempting getLink, so a plain read
+                # sees it immediately, while `centralpay stuck` and the admin
+                # bot deliberately exclude it for
+                # UNEXPECTED_STATE_GRACE_SECONDS. That is precisely the
+                # cross-surface disagreement the canonical predicate exists to
+                # prevent.
+                conditions = (
+                    *unexpected_status_conditions(now=now),
+                    Payment.status.in_(sorted(attention_service.RESOLVABLE_STATUSES)),
+                )
+            payments = list(
+                db.execute(
+                    select(Payment)
+                    .where(*conditions)
+                    .order_by(Payment.created_at.asc())
+                    .limit(args.limit)
+                ).scalars()
+            )
             shown = 0
             for payment in payments:
                 print(
                     json.dumps(
-                        _attention_summary(attention_service.snapshot(payment)),
+                        _attention_summary(
+                            attention_service.snapshot(
+                                payment,
+                                # Same supersession rule the worklist predicate
+                                # applies, so this listing and `centralpay
+                                # stuck` can never disagree about a row.
+                                superseded=attention_service.
+                                resolution_superseded_in_db(db, payment),
+                            )
+                        ),
                         ensure_ascii=False,
                     )
                 )
@@ -1182,7 +1214,12 @@ def _cmd_attention(args: argparse.Namespace) -> int:
             return 1
 
         if args.attention_command == "show":
-            summary = _attention_summary(attention_service.snapshot(found))
+            summary = _attention_summary(
+                attention_service.snapshot(
+                    found,
+                    superseded=attention_service.resolution_superseded_in_db(db, found),
+                )
+            )
             db.rollback()
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
