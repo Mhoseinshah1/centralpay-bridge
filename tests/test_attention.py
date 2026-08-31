@@ -136,6 +136,7 @@ def test_resolve_emits_an_audit_event_recording_the_unchanged_status(
     events = get_events(session_factory, payment.id)
     assert event_types(events) == [*before, "payment_attention_resolved"]
     data = events[-1].data
+    assert data is not None
     assert data["resolution"] == "stale_getlink_failure"
     assert data["note"] == "operator reviewed"
     assert data["operator"] == "host-cli"

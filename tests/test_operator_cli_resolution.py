@@ -18,6 +18,7 @@ Covers three separate operator-UX problems:
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 import pytest
@@ -97,7 +98,7 @@ def _stale_getlink_failed(client, settings, session_factory, stub, *, order_id):
         return payment.id
 
 
-def _json_lines(capsys) -> list[dict]:
+def _json_lines(capsys) -> list[dict[str, Any]]:
     return [
         json.loads(line)
         for line in capsys.readouterr().out.splitlines()
@@ -454,7 +455,7 @@ def test_resolve_many_resolves_the_whole_explicit_batch(
                 )
             )
         ).scalars()
-        counts = {}
+        counts: dict[str, int] = {}
         for event_type in events:
             counts[event_type] = counts.get(event_type, 0) + 1
         assert counts == {"manual_review_resolved": 15, "manual_review_bulk_resolved": 1}

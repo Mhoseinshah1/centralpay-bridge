@@ -21,6 +21,7 @@ existing test exercised it.
 
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import select
@@ -30,6 +31,9 @@ from app.models import Payment, PaymentStatus
 from app.services.stuck_payments import (
     _QUERY_CAP,
     UNEXPECTED_STATE_GRACE_SECONDS,
+    StuckCategory,
+    StuckEntry,
+    StuckOverview,
     stuck_payments_overview,
 )
 from tests.conftest import create_order
@@ -62,7 +66,7 @@ def _bulk_expired(session_factory, settings, count: int) -> None:
         db.commit()
 
 
-def _summary_line(capsys, session_factory, settings, *, limit=20) -> dict:
+def _summary_line(capsys, session_factory, settings, *, limit=20) -> dict[str, Any]:
     with session_factory() as db:
         assert _cmd_stuck(db, settings, limit=limit, as_json=True) == 0
     lines = [
@@ -224,13 +228,31 @@ def test_the_exact_production_outputs_are_now_coherent(counts, materialized, sho
     needs_attention + waiting_gateway + min(expired, 200)), while `total`
     now reports the truth."""
 
-    class _Overview:
-        total_counts = counts
-
-        def ordered(self):
-            return [None] * materialized
-
-    summary = _stuck_summary_dict(_Overview(), shown_count=shown)
+    # A REAL StuckOverview whose exact category counts and materialized entry
+    # list deliberately disagree — precisely the state the per-bucket cap
+    # produces, and the state the old `total` reported incorrectly.
+    placeholder = Payment(
+        bot_order_id="replay",
+        gateway_order_id=1,
+        gateway_user_id=1,
+        amount=1,
+        payable_amount=1,
+        status=PaymentStatus.LINK_CREATED.value,
+    )
+    entries = [
+        StuckEntry(
+            payment=placeholder,
+            category=StuckCategory.EXPIRED,
+            reason="reconciliation_max_age_exceeded",
+        )
+    ] * materialized
+    overview = StuckOverview(
+        needs_attention=[],
+        waiting_gateway=[],
+        expired=entries,
+        total_counts=counts,
+    )
+    summary = _stuck_summary_dict(overview, shown_count=shown)
     assert summary["materialized_total"] == materialized
     assert summary["total"] == sum(counts.values())
     assert summary["truncated"] is True
