@@ -26,10 +26,18 @@ def count_by_status(db: Session, status: str) -> int:
     ).scalar_one()
 
 
-def _open_manual_review_conditions() -> tuple[Any, ...]:
-    """An OPEN manual review still needs operator attention: the payment is in
-    manual_review AND has not been resolved via ``centralpay review resolve``
-    (which stamps review_resolved_at but keeps the status as history)."""
+def open_manual_review_conditions() -> tuple[Any, ...]:
+    """THE canonical "this manual review still needs operator attention"
+    predicate: the payment is in manual_review AND has not been resolved via
+    ``centralpay review resolve`` (which stamps review_resolved_at but keeps
+    the status as history).
+
+    Public (no leading underscore), like
+    ``non_delivery_manual_review_conditions``: ``app.cli``'s legacy
+    ``manual-review`` command and ``app.ops``' ``review list`` both compose it
+    directly, so no surface can re-derive a subtly different notion of "open"
+    and print resolved history as if it were an active worklist.
+    """
     return (
         Payment.status == "manual_review",
         Payment.review_resolved_at.is_(None),
@@ -40,17 +48,17 @@ def count_open_manual_reviews(db: Session) -> int:
     """count_by_status("manual_review") counts ALL rows ever left in that
     status; this counts only the unresolved ones operators must act on."""
     return db.execute(
-        select(func.count(Payment.id)).where(*_open_manual_review_conditions())
+        select(func.count(Payment.id)).where(*open_manual_review_conditions())
     ).scalar_one()
 
 
 def oldest_open_manual_review_age_seconds(db: Session, *, now: datetime) -> float | None:
     """Age of the longest-open unresolved manual review, or None when there
-    is none. Shares _open_manual_review_conditions with
+    is none. Shares open_manual_review_conditions with
     count_open_manual_reviews so the two can never disagree about which
     rows are "open"."""
     oldest: datetime | None = db.execute(
-        select(func.min(Payment.manual_review_at)).where(*_open_manual_review_conditions())
+        select(func.min(Payment.manual_review_at)).where(*open_manual_review_conditions())
     ).scalar_one()
     if oldest is None:
         return None
@@ -66,7 +74,7 @@ def open_manual_review_reason_buckets(db: Session) -> dict[str, int]:
     id or other customer-identifying data."""
     rows = db.execute(
         select(Payment.bot_notify_reason, func.count(Payment.id))
-        .where(*_open_manual_review_conditions())
+        .where(*open_manual_review_conditions())
         .group_by(Payment.bot_notify_reason)
     ).tuples().all()
     buckets: dict[str, int] = {}
@@ -132,7 +140,7 @@ def manual_review_payments(db: Session, limit: int = 20) -> list[Payment]:
     return list(
         db.execute(
             select(Payment)
-            .where(*_open_manual_review_conditions())
+            .where(*open_manual_review_conditions())
             .order_by(Payment.manual_review_at.asc().nulls_first())
             .limit(limit)
         ).scalars()
@@ -234,7 +242,7 @@ def _bot_delivery_manual_review_conditions() -> tuple[Any, ...]:
     (typically None, since those payments never reached notification at
     all). Never includes reconciliation-exhausted or unexpected-status
     rows — those never set ``status = manual_review`` in the first place."""
-    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
+    return (*open_manual_review_conditions(), Payment.bot_notify_reason.is_not(None))
 
 
 def non_delivery_manual_review_conditions() -> tuple[Any, ...]:
@@ -252,13 +260,13 @@ def non_delivery_manual_review_conditions() -> tuple[Any, ...]:
     ``app.services.stuck_payments.count_other_attention`` so its
     non-delivery-manual-review predicate can never drift from this one —
     the same reason ``reconciliation_exhausted_conditions`` is public."""
-    return (*_open_manual_review_conditions(), Payment.bot_notify_reason.is_(None))
+    return (*open_manual_review_conditions(), Payment.bot_notify_reason.is_(None))
 
 
 def count_non_delivery_manual_reviews(db: Session) -> int:
     """EXACT count of open manual-review rows that are NOT a bot-delivery
     problem (financial/verification mismatches). Shares
-    ``_open_manual_review_conditions`` with ``count_open_manual_reviews``
+    ``open_manual_review_conditions`` with ``count_open_manual_reviews``
     (the /manual_review command's total) and is the exact complement of
     ``bot_delivery_snapshot``'s manual-review half."""
     return db.execute(
@@ -411,7 +419,7 @@ def retry_queue_snapshot(db: Session, *, limit: int = 30) -> dict[str, list[Paym
         db.execute(
             select(Payment)
             .where(
-                *_open_manual_review_conditions(),
+                *open_manual_review_conditions(),
                 Payment.bot_notify_reason == "retry_limit_reached",
             )
             .order_by(Payment.manual_review_at.desc())

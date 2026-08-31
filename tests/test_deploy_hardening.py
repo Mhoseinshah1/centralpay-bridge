@@ -455,7 +455,7 @@ def test_cmd_diagnose_manual_review_query_excludes_resolved_rows():
 
 def test_cmd_status_and_diagnose_manual_review_query_matches_count_open_manual_reviews():
     """The shell SQL must express the exact same "open" predicate as
-    app.adminbot.queries._open_manual_review_conditions (status=
+    app.adminbot.queries.open_manual_review_conditions (status=
     'manual_review' AND review_resolved_at IS NULL) -- the two must never
     quietly disagree about what counts as unresolved."""
     source = CLI.read_text()

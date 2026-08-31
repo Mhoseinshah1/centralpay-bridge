@@ -21,7 +21,12 @@ exposes:
   mid-flight — still being polled, gateway not yet paid — is deliberately
   NOT attention-worthy: that is the expected, routine steady state
   (``app.services.verification`` documents this explicitly), so promoting
-  it here would bury real problems in noise.
+  it here would bury real problems in noise. An unexpected-status row an
+  operator has explicitly closed through ``app.services.attention``
+  (``centralpay attention resolve``) drops out of this category — and, via
+  the shared ``unexpected_status_conditions`` builder, out of every other
+  current operational surface at the same instant — while remaining fully
+  visible in historical inspection. Nothing is ever deleted.
 * WAITING_GATEWAY — ``link_created``, unverified, younger than the hard
   reconciliation lifetime, not exhausted: ordinary in-flight polling
   (active or expiring tier, whether never yet checked or checked and not
@@ -48,6 +53,10 @@ from sqlalchemy.orm import Session
 from app.adminbot import queries
 from app.config import Settings
 from app.models import Payment, PaymentStatus
+from app.services.attention import (
+    RESOLVABLE_STATUSES,
+    unresolved_attention_condition,
+)
 from app.services.reconciliation import (
     ERROR_GATEWAY_NOT_PAID,
     aged_out_age_condition,
@@ -84,6 +93,57 @@ _UNEXPECTED_STATUSES = (
     PaymentStatus.GETLINK_FAILED.value,
     PaymentStatus.GATEWAY_VERIFIED.value,
 )
+
+# Load-time proof that the canonical unresolved-attention filter below covers
+# EVERY attention surface an attention-resolvable payment can appear in.
+#
+# `unexpected_status_conditions` is the only NEEDS_ATTENTION predicate in this
+# codebase that composes `unresolved_attention_condition()`. That is correct
+# exactly as long as no attention-resolvable status can reach a DIFFERENT
+# needs-attention predicate: the reused bot-delivery bucket
+# (`queries.bot_delivery_snapshot`) only ever selects `manual_review` /
+# `bot_notify_pending` rows, and the reconciliation-exhausted bucket only ever
+# selects `link_created` rows. So if every resolvable status lives inside
+# `_UNEXPECTED_STATUSES`, a resolved row is filtered out of the current
+# worklist everywhere, by construction rather than by convention.
+#
+# Broadening `app.services.attention.ATTENTION_RESOLUTIONS` to a status
+# outside this tuple would silently break that guarantee, so it fails loudly
+# at import time instead. (tests/test_attention_canonical.py asserts the same
+# invariant explicitly, so the reason survives even if this line moves.)
+assert set(_UNEXPECTED_STATUSES) >= RESOLVABLE_STATUSES, (
+    "every attention-resolvable status must be an unexpected status, otherwise "
+    "unresolved_attention_condition() would not filter every attention surface"
+)
+
+
+def unexpected_status_conditions(*, now: datetime) -> tuple[Any, ...]:
+    """THE canonical "unexpected status still needing attention" predicate.
+
+    A payment sitting past the grace period in a status nothing ever
+    automatically revisits (`created`, `getlink_failed`, or the
+    never-actually-persisted `gateway_verified`) AND whose attention item an
+    operator has not resolved (`app.services.attention`).
+
+    Built exactly once and shared by `_unexpected_status_entries` (the
+    `centralpay stuck` overview's detail rows) and `count_other_attention`
+    (the admin bot's `/status` and `/stuck` "needs attention" summary
+    numbers). Those two were previously separate, identically-written
+    expressions; a resolution filter added to one and not the other would
+    have made the CLI and the admin bot disagree about the same payment.
+    Deriving both from one builder makes that class of drift impossible.
+
+    Resolved rows leave the CURRENT worklist only — they are never deleted
+    and stay fully visible through `centralpay payment ORDER_ID`,
+    `centralpay attention show ORDER_ID`, and
+    `centralpay attention list --resolved`.
+    """
+    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
+    return (
+        Payment.status.in_(_UNEXPECTED_STATUSES),
+        Payment.created_at <= cutoff,
+        unresolved_attention_condition(),
+    )
 
 
 def utcnow() -> datetime:
@@ -232,7 +292,7 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     * open manual-review rows caused by a FINANCIAL/verification mismatch
       (``queries.non_delivery_manual_review_conditions`` — the exact
       complement of ``bot_delivery_snapshot``'s manual-review half, sharing
-      the same ``_open_manual_review_conditions``/
+      the same ``open_manual_review_conditions``/
       ``_bot_delivery_manual_review_conditions`` predicates so a row can
       never be counted in both this function and
       ``bot_delivery_snapshot``, and never dropped from both).
@@ -262,15 +322,11 @@ def count_other_attention(db: Session, settings: Settings, *, now: datetime) -> 
     detail rows, so there is no count/list pair to keep consistent here the
     way there is for the bot-delivery, waiting, and expired totals — only
     the union WITHIN this count itself needed to become one statement."""
-    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
     return db.execute(
         select(func.count(Payment.id)).where(
             or_(
                 and_(*reconciliation_exhausted_conditions(settings, now=now)),
-                and_(
-                    Payment.status.in_(_UNEXPECTED_STATUSES),
-                    Payment.created_at <= cutoff,
-                ),
+                and_(*unexpected_status_conditions(now=now)),
                 and_(*queries.non_delivery_manual_review_conditions()),
             )
         )
@@ -412,11 +468,7 @@ def _link_created_buckets(
 
 
 def _unexpected_status_entries(db: Session, now: datetime) -> tuple[list[StuckEntry], int]:
-    cutoff = now - timedelta(seconds=UNEXPECTED_STATE_GRACE_SECONDS)
-    conditions: tuple[Any, ...] = (
-        Payment.status.in_(_UNEXPECTED_STATUSES),
-        Payment.created_at <= cutoff,
-    )
+    conditions = unexpected_status_conditions(now=now)
     total = db.execute(select(func.count(Payment.id)).where(*conditions)).scalar_one()
     payments = db.execute(
         select(Payment).where(*conditions).order_by(Payment.created_at.asc()).limit(_QUERY_CAP)

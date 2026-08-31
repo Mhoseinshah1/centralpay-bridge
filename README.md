@@ -119,14 +119,20 @@ centralpay payment ORDER_ID
 centralpay recent
 centralpay stuck
 centralpay retry-queue
-centralpay manual-review
+centralpay manual-review [--all]          # deprecated; use `review list`
 
-centralpay review list
+centralpay review list [--all]
 centralpay review show ORDER_ID
 centralpay review acknowledge ORDER_ID --note TEXT
 centralpay review resolve ORDER_ID --resolution VALUE --note TEXT
+centralpay review resolve-many ORDER_ID [ORDER_ID ...] \
+    --resolution VALUE --note TEXT [--yes]
 centralpay review resend ORDER_ID --confirm-idempotent-bot --yes
 centralpay notification accept ORDER_ID --note TEXT --yes
+
+centralpay attention list [--resolved]
+centralpay attention show ORDER_ID
+centralpay attention resolve ORDER_ID --resolution VALUE --note TEXT --yes
 
 centralpay reconciliation status
 centralpay reconcile ORDER_ID
@@ -157,6 +163,42 @@ centralpay rollback
 ```
 
 Detailed Persian runbooks: [OPERATIONS_FA.md](OPERATIONS_FA.md), [BACKUP_RESTORE_FA.md](BACKUP_RESTORE_FA.md), and [ADMIN_BOT_FA.md](ADMIN_BOT_FA.md).
+
+### Operational attention resolution
+
+Some payments never reach a payment link and are never gateway verified — a
+`getLink` timeout leaves the row in `getlink_failed`, which nothing
+automatically revisits, so it stays in `centralpay stuck`'s `needs_attention`
+category forever. Payment and audit history is permanent and is never deleted
+to clear an operator worklist, so `centralpay attention resolve` records that
+decision instead:
+
+- writes only four operational columns (time, actor, allowlisted reason,
+  mandatory note — migration `0013`) and appends a `payment_attention_resolved`
+  audit event;
+- never changes `status`, `amount`, `payable_amount`, the fee snapshot,
+  `gateway_verified_at`, `reference_id`, `gateway_order_id`, `gateway_user_id`,
+  or payer identity, and never deletes a payment, event, or admin alert;
+- uses a strict resolution→status allowlist (`stale_getlink_failure` for
+  `getlink_failed`, `stale_incomplete_creation` for `created`) and refuses a
+  payment that has become financially meaningful, re-checked under the row
+  lock;
+- removes the item from CURRENT attention counts on every surface at once (one
+  shared predicate, `app.services.stuck_payments.unexpected_status_conditions`)
+  while leaving it fully visible historically;
+- never contacts CentralPay or the selling bot, and never blocks a later
+  legitimate settlement — if the gateway did create a link the bridge never
+  received, the normal callback path still settles the payment.
+
+### `stuck --json` summary fields
+
+`total` is the TRUE sum of `needs_attention + waiting_gateway + expired`. It
+previously reported the size of the internally capped result set, which made
+the JSON self-contradictory once any category exceeded that cap (a real
+production line read `needs_attention: 1, waiting_gateway: 25, expired: 5788,
+total: 226`). The capped size is still available, explicitly, as
+`materialized_total`, and `truncated` reports whether any matching payment is
+missing from the entry lines.
 
 ## Production installation
 

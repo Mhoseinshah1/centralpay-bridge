@@ -5,7 +5,7 @@ Usage:
     python -m app.cli recent [--limit N]
     python -m app.cli payment ORDER_ID
     python -m app.cli retry-queue
-    python -m app.cli manual-review
+    python -m app.cli manual-review [--all]
     python -m app.cli stuck [--limit N] [--json]
     python -m app.cli reconciliation status [--json]
     python -m app.cli reconcile ORDER_ID [--verify [--confirm-aged-out]] [--json]
@@ -18,6 +18,14 @@ default (pass --json for a single machine-readable JSON object instead).
 `recent`, `payment`, `retry-queue`, `manual-review`, `reconciliation status`,
 and `reconcile` never modify data and never print secrets, redirect URLs, or
 full card numbers.
+
+`manual-review` is DEPRECATED in favour of `centralpay review list`, which
+renders the same population with acknowledgement/resolution detail. It now
+lists only UNRESOLVED reviews by default (`--all` for the historical view):
+`centralpay review resolve` deliberately keeps `status='manual_review'` as
+permanent history and records the outcome in `review_resolved_at` /
+`review_resolution`, so the old status-only filter reprinted every
+already-resolved review as if it were still active.
 
 `recover-aged-out` is a narrowly-scoped, explicit, SINGLE-payment recovery
 command for a `link_created` payment the reconciliation worker has excluded
@@ -94,6 +102,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adminbot import queries
 from app.adminbot.alerts import configure_alert_creation
 from app.centralpay import CentralPayClient
 from app.config import Settings
@@ -129,7 +138,12 @@ from app.services.reconciliation_status import (
     ReconciliationStatusSnapshot,
     build_reconciliation_status_snapshot,
 )
-from app.services.stuck_payments import StuckCategory, StuckEntry, stuck_payments_overview
+from app.services.stuck_payments import (
+    StuckCategory,
+    StuckEntry,
+    StuckOverview,
+    stuck_payments_overview,
+)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -159,6 +173,18 @@ def _payment_summary(payment: Payment) -> dict[str, Any]:
         "bot_notify_started_at": _iso(payment.bot_notify_started_at),
         "bot_notify_accepted_at": _iso(payment.bot_notify_accepted_at),
         "manual_review_at": _iso(payment.manual_review_at),
+        # Operator resolution facts. Without these a resolved row printed
+        # identically to an active one, which is exactly what made the legacy
+        # `manual-review` listing misleading. Purely additive keys.
+        "review_acknowledged_at": _iso(payment.review_acknowledged_at),
+        "review_resolved_at": _iso(payment.review_resolved_at),
+        "review_resolution": payment.review_resolution,
+        # Operational attention resolution (app.services.attention). Never a
+        # financial fact — see that module and migration 0013.
+        "attention_resolved_at": _iso(payment.attention_resolved_at),
+        "attention_resolution": payment.attention_resolution,
+        "attention_resolved_by": payment.attention_resolved_by,
+        "attention_resolution_note": payment.attention_resolution_note,
         "created_at": _iso(payment.created_at),
         "updated_at": _iso(payment.updated_at),
     }
@@ -226,11 +252,37 @@ def _cmd_retry_queue(db: Session) -> int:
     return 0
 
 
-def _cmd_manual_review(db: Session) -> int:
+def _cmd_manual_review(db: Session, *, include_resolved: bool) -> int:
+    """DEPRECATED listing, kept for compatibility with existing operator
+    habits and scripts. `centralpay review list` is the canonical command
+    (it also renders acknowledgement/resolution detail).
+
+    This previously filtered on ``status == manual_review`` ALONE. Because
+    `centralpay review resolve` deliberately KEEPS that status as permanent
+    history and records the outcome in ``review_resolved_at`` /
+    ``review_resolution`` instead, every review an operator had ever resolved
+    kept printing here as though it were still active — directly contradicting
+    `review list`, the admin bot's `/manual_review`, the `/status` count, and
+    the `manual_review` monitor check, all of which already filtered resolved
+    rows out.
+
+    Default is now UNRESOLVED-ONLY, composed from
+    ``app.adminbot.queries.open_manual_review_conditions`` — the same predicate
+    those other surfaces use, not a re-derived copy. ``--all`` is the explicit
+    opt-in for the historical view, and prints resolved rows too (each one
+    carrying its ``review_resolved_at``/``review_resolution`` in the output, so
+    the two are never confusable). No financial history is hidden either way:
+    resolved rows remain in the database permanently and stay reachable via
+    ``--all``, ``centralpay payment ORDER_ID``, and the admin bot's
+    ``/resolved_reviews``.
+    """
+    conditions: tuple[Any, ...] = (
+        (Payment.status == PaymentStatus.MANUAL_REVIEW.value,)
+        if include_resolved
+        else queries.open_manual_review_conditions()
+    )
     payments = db.execute(
-        select(Payment)
-        .where(Payment.status == PaymentStatus.MANUAL_REVIEW.value)
-        .order_by(Payment.manual_review_at.asc())
+        select(Payment).where(*conditions).order_by(Payment.manual_review_at.asc())
     ).scalars()
     for payment in payments:
         _print(_payment_summary(payment))
@@ -347,7 +399,87 @@ def _stuck_entry_lines(index: int, entry: StuckEntry, now: datetime) -> list[str
     return lines
 
 
+def _stuck_summary_dict(overview: StuckOverview, *, shown_count: int) -> dict[str, Any]:
+    """The `stuck --json` summary line.
+
+    FIELD CONTRACT (changed deliberately; see CHANGELOG):
+
+    * `needs_attention` / `waiting_gateway` / `expired` — EXACT category
+      counts, straight from `StuckOverview.total_counts`. Unbounded plain
+      COUNTs, never reduced by any cap or by `--limit`.
+    * `total` — the TRUE sum of those three exact counts.
+
+      It previously reported `len(overview.ordered())`, i.e. how many detail
+      rows the internal per-bucket cap (`stuck_payments._QUERY_CAP`, 200) had
+      materialized. Once ANY category exceeded that cap, `total` silently
+      became smaller than `needs_attention + waiting_gateway + expired` — a
+      real production output read `needs_attention: 1, waiting_gateway: 25,
+      expired: 5788, total: 226` (= 1 + 25 + 200), which is self-contradictory
+      for a human and outright wrong for a machine consumer summing the
+      categories. `total` now means what every reader already assumed.
+    * `materialized_total` — the OLD `total`: how many entry rows the capped
+      query produced, and therefore the maximum `shown` could ever reach.
+      Exposed explicitly rather than deleted so anything that genuinely wanted
+      the query-window size still has it, under a name that says so.
+    * `shown` — entry lines actually emitted after `--limit`.
+    * `truncated` — `shown < total`, i.e. at least one matching payment is not
+      represented by an entry line, whether because of `--limit` or the
+      internal cap. A consumer that only needs "am I seeing everything?" can
+      read this single boolean instead of re-deriving it.
+    """
+    counts = overview.total_counts
+    total = counts["needs_attention"] + counts["waiting_gateway"] + counts["expired"]
+    materialized_total = len(overview.ordered())
+    return {
+        "needs_attention": counts["needs_attention"],
+        "waiting_gateway": counts["waiting_gateway"],
+        "expired": counts["expired"],
+        "shown": shown_count,
+        "total": total,
+        "materialized_total": materialized_total,
+        "truncated": shown_count < total,
+    }
+
+
+def _print_stuck_truncation_note(
+    overview: StuckOverview, *, ordered_count: int, shown_count: int
+) -> None:
+    """Honest human-mode truncation footer.
+
+    The old footer always said "raise --limit to see more", which is a lie
+    once the internal per-bucket cap is the binding constraint: no `--limit`
+    value can surface a row the capped query never materialized (and `--limit`
+    is itself clamped to `_STUCK_DISPLAY_LIMIT_MAX`). Distinguish the two
+    causes so an operator is told what would actually help — the dedicated
+    `centralpay stuck`-adjacent commands (`/waiting`, `/expired`,
+    `centralpay reconciliation status`) query their categories directly and
+    are not subject to this cap.
+    """
+    counts = overview.total_counts
+    total = counts["needs_attention"] + counts["waiting_gateway"] + counts["expired"]
+    if total <= shown_count:
+        return
+    print()
+    remaining = total - shown_count
+    if ordered_count > shown_count:
+        print(f"... {remaining} more not shown (raise --limit to see more)")
+    else:
+        # Every materialized row is already on screen: the cap, not --limit,
+        # is what is hiding the rest.
+        print(
+            f"... {remaining} more not shown. The per-category detail query is "
+            f"capped at {_STUCK_DISPLAY_LIMIT_MAX} rows, so --limit cannot "
+            "reveal them; the summary counts above are still exact."
+        )
+
+
 def _cmd_stuck(db: Session, settings: Settings, *, limit: int, as_json: bool) -> int:
+    """Categorized operator view.
+
+    JSON summary field contract (see `_stuck_summary_dict`): `total` is the
+    TRUE sum of the three exact category counts; `materialized_total` is how
+    many detail rows the internal capped query actually produced.
+    """
     limit = max(1, min(limit, _STUCK_DISPLAY_LIMIT_MAX))
     overview = stuck_payments_overview(db, settings)
     now = datetime.now(UTC)
@@ -355,16 +487,7 @@ def _cmd_stuck(db: Session, settings: Settings, *, limit: int, as_json: bool) ->
     shown = ordered[:limit]
 
     if as_json:
-        _print(
-            {
-                "type": "summary",
-                "needs_attention": overview.total_counts["needs_attention"],
-                "waiting_gateway": overview.total_counts["waiting_gateway"],
-                "expired": overview.total_counts["expired"],
-                "shown": len(shown),
-                "total": len(ordered),
-            }
-        )
+        _print({"type": "summary", **_stuck_summary_dict(overview, shown_count=len(shown))})
         for entry in shown:
             _print({"type": "entry", **_stuck_entry_dict(entry, now)})
         return 0
@@ -385,10 +508,7 @@ def _cmd_stuck(db: Session, settings: Settings, *, limit: int, as_json: bool) ->
         print()
         for line in _stuck_entry_lines(index, entry, now):
             print(line)
-    remaining = len(ordered) - len(shown)
-    if remaining > 0:
-        print()
-        print(f"... {remaining} more not shown (raise --limit to see more)")
+    _print_stuck_truncation_note(overview, ordered_count=len(ordered), shown_count=len(shown))
     return 0
 
 
@@ -1271,7 +1391,17 @@ def build_parser() -> argparse.ArgumentParser:
     payment = subparsers.add_parser("payment", help="one payment with its audit events")
     payment.add_argument("order_id")
     subparsers.add_parser("retry-queue", help="payments awaiting bot notification")
-    subparsers.add_parser("manual-review", help="payments requiring administrator review")
+    manual_review = subparsers.add_parser(
+        "manual-review",
+        help="DEPRECATED (use `review list`): UNRESOLVED manual-review payments",
+    )
+    manual_review.add_argument(
+        "--all",
+        action="store_true",
+        dest="include_resolved",
+        help="also print reviews an operator has already resolved (historical "
+        "view; resolved rows carry review_resolved_at/review_resolution)",
+    )
     stuck = subparsers.add_parser(
         "stuck", help="categorized view of payments needing operator attention"
     )
@@ -1383,7 +1513,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "retry-queue":
             return _cmd_retry_queue(db)
         if args.command == "manual-review":
-            return _cmd_manual_review(db)
+            return _cmd_manual_review(db, include_resolved=args.include_resolved)
         if args.command == "reconciliation":
             return _cmd_reconciliation_status(db, settings, as_json=args.as_json)
         if args.command == "reconcile":

@@ -120,6 +120,42 @@ resolutionهای allowlistشده:
 
 Resolve کردن review یک تصمیم عملیاتی را ثبت می‌کند و نباید amount، fee snapshot، `gateway_verified_at` یا `reference_id` را جعل/بازنویسی کند.
 
+> **توجه:** `centralpay review resolve` عمداً `status='manual_review'` را به‌عنوان تاریخچهٔ دائمی نگه می‌دارد و فقط `review_resolved_at` / `review_resolution` را ثبت می‌کند. بنابراین «تعیین‌تکلیف‌شده» یعنی «از worklist خارج شد»، نه «حذف شد».
+>
+> دستور قدیمی `centralpay manual-review` قبلاً فقط بر اساس `status=manual_review` فیلتر می‌کرد و به همین دلیل reviewهای تعیین‌تکلیف‌شده را هم مثل موارد فعال چاپ می‌کرد. اکنون به‌صورت پیش‌فرض فقط موارد **تعیین‌تکلیف‌نشده** را نشان می‌دهد و `--all` نمای تاریخی است. این دستور deprecated است؛ دستور canonical همان `centralpay review list` است.
+
+### تعیین‌تکلیف گروهی (bulk)
+
+وقتی چند review دقیقاً یک وضعیت مالی و یک توجیه مشترک دارند (مثلاً ۱۵ سفارش gateway-verified با `retry_limit_reached` که اپراتور مستقل تأیید کرده ربات فروش همه را شارژ کرده)، به‌جای حلقهٔ shell روی دستور تک‌سفارشی:
+
+<div dir="ltr">
+
+```bash
+# ۱) preview — هیچ چیزی نوشته نمی‌شود
+centralpay review resolve-many ORDER_A ORDER_B ORDER_C \
+  --resolution confirmed_by_bot_operator \
+  --note "Confirmed credited by downstream bot operator"
+
+# ۲) اجرا — پس از بررسی گزارش preview
+centralpay review resolve-many ORDER_A ORDER_B ORDER_C \
+  --resolution confirmed_by_bot_operator \
+  --note "Confirmed credited by downstream bot operator" --yes
+```
+
+</div>
+
+قواعد ایمنی این دستور:
+
+- فقط **لیست صریح ORDER_ID**؛ هیچ حالت «resolve all» یا انتخاب مبتنی بر فیلتر وجود ندارد
+- بدون `--yes` فقط preview است و هیچ نوشتنی انجام نمی‌دهد
+- هر ردیف جداگانه دقیقاً همان بررسی‌های ایمنی تک‌سفارشی را می‌گذراند
+- **all-or-nothing**: یک ردیف نامعتبر کل batch را رد می‌کند و هیچ چیزی resolve نمی‌شود
+- مجموعه‌ای که gateway-verified و never-verified را با هم دارد رد می‌شود (`mixed_verification_set`) — یک توجیه مشترک نمی‌تواند صادقانه هر دو را پوشش دهد
+- `confirmed_by_bot_operator` / `duplicate_notification_confirmed_safe` فقط روی پرداخت gateway-verified مجاز است
+- reviewای که قبلاً resolve شده رد می‌شود؛ اصلاح یک مورد قبلی عمداً فقط از مسیر تک‌سفارشی `review resolve` ممکن است
+- هیچ HTTP به CentralPay یا ربات فروش زده نمی‌شود و هیچ فیلد مالی تغییر نمی‌کند
+- برای هر ردیف یک audit event و برای کل batch یک event ثبت می‌شود
+
 ### وقتی اپراتور می‌داند ربات فروش واقعاً شارژ کرده است
 
 اگر پرداخت در `manual_review` است و اپراتور مستقل تأیید کرده ربات فروش آن order را پردازش کرده، معمولاً resolution مناسب:
@@ -135,6 +171,50 @@ centralpay review resolve ORDER_ID \
 </div>
 
 فرمان confirmation تعاملی خود CLI را دنبال کنید.
+
+## Attention resolution (خطاهای کهنهٔ غیرمالی)
+
+بعضی پرداخت‌ها هیچ‌وقت به لینک پرداخت نرسیدند و هیچ‌وقت gateway-verified نشدند — مثلاً وقتی `getLink.php` با ReadTimeout شکست خورده است. چنین ردیفی برای همیشه در `centralpay stuck` با دستهٔ `needs_attention` و دلیل `unexpected_status:getlink_failed` می‌ماند، چون هیچ مسیر خودکاری دوباره سراغش نمی‌رود.
+
+**این ردیف را حذف نکنید.** تاریخچهٔ payment و payment_events دائمی است.
+
+<div dir="ltr">
+
+```bash
+centralpay attention list                 # موارد باز
+centralpay attention list --resolved      # نمای تاریخی
+centralpay attention show ORDER_ID        # جزئیات + دلیل واجد شرایط بودن/نبودن
+centralpay attention resolve ORDER_ID \
+  --resolution stale_getlink_failure \
+  --note "getLink ReadTimeout; no payment link was ever issued" --yes
+```
+
+</div>
+
+resolutionهای allowlistشده و statusهای مجاز آن‌ها:
+
+| resolution | فقط برای status |
+| --- | --- |
+| `stale_getlink_failure` | `getlink_failed` |
+| `stale_incomplete_creation` | `created` |
+
+این دستور:
+
+- ردیف Payment، تک‌تک PaymentEventها و همهٔ admin alertها را **دست‌نخورده** نگه می‌دارد
+- `status` را تغییر نمی‌دهد؛ `getlink_failed` همان `getlink_failed` می‌ماند
+- amount، payable_amount، fee snapshot، `gateway_verified_at`، `reference_id`، `gateway_order_id`، `gateway_user_id` و هویت پرداخت‌کننده را تغییر نمی‌دهد
+- actor، زمان، دلیل و note را به‌صورت دائمی ثبت می‌کند و یک audit event از نوع `payment_attention_resolved` می‌نویسد
+- زیر row lock دوباره تمام شرایط را بررسی می‌کند و اگر پرداخت در این فاصله «مالی» شده باشد رد می‌شود
+- بدون `--yes` رد می‌شود
+
+اگر پرداخت gateway-verified شده، `reference_id` دارد، به manual review رفته، تلاش ارسال به ربات داشته، یا `redirect_url` دارد (یعنی لینک پرداخت واقعاً صادر شده) — دستور رد می‌شود. در آن حالت ابتدا `centralpay reconcile ORDER_ID` را بررسی کنید.
+
+پس از resolve:
+
+- `centralpay payment ORDER_ID` همچنان تمام حقایق مالی و خطای اصلی را به‌علاوهٔ resolution و audit history نشان می‌دهد
+- شمارش‌های `needs attention` (در `centralpay stuck`، `/status` و `/stuck` ربات مدیریتی) دیگر آن را شامل نمی‌شوند
+
+> **محدودهٔ ادعا:** resolve کردن فقط یعنی «این bridge هیچ‌وقت لینک پرداختی برای این سفارش تحویل نداده و کار دیگری برایش ندارد». یعنی **نمی‌گوید** CentralPay هیچ رکوردی ندارد. اگر CentralPay واقعاً لینکی ساخته باشد که ما هرگز دریافتش نکردیم و مشتری آن را پرداخت کند، مسیر عادی callback همچنان پرداخت را settle می‌کند و ردیف دوباره در سطوح عادی delivery ظاهر می‌شود. attention resolution هیچ‌وقت جلوی settle شدن قانونی را نمی‌گیرد.
 
 ## `notification accept`
 
@@ -227,6 +307,44 @@ centralpay recover-aged-out ORDER_ID --confirm
 </div>
 
 بدون `--confirm` فقط preview است. با confirm، ردیف lock و دوباره eligibility check می‌شود و در صورت واجدشرایط بودن فقط یک بار مسیر canonical `verify_and_settle()` اجرا می‌شود. این فرمان automatic reconciliation آن payment را دوباره نامحدود فعال نمی‌کند.
+
+### بررسی شدت polling (cadence)
+
+اگر در `centralpay stuck --json` تعداد زیادی `link_created` تأییدنشده با attempts بالا (مثلاً ۱۰۰ تا ۱۸۰) و فاصلهٔ retry حدود ۶۰ ثانیه دیدید: این‌ها **incident مالی نیستند** — دستهٔ `waiting_gateway` هستند و `gateway_state: not_paid` وضعیت عادی است. اما می‌تواند نشانهٔ فشار غیرلازم روی CentralPay باشد.
+
+زمان‌بندی shipped دو مرحله‌ای و بر اساس **سن واقعی لینک** است (نه شمارندهٔ attempt):
+
+| سن لینک | فاصلهٔ بررسی |
+| --- | --- |
+| `< 900s` (tier فعال) | هر `10s` |
+| `900s` تا `< 7200s` (tier در حال انقضا) | هر `300s` |
+| `>= 7200s` | کلاً از reconciliation خارج می‌شود (هرگز حذف/failed/paid نمی‌شود) |
+
+با این تنظیمات، یک پرداخت ۱ تا ۲ ساعته **باید** فاصلهٔ ۳۰۰ ثانیه داشته باشد و حداکثر می‌تواند حدود ۱۱۱ attempt جمع کرده باشد. مشاهدهٔ فاصلهٔ ۶۰ ثانیه و ۱۸۰ attempt یعنی این deployment مقدار `RECONCILIATION_SLOW_INTERVAL_SECONDS` را override کرده است — نه اینکه default مخزن یا scheduler اشکال دارد (این حساب در `tests/test_reconciliation_schedule_defaults.py` به‌صورت اجرایی pin شده است).
+
+تنظیمات مؤثر واقعی را بدون حدس‌زدن ببینید:
+
+<div dir="ltr">
+
+```bash
+centralpay reconciliation status --json
+```
+
+</div>
+
+در خروجی، بخش `config` مقادیر مؤثر همان پروسه را نشان می‌دهد (`fast_window_seconds`، `fast_interval_seconds`، `slow_interval_seconds`، `max_age_seconds`، `batch_size`، `scan_interval_seconds`) و `runtime.config_source` می‌گوید آیا این مقادیر از همان containerی خوانده شده که worker در آن اجرا می‌شود (`worker_container`) یا تأییدنشده است (`unconfirmed`).
+
+اگر `slow_interval_seconds` برابر ۳۰۰ نبود، مقدار در `/etc/centralpay-bridge/centralpay.env` override شده است. برای بازگشت به cadence مستندشده آن خط را به مقدار زیر تغییر دهید و سرویس را restart کنید:
+
+<div dir="ltr">
+
+```bash
+RECONCILIATION_SLOW_INTERVAL_SECONDS=300
+```
+
+</div>
+
+> این یک تغییر رفتار مالی است: فاصلهٔ کندتر یعنی در بدترین حالت، کشف یک پرداخت انجام‌شده که callbackش گم شده تا ۳۰۰ ثانیه دیرتر انجام می‌شود (به‌جای ۶۰ ثانیه). پوشش تغییر نمی‌کند — فقط تأخیر کشف. مقدار کمتر ایمن است اما ترافیک verify را چند برابر می‌کند. حد بالای متوسط تماس‌های verify برابر `RECONCILIATION_BATCH_SIZE / RECONCILIATION_INTERVAL_SECONDS` است (پیش‌فرض: حدود ۲ در ثانیه).
 
 ### لاگ‌های معمول reconciliation
 

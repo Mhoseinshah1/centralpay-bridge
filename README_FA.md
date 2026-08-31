@@ -158,14 +158,20 @@ centralpay payment ORDER_ID
 centralpay recent
 centralpay stuck
 centralpay retry-queue
-centralpay manual-review
+centralpay manual-review [--all]          # منسوخ؛ از review list استفاده کنید
 
-centralpay review list
+centralpay review list [--all]
 centralpay review show ORDER_ID
 centralpay review acknowledge ORDER_ID --note TEXT
 centralpay review resolve ORDER_ID --resolution VALUE --note TEXT
+centralpay review resolve-many ORDER_ID [ORDER_ID ...] \
+    --resolution VALUE --note TEXT [--yes]
 centralpay review resend ORDER_ID --confirm-idempotent-bot --yes
 centralpay notification accept ORDER_ID --note TEXT --yes
+
+centralpay attention list [--resolved]
+centralpay attention show ORDER_ID
+centralpay attention resolve ORDER_ID --resolution VALUE --note TEXT --yes
 
 centralpay reconciliation status
 centralpay reconcile ORDER_ID

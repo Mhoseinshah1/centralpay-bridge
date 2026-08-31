@@ -30,6 +30,7 @@ from sqlalchemy.orm import sessionmaker
 from app.centralpay import CentralPayClient
 from app.models import Base, Payment, PaymentEvent, PaymentStatus
 from app.services.reconciliation import run_reconciliation_pass
+from tests.alembic_head import ALEMBIC_HEAD
 from tests.conftest import (
     CentralPayStub,
     build_app,
@@ -385,7 +386,7 @@ def test_migration_0010_from_production_0008(settings, pg_engine):
         )
 
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0012"
+    assert _alembic_version(pg_engine) == ALEMBIC_HEAD
     assert _column_names(pg_engine, "payments") >= _RECON_COLUMNS
     assert "ix_payments_reconciliation_due" in _index_names(pg_engine, "payments")
     with pg_engine.connect() as conn:
@@ -401,12 +402,12 @@ def test_migration_0010_from_production_0008(settings, pg_engine):
     # downgrade both no-op destructively.
     _alembic("stamp", "0009")
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0012"
+    assert _alembic_version(pg_engine) == ALEMBIC_HEAD
     _alembic("downgrade", "0009")
     assert _alembic_version(pg_engine) == "0009"
     assert _column_names(pg_engine, "payments") >= _RECON_COLUMNS  # preserved
     _alembic("upgrade", "head")
-    assert _alembic_version(pg_engine) == "0012"
+    assert _alembic_version(pg_engine) == ALEMBIC_HEAD
 
     # The previously stuck payment now reconciles through the normal path.
     stub = CentralPayStub()

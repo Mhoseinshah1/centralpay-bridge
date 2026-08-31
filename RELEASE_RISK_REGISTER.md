@@ -277,12 +277,29 @@ unaccounted for — the top priority of AGENTS.md.
 | B1 | Installer never executed on a real Ubuntu host (no VM access from this environment) | `REAL_HOST_VALIDATION.md` |
 | B2 | CentralPay contract never observed for real: staging run against the real/sandbox gateway (verify schema, verify-after-verify idempotency, real Caddy TLS) | `STAGING_VALIDATION.md` |
 | B3 | Live Telegram validation of the admin bot (blocker for enabling the admin bot; the payment path does not depend on it) | `ADMIN_BOT_VALIDATION.md` |
-| B5 | Release workflow (`.github/workflows/release.yml`) has not yet run green: Docker builds, Trivy scan, SBOM, and artifact packaging are CI-delegated and unverified locally | GitHub Actions |
+
+**Post-rc4 re-audit (see `RELEASE_EVIDENCE_0.6.0_RC4_POST_TAG.md`):** B5 is now
+CLOSED by a real tag-triggered `release.yml` run. B1, B2, and B3 remain OPEN on
+their existing, unchanged scope, and that document states exactly what each one
+still needs. In particular:
+
+- **B1 is not closed by the successful rc4 production rollout.** Updating an
+  already-provisioned host exercises `perform_update`, not the from-zero
+  installer, TLS issuance, systemd units, or UFW rules on a clean VM.
+- **B2 is not closed by production traffic.** Successful real payments are
+  evidence for the cases that happened to occur; B2 requires a controlled
+  procedure that produces evidence for verify-after-verify idempotency, real
+  response schemas and message texts, and a deliberately forced mismatch.
+- **B3 was re-audited against its own seven acceptance steps and none are
+  recorded** — `ADMIN_BOT_VALIDATION.md`'s Results section is still empty. The
+  production manual-review resolutions were performed through the host CLI and
+  say nothing about live Telegram.
 
 ## Closed release blockers
 
 | # | Blocker | Resolution | Evidence document |
 |---|---------|------------|--------------------|
+| B5 | Release workflow has not yet run green (Docker builds, Trivy scan, SBOM, artifact packaging CI-delegated and unverified locally) | **CLOSED (post-rc4).** The `v0.6.0-rc4` tag triggered `.github/workflows/release.yml` (run ID `33276671809`) against commit `ee3f2e694a7d45cf5d378a42d760381588c0071c`; the run completed successfully with every job green — documentation checks, ShellCheck/installer checks, gitleaks, dependency vulnerability scan, Python quality gates on Ubuntu 22.04 and 24.04, migrations on PG16, the full PostgreSQL test suite, security suites, Docker amd64 build, arm64 build validation, smoke test, Caddy validation, the strict Trivy HIGH/CRITICAL scan, the Syft SPDX SBOM, and release artifact packaging. Artifacts were created and the GitHub Release was published as a prerelease (`draft=false`, `prerelease=true`, `latest=false`). This closes the release-PIPELINE blocker only; it does not authorize using this version for real payments, which remains gated on B1, B2, B3 (for admin-bot enablement) and a recorded human approval. The rc2/rc3/rc4 tags are unchanged and `RELEASE_NOTES_0.6.0_RC4.md` was deliberately not rewritten. | `RELEASE_EVIDENCE_0.6.0_RC4_POST_TAG.md` |
 | B4 | Multi-agent adversarial review | **CLOSED (2026-08-17), independently revalidated on `c68e86e45b718b1da34439246572dfe5d8ac947a`.** First run 2026-07-19 (six agents, real PostgreSQL 16) on SHA `4e62a552…` → `B4_FAILED_CONFIRMED_CODE_BLOCKERS` (topics 33–35, 38 = CANON-1/2/3/5). Remediated in `fix/b4-confirmed-release-blockers` + `fix/release-manifest-exactness`. Independently rechecked by seven adversarial agents plus a full local verification run (ruff/mypy/pytest incl. real PostgreSQL 16/shellcheck) on current `main`: **zero confirmed B4 blockers**, CANON-1/2/3/5 all FIXED-CONFIRMED, financial and concurrency invariants proven live on PostgreSQL. Six new non-blocking-defect topics recorded (42–47), plus one incremental detail folded into existing topic 39 and one already-known B2-scoped risk note recorded at topic 48 (not a new B4 finding). The historical FAILED verdict on `4e62a552…` is preserved unchanged. | `ADVERSARIAL_REVIEW_0.6.0_RC1.md` (original, FAILED) + `ADVERSARIAL_REVIEW_B4_RECHECK_c68e86e4.md` (recheck, CLOSED) |
 
 **Release decision:** 0.6.0-rc1 is a code-complete release candidate.
@@ -965,3 +982,69 @@ deadlock/lock-ordering cycles (none found).
   register does not authorize either.
 - No production access, no deployment, and no real CentralPay/Telegram
   call occurred while diagnosing or fixing any of this.
+
+
+---
+
+## Topic 54 (post-rc4 `main`) — stale `/releases/latest` pointer — **METADATA HYGIENE; LOW; documented recommendation only, NOT executed**
+
+An older GitHub Release named/tagged `v0.6.1-rc1` was historically published
+with `prerelease=false`. GitHub resolves `/releases/latest` to the most recent
+non-draft, non-prerelease release, so that old RC-named release is what the API
+currently advertises as this project's latest release. `v0.6.0-rc4` was
+deliberately published `draft=false`, `prerelease=true`, `latest=false` and is
+correctly excluded.
+
+**No production-update impact.** `centralpay update` resolves an explicit
+release tag and verifies the artifact and `SOURCE_COMMIT` through `SHA256SUMS`,
+requiring the fetched tag commit to equal the verified `SOURCE_COMMIT` before
+any deployment work. It never reads `/releases/latest`. The impact is confusing
+metadata for humans and for third-party tooling that does read that endpoint.
+
+**Recommended remediation (requires separate human authorization; deliberately
+not performed):** edit the existing `v0.6.1-rc1` release and set
+`prerelease=true`, changing only that flag — never deleting the release,
+never deleting or moving the tag, never altering its notes or assets. Afterwards
+`/releases/latest` should return 404, which is correct for a repository with no
+stable release yet. No RC may ever be marked `latest`. Full detail, including
+the post-change verification steps, is in
+`RELEASE_EVIDENCE_0.6.0_RC4_POST_TAG.md` §4.
+
+**No GitHub Release or tag metadata was mutated while recording this.**
+
+## Topic 55 (post-rc4 `main`) — reconciliation polling cadence — **INVESTIGATED; NO CODE DEFECT; deployment configuration**
+
+Production `stuck --json` showed many unverified `link_created` payments with
+roughly 100-180 reconciliation attempts, ages of 1-2 hours, and a next retry
+about 60 seconds after the last check, against a documented default slow
+interval of 300 seconds. These are `waiting_gateway` rows with
+`gateway_state: not_paid` — the expected steady state, not financial incidents
+— but the cadence implied unnecessary CentralPay verify traffic.
+
+**Audit result: the shipped defaults and the scheduler are correct.**
+`app/config.py`, `.env.example`, and `deploy/centralpay.env.template` all agree
+on the documented two-stage age-based schedule (fast window 900 s at 10 s, then
+300 s, hard lifetime 7200 s, attempt cap 1000 as a secondary guard). No commit
+in the repository's history ever shipped a 60-second slow interval, and
+`reconciliation_retry_delay_seconds` derives the stage from real link age
+rather than the attempt counter, so a worker restart cannot restart the fast
+window.
+
+The attempt arithmetic attributes the observation to a deployment-level
+override rather than a shipped-default or scheduler defect: within the 2-hour
+lifetime the shipped 300-second interval tops out near 111 attempts and cannot
+produce 180, whereas a 60-second interval spans exactly the observed 100-180
+range at ages of 1-2 hours.
+
+**Action taken:** no financial or reconciliation behavior changed.
+`tests/test_reconciliation_schedule_defaults.py` pins the schedule math and
+asserts the three configuration surfaces agree — template/code drift being the
+realistic way this could later become a genuine shipped-default defect — and
+`OPERATIONS_FA.md` gained a procedure for reading the effective values from
+`centralpay reconciliation status --json` (whose `runtime.config_source` says
+whether they came from the worker's own container) and restoring the documented
+cadence, with an explicit note that a slower interval delays discovery of a
+lost-callback payment without reducing coverage.
+
+**No production access, no deployment, and no real CentralPay call occurred
+while investigating this.**
