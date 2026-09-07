@@ -1084,3 +1084,118 @@ create-payment crash model, which would be its own review.
 **Operator recourse.** `centralpay reconcile ORDER_ID` inspects a specific
 payment against local state at any time, and `centralpay attention list
 --resolved` keeps every resolved item permanently visible.
+
+## Topic 57 (post-rc4 `main`) — `POST /api/custom-payment` `schema_invalid` under the form content type — **INSTRUMENTED, NOT FIXED; evidence insufficient to identify the shape**
+
+Raised alongside the `urlencoded_raw_json_body` fix (which closed a *different*
+production class) and deliberately NOT resolved in the same change.
+
+**What production shows.** Repeated rejections carrying only::
+
+    representation=schema_invalid
+    content_type=application/x-www-form-urlencoded
+    body_size=286 / 288 / 292
+
+**Why that is not enough.** `schema_invalid` is raised at the very END of
+`parse_create_payment_request`: the body DECODED and normalized cleanly and
+then failed strict `CreatePaymentRequest` validation. The failure is therefore
+a value/type problem, not a parsing problem — but `_reject` overwrote the
+representation label with the fixed string `schema_invalid`, so **the decoder
+that produced the offending value was never recorded**. Under the form content
+type, five decoders can reach that point (`urlencoded`, `urlencoded_json_key`,
+`urlencoded_raw_json_key`, `urlencoded_json_object`,
+`urlencoded_json_string_object`), and several mutually exclusive explanations
+fit the evidence equally well:
+
+  * an ordinary form whose `amount` is a non-ASCII-decimal string
+    (`"10000.0"`, `"10,000"`, Persian/Arabic digits, surrounding whitespace) —
+    every form value arrives as a string and `_normalize` converts only a pure
+    ASCII-decimal one;
+  * a JSON body (via the fallback) whose `amount` is a float or boolean;
+  * an `order_id` that is empty, over 128 characters, or carries a control
+    character;
+  * an `api_key` that is not a JSON string.
+
+**Decision: do not guess.** Broadening acceptance to cover a hypothesis would
+relax strict validation on unauthenticated input with no evidence, which this
+contract forbids. Acceptance is unchanged and the HTTP response is
+byte-identical; only the log gained structure.
+
+**What the next production event will settle, precisely.**
+
+| Diagnostic | What it decides |
+| --- | --- |
+| `decoded_representation` | `urlencoded` ⇒ a genuine form, so the problem is a field VALUE. Any JSON label ⇒ the JSON-over-form-content-type sender, so the problem is a JSON TYPE. This alone splits the hypothesis space in two. |
+| `invalid_fields` | which of `api_key` / `amount` / `order_id` failed |
+| `invalid_error_types` | pydantic's reason: `int_type`, `string_type`, `greater_than`, `string_too_long`, `string_too_short`, `string_pattern_mismatch`, `missing` |
+| `field_types` | the JSON type each field actually arrived as |
+| `amount_is_ascii_decimal_string` | separates "a numeric string `_normalize` already converts" from "a string it deliberately will not" |
+| `order_id_length` | settles the over-128-character hypothesis outright |
+
+Taken together these pin the shape exactly. **Only then** should a targeted
+decision be made, and only if the shape turns out to be a legitimate sender
+rather than malformed or hostile traffic. If it is a sender-side defect that
+the customer can fix, the correct outcome is to report it, not to widen the
+parser.
+
+**Safety of the diagnostics themselves.** Every emitted value is one of our own
+field names, a pydantic error slug, a fixed JSON type name, a boolean, or a
+length — never a submitted value, the raw body, `api_key`, `order_id`, or a
+Telegram id. `api_key`'s LENGTH is deliberately omitted (only its type is
+reported) so an unauthenticated caller can never probe secret-adjacent length
+information. `tests/test_custom_payment_schema_invalid_diagnostics.py` asserts
+both accuracy and non-leakage.
+
+**Known bounded limitation of the sibling fix.** `_try_recover_raw_json_body`
+requires EXACTLY one parsed pair, matching the observed `total_pair_count=1`.
+A raw JSON body carrying TWO OR MORE unescaped `=` characters would produce
+several pairs and is deliberately NOT recovered. Such a body would still be
+visible as `representation=urlencoded` with `total_pair_count>1` and all three
+required fields missing; no such event has been observed. Widening to that case
+requires its own evidence.
+
+## Topic 58 (post-rc4 `main`) — unauthenticated HTTP 500 on a deeply nested JSON body at `POST /api/custom-payment` — **FIXED**
+
+Found by hostile review of the `urlencoded_raw_json_body` compatibility branch,
+not by a production report. Pre-existing on `main` since the legacy-body
+compatibility decoder was introduced; the new branch added one more route to
+the same weakness, which is what surfaced it.
+
+**Defect.** CPython's JSON scanner raises `RecursionError` for a deeply nested
+document. `RecursionError` derives from `RuntimeError`, **not** `ValueError`,
+and every `json.loads` site in `app/api/payments.py` caught only `ValueError`.
+The exception therefore escaped `parse_create_payment_request` entirely and was
+answered by the generic unhandled-error handler.
+
+**Reachability.** Bounded by `_MAX_BODY_BYTES` (64 KB) — but that bound is not
+tight enough: a body of the form `{"a":{"a":…"x"…}}` costs 5 bytes per level,
+so ~10,000 levels fit in ~60 KB, comfortably past the interpreter's recursion
+limit. Measured: depth 9,000 (54 KB) parses; depth 10,000 (60 KB) raises.
+Confirmed end-to-end that `application/json`, `text/plain`, **and**
+`application/x-www-form-urlencoded` each returned **500** with a full traceback
+logged at ERROR, from a completely unauthenticated request.
+
+**Impact.** Availability and observability, not financial: no payment,
+callback, verification, or notification path is involved, no state is mutated,
+and no secret is disclosed (the traceback contains library frames and the
+exception message, not the body). But an unauthenticated caller could fill the
+error log with tracebacks and take a documented sanitized-422 contract to 500.
+
+**Fix.** `_JSON_DECODE_ERRORS = (ValueError, RecursionError)`, applied at all
+six `json.loads` sites in the module (`_decode_json_layers` ×2,
+`_try_recover_json_key_form`, `_try_recover_raw_json_key_with_unescaped_equals`,
+`_try_recover_raw_json_body`, `_json_shape_label`). The body is now rejected
+through the ordinary path and answered with the standard sanitized 422.
+
+**This REJECTS more reliably; it never accepts anything new.** The change can
+only convert a would-be 500 into the documented rejection. The body-size bound
+is unchanged, and `tests/test_custom_payment_representation_matrix.py` proves
+no other representation moved.
+
+**Residual.** The nesting limit is the interpreter's, not a configured one, so
+the exact depth at which rejection begins is runtime-dependent. That is
+acceptable because BOTH outcomes are now safe: below the limit the document
+parses and faces strict validation; at or above it the request is rejected.
+`tests/test_custom_payment_parser_fuzz.py` guards the fixture itself with an
+explicit `pytest.raises(RecursionError)` so the regression tests cannot pass
+vacuously if a future runtime raises the limit.
