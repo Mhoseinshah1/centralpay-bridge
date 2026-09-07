@@ -94,6 +94,21 @@ See [FINANCIAL_INVARIANTS.md](FINANCIAL_INVARIANTS.md) and [FINANCIAL_TEST_MATRI
 
 Legacy clients using `application/x-www-form-urlencoded`, `text/plain`, or one extra JSON-string wrapper are supported only through bounded normalization; authentication, amount rules, idempotency, fee handling, and gateway validation remain identical.
 
+Each accepted body is labelled with a fixed representation, logged on `custom_payment_body_normalized` (and, on a strict-validation failure, as `decoded_representation` on `custom_payment_body_rejected`):
+
+| Representation | Wire shape |
+| --- | --- |
+| `json_object` | a JSON object (also used when `Content-Type` is absent) |
+| `json_string_object` | a JSON *string* containing one JSON object |
+| `text_json` | `text/plain` carrying either of the above |
+| `urlencoded` | an ordinary form with `api_key`, `amount`, `order_id` each exactly once |
+| `urlencoded_json_key` | the whole JSON document percent-encoded as the form key, empty value |
+| `urlencoded_raw_json_key` | raw JSON as the form key with an unescaped internal `=`, plus the trailing `=` separator |
+| `urlencoded_json_object` / `urlencoded_json_string_object` | form content type but a body strict form parsing cannot tokenize at all |
+| `urlencoded_raw_json_body` | form content type, the **complete** body is a raw JSON object with an unescaped internal `=` and **no** trailing `=` |
+
+The four `urlencoded_*` compatibility shapes exist only for inaccessible legacy senders and are each gated to one narrow, production-evidenced fingerprint; they are mutually exclusive and never reinterpret an ordinary form. Every one of them is handed to the same strict model, so nothing is coerced beyond an ASCII-decimal `amount` string. `tests/test_custom_payment_representation_matrix.py` pins the whole table, accepted and rejected alike.
+
 ## Rate limiting and client IP
 
 The application uses bounded in-process sliding-window limiters. Payment creation has both per-IP and global ceilings; invalid callback signatures have per-IP and global ceilings; invalid API-key attempts retain a global ceiling. Caddy explicitly overwrites `X-Forwarded-For` with its resolved peer address, and the application accepts only one syntactically valid IP value before using it for limiter identity.

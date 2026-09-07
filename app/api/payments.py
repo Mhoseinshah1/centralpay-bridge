@@ -120,6 +120,16 @@ _MAX_FORM_PAIRS = 32
 # ASCII decimal only: `[0-9]` never matches Persian/Arabic digits, and re.ASCII
 # keeps it strict. No sign, separators, whitespace, exponent, or decimal point.
 _ASCII_DECIMAL = re.compile(r"[0-9]+", re.ASCII)
+# Every ``json.loads`` failure this module must treat as "not decodable".
+# ``RecursionError`` is NOT a ``ValueError`` (it derives from ``RuntimeError``),
+# and CPython's JSON scanner raises it — not a decode error — for a deeply
+# nested document. Within the 64 KB body bound an unauthenticated caller can
+# reach roughly 10,000 nesting levels, which is past the interpreter's limit,
+# so catching only ``ValueError`` let such a body escape as an unhandled
+# exception: a 500 with a full traceback instead of the sanitized 422. Listing
+# it here rejects the body through the normal path. This REJECTS more
+# reliably; it never accepts anything new.
+_JSON_DECODE_ERRORS = (ValueError, RecursionError)
 
 
 class _CompatReject(Exception):
@@ -214,14 +224,14 @@ def _decode_json_layers(
         raise _CompatReject(object_category) from exc
     try:
         first = json.loads(text)
-    except ValueError as exc:
+    except _JSON_DECODE_ERRORS as exc:
         raise _CompatReject(object_category) from exc
     if isinstance(first, dict):
         return object_category, first
     if isinstance(first, str):
         try:
             second = json.loads(first)
-        except ValueError as exc:
+        except _JSON_DECODE_ERRORS as exc:
             raise _CompatReject(string_category) from exc
         if isinstance(second, dict):
             return string_category, second
@@ -263,7 +273,7 @@ def _try_recover_json_key_form(pairs: list[tuple[str, str]]) -> dict[str, Any] |
         return None
     try:
         parsed = json.loads(key)
-    except ValueError:
+    except _JSON_DECODE_ERRORS:
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -315,7 +325,74 @@ def _try_recover_raw_json_key_with_unescaped_equals(
         return None
     try:
         parsed = json.loads(text[:-1])
-    except ValueError:
+    except _JSON_DECODE_ERRORS:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _try_recover_raw_json_body(text: str, pairs: list[tuple[str, str]]) -> dict[str, Any] | None:
+    """Recover the third and narrowest legacy shape, confirmed by production
+    evidence: the COMPLETE request body is a raw (never percent-encoded) JSON
+    OBJECT sent under ``Content-Type: application/x-www-form-urlencoded``,
+    where a literal ``=`` inside one of the JSON string values was not
+    percent-encoded and there is NO trailing ``=`` form separator at all.
+
+    ``parse_qsl`` therefore splits the document at that single internal ``=``
+    and reports ONE syntactically valid pair whose key is the JSON's head and
+    whose value is its tail -- so form parsing neither raises (no fallback to
+    the JSON decoder in ``_decode``) nor finds any real field name.
+
+    The exact production fingerprint this recovers, reproduced byte-for-byte
+    in tests::
+
+        representation=urlencoded  content_type=application/x-www-form-urlencoded
+        body_size=278              total_pair_count=1
+        extra_field_count=1        missing_required_fields=["api_key","amount","order_id"]
+        duplicate_required_fields=[]
+        key_length=182             value_length=95        value_empty=false
+        key_json_type=invalid      value_json_type=invalid
+        key_starts_json_object=true                       key_ends_json_object=false
+        raw_pair_equals_count=1
+
+    Deliberately NOT a relaxation of
+    ``_try_recover_raw_json_key_with_unescaped_equals``: that sibling requires
+    a trailing ``=`` separator and MORE than one literal ``=``, and rebuilds
+    its candidate by trimming that separator. This shape has neither, and its
+    candidate is the untouched original body. The three urlencoded recoveries
+    are mutually exclusive by construction -- a body whose COMPLETE text
+    parses as a JSON object cannot end with ``=``, which is precisely what
+    both siblings require.
+
+    Returns the parsed JSON object ONLY when ALL of the following hold --
+    otherwise returns None and the caller falls through to the unchanged
+    ordinary parsing/rejection path (diagnostics included):
+      * EXACTLY one parsed pair (the production fingerprint; an ordinary form
+        carrying several fields is never reconsidered)
+      * that pair's key is not one of the required/alias field names -- i.e.
+        none of api_key/amount/order_id was recognized as a real form field
+      * the raw wire text, ignoring leading whitespace, BEGINS with ``{``
+        (a cheap structural gate before any parse is attempted)
+      * the COMPLETE, unmodified raw wire text parses as JSON
+      * that parse yields an OBJECT (dict) -- never an array, string, number,
+        boolean, null, or malformed JSON
+
+    Exactly one ``json.loads`` call, on the COMPLETE ORIGINAL body: nothing is
+    trimmed, searched for, unwrapped, or recursively decoded, and the
+    percent-decoded pair is never consulted for content. The recovered object
+    is returned to the SAME normalize -> strict-validate -> authenticate ->
+    amount-policy -> rate-limit -> create pipeline as every other
+    representation; no validation is weakened anywhere.
+    """
+    if len(pairs) != 1:
+        return None
+    key, _value = pairs[0]
+    if key in _REQUIRED_FIELDS or key in _ALIAS_FIELD_SET:
+        return None
+    if not text.lstrip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except _JSON_DECODE_ERRORS:
         return None
     return parsed if isinstance(parsed, dict) else None
 
@@ -326,7 +403,7 @@ def _json_shape_label(text: str) -> str:
     or logs the text itself. Used only for safe diagnostic logging."""
     try:
         parsed = json.loads(text)
-    except ValueError:
+    except _JSON_DECODE_ERRORS:
         return "invalid"
     if isinstance(parsed, dict):
         return "object"
@@ -335,6 +412,80 @@ def _json_shape_label(text: str) -> str:
     if isinstance(parsed, str):
         return "string"
     return "scalar"  # int, float, bool, or null
+
+
+def _json_type_name(value: Any) -> str:
+    """Classify a DECODED Python value into a fixed JSON type vocabulary
+    ("object"/"array"/"string"/"integer"/"number"/"boolean"/"null") — NEVER
+    returns the value itself. ``bool`` is checked before ``int`` because it is
+    an ``int`` subclass and the strict model rejects it as a distinct case."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return "unknown"
+
+
+def _schema_invalid_diagnostics(
+    representation: str, normalized: dict[str, Any], exc: PydanticValidationError
+) -> dict[str, Any]:
+    """SAFE, non-secret structural diagnostics for a body that DECODED and
+    normalized cleanly but then failed strict ``CreatePaymentRequest``
+    validation.
+
+    Production shows repeated ``representation=schema_invalid`` events under
+    ``application/x-www-form-urlencoded`` at body_size 286/288/292, but the
+    rejection log overwrote the representation label with the fixed string
+    ``schema_invalid``, so the decoded shape that produced them was NOT
+    recorded and CANNOT be inferred from the existing evidence. These fields
+    close exactly that gap WITHOUT broadening acceptance in any way — nothing
+    here changes what is accepted or rejected.
+
+    Every value is our own field name, a pydantic error slug, a fixed type
+    name, a boolean, or a length — NEVER a submitted value, the raw body,
+    api_key, order_id, or a Telegram id. api_key's LENGTH is deliberately
+    omitted (only its type is reported) so an unauthenticated caller can
+    never probe secret-adjacent length information.
+    """
+    invalid_fields: set[str] = set()
+    error_types: set[str] = set()
+    for error in exc.errors():
+        error_types.add(str(error.get("type", "unknown")))
+        loc = error.get("loc") or ()
+        field = str(loc[0]) if loc else ""
+        # normalized only ever carries the three required field names, so this
+        # can only be one of them; anything else is bucketed without echoing it.
+        invalid_fields.add(field if field in _REQUIRED_FIELDS else "other")
+    amount = normalized.get("amount")
+    order_id = normalized.get("order_id")
+    return {
+        # THE missing datum: which decoder produced the value that then failed.
+        "decoded_representation": representation,
+        "invalid_fields": sorted(invalid_fields),
+        "invalid_error_types": sorted(error_types),
+        "field_types": {
+            field: (_json_type_name(normalized[field]) if field in normalized else "missing")
+            for field in _REQUIRED_FIELDS
+        },
+        # Distinguishes "amount arrived as a string that _normalize could not
+        # convert" (decimal point, separators, whitespace, non-ASCII digits)
+        # from a genuine JSON float/bool/object. False when amount is absent
+        # or was not a string at all.
+        "amount_is_ascii_decimal_string": bool(
+            isinstance(amount, str) and _ASCII_DECIMAL.fullmatch(amount)
+        ),
+        "order_id_length": len(order_id) if isinstance(order_id, str) else None,
+    }
 
 
 def _unrecovered_single_pair_diagnostics(pair: tuple[str, str], raw_text: str) -> dict[str, Any]:
@@ -419,6 +570,16 @@ def _decode_urlencoded(raw: bytes) -> tuple[str, dict[str, Any]]:
     recovered = _try_recover_raw_json_key_with_unescaped_equals(text, pairs)
     if recovered is not None:
         return "urlencoded_raw_json_key", recovered
+    # Third confirmed shape (see _try_recover_raw_json_body): the COMPLETE
+    # body is a raw JSON object with ONE unescaped internal '=' and NO
+    # trailing separator, so parse_qsl splits it into a single useless pair
+    # instead of failing. Checked LAST so both siblings above keep their
+    # exact precedence; the three are mutually exclusive by construction.
+    # Fed through the SAME normalize/validate pipeline as every other
+    # representation — never a separate, weaker path.
+    recovered = _try_recover_raw_json_body(text, pairs)
+    if recovered is not None:
+        return "urlencoded_raw_json_body", recovered
     # Count occurrences of the REQUIRED fields; also capture optional aliases.
     # Every other extra field is dropped here (name/value neither retained nor
     # logged).
@@ -573,8 +734,16 @@ async def parse_create_payment_request(request: Request) -> ParsedPaymentRequest
     )
     try:
         body = CreatePaymentRequest(**normalized)
-    except PydanticValidationError:
-        _reject("schema_invalid", media_type, body_size)
+    except PydanticValidationError as exc:
+        # Diagnostics only — acceptance is unchanged (see
+        # _schema_invalid_diagnostics for why the decoded representation was
+        # the datum production was missing).
+        _reject(
+            "schema_invalid",
+            media_type,
+            body_size,
+            _schema_invalid_diagnostics(representation, normalized, exc),
+        )
     return ParsedPaymentRequest(body=body, telegram_user_id=telegram_user_id)
 
 

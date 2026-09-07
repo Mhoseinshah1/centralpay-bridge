@@ -52,6 +52,63 @@ released, not deployed.
   blanket judgement has financial consequences; they remain resolvable
   individually with `centralpay review resolve`, which is unchanged.
 
+### Fixed
+- **Intermittent HTTP 422 on `POST /api/custom-payment` for one legacy VPN-bot
+  account** (`app/api/payments.py`, `_try_recover_raw_json_body`, new
+  representation `urlencoded_raw_json_body`). The sender declares
+  `Content-Type: application/x-www-form-urlencoded` but sends a raw JSON
+  object as the COMPLETE body, with a literal `=` inside a string value left
+  un-percent-encoded and **no** trailing `=` separator. `parse_qsl` therefore
+  splits the document at that single internal `=` and reports one
+  syntactically valid pair — so form parsing neither raises (the JSON fallback
+  triggers only on a *syntax* failure) nor matches any field name, and the
+  request died reporting all three required fields "missing". The production
+  fingerprint is reproduced byte-for-byte in tests (`body_size=278` =
+  `key_length=182` + `=` + `value_length=95`, `raw_pair_equals_count=1`).
+  The recovery is gated to that exact shape — form content type, EXACTLY one
+  parsed pair, no required/alias field name matched, body begins with `{`, and
+  the complete unmodified body parses with one `json.loads` to a dict — and
+  feeds the SAME normalize → strict-validate → authenticate → amount-policy →
+  rate-limit → idempotency → create pipeline. Nothing is coerced, no
+  validation is weakened, and an ordinary form is never reinterpreted merely
+  because required fields are missing. The three `urlencoded` recoveries are
+  mutually exclusive by construction: a body whose complete text parses as a
+  JSON object cannot end with `=`, which both siblings require.
+  `tests/test_custom_payment_representation_matrix.py` pins every other
+  representation, accepted and rejected, so the blast radius is exactly one
+  row.
+
+- **Unauthenticated HTTP 500 on a deeply nested JSON body**
+  (`_JSON_DECODE_ERRORS`). CPython's JSON scanner raises `RecursionError` —
+  which is **not** a `ValueError` — for a deeply nested document, and every
+  `json.loads` site in `app/api/payments.py` caught only `ValueError`. Within
+  the existing 64 KB body bound an unauthenticated caller reaches roughly
+  10,000 nesting levels, past the interpreter limit, so a ~60 KB body answered
+  **500 with a full traceback** instead of the sanitized 422 — on
+  `application/json`, `text/plain`, and `application/x-www-form-urlencoded`
+  alike. Found while hostile-reviewing the raw-JSON-body branch above, which
+  added one more route to the same pre-existing weakness. All six decode sites
+  now reject through the normal path. This makes the parser reject **more**
+  reliably; it never accepts anything new, and the body-size bound is
+  unchanged.
+
+### Added
+- **Structural diagnostics for `representation=schema_invalid`**
+  (`_schema_invalid_diagnostics`). Production also logs repeated
+  `schema_invalid` rejections under the form content type at body_size
+  286/288/292, but the rejection log overwrote the representation with the
+  fixed string `schema_invalid`, so the decoder that produced the offending
+  value was never recorded and the shape **cannot** be identified from the
+  existing evidence. Rather than guess, the rejection now also carries
+  `decoded_representation`, `invalid_fields`, `invalid_error_types`,
+  `field_types`, `amount_is_ascii_decimal_string`, and `order_id_length` —
+  our own field names, pydantic's fixed error slugs, JSON type names,
+  booleans, and lengths only. `api_key`'s length is deliberately omitted so
+  an unauthenticated caller cannot probe secret-adjacent length information.
+  **No acceptance is broadened for this class**; the HTTP response is
+  byte-identical to before. See `RELEASE_RISK_REGISTER.md` Topic 57 for
+  exactly what the next production event will settle.
+
 ### Changed
 - **Attention resolution is scoped to the incident, not the payment.**
   `create_payment` deliberately retries `getLink` for an existing
